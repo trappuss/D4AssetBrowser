@@ -1969,6 +1969,36 @@ void GLModelWidget::buildSpringBones()
             }
         }
     }
+    m_orphanLegacy = qEnvironmentVariableIsSet("D4_CLOTH_LEGACY_ORPHANS");
+
+    // ── CAGE-LESS cloth bones: give them a GEOMETRY-DERIVED tether ───────────────────────────
+    // A bone no cage claimed keeps the synthetic m_sbAttach default of 1.0, which under the
+    // absolute-tether semantics (FINDINGS F1) means a ~1 wu leash — they dangled limply. The
+    // response was a hard clamp (hairTight 0.10 x noCage) that pinned them to within ~7-100 mm of
+    // the animated pose, i.e. RIGID: measured on barF_base08_LEG, 122 of 329 cloth bones (37%) are
+    // cage-less and their cloth-orphan displacement sits at d = 2-45 mm. Both extremes are wrong.
+    //
+    // A tether is a LENGTH, so derive it from the chain: how far this bone sits from its chain root
+    // (first non-cloth ancestor) in the REST pose. A hem bone 40 cm down the chain may swing on the
+    // order of 40 cm; a bone 2 cm from its anchor may not. No per-model constants — it is measured
+    // from the rig. Genuine hair keeps its tight clamp (handled by m_sbHair downstream).
+    for (int j = scanStart; j < nb; ++j) {
+        if (j >= m_sbIsCloth.size() || !m_sbIsCloth[j]) continue;
+        if (m_sbSim[j] >= 0) continue;                    // cage-matched: authored tether stands
+        if (j < m_sbPin.size() && m_sbPin[j]) continue;
+        int r = j, guard = 0;                              // walk to the first non-cloth ancestor
+        while (guard++ < 256) {
+            const int p = m_skeleton[r].parent;
+            if (p < 0 || p >= nb) break;
+            if (p < m_sbIsCloth.size() && !m_sbIsCloth[p]) { r = p; break; }
+            r = p;
+        }
+        const float dx = restG[j][12]-restG[r][12], dy = restG[j][13]-restG[r][13],
+                    dz = restG[j][14]-restG[r][14];
+        const float len = std::sqrt(dx*dx + dy*dy + dz*dz);
+        if (len > 1e-4f) m_sbAttach[j] = len;              // absolute wu, same semantics as authored
+    }
+
     int hairBones = 0, hairLoose = 0, drivenBones = 0;
     for (int j = scanStart; j < nb; ++j) {
         if (m_sbHair[j]) { ++hairBones; if (m_sbSim[j] < 0) ++hairLoose; }
@@ -2621,7 +2651,12 @@ void GLModelWidget::springBoneStep(QVector<Mat4>& global)
         // item replaces). The game's only authored truth left for them is the SKINNED
         // pose — so track it tightly with subtle lag (hair treatment) instead of loose
         // cloth swing, which left the pelt hanging flatly through the striding leg.
-        const bool hairBone = (j < m_sbHair.size() && m_sbHair[j] && !tuned) || si < 0;
+        // `|| si < 0` (cage-less ⇒ hair treatment) is what made 37% of a garment's cloth bones
+        // rigid: snap-back, heavy damping and 0.35x gravity, on top of the tight leash below. It
+        // was a workaround for the synthetic 1.0 tether; those bones now carry a geometry-derived
+        // tether (see buildSpringBones), so the workaround is off by default. D4_CLOTH_LEGACY_ORPHANS=1
+        // restores it. GENUINE hair (m_sbHair) is unaffected either way.
+        const bool hairBone = (j < m_sbHair.size() && m_sbHair[j] && !tuned) || (si < 0 && m_orphanLegacy);
         const float stiffJ = hairBone ? qMax(stiff, 0.55f) : stiff;   // hold close to the skinned pose
         const float keepJ  = hairBone ? qMin(keep, 0.45f)  : keep;    // heavier damping → settles fast
         const float gjJ    = hairBone ? gj * 0.35f          : gj;      // hair droops far less than cloth
@@ -2673,8 +2708,8 @@ void GLModelWidget::springBoneStep(QVector<Mat4>& global)
             // UNITS, corrected (tools/d4cloth/FINDINGS.md F1): m_sbAttach is an authored
             // ABSOLUTE tether length — apply the slider only (1.0 = game). The old tnorm²
             // tracking scale treated it as a normalized fraction. Hair keeps a tight clamp.
-            const float hairTight = ((j < m_sbHair.size() && m_sbHair[j] && !tuned2) || si2 < 0)
-                                        ? 0.10f : 1.0f;
+            const float hairTight = ((j < m_sbHair.size() && m_sbHair[j] && !tuned2)
+                                     || (si2 < 0 && m_orphanLegacy)) ? 0.10f : 1.0f;
             // CAGE-LESS cloth bones (si2 < 0 — no cage claimed them, so m_sbAttach is the
             // synthetic default 1.0, NOT an authored tether): the absolute-units clamp gave
             // them a ~1 wu leash, so the fur/tassel chains of pieces that ship no cage for
@@ -2684,7 +2719,9 @@ void GLModelWidget::springBoneStep(QVector<Mat4>& global)
             // pose with subtle secondary swing, which is also what they did before the port.
             // Bones WITH an authored tether (cage-matched) keep the absolute F1 semantics.
             const float tnorm2 = qBound(0.0f, (1.0f - trk) / 0.55f, 1.0f);
-            const float noCage = (si2 < 0) ? qMax(0.05f, tnorm2 * tnorm2) : 1.0f;
+            // Cage-less bones now carry a real (geometry-derived) tether, so this extra squeeze
+            // is legacy-only; with it applied on top, a hem bone was leashed to ~7-100 mm.
+            const float noCage = (si2 < 0 && m_orphanLegacy) ? qMax(0.05f, tnorm2 * tnorm2) : 1.0f;
             const float md = m_sbAttach[j] * qBound(0.05f, m_cloth.maxDistance, 2.0f) * hairTight * noCage;
             float* S=m_sbSimHead.data()+j*3;
             const float dx=S[0]-animG[j][12], dy=S[1]-animG[j][13], dz=S[2]-animG[j][14];

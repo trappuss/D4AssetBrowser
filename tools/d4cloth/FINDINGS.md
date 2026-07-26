@@ -394,6 +394,47 @@ inside the authored capsules. Transform each capsule into cage space for each ca
 count particle interpenetrations — the correct axis minimises them. Blocked on skeleton parsing in
 the harness (bone rest transforms), which `tools/d4cloth` does not yet do.
 
+## F12 — ROOT CAUSE of "rigid, not flowing": cage-less cloth bones got hair treatment
+
+User report: most skirts deform around colliders instead of flowing. Diagnosed from the shipping
+build's own logs — no new instrumentation needed.
+
+**Measured** (`cloth_cage_diag.txt`, barF_base08_LEG + barF_base00 body cloth):
+
+```
+nb=519  baseBones=190  physBones=329  cages=7  cageDriven=207
+```
+
+**122 of 329 cloth bones (37%) are cage-less.** `authoredNone` across the seven FOLLOW lines totals
+88 — the authored follower tables themselves assign no bone for those verts. The `cloth-orphan`
+lines show their simulated position sitting **d = 2-45 mm** from the animated pose: frozen, with
+`moves=0` (so the animation is not what holds them).
+
+**Mechanism (three compounding clamps, all keyed on `si < 0` = "no cage"):**
+
+| site | effect on a cage-less bone |
+|---|---|
+| `hairBone` | `stiff >= 0.55` (snap-back), `keep <= 0.45` (heavy damping), `gravity x 0.35` |
+| `hairTight` | tether x **0.10** |
+| `noCage` | tether x `tnorm^2` (a further ~0.07-1.0) |
+
+Net leash ~7-100 mm around the skinned pose. That is the "rigid but deforming around colliders"
+look exactly: no chain dynamics, only collision displacement.
+
+**Why it was there:** a cage-less bone keeps the synthetic `m_sbAttach` default of **1.0**, which
+under absolute-tether semantics (F1) is a ~1 wu leash — they dangled limply through walking legs
+(spiF_stor214). The clamp was the fix for that. Both ends are wrong: 1 wu = loose, 0.007 wu = rigid.
+
+**Fix:** a tether is a LENGTH, so derive it from the rig — the rest-pose distance from the bone to
+its chain root (first non-cloth ancestor). A hem bone 40 cm down its chain gets a 40 cm tether; a
+bone 2 cm from its anchor gets 2 cm. Measured per bone, no per-model constants. The three clamps
+are then legacy-only (`D4_CLOTH_LEGACY_ORPHANS=1` restores them). **Genuine hair (`m_sbHair`) keeps
+its tight treatment** — it is a separate flag and is untouched.
+
+**Verify:** `cloth-orphan` d values should rise from 2-45 mm to tens of mm on hem bones (proportional
+to chain depth), and skirts should swing. `cloth-diverge` should NOT increase materially; if it
+does, the geometric tether is too generous and should be scaled by the max-distance slider.
+
 ## Remaining unknowns (decoded shape, purpose pending — none block the solver)
 
 - `ptDeltaFrames`: one 4×4 matrix per vert (pure rotation + identity row) — per-particle
