@@ -160,7 +160,10 @@ private:
     void applyFur();               // push saved stable2/fur/* + stable2/fx/* to the viewport
     void applyDetailConfig();      // push saved stable2/detail/* to the viewport
     void applyClothParams();       // push saved stable2/cloth/* to the viewport
-    void showPartContextMenu(int part, const QPoint& globalPos);   // viewport AND parts panel
+    // viewport AND parts panel. `groupPart` is any part belonging to the group whose HEADER was
+    // right-clicked: part stays -1 (no single part was picked) but the model-level actions still
+    // scope to that group's source item instead of falling back to the whole assembly.
+    void showPartContextMenu(int part, const QPoint& globalPos, int groupPart = -1);
 
     void reapplyOverlays();        // re-push ALL overlay state (master gate + each box)
     void linkColliderToggles();    // mirror the Overlays + Physics "collision model" boxes

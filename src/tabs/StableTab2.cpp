@@ -316,7 +316,11 @@ StableTab2::StableTab2(QWidget* parent) : BrowserTab(parent)
     connect(m_partTree, &QTreeWidget::customContextMenuRequested, this, [this](const QPoint& pos) {
         QTreeWidgetItem* it = m_partTree->itemAt(pos);
         const int idx = it ? it->data(0, Qt::UserRole).toInt() : -1;
-        showPartContextMenu(idx, m_partTree->viewport()->mapToGlobal(pos));
+        // Group headers store -1. Hand over a representative child so "Export Model" means THAT
+        // appearance rather than the whole assembly — the tree has one group per equipped piece.
+        const int group = (idx < 0 && it && it->childCount() > 0)
+                            ? it->child(0)->data(0, Qt::UserRole).toInt() : -1;
+        showPartContextMenu(idx, m_partTree->viewport()->mapToGlobal(pos), group);
     });
 
     m_status = new QLabel(QStringLiteral("Pick a mount."));   // lives in the sidebar's INFO panel
@@ -4358,7 +4362,7 @@ void StableTab2::applyClothParams()
 // Anything needing overlays refreshed calls THIS — never setShow*() directly, or the master gate
 // gets bypassed.
 // ONE part menu, shown from BOTH the 3D viewport and the PARTS PANEL.
-void StableTab2::showPartContextMenu(int part, const QPoint& gp)
+void StableTab2::showPartContextMenu(int part, const QPoint& gp, int groupPart)
 {
         if (!m_partTree) return;
         auto itemForPart = [this](int p) -> QTreeWidgetItem* {
@@ -4381,7 +4385,8 @@ void StableTab2::showPartContextMenu(int part, const QPoint& gp)
         ViewportPartMenu::Actions act;
         QTreeWidgetItem* item = nullptr;
         // "Model" scope = the equipped appearance the picked part belongs to (empty space → all).
-        const QVector<int> modelParts = partsOfSource(part);
+        const int srcPart = (part >= 0) ? part : groupPart;   // group header → that group's item
+        const QVector<int> modelParts = partsOfSource(srcPart);
         int modelTris = 0;
         if (m_view) {
             if (modelParts.isEmpty())
@@ -4389,8 +4394,8 @@ void StableTab2::showPartContextMenu(int part, const QPoint& gp)
             else
                 for (int i : modelParts) modelTris += m_view->partTriangles(i);
         }
-        in.sourceModel   = (part >= 0 && part < m_partSource.size() && !m_partSource[part].isEmpty())
-                             ? m_partSource[part] : QStringLiteral("Mount");
+        in.sourceModel   = (srcPart >= 0 && srcPart < m_partSource.size() && !m_partSource[srcPart].isEmpty())
+                             ? m_partSource[srcPart] : QStringLiteral("Mount");
         in.modelTris     = modelTris;
         in.lastExportDir = QSettings().value(QStringLiteral("stable2/exportDir")).toString();
         if (part >= 0 && part < m_lastGeo.primitives.size()) {

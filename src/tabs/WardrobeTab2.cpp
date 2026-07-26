@@ -2425,7 +2425,11 @@ WardrobeTab2::WardrobeTab2(QWidget* parent) : BrowserTab(parent)
                            : it->text(0);                                // root: source-piece name
         Q_UNUSED(name);
         // Same menu as the viewport, so parts can be copied/exported straight from the panel.
-        showPartContextMenu(idx, m_partTree->viewport()->mapToGlobal(pos));
+        // Group headers store -1. Hand over a representative child so "Export Model" means THAT
+        // outfit piece rather than the whole assembled outfit.
+        const int group = (idx < 0 && it && it->childCount() > 0)
+                            ? it->child(0)->data(0, Qt::UserRole).toInt() : -1;
+        showPartContextMenu(idx, m_partTree->viewport()->mapToGlobal(pos), group);
     });
     applySidebars();
 
@@ -7721,7 +7725,7 @@ void WardrobeTab2::exportPartsSubset(const QVector<int>& parts, const QString& l
 
 // ONE part menu, shown from BOTH the 3D viewport right-click and the PARTS PANEL, so the panel
 // can copy/export exactly like the viewport. part < 0 = clicked empty space (all-parts actions only).
-void WardrobeTab2::showPartContextMenu(int part, const QPoint& gp)
+void WardrobeTab2::showPartContextMenu(int part, const QPoint& gp, int groupPart)
 {
         if (!m_partTree) return;
         auto itemForPart = [this](int p) -> QTreeWidgetItem* {
@@ -7744,14 +7748,15 @@ void WardrobeTab2::showPartContextMenu(int part, const QPoint& gp)
         ViewportPartMenu::Actions act;
         QTreeWidgetItem* item = nullptr;
         // "Model" scope = the source item the picked part belongs to (empty space → whole outfit).
-        const QVector<int> modelParts = partsOfSource(part);
+        const int srcPart = (part >= 0) ? part : groupPart;   // group header → that group's piece
+        const QVector<int> modelParts = partsOfSource(srcPart);
         int modelTris = 0;
         if (modelParts.isEmpty()) { for (int i = 0; i < m_partTris.size(); ++i) modelTris += m_partTris[i]; }
         else                      { for (int i : modelParts) modelTris += m_partTris.value(i); }
         // The title names the SOURCE piece under the cursor, and "Export Model" is scoped to
         // that same piece — right-clicking a cape exports the cape, not the whole outfit.
-        in.sourceModel   = (part >= 0 && part < m_partSource.size() && !m_partSource[part].isEmpty())
-                             ? m_partSource[part] : QStringLiteral("Outfit");
+        in.sourceModel   = (srcPart >= 0 && srcPart < m_partSource.size() && !m_partSource[srcPart].isEmpty())
+                             ? m_partSource[srcPart] : QStringLiteral("Outfit");
         in.modelTris     = modelTris;
         in.lastExportDir = QSettings().value(QStringLiteral("wardrobe2/lastExportDir")).toString();
         if (part >= 0 && part < m_lastMerged.primitives.size()) {

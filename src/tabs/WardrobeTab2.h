@@ -443,7 +443,10 @@ private:
     void composeEyeMaps(const QString& d4, const QString& stem, QImage& base, QImage& norm,
                         QImage& orm, QImage& emis, float& emisMul, float& irisRough);
     void applyClothParams();               // read wardrobe/cloth/* → m_view->setClothParams
-    void showPartContextMenu(int part, const QPoint& globalPos);   // viewport AND parts panel
+    // viewport AND parts panel. `groupPart` is any part belonging to the group whose HEADER was
+    // right-clicked: part stays -1 (no single part was picked) but the model-level actions still
+    // scope to that group's source item instead of falling back to the whole assembly.
+    void showPartContextMenu(int part, const QPoint& globalPos, int groupPart = -1);
     QVector<int> visibleParts() const;                          // parts drawn right now
     QVector<int> partsOfSource(int part) const;                 // parts sharing one source item
     void exportPartsSubset(const QVector<int>& parts, const QString& label, bool toLast);
