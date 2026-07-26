@@ -8,6 +8,7 @@
 #include "index/AppearanceMeta.h"
 #include "app/ExportNotifier.h"
 #include "index/AssetLinks.h"
+#include "index/BackTrophyIndex.h"
 #include "index/ItemHoverIndex.h"
 #include "index/DadOverride.h"
 #include "index/IconAudit.h"
@@ -986,6 +987,7 @@ void MainWindow::finishReload(const ReloadResult& r)
             AppearanceMeta::instance().reset();
             AssetLinks::instance().reset();
             ItemHoverIndex::instance().reset();   // hover metadata re-derives from the new snapshot
+            BackTrophyIndex::instance().reset();  // Item→Actor→Appearance chain is snapshot-specific
             QPixmapCache::clear();   // in-memory thumbnails (grid views) — stale art after a patch
             s.setValue(QStringLiteral("index/fingerprint"), fp);
         } else if (!QFileInfo::exists(DadOverride::defaultPath())) {

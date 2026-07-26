@@ -23,6 +23,7 @@
 #include <QProgressDialog>
 #include "index/AnimActionIndex.h"
 #include "index/AppearanceMeta.h"
+#include "index/BackTrophyIndex.h"
 #include "index/IconIndex.h"
 #include "index/CoreToc.h"
 #include "index/SnoIndex.h"
@@ -2666,7 +2667,8 @@ WardrobeTab2::WardrobeTab2(QWidget* parent) : BrowserTab(parent)
     });
     connect(m_backTrophy, &QComboBox::currentIndexChanged, this, [this](int) {
         if (m_restoring) return;
-        QSettings().setValue(QStringLiteral("wardrobe2/backTrophy"), m_backTrophy->currentText());
+        QSettings().setValue(QStringLiteral("wardrobe2/backTrophy"),
+                             QString::number(m_backTrophy->currentData().toInt()));
         scheduleRebuild();
     });
     // Build both popups eagerly so m_env (Preview) and m_fovSlider (Camera) exist for
@@ -2748,6 +2750,11 @@ void WardrobeTab2::refresh()
     ItemHoverIndex::instance().ensureBuilt(Config::d4dataDir());
     connect(&ItemHoverIndex::instance(), &ItemHoverIndex::readyChanged, this,
             [this] { fillLookGrid(); refreshSlotCells(); });
+    // Back trophies: Item(CosmeticBack) → Actor → Appearance, built in the background. The picker
+    // is empty until this lands, so refill the slot lists when it does.
+    BackTrophyIndex::instance().ensureBuilt(Config::d4dataDir());
+    connect(&BackTrophyIndex::instance(), &BackTrophyIndex::readyChanged, this,
+            [this] { populateSlots(); });
     // Appearance-icon atlas index (same trigger point as the Models tab). Refill the grid/cells
     // when it finishes; show the live percentage while it scans.
     IconIndex::instance().ensureBuilt(Config::d4dataDir());
@@ -4381,21 +4388,40 @@ void WardrobeTab2::populateSlots()
         const int si = saved.isEmpty() ? 0 : m_slot[i]->findText(saved);
         if (si > 0) m_slot[i]->setCurrentIndex(si);
     }
-    // Back trophy (player back cosmetic, ItemType CosmeticBack): the appearances are named
-    // "back_*" (e.g. back_dru00, back_bar_proxy001) and carry their own spine/cloth rig, so they
-    // skin onto the body via the normal armour merge. Class-agnostic — list them all.
+    // Back trophy (player back cosmetic). Resolved through the real chain — an Item whose
+    // snoItemType is ItemType/CosmeticBack, then snoActor → Actor → snoAppearance — because the
+    // appearances are NOT named "back_*". Scanning appearance names for that prefix matched only
+    // six placeholder/proxy meshes and none of the ~110 real trophies, which are named
+    // "trophy_<class><NN>_stor"; that is why the picker loaded completely unrelated models.
     if (m_backTrophy) {
         QSignalBlocker blockBt(m_backTrophy);
+        const QString savedBt = QSettings().value(QStringLiteral("wardrobe2/backTrophy")).toString();
         m_backTrophy->clear();
         m_backTrophy->addItem(QStringLiteral("(none)"), 0);
-        for (const SnoEntry& e : all) {
-            const QString l = e.name.toLower();
-            if (l.startsWith(QLatin1String("back_")) && !l.contains(QLatin1String("_wall"))
-                && !l.contains(QLatin1String("_stage")) && !l.contains(QLatin1String("_stair")))
-                m_backTrophy->addItem(e.name, e.snoId);
+        // Appearance name → sno, so the index (which speaks names) can hand back loadable snos.
+        // Keep the ARCHIVE's own spelling: that string is handed to parseApp/appearanceRoster,
+        // and the index speaks d4data's JSON filenames, which need not match case for case.
+        QHash<QString, QPair<int, QString>> appByName;
+        appByName.reserve(all.size());
+        for (const SnoEntry& e : all) appByName.insert(e.name.toLower(), {e.snoId, e.name});
+        int missing = 0;
+        for (const BackTrophyIndex::Entry& t : BackTrophyIndex::instance().entries()) {
+            const auto hit = appByName.value(t.appearance.toLower(), {0, QString()});
+            if (hit.first <= 0) { ++missing; continue; }   // indexed but absent from this archive
+            const QString label = t.displayName.isEmpty()
+                ? hit.second
+                : QStringLiteral("%1  (%2)").arg(t.displayName, hit.second);
+            m_backTrophy->addItem(label, hit.first);
+            m_backTrophy->setItemData(m_backTrophy->count() - 1, hit.second, Qt::UserRole + 1);
         }
-        const QString savedBt = QSettings().value(QStringLiteral("wardrobe2/backTrophy")).toString();
-        const int bi = savedBt.isEmpty() ? 0 : m_backTrophy->findText(savedBt);
+        if (missing)
+            qInfo("back trophies: %d indexed entr%s had no appearance in the archive",
+                  missing, missing == 1 ? "y" : "ies");
+        // Restore by APPEARANCE SNO: the label carries a localized name that a game patch can
+        // reword, and findText would then silently fall back to (none).
+        const int savedSno = savedBt.toInt();
+        int bi = savedSno > 0 ? m_backTrophy->findData(savedSno) : -1;
+        if (bi < 0 && !savedBt.isEmpty()) bi = m_backTrophy->findText(savedBt);   // pre-sno setting
         if (bi > 0) m_backTrophy->setCurrentIndex(bi);
     }
     populateSets();
@@ -5625,9 +5651,15 @@ void WardrobeTab2::refreshSlotCells()
         // Tooltip: the slot label + the equipped item's name/series/file (if any) + pigment.
         AppearanceMeta& am = AppearanceMeta::instance();
         if (cb->currentIndex() > 0) {
+            // The APPEARANCE name, not the label. Weapon combos have always shown a short name
+            // while keeping the full one in UserRole+1, and the back trophy now shows a localized
+            // item name — so the file line and the ItemHoverIndex join both need the real stem.
+            const QString fileName = cb->currentData(Qt::UserRole + 1).toString().isEmpty()
+                                         ? cb->currentText()
+                                         : cb->currentData(Qt::UserRole + 1).toString();
             QString tip = infoTip(sno, slotLabel(i) + QStringLiteral(": ")
-                                  + (am.titleFor(sno).isEmpty() ? cb->currentText() : am.titleFor(sno)),
-                                  am.collectionFor(sno), cb->currentText(),
+                                  + (am.titleFor(sno).isEmpty() ? fileName : am.titleFor(sno)),
+                                  am.collectionFor(sno), fileName,
                                   /*dyeableKnown=*/i < 5, /*dyeable=*/i < 5 && m_slotDyeable[i]);
             if (dyed) tip += QStringLiteral("<br>Pigment: %1").arg(
                 m_slotDye[i].name.isEmpty() ? QStringLiteral("custom") : m_slotDye[i].name.toHtmlEscaped());
@@ -6564,7 +6596,10 @@ void WardrobeTab2::rebuildOutfitImpl(bool async)
         // onto the body like an armour piece. Tagged slot 9 so framing/selection find it.
         if (m_backTrophy) {
             const int btSno = m_backTrophy->currentData().toInt();
-            if (btSno > 0) addPiece(btSno, m_backTrophy->currentText(), false, 9);
+            // The APPEARANCE name, not currentText(): the label is "<localized name>  (<stem>)"
+            // and appearanceRoster/parseApp key off the appearance stem.
+            if (btSno > 0)
+                addPiece(btSno, m_backTrophy->currentData(Qt::UserRole + 1).toString(), false, 9);
         }
         // Creator mesh pieces (additive appearances, like equipment):
         //   Hair style → <pref>_H<NN>   ·   Jewelry → jwl<NN>_<pref>

@@ -55,7 +55,8 @@ qt_add_executable(D4AssetBrowser WIN32
     src/index/ItemDef.h         src/index/ItemDef.cpp
     src/index/DadOverride.h     src/index/DadOverride.cpp
     src/index/IconAudit.h       src/index/IconAudit.cpp
-    src/index/ItemHoverIndex.h  src/index/ItemHoverIndex.cpp
+    src/index/ItemHoverIndex.h   src/index/ItemHoverIndex.cpp
+    src/index/BackTrophyIndex.h  src/index/BackTrophyIndex.cpp
 
     src/tex/TexFormat.h         src/tex/TexFormat.cpp
     src/tex/TexMeta.h           src/tex/TexMeta.cpp
