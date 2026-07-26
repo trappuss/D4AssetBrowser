@@ -3071,17 +3071,25 @@ ModelsTab::ModelsTab(QWidget* parent) : BrowserTab(parent)
             for (auto it = all.constBegin(); it != all.constEnd(); ++it) m_treeModel->setPartCheck(it.key(), true);
             recomputePartVisibility();
         };
-        // Shared builder (util/ViewportPartMenu.h) — same menu in Models/Wardrobe/Stable.
+        // Right-click SELECTS the part (blue outline) but must NOT move the camera — framing is
+        // an explicit menu action. Shared builder: util/ViewportPartMenu.h.
+        if (m_modelView) m_modelView->setPickedPart(part);
         ViewportPartMenu::Info in;
         ViewportPartMenu::Actions act;
+        int modelTris = 0;
+        for (int i = 0; i < m_curGeo.primitives.size(); ++i) modelTris += m_modelView->partTriangles(i);
+        in.sourceModel   = m_curName;
+        in.sourceFileName= m_curName;
+        in.sourceName    = m_curName;
+        in.sno           = m_curSno;
+        in.modelTris     = modelTris;
+        in.lastExportDir = QSettings().value(QStringLiteral("models/lastExportDir")).toString();
         if (part >= 0 && part < m_curGeo.primitives.size()) {
             QHash<int, bool> checks; m_treeModel->partChecks(checks);
             in.part         = part;
-            in.materialName = m_curGeo.primitives[part].materialName;
-            in.partName     = in.materialName;
-            in.tris         = m_curGeo.primitives[part].vertices.isEmpty()
-                                ? 0 : m_modelView->partTriangles(part);
-            in.sno          = m_curSno;                       // the loaded model owns every part
+            in.partName     = m_curGeo.primitives[part].materialName;
+            in.partFileName = in.partName;
+            in.partTris     = m_modelView->partTriangles(part);
             in.visible      = checks.value(part, true);
             in.isFx         = part < m_partIsFx.size()  && m_partIsFx[part];
             in.isSim        = part < m_partIsSim.size() && m_partIsSim[part];
@@ -3098,20 +3106,12 @@ ModelsTab::ModelsTab(QWidget* parent) : BrowserTab(parent)
                 if (m_modelView->partsBounds(QVector<int>{part}, c, r))
                     m_modelView->frameRegionKeepRotation(c, r, /*animate=*/true);
             };
-            // Export just this part by ISOLATING it and reusing the normal export path — the
-            // exporter already filters on partVisible(), so there is no second export code path
-            // to keep in sync. Visibility is restored afterwards whatever happens.
-            act.exportPart  = [this, part] {
-                QHash<int, bool> saved; m_treeModel->partChecks(saved);
-                for (auto it = saved.constBegin(); it != saved.constEnd(); ++it)
-                    m_treeModel->setPartCheck(it.key(), it.key() == part);
-                recomputePartVisibility();
-                exportSelectedGlb();
-                for (auto it = saved.constBegin(); it != saved.constEnd(); ++it)
-                    m_treeModel->setPartCheck(it.key(), it.value());
-                recomputePartVisibility();
-            };
+            act.selectPart  = [this, part] { selectPartInOutliner(part); };
+            act.exportPart        = [this, part] { exportSinglePart(part, /*toLast=*/false); };
+            act.exportPartLastDir = [this, part] { exportSinglePart(part, /*toLast=*/true); };
         }
+        act.exportModel        = [this] { exportSelectedGlb(); };
+        act.exportModelLastDir = [this] { exportSelectionToLast(); };
         act.showAll = [showAll] { showAll(); };
         act.hideAll = [this] {
             QHash<int, bool> all; m_treeModel->partChecks(all);
@@ -9230,6 +9230,36 @@ void ModelsTab::addRowExportCopyActions(QMenu& menu, const QList<int>& snos)
             showDependencies(models.first().first, models.first().second);
         });
     }
+}
+
+// Select a part in the OUTLINER without touching the camera. "Select Part" in the context menu
+// must not fly the view somewhere — framing is its own explicit action.
+void ModelsTab::selectPartInOutliner(int part)
+{
+    if (!m_treeModel || !m_list || part < 0) return;
+    const QModelIndex ix = m_treeModel->indexOfPart(part);
+    if (!ix.isValid()) return;
+    m_list->expand(ix.parent());
+    m_list->selectionModel()->setCurrentIndex(
+        ix, QItemSelectionModel::ClearAndSelect | QItemSelectionModel::Rows);
+    m_list->scrollTo(ix);
+}
+
+// Export ONE part by isolating it and reusing the tab's normal export, which already filters on
+// partVisible() — so there is no second export path to keep in sync. Visibility is restored
+// afterwards regardless of how the export ends.
+void ModelsTab::exportSinglePart(int part, bool toLast)
+{
+    if (!m_treeModel || part < 0) return;
+    QHash<int, bool> saved; m_treeModel->partChecks(saved);
+    for (auto it = saved.constBegin(); it != saved.constEnd(); ++it)
+        m_treeModel->setPartCheck(it.key(), it.key() == part);
+    recomputePartVisibility();
+    if (toLast) exportSelectionToLast();
+    else        exportSelectedGlb();
+    for (auto it = saved.constBegin(); it != saved.constEnd(); ++it)
+        m_treeModel->setPartCheck(it.key(), it.value());
+    recomputePartVisibility();
 }
 
 void ModelsTab::applyModelRig()

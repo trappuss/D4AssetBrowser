@@ -164,6 +164,8 @@ private:
     void   togglePreviewPanel();         // show/hide it under the button
     void   buildDyePanel();              // construct the Pigment (dye-zone) popup
     void   toggleDyePanel();             // show/hide it under the Pigment button
+    void   selectPartInOutliner(int part);   // select in the tree; never moves the camera
+    void   exportSinglePart(int part, bool toLast);   // isolate → normal export → restore
     void   applyModelRig();              // push saved models/rig/* flags to m_modelView
     void   reapplyOverlays();            // re-push ALL overlay state (master gate + each box)
     // Shared row context-menu builders — list AND thumbnail grid compose from these,

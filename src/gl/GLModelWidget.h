@@ -53,8 +53,12 @@ public:
     int     partTriangles(int i) const;   // triangle count of part i
     void    setPartVisible(int i, bool on);
     bool    partVisible(int i) const;             // current viewport visibility of part i
-    void    setHighlightPart(int i);              // -1 = none; tints one part
-    void    setHighlightParts(const QList<int>& parts);   // tint a set of parts
+    // Highlighting is drawn as a SEE-THROUGH OUTLINE, not a flat tint: a tint destroys the very
+    // textures you are inspecting, and is invisible when the part is behind other geometry.
+    void    setHighlightPart(int i);              // -1 = none; RED outline (parts-list selection)
+    void    setHighlightParts(const QList<int>& parts);   // RED outline over a set
+    void    setPickedPart(int i);                 // -1 = none; BLUE outline (right-clicked part)
+    int     pickedPart() const { return m_pickedPart; }
     // Per-part base-colour textures (index = part = source primitive). Null image →
     // that part renders flat grey. Uploaded to GL on the next paint.
     void    setPartTextures(const QVector<QImage>& baseColor);
@@ -396,7 +400,8 @@ private:
     // One draw-range per source primitive (sub-object), toggleable for the parts tree.
     struct Part { int offset = 0; int count = 0; bool visible = true; QString name; };
     QVector<Part>       m_parts;
-    QSet<int>           m_highlight;
+    QSet<int>           m_highlight;      // red outline
+    int                 m_pickedPart = -1;  // blue outline — the part the user right-clicked
     QVector<int>        m_followParts;   // parts the camera keeps centred each anim frame (Camera Snap+follow)
 
     // Skinning data (kept so animation can re-deform the bind pose on the CPU).

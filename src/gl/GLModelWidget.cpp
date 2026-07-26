@@ -4142,11 +4142,14 @@ void main() { o = vec4(mix(uBot, uTop, clamp(vT, 0.0, 1.0)), 1.0); })";
             if (!p.visible || p.count == 0) continue;
             // FX submeshes are drawn in the separate blended pass below, never here.
             if (i < m_partFx.size() && m_partFx[i]) continue;
-            const bool hot = m_highlight.contains(i);
+            // NOTE: highlighting no longer forces a flat tint here — it is drawn as an outline
+            // after this pass (see the outline block), so the part keeps its real material while
+            // selected. `hot` now only suppresses the normal map, which would fight the outline.
+            const bool hot = false;
             const GLuint tex = (i < m_partTex.size()) ? m_partTex[i] : 0;
-            if (hot || tex == 0 || !m_showTex) {
-                glUniform1i(uHasTex, 0);   // highlight / untextured / textures-off → flat
-                setTint(hot);
+            if (tex == 0 || !m_showTex) {
+                glUniform1i(uHasTex, 0);   // untextured / textures-off → flat
+                setTint(false);
             } else {
                 glActiveTexture(GL_TEXTURE0);
                 glBindTexture(GL_TEXTURE_2D, tex);
@@ -4291,6 +4294,45 @@ void main() { o = vec4(mix(uBot, uTop, clamp(vT, 0.0, 1.0)), 1.0); })";
             }
         }
         glDisable(GL_SAMPLE_ALPHA_TO_COVERAGE);   // end alpha-cutout pass
+
+        // ── Selection OUTLINE pass ────────────────────────────────────────────────────────
+        // Selected parts keep their real material (a flat tint hid the textures you are trying
+        // to inspect) and instead get a wireframe overlay drawn with the DEPTH TEST OFF, so the
+        // selection stays visible even when the part is buried inside the body or behind armour.
+        // RED  = parts-list / programmatic highlight.
+        // BLUE = the part you right-clicked in the viewport.
+        // Blue wins where both apply, because that is the one the open menu refers to.
+        {
+            QVector<QPair<int, int>> outline;   // (part, 0 = red, 1 = blue)
+            for (int i : m_highlight)
+                if (i >= 0 && i < m_parts.size() && m_parts[i].visible && m_parts[i].count)
+                    outline.push_back({i, 0});
+            if (m_pickedPart >= 0 && m_pickedPart < m_parts.size()
+                && m_parts[m_pickedPart].visible && m_parts[m_pickedPart].count) {
+                for (int k = outline.size() - 1; k >= 0; --k)
+                    if (outline[k].first == m_pickedPart) outline.removeAt(k);
+                outline.push_back({m_pickedPart, 1});
+            }
+            if (!outline.isEmpty()) {
+                glDisable(GL_DEPTH_TEST);
+                glDisable(GL_CULL_FACE);
+                glPolygonMode(GL_FRONT_AND_BACK, GL_LINE);
+                glLineWidth(1.0f);
+                glUniform1i(uHasTex, 0); glUniform1i(uHasNormal, 0); glUniform1i(uHasEmissive, 0);
+                glUniform1i(uHasDyeMask, 0); glUniform1i(uHasDyeRamp, 0); glUniform1i(uPbr, 0);
+                for (const auto& o : outline) {
+                    if (o.second == 1) glUniform3f(uBase, 0.25f, 0.60f, 1.00f);   // blue = picked
+                    else               glUniform3f(uBase, 1.00f, 0.15f, 0.15f);   // red  = highlight
+                    const Part& p = m_parts[o.first];
+                    glDrawElements(GL_TRIANGLES, p.count, GL_UNSIGNED_INT,
+                                   reinterpret_cast<void*>(qintptr(p.offset) * sizeof(quint32)));
+                }
+                glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
+                glEnable(GL_CULL_FACE);
+                glEnable(GL_DEPTH_TEST);
+                glUniform1i(uPbr, m_pbr ? 1 : 0);   // restore for later passes
+            }
+        }
 
         // ── Mesh FX pass: visible FX submeshes, unlit + alpha-blended + scrolling, two-sided. ──
         bool anyFx = false;
@@ -4449,6 +4491,12 @@ void GLModelWidget::setHighlightPart(int i)
     QSet<int> s;
     if (i >= 0 && i < m_parts.size()) s.insert(i);
     if (s != m_highlight) { m_highlight = s; update(); }
+}
+
+void GLModelWidget::setPickedPart(int i)
+{
+    const int v = (i >= 0 && i < m_parts.size()) ? i : -1;
+    if (v != m_pickedPart) { m_pickedPart = v; update(); }
 }
 
 void GLModelWidget::setHighlightParts(const QList<int>& parts)

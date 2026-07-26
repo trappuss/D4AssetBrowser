@@ -440,6 +440,9 @@ private:
     void composeEyeMaps(const QString& d4, const QString& stem, QImage& base, QImage& norm,
                         QImage& orm, QImage& emis, float& emisMul, float& irisRough);
     void applyClothParams();               // read wardrobe/cloth/* → m_view->setClothParams
+    void showPartContextMenu(int part, const QPoint& globalPos);   // viewport AND parts panel
+    void exportSinglePart(QTreeWidgetItem* item,
+                          const std::function<void(Qt::CheckState)>& setAll, bool toLast);
     void reapplyOverlays();        // re-push ALL overlay state (master gate + each box)
     void loadClothTuning();                // read the equipped pieces' real Cloth/*.clt.json params
     void fillClothSimTuning(ModelGeometry& geo);   // per-ClothSim tuning from its Cloth/<name>_sim.clt.json
@@ -489,6 +492,7 @@ private:
     // EVERY clip in the (filtered) ANIMATIONS list. Falls back to the selected list entry
     // when nothing is playing, so "Embed animation" never silently exports none.
     void collectExportAnims(QVector<AnimParser::DecodedAnim>& anims, QStringList& names);
+    static QString exportMenuExtras(const QString& suffix);   // suffix minus "1 model"
     QString exportMenuSuffix(int sno, const QString& appr);   // "1 model + N anims + M raw" per settings
     bool exportOutfitGlb(const QString& path);   // shared writer for the two outfit-export entry points
     void applyAnimSpeed();

@@ -311,7 +311,13 @@ StableTab2::StableTab2(QWidget* parent) : BrowserTab(parent)
     });
     m_partTree->viewport()->installEventFilter(this);
     m_partTree->installEventFilter(this);
-    installCopyMenu(m_partTree, 0);   // right-click → Copy name / Copy all
+    // Parts panel gets the SAME menu as the viewport (copy/export/isolate), not just "Copy name".
+    m_partTree->setContextMenuPolicy(Qt::CustomContextMenu);
+    connect(m_partTree, &QTreeWidget::customContextMenuRequested, this, [this](const QPoint& pos) {
+        QTreeWidgetItem* it = m_partTree->itemAt(pos);
+        const int idx = it ? it->data(0, Qt::UserRole).toInt() : -1;
+        showPartContextMenu(idx, m_partTree->viewport()->mapToGlobal(pos));
+    });
 
     m_status = new QLabel(QStringLiteral("Pick a mount."));   // lives in the sidebar's INFO panel
     m_status->setStyleSheet(QStringLiteral("color:#888;"));
@@ -608,79 +614,8 @@ StableTab2::StableTab2(QWidget* parent) : BrowserTab(parent)
         }
     });
     // Right-click a part in the viewport → hide/show it + copy its material name.
-    connect(m_view, &GLModelWidget::partRightClicked, this, [this](int part, const QPoint& gp) {
-        if (!m_partTree) return;
-        auto itemForPart = [this](int p) -> QTreeWidgetItem* {
-            for (int r = 0; r < m_partTree->topLevelItemCount(); ++r) {
-                QTreeWidgetItem* root = m_partTree->topLevelItem(r);
-                for (int c = 0; c < root->childCount(); ++c)
-                    if (root->child(c)->data(0, Qt::UserRole).toInt() == p) return root->child(c);
-            }
-            return nullptr;
-        };
-        auto setAll = [this](Qt::CheckState st) {
-            for (int r = 0; r < m_partTree->topLevelItemCount(); ++r) {
-                QTreeWidgetItem* root = m_partTree->topLevelItem(r);
-                for (int c = 0; c < root->childCount(); ++c) root->child(c)->setCheckState(0, st);
-            }
-        };
-        // Shared builder (util/ViewportPartMenu.h) — same menu in Models/Wardrobe/Stable.
-        ViewportPartMenu::Info in;
-        ViewportPartMenu::Actions act;
-        QTreeWidgetItem* item = nullptr;
-        if (part >= 0 && part < m_lastGeo.primitives.size()) {
-            item = itemForPart(part);
-            in.part         = part;
-            in.materialName = m_lastGeo.primitives[part].materialName;
-            in.partName     = in.materialName;
-            in.tris         = m_view ? m_view->partTriangles(part) : 0;
-            in.visible      = !item || item->checkState(0) == Qt::Checked;
-            in.isSim        = part < m_partSim.size() && m_partSim[part];
-            in.isFx         = part < m_partFx.size()  && m_partFx[part];
-            act.setVisible  = [item](bool on) { if (item) item->setCheckState(0, on ? Qt::Checked : Qt::Unchecked); };
-            act.isolate     = [setAll, item] { setAll(Qt::Unchecked); if (item) item->setCheckState(0, Qt::Checked); };
-            act.selectInTree= [this, item] {
-                if (!item || !m_partTree) return;
-                m_partTree->setCurrentItem(item); m_partTree->scrollToItem(item);
-            };
-            act.frame       = [this, part] {
-                if (!m_view) return;
-                QVector3D c; float r;
-                if (m_view->partsBounds(QVector<int>{part}, c, r))
-                    m_view->frameRegionKeepRotation(c, r, /*animate=*/true);
-            };
-            // Isolate → export → restore, reusing exportMount() so there is one export path.
-            act.exportPart  = [this, item, setAll] {
-                if (!m_partTree) return;
-                QVector<Qt::CheckState> saved;
-                for (int r = 0; r < m_partTree->topLevelItemCount(); ++r) {
-                    QTreeWidgetItem* root = m_partTree->topLevelItem(r);
-                    for (int c = 0; c < root->childCount(); ++c) saved << root->child(c)->checkState(0);
-                }
-                setAll(Qt::Unchecked);
-                if (item) item->setCheckState(0, Qt::Checked);
-                exportMount();
-                int k = 0;
-                for (int r = 0; r < m_partTree->topLevelItemCount(); ++r) {
-                    QTreeWidgetItem* root = m_partTree->topLevelItem(r);
-                    for (int c = 0; c < root->childCount(); ++c)
-                        if (k < saved.size()) root->child(c)->setCheckState(0, saved[k++]);
-                }
-            };
-        }
-        act.showAll = [setAll] { setAll(Qt::Checked); };
-        act.hideAll = [setAll] { setAll(Qt::Unchecked); };
-        act.invert  = [this] {
-            for (int r = 0; r < m_partTree->topLevelItemCount(); ++r) {
-                QTreeWidgetItem* root = m_partTree->topLevelItem(r);
-                for (int c = 0; c < root->childCount(); ++c) {
-                    QTreeWidgetItem* it = root->child(c);
-                    it->setCheckState(0, it->checkState(0) == Qt::Checked ? Qt::Unchecked : Qt::Checked);
-                }
-            }
-        };
-        ViewportPartMenu::exec(this, gp, in, act);
-    });
+    connect(m_view, &GLModelWidget::partRightClicked, this,
+            [this](int part, const QPoint& gp) { showPartContextMenu(part, gp); });
     buildVpStrip();   // Reset · Camera · Lighting · Fullscreen pinned to the viewport edge
 
     left->setMinimumWidth(230);
@@ -1561,10 +1496,22 @@ void StableTab2::fillGrid()
                         }
                         menu.addSeparator();
                         const QString exSuffix = exportMenuSuffix(entry.appr, isPet);
-                        menu.addAction(QStringLiteral("Export (last dir)  —  %1").arg(exSuffix), this,
-                                       [this, entry] { exportAppearanceModel(entry.apprSno, entry.appr, true); });
-                        menu.addAction(QStringLiteral("Export to…  —  %1").arg(exSuffix), this,
-                                       [this, entry] { exportAppearanceModel(entry.apprSno, entry.appr, false); });
+                        // Match the Wardrobe/viewport wording: destination + size, not "1 model".
+                        {
+                            const QString exDir = ViewportPartMenu::condensePath(
+                                QSettings().value(QStringLiteral("stable2/lastExportDir")).toString());
+                            QStringList ex = exSuffix.split(QStringLiteral(" + "), Qt::SkipEmptyParts);
+                            for (int i = ex.size() - 1; i >= 0; --i)
+                                if (ex[i].trimmed() == QLatin1String("1 model")) ex.removeAt(i);
+                            const QString extra = ex.isEmpty()
+                                ? QString() : QStringLiteral("  —  %1").arg(ex.join(QStringLiteral(" + ")));
+                            if (!exDir.isEmpty())
+                                menu.addAction(ViewportPartMenu::withValue(
+                                                   QStringLiteral("Export Model Last dir"), exDir) + extra, this,
+                                               [this, entry] { exportAppearanceModel(entry.apprSno, entry.appr, true); });
+                            menu.addAction(QStringLiteral("Export Model") + extra, this,
+                                           [this, entry] { exportAppearanceModel(entry.apprSno, entry.appr, false); });
+                        }
                         menu.addSeparator();
                         auto clip = [](const QString& s) { QGuiApplication::clipboard()->setText(s); };
                         auto prev = [](const QString& s) { return s.size() > 30 ? s.left(29) + QChar(0x2026) : s; };
@@ -4364,6 +4311,112 @@ void StableTab2::applyClothParams()
 // Single place that pushes overlay state to the viewport: master gate AND each box's own state.
 // Anything needing overlays refreshed calls THIS — never setShow*() directly, or the master gate
 // gets bypassed.
+// Isolate one part, run exportMount() (which honours the parts-tree checks), then restore.
+// ONE part menu, shown from BOTH the 3D viewport and the PARTS PANEL.
+void StableTab2::showPartContextMenu(int part, const QPoint& gp)
+{
+    if (!m_partTree) return;
+    auto itemForPart = [this](int p) -> QTreeWidgetItem* {
+        for (int r = 0; r < m_partTree->topLevelItemCount(); ++r) {
+            QTreeWidgetItem* root = m_partTree->topLevelItem(r);
+            for (int c = 0; c < root->childCount(); ++c)
+                if (root->child(c)->data(0, Qt::UserRole).toInt() == p) return root->child(c);
+        }
+        return nullptr;
+    };
+    auto setAll = [this](Qt::CheckState st) {
+        for (int r = 0; r < m_partTree->topLevelItemCount(); ++r) {
+            QTreeWidgetItem* root = m_partTree->topLevelItem(r);
+            for (int c = 0; c < root->childCount(); ++c) root->child(c)->setCheckState(0, st);
+        }
+    };
+
+        if (!m_partTree) return;
+        auto itemForPart = [this](int p) -> QTreeWidgetItem* {
+            for (int r = 0; r < m_partTree->topLevelItemCount(); ++r) {
+                QTreeWidgetItem* root = m_partTree->topLevelItem(r);
+                for (int c = 0; c < root->childCount(); ++c)
+                    if (root->child(c)->data(0, Qt::UserRole).toInt() == p) return root->child(c);
+            }
+            return nullptr;
+        };
+        auto setAll = [this](Qt::CheckState st) {
+            for (int r = 0; r < m_partTree->topLevelItemCount(); ++r) {
+                QTreeWidgetItem* root = m_partTree->topLevelItem(r);
+                for (int c = 0; c < root->childCount(); ++c) root->child(c)->setCheckState(0, st);
+            }
+        };
+        // Right-click SELECTS (blue outline); the camera only moves via "Frame Part".
+        if (m_view) m_view->setPickedPart(part);
+        ViewportPartMenu::Info in;
+        ViewportPartMenu::Actions act;
+        QTreeWidgetItem* item = nullptr;
+        int modelTris = 0;
+        if (m_view)
+            for (int i = 0; i < m_lastGeo.primitives.size(); ++i) modelTris += m_view->partTriangles(i);
+        in.sourceModel   = QStringLiteral("Mount");
+        in.modelTris     = modelTris;
+        in.lastExportDir = QSettings().value(QStringLiteral("stable2/lastExportDir")).toString();
+        if (part >= 0 && part < m_lastGeo.primitives.size()) {
+            item = itemForPart(part);
+            in.part         = part;
+            in.partName     = m_lastGeo.primitives[part].materialName;
+            in.partFileName = in.partName;
+            in.partTris     = m_view ? m_view->partTriangles(part) : 0;
+            in.visible      = !item || item->checkState(0) == Qt::Checked;
+            in.isSim        = part < m_partSim.size() && m_partSim[part];
+            in.isFx         = part < m_partFx.size()  && m_partFx[part];
+            act.setVisible  = [item](bool on) { if (item) item->setCheckState(0, on ? Qt::Checked : Qt::Unchecked); };
+            act.isolate     = [setAll, item] { setAll(Qt::Unchecked); if (item) item->setCheckState(0, Qt::Checked); };
+            act.selectPart  = [this, item] {
+                if (!item || !m_partTree) return;
+                m_partTree->setCurrentItem(item); m_partTree->scrollToItem(item);
+            };
+            act.frame       = [this, part] {
+                if (!m_view) return;
+                QVector3D c; float r;
+                if (m_view->partsBounds(QVector<int>{part}, c, r))
+                    m_view->frameRegionKeepRotation(c, r, /*animate=*/true);
+            };
+            act.exportPart        = [this, item, setAll] { exportSinglePart(item, setAll); };
+            act.exportPartLastDir = [this, item, setAll] { exportSinglePart(item, setAll); };
+        }
+        act.exportModel        = [this] { exportMount(); };
+        act.exportModelLastDir = [this] { exportMount(); };
+        act.showAll = [setAll] { setAll(Qt::Checked); };
+        act.hideAll = [setAll] { setAll(Qt::Unchecked); };
+        act.invert  = [this] {
+            for (int r = 0; r < m_partTree->topLevelItemCount(); ++r) {
+                QTreeWidgetItem* root = m_partTree->topLevelItem(r);
+                for (int c = 0; c < root->childCount(); ++c) {
+                    QTreeWidgetItem* it = root->child(c);
+                    it->setCheckState(0, it->checkState(0) == Qt::Checked ? Qt::Unchecked : Qt::Checked);
+                }
+            }
+        };
+        ViewportPartMenu::exec(this, gp, in, act);
+}
+
+void StableTab2::exportSinglePart(QTreeWidgetItem* item,
+                                  const std::function<void(Qt::CheckState)>& setAll)
+{
+    if (!m_partTree || !item) return;
+    QVector<Qt::CheckState> saved;
+    for (int r = 0; r < m_partTree->topLevelItemCount(); ++r) {
+        QTreeWidgetItem* root = m_partTree->topLevelItem(r);
+        for (int c = 0; c < root->childCount(); ++c) saved << root->child(c)->checkState(0);
+    }
+    setAll(Qt::Unchecked);
+    item->setCheckState(0, Qt::Checked);
+    exportMount();
+    int k = 0;
+    for (int r = 0; r < m_partTree->topLevelItemCount(); ++r) {
+        QTreeWidgetItem* root = m_partTree->topLevelItem(r);
+        for (int c = 0; c < root->childCount(); ++c)
+            if (k < saved.size()) root->child(c)->setCheckState(0, saved[k++]);
+    }
+}
+
 void StableTab2::reapplyOverlays()
 {
     if (!m_view) return;

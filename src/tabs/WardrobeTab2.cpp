@@ -2043,82 +2043,8 @@ WardrobeTab2::WardrobeTab2(QWidget* parent) : BrowserTab(parent)
         }
     });
     // Right-click a part in the viewport → hide/show it + copy its material name.
-    connect(m_view, &GLModelWidget::partRightClicked, this, [this](int part, const QPoint& gp) {
-        if (!m_partTree) return;
-        auto itemForPart = [this](int p) -> QTreeWidgetItem* {
-            for (int r = 0; r < m_partTree->topLevelItemCount(); ++r) {
-                QTreeWidgetItem* root = m_partTree->topLevelItem(r);
-                for (int c2 = 0; c2 < root->childCount(); ++c2)
-                    if (root->child(c2)->data(0, Qt::UserRole).toInt() == p) return root->child(c2);
-            }
-            return nullptr;
-        };
-        auto setAll = [this](Qt::CheckState st) {
-            for (int r = 0; r < m_partTree->topLevelItemCount(); ++r) {
-                QTreeWidgetItem* root = m_partTree->topLevelItem(r);
-                for (int c2 = 0; c2 < root->childCount(); ++c2) root->child(c2)->setCheckState(0, st);
-            }
-        };
-        // Shared builder (util/ViewportPartMenu.h) so Models/Wardrobe/Stable can't drift apart.
-        ViewportPartMenu::Info in;
-        ViewportPartMenu::Actions act;
-        QTreeWidgetItem* item = nullptr;
-        if (part >= 0 && part < m_lastMerged.primitives.size()) {
-            item = itemForPart(part);
-            in.part         = part;
-            in.materialName = m_lastMerged.primitives[part].materialName;
-            in.partName     = in.materialName;
-            in.sourceName   = m_partSource.value(part);          // owning outfit piece
-            in.tris         = m_partTris.value(part);
-            in.visible      = !item || item->checkState(0) == Qt::Checked;
-            in.isSim        = part < m_partSim.size() && m_partSim[part];
-            in.isFx         = part < m_partFx.size()  && m_partFx[part];
-            act.setVisible  = [item](bool on) { if (item) item->setCheckState(0, on ? Qt::Checked : Qt::Unchecked); };
-            act.isolate     = [setAll, item] { setAll(Qt::Unchecked); if (item) item->setCheckState(0, Qt::Checked); };
-            act.selectInTree= [this, item] {
-                if (!item || !m_partTree) return;
-                m_partTree->setCurrentItem(item); m_partTree->scrollToItem(item);
-            };
-            act.frame       = [this, part] {
-                if (!m_view) return;
-                QVector3D c; float r;
-                if (m_view->partsBounds(QVector<int>{part}, c, r))
-                    m_view->frameRegionKeepRotation(c, r, /*animate=*/true);
-            };
-            // Isolate → export → restore, reusing the tab's normal export (which honours the
-            // part-tree check states), so no separate per-part export path can drift.
-            act.exportPart  = [this, item, setAll] {
-                if (!m_partTree) return;
-                QVector<Qt::CheckState> saved;
-                for (int r = 0; r < m_partTree->topLevelItemCount(); ++r) {
-                    QTreeWidgetItem* root = m_partTree->topLevelItem(r);
-                    for (int c2 = 0; c2 < root->childCount(); ++c2) saved << root->child(c2)->checkState(0);
-                }
-                setAll(Qt::Unchecked);
-                if (item) item->setCheckState(0, Qt::Checked);
-                exportSelection();
-                int k = 0;
-                for (int r = 0; r < m_partTree->topLevelItemCount(); ++r) {
-                    QTreeWidgetItem* root = m_partTree->topLevelItem(r);
-                    for (int c2 = 0; c2 < root->childCount(); ++c2)
-                        if (k < saved.size()) root->child(c2)->setCheckState(0, saved[k++]);
-                }
-            };
-        }
-        act.showAll = [setAll] { setAll(Qt::Checked); };
-        act.hideAll = [setAll] { setAll(Qt::Unchecked); };
-        act.invert  = [this] {
-            if (!m_partTree) return;
-            for (int r = 0; r < m_partTree->topLevelItemCount(); ++r) {
-                QTreeWidgetItem* root = m_partTree->topLevelItem(r);
-                for (int c2 = 0; c2 < root->childCount(); ++c2) {
-                    QTreeWidgetItem* it = root->child(c2);
-                    it->setCheckState(0, it->checkState(0) == Qt::Checked ? Qt::Unchecked : Qt::Checked);
-                }
-            }
-        };
-        ViewportPartMenu::exec(this, gp, in, act);
-    });
+    connect(m_view, &GLModelWidget::partRightClicked, this,
+            [this](int part, const QPoint& gp) { showPartContextMenu(part, gp); });
     // F = fullscreen (maximize-in-place), matching the Models tab. Scoped to the viewport
     // (click it first) so it never hijacks the letter "f" typed into the tab's search boxes.
     // Re-framing is middle-click; the old F-to-fit is retired with it.
@@ -2497,12 +2423,9 @@ WardrobeTab2::WardrobeTab2(QWidget* parent) : BrowserTab(parent)
         QString name = (idx >= 0 && idx < m_lastMerged.primitives.size())
                            ? m_lastMerged.primitives[idx].materialName   // child: clean material name
                            : it->text(0);                                // root: source-piece name
-        if (name.isEmpty()) return;
-        QMenu menu;
-        menu.addAction(QStringLiteral("Copy name"), this, [name] {
-            QGuiApplication::clipboard()->setText(name);
-        });
-        menu.exec(m_partTree->viewport()->mapToGlobal(pos));
+        Q_UNUSED(name);
+        // Same menu as the viewport, so parts can be copied/exported straight from the panel.
+        showPartContextMenu(idx, m_partTree->viewport()->mapToGlobal(pos));
     });
     applySidebars();
 
@@ -5025,9 +4948,16 @@ void WardrobeTab2::appendLookCards(int maxCards)
                                        this, [this, sno, fullName] { equipTheme(sno, fullName, ThemeWeapons); });
                         menu.addSeparator();
                         const QString exSuffix = exportMenuSuffix(sno, fullName);
-                        menu.addAction(QStringLiteral("Export (last dir)  —  %1").arg(exSuffix), this,
-                                       [this, sno, fullName] { exportItemModel(sno, fullName, true); });
-                        menu.addAction(QStringLiteral("Export to…  —  %1").arg(exSuffix), this,
+                        // "1 model" was noise — you can only pick one item here. Show the DESTINATION
+                        // and the size instead, matching the viewport part menu's wording.
+                        const QString exDir = ViewportPartMenu::condensePath(
+                            QSettings().value(QStringLiteral("wardrobe2/lastExportDir")).toString());
+                        const QString exExtra = exportMenuExtras(exSuffix);
+                        if (!exDir.isEmpty())
+                            menu.addAction(ViewportPartMenu::withValue(
+                                               QStringLiteral("Export Model Last dir"), exDir) + exExtra, this,
+                                           [this, sno, fullName] { exportItemModel(sno, fullName, true); });
+                        menu.addAction(QStringLiteral("Export Model") + exExtra, this,
                                        [this, sno, fullName] { exportItemModel(sno, fullName, false); });
                         menu.addSeparator();
                         auto clip = [](const QString& s) { QGuiApplication::clipboard()->setText(s); };
@@ -7688,6 +7618,121 @@ void WardrobeTab2::applyClothParams()
 // Single place that pushes overlay state to the viewport: master gate AND each box's own state.
 // Anything needing overlays refreshed calls THIS — never setShow*() directly, or the master gate
 // gets bypassed (that is exactly how physics-panel edits used to switch overlays back on).
+// Export ONE part: isolate it in the parts tree, run the tab's normal export (which honours the
+// tree's check states), then restore. Reusing the real export path means no second exporter to
+// keep in sync — and restoration happens however the export ends.
+void WardrobeTab2::exportSinglePart(QTreeWidgetItem* item, const std::function<void(Qt::CheckState)>& setAll,
+                                    bool toLast)
+{
+    if (!m_partTree || !item) return;
+    QVector<Qt::CheckState> saved;
+    for (int r = 0; r < m_partTree->topLevelItemCount(); ++r) {
+        QTreeWidgetItem* root = m_partTree->topLevelItem(r);
+        for (int c = 0; c < root->childCount(); ++c) saved << root->child(c)->checkState(0);
+    }
+    setAll(Qt::Unchecked);
+    item->setCheckState(0, Qt::Checked);
+    if (toLast) exportSelectionToLast();
+    else        exportSelection();
+    int k = 0;
+    for (int r = 0; r < m_partTree->topLevelItemCount(); ++r) {
+        QTreeWidgetItem* root = m_partTree->topLevelItem(r);
+        for (int c = 0; c < root->childCount(); ++c)
+            if (k < saved.size()) root->child(c)->setCheckState(0, saved[k++]);
+    }
+}
+
+// ONE part menu, shown from BOTH the 3D viewport right-click and the PARTS PANEL, so the panel
+// can copy/export exactly like the viewport. part < 0 = clicked empty space (all-parts actions only).
+void WardrobeTab2::showPartContextMenu(int part, const QPoint& gp)
+{
+    if (!m_partTree) return;
+    auto itemForPart = [this](int p) -> QTreeWidgetItem* {
+        for (int r = 0; r < m_partTree->topLevelItemCount(); ++r) {
+            QTreeWidgetItem* root = m_partTree->topLevelItem(r);
+            for (int c2 = 0; c2 < root->childCount(); ++c2)
+                if (root->child(c2)->data(0, Qt::UserRole).toInt() == p) return root->child(c2);
+        }
+        return nullptr;
+    };
+    auto setAll = [this](Qt::CheckState st) {
+        for (int r = 0; r < m_partTree->topLevelItemCount(); ++r) {
+            QTreeWidgetItem* root = m_partTree->topLevelItem(r);
+            for (int c2 = 0; c2 < root->childCount(); ++c2) root->child(c2)->setCheckState(0, st);
+        }
+    };
+
+        if (!m_partTree) return;
+        auto itemForPart = [this](int p) -> QTreeWidgetItem* {
+            for (int r = 0; r < m_partTree->topLevelItemCount(); ++r) {
+                QTreeWidgetItem* root = m_partTree->topLevelItem(r);
+                for (int c2 = 0; c2 < root->childCount(); ++c2)
+                    if (root->child(c2)->data(0, Qt::UserRole).toInt() == p) return root->child(c2);
+            }
+            return nullptr;
+        };
+        auto setAll = [this](Qt::CheckState st) {
+            for (int r = 0; r < m_partTree->topLevelItemCount(); ++r) {
+                QTreeWidgetItem* root = m_partTree->topLevelItem(r);
+                for (int c2 = 0; c2 < root->childCount(); ++c2) root->child(c2)->setCheckState(0, st);
+            }
+        };
+        // Right-click SELECTS (blue outline); the camera only moves via "Frame Part".
+        if (m_view) m_view->setPickedPart(part);
+        ViewportPartMenu::Info in;
+        ViewportPartMenu::Actions act;
+        QTreeWidgetItem* item = nullptr;
+        int modelTris = 0;
+        for (int i = 0; i < m_partTris.size(); ++i) modelTris += m_partTris[i];
+        // The "model" here is the assembled outfit; its per-part SOURCE piece is the useful name,
+        // so the title shows the piece under the cursor rather than a generic label.
+        in.sourceModel   = (part >= 0 && part < m_partSource.size() && !m_partSource[part].isEmpty())
+                             ? m_partSource[part] : QStringLiteral("Outfit");
+        in.modelTris     = modelTris;
+        in.lastExportDir = QSettings().value(QStringLiteral("wardrobe2/lastExportDir")).toString();
+        if (part >= 0 && part < m_lastMerged.primitives.size()) {
+            item = itemForPart(part);
+            in.part           = part;
+            in.partName       = m_lastMerged.primitives[part].materialName;
+            in.partFileName   = in.partName;
+            in.sourceFileName = m_partSource.value(part);     // the outfit piece this part came from
+            in.sourceName     = m_partSource.value(part);
+            in.partTris       = m_partTris.value(part);
+            in.visible        = !item || item->checkState(0) == Qt::Checked;
+            in.isSim          = part < m_partSim.size() && m_partSim[part];
+            in.isFx           = part < m_partFx.size()  && m_partFx[part];
+            act.setVisible    = [item](bool on) { if (item) item->setCheckState(0, on ? Qt::Checked : Qt::Unchecked); };
+            act.isolate       = [setAll, item] { setAll(Qt::Unchecked); if (item) item->setCheckState(0, Qt::Checked); };
+            act.selectPart    = [this, item] {
+                if (!item || !m_partTree) return;
+                m_partTree->setCurrentItem(item); m_partTree->scrollToItem(item);
+            };
+            act.frame         = [this, part] {
+                if (!m_view) return;
+                QVector3D c; float r;
+                if (m_view->partsBounds(QVector<int>{part}, c, r))
+                    m_view->frameRegionKeepRotation(c, r, /*animate=*/true);
+            };
+            act.exportPart        = [this, item, setAll] { exportSinglePart(item, setAll, false); };
+            act.exportPartLastDir = [this, item, setAll] { exportSinglePart(item, setAll, true); };
+        }
+        act.exportModel        = [this] { exportSelection(); };
+        act.exportModelLastDir = [this] { exportSelectionToLast(); };
+        act.showAll = [setAll] { setAll(Qt::Checked); };
+        act.hideAll = [setAll] { setAll(Qt::Unchecked); };
+        act.invert  = [this] {
+            if (!m_partTree) return;
+            for (int r = 0; r < m_partTree->topLevelItemCount(); ++r) {
+                QTreeWidgetItem* root = m_partTree->topLevelItem(r);
+                for (int c2 = 0; c2 < root->childCount(); ++c2) {
+                    QTreeWidgetItem* it = root->child(c2);
+                    it->setCheckState(0, it->checkState(0) == Qt::Checked ? Qt::Unchecked : Qt::Checked);
+                }
+            }
+        };
+        ViewportPartMenu::exec(this, gp, in, act);
+}
+
 void WardrobeTab2::reapplyOverlays()
 {
     if (!m_view) return;
@@ -8158,6 +8203,16 @@ AnimParser::DecodedAnim WardrobeTab2::decodeAnimByName(const QString& animName)
 // the animation count (or the playing/selected clip name, if scope = playing) when animations are
 // on, plus the raw-source file count (.app + distinct .tex) when raw export is on. All cheap — the
 // clip count is the ANIMATIONS list size; the raw count parses the item's materials.
+// The export suffix leads with "1 model", which carries no information when only one item can be
+// selected. Strip it and keep the rest (animation scope/clip), so the new labels stay informative.
+QString WardrobeTab2::exportMenuExtras(const QString& suffix)
+{
+    QStringList parts = suffix.split(QStringLiteral(" + "), Qt::SkipEmptyParts);
+    for (int i = parts.size() - 1; i >= 0; --i)
+        if (parts[i].trimmed() == QLatin1String("1 model")) parts.removeAt(i);
+    return parts.isEmpty() ? QString() : QStringLiteral("  —  %1").arg(parts.join(QStringLiteral(" + ")));
+}
+
 QString WardrobeTab2::exportMenuSuffix(int sno, const QString& appr)
 {
     Q_UNUSED(sno);

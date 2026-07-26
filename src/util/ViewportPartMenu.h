@@ -1,16 +1,23 @@
 #pragma once
-// Shared right-click menu for a PART picked in the 3D viewport (Models / Wardrobe / Stable).
+// Shared part context menu — used by the 3D VIEWPORT right-click AND the PARTS PANEL in
+// Models / Wardrobe / Stable, so all six entry points offer the same actions in the same order.
 //
 // The three tabs previously built this menu independently and had drifted to the same three
-// entries each — the identical failure mode the list/grid context menus had. One builder here
-// means adding an action lights it up in every viewport at once, and the ordering/grouping stays
-// consistent. Each tab supplies what it can resolve (a Models part has no owning outfit piece,
-// a Stable part has no dye) and leaves the rest empty/null; empty fields and null callbacks are
-// simply omitted, so no tab shows an action it cannot perform.
+// entries each — the identical failure mode the list/grid context menus had. One builder means
+// adding an action lights it up everywhere at once.
+//
+// Each caller supplies only what it can resolve (a Models part has no owning outfit piece; a
+// Stable part has no collection) and leaves the rest empty/null. Empty fields and null callbacks
+// are omitted, so no menu ever shows an action it cannot perform. Labels carry their VALUE in
+// parentheses — "Copy source name (barF_base03_TRS)" — so you can read what you are about to
+// copy without invoking it.
 
 #include <QAction>
 #include <QClipboard>
+#include <QDir>
+#include <QFileInfo>
 #include <QGuiApplication>
+#include <QLocale>
 #include <QMenu>
 #include <QPoint>
 #include <QString>
@@ -21,30 +28,37 @@
 
 namespace ViewportPartMenu {
 
-// What the tab managed to resolve about the picked part. Empty strings / -1 = unavailable.
+// What the caller resolved about the picked part. Empty strings / -1 = unavailable.
 struct Info {
     int     part      = -1;        // primitive index (-1 = clicked empty space)
-    QString materialName;          // material bound to this submesh
-    QString partName;              // submesh / display name (often == materialName)
-    QString sourceName;            // owning piece: outfit item, mount slot… (blank in Models)
-    QString collection;            // collection / set name, if the tab knows one
-    int     tris      = 0;
-    int     sno       = -1;        // owning appearance SNO, if known
+    QString sourceModel;           // owning MODEL name — the menu title's left half
+    QString partName;              // this submesh's name — the menu title's right half
+    QString partFileName;          // part's own file/material name (Copy)
+    QString sourceFileName;        // source model's file name (Copy)
+    QString sourceName;            // human/display name of the source (Copy)
+    QString collection;            // collection / set name (Copy)
+    int     sno       = -1;        // source appearance SNO (Copy)
+    int     partTris  = 0;         // triangles in THIS part
+    int     modelTris = 0;         // triangles in the whole model
+    QString lastExportDir;         // last-used export folder (shown condensed)
     bool    visible   = true;      // current viewport visibility of this part
     bool    isSim     = false;     // cloth simulation cage proxy
     bool    isFx      = false;     // FX submesh
 };
 
-// Everything the menu can DO. Leave a callback null to omit its action.
+// Leave a callback null to omit its action.
 struct Actions {
-    std::function<void(bool)> setVisible;   // show/hide just this part
-    std::function<void()>     isolate;      // hide every other part
+    std::function<void()>     exportModelLastDir;  // whole model → last dir, no prompt
+    std::function<void()>     exportModel;         // whole model → prompt
+    std::function<void()>     exportPartLastDir;   // this part only → last dir, no prompt
+    std::function<void()>     exportPart;          // this part only → prompt
+    std::function<void()>     frame;               // point the camera at this part
+    std::function<void()>     selectPart;          // select in the parts panel (no camera move)
+    std::function<void(bool)> setVisible;
+    std::function<void()>     isolate;
     std::function<void()>     showAll;
     std::function<void()>     hideAll;
     std::function<void()>     invert;
-    std::function<void()>     frame;        // point the camera at this part
-    std::function<void()>     selectInTree; // reveal + select the part in the tab's parts panel
-    std::function<void()>     exportPart;   // export just this part
 };
 
 inline void copyText(const QString& s)
@@ -52,77 +66,115 @@ inline void copyText(const QString& s)
     if (!s.isEmpty()) QGuiApplication::clipboard()->setText(s);
 }
 
-// Build and execute the menu at `globalPos`. Returns immediately if there is nothing to show.
+// "C:/Users/me/Documents/D4/exports" → ".../D4/exports". A full path makes the menu unreadable;
+// the last two components are what actually distinguishes one export folder from another.
+inline QString condensePath(const QString& path)
+{
+    if (path.isEmpty()) return {};
+    const QString clean = QDir::fromNativeSeparators(QDir::cleanPath(path));
+    const QStringList parts = clean.split(QLatin1Char('/'), Qt::SkipEmptyParts);
+    if (parts.size() <= 2) return QDir::toNativeSeparators(clean);
+    return QStringLiteral("…/%1/%2").arg(parts[parts.size() - 2], parts.last());
+}
+
+inline QString withCount(const QString& label, int n)
+{
+    return n > 0 ? QStringLiteral("%1 (%2 tris)").arg(label, QLocale().toString(n)) : label;
+}
+
+inline QString withValue(const QString& label, const QString& value)
+{
+    return value.isEmpty() ? label : QStringLiteral("%1 (%2)").arg(label, value);
+}
+
+// Build and execute the menu at `globalPos`.
 inline void exec(QWidget* parent, const QPoint& globalPos, const Info& in, const Actions& act)
 {
     QMenu menu(parent);
     const bool hasPart = in.part >= 0;
 
-    // ── Part ──────────────────────────────────────────────────────────────────────────────
+    // ── Title: which model, which part ────────────────────────────────────────────────────
     if (hasPart) {
-        // A header line naming what was actually clicked: right-clicking a mesh should tell you
-        // WHICH mesh, otherwise every action below is a guess.
-        QString title = in.partName.isEmpty() ? in.materialName : in.partName;
-        if (title.isEmpty()) title = QStringLiteral("part %1").arg(in.part);
-        if (in.isSim)  title += QStringLiteral("  [SIM]");
-        if (in.isFx)   title += QStringLiteral("  [FX]");
-        if (in.tris > 0) title += QStringLiteral("  ·  %L1 tris").arg(in.tris);
+        QString part = in.partName.isEmpty() ? in.partFileName : in.partName;
+        if (part.isEmpty()) part = QStringLiteral("part %1").arg(in.part);
+        if (in.isSim) part += QStringLiteral("  [SIM]");
+        if (in.isFx)  part += QStringLiteral("  [FX]");
+        const QString title = in.sourceModel.isEmpty()
+            ? part : QStringLiteral("%1  —  %2").arg(in.sourceModel, part);
         QAction* hdr = menu.addAction(title);
         hdr->setEnabled(false);
         menu.addSeparator();
+    }
 
-        if (act.frame)        menu.addAction(QStringLiteral("Frame this part"), parent, act.frame);
-        if (act.selectInTree) menu.addAction(QStringLiteral("Select in parts list"), parent, act.selectInTree);
-        if (act.setVisible)
-            menu.addAction(in.visible ? QStringLiteral("Hide this part")
-                                      : QStringLiteral("Show this part"),
-                           parent, [act, v = in.visible] { act.setVisible(!v); });
-        if (act.isolate) menu.addAction(QStringLiteral("Isolate this part"), parent, act.isolate);
+    // ── Export ────────────────────────────────────────────────────────────────────────────
+    const QString dir = condensePath(in.lastExportDir);
+    bool anyExport = false;
+    if (act.exportModelLastDir && !dir.isEmpty()) {
+        menu.addAction(withValue(QStringLiteral("Export Model Last dir"), dir),
+                       parent, act.exportModelLastDir);
+        anyExport = true;
+    }
+    if (act.exportModel) {
+        menu.addAction(withCount(QStringLiteral("Export Model"), in.modelTris),
+                       parent, act.exportModel);
+        anyExport = true;
+    }
+    if (hasPart && act.exportPartLastDir && !dir.isEmpty()) {
+        menu.addAction(withValue(QStringLiteral("Export Part Last dir"), dir),
+                       parent, act.exportPartLastDir);
+        anyExport = true;
+    }
+    if (hasPart && act.exportPart) {
+        menu.addAction(withCount(QStringLiteral("Export Part"), in.partTris),
+                       parent, act.exportPart);
+        anyExport = true;
     }
 
     // ── Copy ──────────────────────────────────────────────────────────────────────────────
     if (hasPart) {
-        menu.addSeparator();
-        QMenu* copy = menu.addMenu(QStringLiteral("Copy"));
-        if (!in.partName.isEmpty())
-            copy->addAction(QStringLiteral("Part name"), parent, [n = in.partName] { copyText(n); });
-        if (!in.materialName.isEmpty())
-            copy->addAction(QStringLiteral("Material name"), parent, [n = in.materialName] { copyText(n); });
-        if (!in.sourceName.isEmpty())
-            copy->addAction(QStringLiteral("Source piece"), parent, [n = in.sourceName] { copyText(n); });
-        if (!in.collection.isEmpty())
-            copy->addAction(QStringLiteral("Collection"), parent, [n = in.collection] { copyText(n); });
-        if (in.sno > 0)
-            copy->addAction(QStringLiteral("SNO id"), parent,
-                            [s = in.sno] { copyText(QString::number(s)); });
-        copy->addSeparator();
-        // One line with everything — what you actually want when pasting into notes or a bug report.
-        copy->addAction(QStringLiteral("All details"), parent, [in] {
-            QStringList f;
-            if (!in.partName.isEmpty())     f << QStringLiteral("part=%1").arg(in.partName);
-            if (!in.materialName.isEmpty()) f << QStringLiteral("material=%1").arg(in.materialName);
-            if (!in.sourceName.isEmpty())   f << QStringLiteral("source=%1").arg(in.sourceName);
-            if (!in.collection.isEmpty())   f << QStringLiteral("collection=%1").arg(in.collection);
-            if (in.sno > 0)                 f << QStringLiteral("sno=%1").arg(in.sno);
-            if (in.tris > 0)                f << QStringLiteral("tris=%1").arg(in.tris);
-            if (in.isSim)                   f << QStringLiteral("[SIM]");
-            if (in.isFx)                    f << QStringLiteral("[FX]");
-            copyText(f.join(QStringLiteral("  ·  ")));
-        });
+        QStringList copies;
+        if (!in.partFileName.isEmpty())   copies << QStringLiteral("part");
+        if (!in.sourceFileName.isEmpty()) copies << QStringLiteral("srcfile");
+        if (in.sno > 0)                   copies << QStringLiteral("sno");
+        if (!in.sourceName.isEmpty())     copies << QStringLiteral("srcname");
+        if (!in.collection.isEmpty())     copies << QStringLiteral("coll");
+        if (!copies.isEmpty()) {
+            if (anyExport) menu.addSeparator();
+            if (!in.partFileName.isEmpty())
+                menu.addAction(withValue(QStringLiteral("Copy part file name"), in.partFileName),
+                               parent, [n = in.partFileName] { copyText(n); });
+            if (!in.sourceFileName.isEmpty())
+                menu.addAction(withValue(QStringLiteral("Copy part source file name"), in.sourceFileName),
+                               parent, [n = in.sourceFileName] { copyText(n); });
+            if (in.sno > 0)
+                menu.addAction(withValue(QStringLiteral("Copy source SNO ID"), QString::number(in.sno)),
+                               parent, [s = in.sno] { copyText(QString::number(s)); });
+            if (!in.sourceName.isEmpty())
+                menu.addAction(withValue(QStringLiteral("Copy source name"), in.sourceName),
+                               parent, [n = in.sourceName] { copyText(n); });
+            if (!in.collection.isEmpty())
+                menu.addAction(withValue(QStringLiteral("Copy source collection name"), in.collection),
+                               parent, [n = in.collection] { copyText(n); });
+        }
     }
 
-    // ── Visibility (works with no part under the cursor too) ──────────────────────────────
+    // ── This part ─────────────────────────────────────────────────────────────────────────
+    if (hasPart && (act.frame || act.selectPart || act.setVisible || act.isolate)) {
+        menu.addSeparator();
+        if (act.frame)      menu.addAction(QStringLiteral("Frame Part"), parent, act.frame);
+        if (act.selectPart) menu.addAction(QStringLiteral("Select Part"), parent, act.selectPart);
+        if (act.setVisible)
+            menu.addAction(in.visible ? QStringLiteral("Hide Part") : QStringLiteral("Show Part"),
+                           parent, [act, v = in.visible] { act.setVisible(!v); });
+        if (act.isolate)    menu.addAction(QStringLiteral("Isolate Part"), parent, act.isolate);
+    }
+
+    // ── All parts (works with nothing under the cursor too) ───────────────────────────────
     if (act.showAll || act.hideAll || act.invert) {
         menu.addSeparator();
-        if (act.showAll) menu.addAction(QStringLiteral("Show all parts"), parent, act.showAll);
-        if (act.hideAll) menu.addAction(QStringLiteral("Hide all parts"), parent, act.hideAll);
-        if (act.invert)  menu.addAction(QStringLiteral("Invert visibility"), parent, act.invert);
-    }
-
-    // ── Export ────────────────────────────────────────────────────────────────────────────
-    if (hasPart && act.exportPart) {
-        menu.addSeparator();
-        menu.addAction(QStringLiteral("Export this part…"), parent, act.exportPart);
+        if (act.showAll) menu.addAction(QStringLiteral("Show All"), parent, act.showAll);
+        if (act.hideAll) menu.addAction(QStringLiteral("Hide All"), parent, act.hideAll);
+        if (act.invert)  menu.addAction(QStringLiteral("Invert"), parent, act.invert);
     }
 
     if (!menu.isEmpty()) menu.exec(globalPos);
