@@ -680,6 +680,15 @@ reading the right blob out of packed storage.</p>
         QStringLiteral("Load and render a model as soon as you select it. Off = selecting only "
                        "shows its data; double-click a row to load it on demand (useful when "
                        "browsing or multi-selecting for export)."));
+    mdlChk(QStringLiteral("models/baseColorOnly"),
+        QStringLiteral("Base colour only (faster loads)"), false,
+        QStringLiteral("Decode ONE texture per material — base colour — instead of up to ten "
+                       "(normal, ORM, emissive, detail normal/roughness, translucency, mask, "
+                       "dye mask and ramp).\n\n"
+                       "Models load substantially faster and use far less memory. The preview "
+                       "renders flat-lit: no surface detail, glow or dye tinting.\n\n"
+                       "Models tab only — it does not affect the Wardrobe or Stable previews, "
+                       "or anything you export."));
     mdlChk(QStringLiteral("models/rememberPanels"),
         QStringLiteral("Remember the right-hand panel layout"), true,
         QStringLiteral("Restore which panels (Info, Parts, Animations…) are open, their order and "
@@ -798,16 +807,6 @@ reading the right blob out of packed storage.</p>
         pfl->addWidget(cb);
         return cb;
     };
-    QCheckBox* pfBaseOnly = mkPerf(QStringLiteral("perf/baseColorOnly"),
-           QStringLiteral("Base colour only — fastest model loads"), false,
-           QStringLiteral("Decode ONE texture per material (base colour) instead of up to ten "
-                          "(normal, ORM, emissive, detail normal/roughness, translucency, mask, "
-                          "dye mask/ramp).\n\n"
-                          "Models load much faster and use far less memory; the preview renders "
-                          "flat-lit with no surface detail, glow or dye tinting.\n\n"
-                          "Applies to the MODELS tab preview. The Wardrobe and Stable tabs still "
-                          "decode everything, because their dye and body-marking passes read those "
-                          "maps."));
     QCheckBox* pfCoalesce = mkPerf(QStringLiteral("wardrobe2/perf/coalesce"),
            QStringLiteral("Merge rapid selections (recommended)"), true,
            QStringLiteral("Clicking quickly through a list rebuilds only the item you settle on, "
@@ -1390,7 +1389,7 @@ reading the right blob out of packed storage.</p>
     // product, and the tuned Preview-popup camera/lighting/background untouched. OK still applies.
     auto* resetBtn = bb->addButton(QStringLiteral("Restore Defaults"), QDialogButtonBox::ResetRole);
     QObject::connect(resetBtn, &QPushButton::clicked, this,
-        [this, pfCoalesce, pfAsync, pfTex, pfVram, pfBaseOnly] {
+        [this, pfCoalesce, pfAsync, pfTex, pfVram] {
             if (QMessageBox::question(this, QStringLiteral("Restore Defaults"),
                     QStringLiteral("Reset the View, Models, Wardrobe-panel, Performance, Export and "
                                    "preview-feature options to their defaults?\n\nYour folder paths, "
@@ -1412,7 +1411,6 @@ reading the right blob out of packed storage.</p>
             pfAsync->setChecked(true);   // background loading is the default now
             pfTex->setChecked(true);
             pfVram->setChecked(false);
-            pfBaseOnly->setChecked(false);   // performance mode is opt-in
             // Export tab (each action sets its widget to default → live-writes the key).
             for (const auto& r : m_exportResetActions) r();
             // Preview Settings popup feature toggles (rendering features, not camera/lighting/bg).

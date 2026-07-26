@@ -2058,22 +2058,46 @@ WardrobeTab2::WardrobeTab2(QWidget* parent) : BrowserTab(parent)
                 for (int c2 = 0; c2 < root->childCount(); ++c2) root->child(c2)->setCheckState(0, st);
             }
         };
-        QMenu menu;
+        // Shared builder (util/ViewportPartMenu.h) so Models/Wardrobe/Stable can't drift apart.
+        ViewportPartMenu::Info in;
+        ViewportPartMenu::Actions act;
+        QTreeWidgetItem* item = nullptr;
         if (part >= 0 && part < m_lastMerged.primitives.size()) {
-            QTreeWidgetItem* item = itemForPart(part);
-            const bool visible = !item || item->checkState(0) == Qt::Checked;
-            const QString matName = m_lastMerged.primitives[part].materialName;
-            menu.addAction(visible ? QStringLiteral("Hide this part") : QStringLiteral("Show this part"),
-                           this, [item, visible] { if (item) item->setCheckState(0, visible ? Qt::Unchecked : Qt::Checked); });
-            menu.addAction(QStringLiteral("Isolate this part"), this, [setAll, item] {
-                setAll(Qt::Unchecked); if (item) item->setCheckState(0, Qt::Checked); });
-            menu.addSeparator();
-            menu.addAction(QStringLiteral("Copy material name"), this,
-                           [matName] { QGuiApplication::clipboard()->setText(matName); });
-            menu.addSeparator();
+            item = itemForPart(part);
+            in.part         = part;
+            in.materialName = m_lastMerged.primitives[part].materialName;
+            in.partName     = in.materialName;
+            in.sourceName   = m_partSource.value(part);          // owning outfit piece
+            in.tris         = m_partTris.value(part);
+            in.visible      = !item || item->checkState(0) == Qt::Checked;
+            in.isSim        = part < m_partSim.size() && m_partSim[part];
+            in.isFx         = part < m_partFx.size()  && m_partFx[part];
+            act.setVisible  = [item](bool on) { if (item) item->setCheckState(0, on ? Qt::Checked : Qt::Unchecked); };
+            act.isolate     = [setAll, item] { setAll(Qt::Unchecked); if (item) item->setCheckState(0, Qt::Checked); };
+            act.selectInTree= [this, item] {
+                if (!item || !m_partTree) return;
+                m_partTree->setCurrentItem(item); m_partTree->scrollToItem(item);
+            };
+            act.frame       = [this, part] {
+                if (!m_view) return;
+                QVector3D c; float r;
+                if (m_view->partsBounds(QVector<int>{part}, c, r))
+                    m_view->frameRegionKeepRotation(c, r, /*animate=*/true);
+            };
         }
-        menu.addAction(QStringLiteral("Show all parts"), this, [setAll] { setAll(Qt::Checked); });
-        menu.exec(gp);
+        act.showAll = [setAll] { setAll(Qt::Checked); };
+        act.hideAll = [setAll] { setAll(Qt::Unchecked); };
+        act.invert  = [this] {
+            if (!m_partTree) return;
+            for (int r = 0; r < m_partTree->topLevelItemCount(); ++r) {
+                QTreeWidgetItem* root = m_partTree->topLevelItem(r);
+                for (int c2 = 0; c2 < root->childCount(); ++c2) {
+                    QTreeWidgetItem* it = root->child(c2);
+                    it->setCheckState(0, it->checkState(0) == Qt::Checked ? Qt::Unchecked : Qt::Checked);
+                }
+            }
+        };
+        ViewportPartMenu::exec(this, gp, in, act);
     });
     // F = fullscreen (maximize-in-place), matching the Models tab. Scoped to the viewport
     // (click it first) so it never hijacks the letter "f" typed into the tab's search boxes.

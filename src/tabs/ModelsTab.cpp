@@ -3070,25 +3070,46 @@ ModelsTab::ModelsTab(QWidget* parent) : BrowserTab(parent)
             for (auto it = all.constBegin(); it != all.constEnd(); ++it) m_treeModel->setPartCheck(it.key(), true);
             recomputePartVisibility();
         };
-        QMenu menu(this);
+        // Shared builder (util/ViewportPartMenu.h) — same menu in Models/Wardrobe/Stable.
+        ViewportPartMenu::Info in;
+        ViewportPartMenu::Actions act;
         if (part >= 0 && part < m_curGeo.primitives.size()) {
             QHash<int, bool> checks; m_treeModel->partChecks(checks);
-            const bool visible = checks.value(part, true);
-            const QString matName = m_curGeo.primitives[part].materialName;
-            menu.addAction(visible ? QStringLiteral("Hide this part") : QStringLiteral("Show this part"),
-                           this, [this, part, visible] { m_treeModel->setPartCheck(part, !visible); recomputePartVisibility(); });
-            menu.addAction(QStringLiteral("Isolate this part"), this, [this, part] {
+            in.part         = part;
+            in.materialName = m_curGeo.primitives[part].materialName;
+            in.partName     = in.materialName;
+            in.tris         = m_curGeo.primitives[part].vertices.isEmpty()
+                                ? 0 : m_modelView->partTriangles(part);
+            in.sno          = m_curSno;                       // the loaded model owns every part
+            in.visible      = checks.value(part, true);
+            in.isFx         = part < m_partIsFx.size()  && m_partIsFx[part];
+            in.isSim        = part < m_partIsSim.size() && m_partIsSim[part];
+            act.setVisible  = [this, part](bool on) { m_treeModel->setPartCheck(part, on); recomputePartVisibility(); };
+            act.isolate     = [this, part] {
                 QHash<int, bool> all; m_treeModel->partChecks(all);
-                for (auto it = all.constBegin(); it != all.constEnd(); ++it) m_treeModel->setPartCheck(it.key(), it.key() == part);
+                for (auto it = all.constBegin(); it != all.constEnd(); ++it)
+                    m_treeModel->setPartCheck(it.key(), it.key() == part);
                 recomputePartVisibility();
-            });
-            menu.addSeparator();
-            menu.addAction(QStringLiteral("Copy material name"), this,
-                           [matName] { QApplication::clipboard()->setText(matName); });
-            menu.addSeparator();
+            };
+            act.frame       = [this, part] {
+                if (!m_modelView) return;
+                QVector3D c; float r;
+                if (m_modelView->partsBounds(QVector<int>{part}, c, r))
+                    m_modelView->frameRegionKeepRotation(c, r, /*animate=*/true);
+            };
         }
-        menu.addAction(QStringLiteral("Show all parts"), this, [showAll] { showAll(); });
-        menu.exec(gp);
+        act.showAll = [showAll] { showAll(); };
+        act.hideAll = [this] {
+            QHash<int, bool> all; m_treeModel->partChecks(all);
+            for (auto it = all.constBegin(); it != all.constEnd(); ++it) m_treeModel->setPartCheck(it.key(), false);
+            recomputePartVisibility();
+        };
+        act.invert = [this] {
+            QHash<int, bool> all; m_treeModel->partChecks(all);
+            for (auto it = all.constBegin(); it != all.constEnd(); ++it) m_treeModel->setPartCheck(it.key(), !it.value());
+            recomputePartVisibility();
+        };
+        ViewportPartMenu::exec(this, gp, in, act);
     });
     // Double-click = expand/collapse, everywhere, deterministically. The stock
     // expandsOnDoubleClick is style-hint-dependent (a QSS-styled app can silently disable it),
@@ -7764,7 +7785,7 @@ void ModelsTab::applyPartMaterials()
     };
     // Base-colour-only mode: one texture decode per material instead of ten. Shared by the
     // prefetch list and the per-part gather so the two can never disagree.
-    const bool baseOnly = QSettings().value(QStringLiteral("perf/baseColorOnly"), false).toBool();
+    const bool baseOnly = QSettings().value(QStringLiteral("models/baseColorOnly"), false).toBool();
     // Fur: dwFlags bit 5 (0x20), a fur shader-map, or a "_fur" material name — parity with the
     // Wardrobe's isFurMaterial. The Models tab previously never marked fur parts, so fur props like
     // trophy_bar032_stor (…_mat_fur) rendered with no shells.
@@ -8024,6 +8045,16 @@ void ModelsTab::onSettingsChanged()
         const bool fill = QSettings().value(QStringLiteral("models/fillSkin"), true).toBool();
         if (fill != lastFill) {
             lastFill = fill;
+            if (m_curGeo.valid) applyPartMaterials();
+        }
+    }
+    // "Base colour only" toggled → re-decode with/without the extra maps, same live-apply as above.
+    // Turning it OFF must decode the maps that were skipped, so this cannot be a no-op either way.
+    {
+        static bool lastBaseOnly = QSettings().value(QStringLiteral("models/baseColorOnly"), false).toBool();
+        const bool bo = QSettings().value(QStringLiteral("models/baseColorOnly"), false).toBool();
+        if (bo != lastBaseOnly) {
+            lastBaseOnly = bo;
             if (m_curGeo.valid) applyPartMaterials();
         }
     }
