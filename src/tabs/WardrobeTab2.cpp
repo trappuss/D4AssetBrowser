@@ -558,23 +558,8 @@ QString femaleCleanFacialHairMat(const QString& d4)
     return best.isEmpty() ? QString() : facialHairMat(d4, best, false);
 }
 
-// Mid colour of a HairColor definition's 3-colour ramp (for tinting the hair material).
-QColor hairColorMid(const QString& d4, const QString& stem)
-{
-    QFile f(d4 + QStringLiteral("/json/base/meta/HairColor/") + stem + QStringLiteral(".hcl.json"));
-    if (!f.open(QIODevice::ReadOnly)) return QColor();
-    const QJsonArray a = QJsonDocument::fromJson(f.readAll()).object()
-                             .value(QStringLiteral("rgbaColors")).toArray();
-    if (a.isEmpty()) return QColor();
-    const QJsonObject c = a[a.size() / 2].toObject();
-    return QColor(c.value(QStringLiteral("r")).toInt(), c.value(QStringLiteral("g")).toInt(),
-                  c.value(QStringLiteral("b")).toInt());
-}
-
-// Full HairColor ramp stops (dark root/shadow → bright length → tip). D4 colours hair by
-// GRADIENT-MAPPING the grayscale strand texture through this ramp — that tonal spread across the
-// strands is the hair's depth. We previously collapsed the ramp to its middle stop → flat hair.
-QVector<QColor> hairColorRamp(const QString& d4, const QString& stem)
+// Read a HairColor's rgbaColors as authored (no reordering).
+QVector<QColor> hairColorStops(const QString& d4, const QString& stem)
 {
     QVector<QColor> out;
     QFile f(d4 + QStringLiteral("/json/base/meta/HairColor/") + stem + QStringLiteral(".hcl.json"));
@@ -587,10 +572,46 @@ QVector<QColor> hairColorRamp(const QString& d4, const QString& stem)
     return out;
 }
 
+// flHairColorInfluence: how strongly the HairColor overrides the hair material's own base colour.
+// 28 of the 32 shipped colours author 1.0; Chestnut, MidnightRuby and DarkVelvet author 0.5 (a
+// deliberately subtle tint) and the bad-data entry authors 0. Ignoring it over-saturated those.
+float hairColorInfluence(const QString& d4, const QString& stem)
+{
+    QFile f(d4 + QStringLiteral("/json/base/meta/HairColor/") + stem + QStringLiteral(".hcl.json"));
+    if (!f.open(QIODevice::ReadOnly)) return 1.0f;
+    const QJsonValue v = QJsonDocument::fromJson(f.readAll()).object()
+                             .value(QStringLiteral("flHairColorInfluence"));
+    return v.isDouble() ? float(qBound(0.0, v.toDouble(), 1.0)) : 1.0f;   // absent ⇒ full
+}
+
+// Representative colour of a HairColor (flat-tint fallback + swatches). This is the MID stop, not
+// the array's middle element: see hairColorRamp() for why those are not the same thing.
+QColor hairColorMid(const QString& d4, const QString& stem)
+{
+    const QVector<QColor> a = hairColorStops(d4, stem);
+    if (a.isEmpty()) return QColor();
+    return (a.size() >= 3) ? a[2] : a[a.size() / 2];
+}
+
+// HairColor stops in DARK→BRIGHT render order, ready to gradient-map the strand texture through.
+//
+// rgbaColors is NOT stored in ramp order. It is [shadow, HIGHLIGHT, mid] — the brightest stop sits
+// in the middle of the array. Measured across every shipped HairColor: ordering the stops [0,2,1]
+// gives a luminance-monotonic ramp for 31 of the 31 real definitions, while the stored order [0,1,2]
+// is monotonic for exactly 1. Walking the array as-authored therefore handed mid-luminance strands
+// the most saturated stop and the brightest strands a duller one — which is what made hair read as
+// flat neon plastic, worst on the vivid colours (018AuburnRed's highlight is a near-primary 255,38,1).
+QVector<QColor> hairColorRamp(const QString& d4, const QString& stem)
+{
+    const QVector<QColor> a = hairColorStops(d4, stem);
+    if (a.size() < 3) return a;                       // 2-stop or malformed: use as-is
+    return { a[0], a[2], a[1] };                      // shadow → mid → highlight
+}
+
 // Gradient-map a grayscale strand base through the hair ramp: each texel's luminance walks the ramp
 // (dark gaps/roots → first stop, bright lit strands → last stop). This is D4's own hair-colour
 // method and restores the tonal depth a flat tint destroys. Alpha (the strand cutout) is preserved.
-QImage hairGradientMap(QImage img, const QVector<QColor>& ramp)
+QImage hairGradientMap(QImage img, const QVector<QColor>& ramp, float influence = 1.0f)
 {
     if (img.isNull() || ramp.size() < 2) return img;
     img = img.convertToFormat(QImage::Format_RGBA8888);
@@ -609,17 +630,17 @@ QImage hairGradientMap(QImage img, const QVector<QColor>& ramp)
         for (int x = 0; x < img.width(); ++x) {
             const int lum = (s[x*4]*30 + s[x*4+1]*59 + s[x*4+2]*11) / 100;
             const QRgb c = lut[lum & 0xFF];
-            // Retain the strand texture's own brightness as a mild AO so gaps/roots stay DARKER (not
-            // just differently-coloured) — restores the occlusion depth the flat colour-map loses.
-            // D4 hair has NO AO texture — depth comes from the grayscale base's own baked strand
-            // shading (dark gaps/roots) + dithered self-shadowing. Preserve that shading strongly as
-            // brightness so gaps read as deep occlusion, not lifted flat colour. Gamma the luminance
-            // so mid-strands stay bright while gaps crush dark.
+            // Mild contact darkening only. The ramp's first stop is the AUTHORED shadow colour, so
+            // luminance already picks the dark end for gaps and roots; the old 0.12→1.0 curve
+            // multiplied that same coordinate in a second time and crushed roots to near-black.
             const float ln = lum / 255.0f;
-            const float shade = 0.12f + 0.88f * ln * ln;   // gaps → ~0.12 (deep AO), lit strands → full
-            s[x*4]   = uchar(qBound(0, int(qRed(c)   * shade), 255));
-            s[x*4+1] = uchar(qBound(0, int(qGreen(c) * shade), 255));
-            s[x*4+2] = uchar(qBound(0, int(qBlue(c)  * shade), 255));   // alpha kept
+            const float shade = 0.78f + 0.22f * ln;
+            const float inf = qBound(0.0f, influence, 1.0f);
+            for (int k = 0; k < 3; ++k) {
+                const int src = s[x*4+k];
+                const int col = int((k == 0 ? qRed(c) : k == 1 ? qGreen(c) : qBlue(c)) * shade);
+                s[x*4+k] = uchar(qBound(0, int(src * (1.0f - inf) + col * inf), 255));   // alpha kept
+            }
         }
     }
     return img;
@@ -630,11 +651,12 @@ QImage hairGradientMap(QImage img, const QVector<QColor>& ramp)
 // HairColor ramp by that mask coordinate — dark-maroon roots → bright-copper mid-length → medium
 // tips — AND uses the mask as strand AO (roots occluded). That mask is the hair's real depth; the
 // base only supplies the alpha cutout. Falls back to the base-luminance map when no mask exists.
-QImage hairColorFromMask(QImage base, const QImage& maskIn, const QVector<QColor>& ramp)
+QImage hairColorFromMask(QImage base, const QImage& maskIn, const QVector<QColor>& ramp,
+                         float influence = 1.0f)
 {
     if (base.isNull() || ramp.size() < 2) return base;
     base = base.convertToFormat(QImage::Format_RGBA8888);
-    if (maskIn.isNull()) return hairGradientMap(base, ramp);
+    if (maskIn.isNull()) return hairGradientMap(base, ramp, influence);
     QImage m = maskIn.convertToFormat(QImage::Format_RGBA8888);
     if (m.size() != base.size())          // the mask shares the base's UVs; align its grid
         m = m.scaled(base.size(), Qt::IgnoreAspectRatio, Qt::SmoothTransformation);
@@ -653,10 +675,16 @@ QImage hairColorFromMask(QImage base, const QImage& maskIn, const QVector<QColor
         for (int x = 0; x < base.width(); ++x) {
             const int mv = (s[x*4]*30 + s[x*4+1]*59 + s[x*4+2]*11) / 100;   // root(0) → tip(255)
             const QRgb c = lut[mv & 0xFF];
-            const float ao = 0.42f + 0.58f * (mv / 255.0f);                // roots deep but keep colour
-            d[x*4]   = uchar(qBound(0, int(qRed(c)   * ao), 255));
-            d[x*4+1] = uchar(qBound(0, int(qGreen(c) * ao), 255));
-            d[x*4+2] = uchar(qBound(0, int(qBlue(c)  * ao), 255));         // base alpha (cutout) kept
+            // Same reasoning as hairGradientMap: the ramp's shadow stop already darkens the roots,
+            // so the old 0.42 floor darkened them twice and flattened the tonal range the ramp
+            // exists to provide.
+            const float ao = 0.82f + 0.18f * (mv / 255.0f);
+            const float inf = qBound(0.0f, influence, 1.0f);
+            for (int k = 0; k < 3; ++k) {
+                const int src = d[x*4+k];
+                const int col = int((k == 0 ? qRed(c) : k == 1 ? qGreen(c) : qBlue(c)) * ao);
+                d[x*4+k] = uchar(qBound(0, int(src * (1.0f - inf) + col * inf), 255));
+            }                                                              // base alpha (cutout) kept
         }
     }
     return base;
@@ -5844,7 +5872,8 @@ void WardrobeTab2::resetDefaults()
                              QStringLiteral("wardrobe2/weaponType"), QStringLiteral("wardrobe2/weapon"),
                              QStringLiteral("wardrobe2/weaponType2"), QStringLiteral("wardrobe2/weapon2"),
                              QStringLiteral("wardrobe2/weaponSheath"), QStringLiteral("wardrobe2/weaponSheath2"),
-                             QStringLiteral("wardrobe2/backTrophy"), QStringLiteral("wardrobe2/dyeSel")})
+                             QStringLiteral("wardrobe2/backTrophy"), QStringLiteral("wardrobe2/dyeSel"),
+                             QStringLiteral("wardrobe2/skinTone"), QStringLiteral("wardrobe2/skinDetail")})
         s.remove(k);
     for (int i = 0; i < 5; ++i) s.remove(QStringLiteral("wardrobe2/slot/%1").arg(i));
     for (int i = 0; i < 9; ++i) s.remove(QStringLiteral("wardrobe2/creator/%1").arg(i));
@@ -5867,6 +5896,8 @@ void WardrobeTab2::resetDefaults()
     if (m_weapon4 && m_weapon4->count() > 0) m_weapon4->setCurrentIndex(0);
     if (m_backTrophy && m_backTrophy->count() > 0) m_backTrophy->setCurrentIndex(0);
     if (m_dyeCombo && m_dyeCombo->count() > 0) m_dyeCombo->setCurrentIndex(0);
+    if (m_skinTone && m_skinTone->count() > 0) m_skinTone->setCurrentIndex(0);       // "(default)"
+    if (m_skinDetail && m_skinDetail->count() > 0) m_skinDetail->setCurrentIndex(0); // "(none)"
     if (m_env) m_env->setCurrentIndex(1);
     m_restoring = false;
 
@@ -6566,6 +6597,7 @@ void WardrobeTab2::rebuildOutfitImpl(bool async)
     auto sel = [&](int cat) { return m_creator[cat] ? m_creator[cat]->currentData().toString() : QString(); };
     const QColor hairTint = hairColorMid(d4, sel(2));                     // Hair colour (flat fallback)
     const QVector<QColor> hairRamp = hairColorRamp(d4, sel(2));           // full ramp → gradient-map
+    const float hairInfl = hairColorInfluence(d4, sel(2));                // authored tint strength
     const QColor irisCol  = eyeIrisColor(d4, sel(3));                     // Eye colour (iris inner)
     const QColor irisOuter = eyeIrisOuterColor(d4, sel(3));              // iris outer (limbus)
     // D4 eyes are rendered by the Hero_Eye shader off a SHARED set of global eye textures (the
@@ -6837,7 +6869,7 @@ void WardrobeTab2::rebuildOutfitImpl(bool async)
                 // Walk the ramp by the MASK_PRIMARY root→tip gradient (D4's real method) — this is
                 // where the hair's depth/AO lives, not in the flat white base.
                 const QImage hairMask = MaterialDecode::byRole(m_reader, d4, effMat, "MASK_PRIMARY");
-                base = hairColorFromMask(base, hairMask, hairRamp);
+                base = hairColorFromMask(base, hairMask, hairRamp, hairInfl);
             } else if (hairTint.isValid()) base = tintImage(base, hairTint);   // fallback: flat tint
         }
         if (isSkin && !isHair && skinCol.isValid()) base = skinRecolor(base, skinCol);   // skin tone
