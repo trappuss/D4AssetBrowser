@@ -243,6 +243,8 @@ private:
     void setActiveTheme(int sno, const QString& appearanceName);   // resolve + re-highlight grids
     void refreshLookHighlights();    // outline look cards that belong to the active theme
     void refreshCreatorHighlights(); // outline creator cards that belong to the active theme
+    QString markingAuthoredColorStem() const;   // the selected Marking's own snoDefaultColor
+    void    updateMarkingDefaultLabel();        // name it in the Marking colour "(default)" entry
     void refreshSlotCells();     // update each slot cell's equipped icon
     void updateLookHeader();     // "<SLOT> (N) — <title> · <collection> · <filename>"
     // Appearance page: the 9 creator categories as a cell grid + a per-category card browser

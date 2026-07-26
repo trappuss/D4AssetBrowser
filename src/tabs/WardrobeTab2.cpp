@@ -263,6 +263,12 @@ const QString kCardBaseQss  = QStringLiteral(
 const QString kCardMatchQss = QStringLiteral(
     "QToolButton{border:2px solid #46c2ff;border-radius:4px;}"
     "QToolButton:checked{border:2px solid #ffffff;border-radius:4px;}");
+// The MarkingColor the selected Marking authors as its own (snoDefaultColor). Markings are not
+// recolourable in-game, so this pairing is the real look; green keeps it distinct from the blue
+// theme match, the gold custom-pigment border and the dashed gold keyboard cursor.
+const QString kCardAuthoredQss = QStringLiteral(
+    "QToolButton{border:2px solid #5fd18a;border-radius:4px;}"
+    "QToolButton:checked{border:2px solid #ffffff;border-radius:4px;}");
 // Keyboard cursor outline (look grid): a dashed gold border marks the focused card before
 // it's equipped (press Enter/Space to equip), so arrowing around doesn't reload geometry.
 const QString kCardCursorQss = QStringLiteral(
@@ -2517,6 +2523,10 @@ WardrobeTab2::WardrobeTab2(QWidget* parent) : BrowserTab(parent)
         connect(m_creator[i], &QComboBox::currentIndexChanged, this, [this, i](int) {
             if (m_restoring) return;
             QSettings().setValue(QStringLiteral("wardrobe2/creator/%1").arg(i), m_creator[i]->currentData().toString());
+            if (i == 6) {          // Marking changed → so did the colour it authors for itself
+                refreshCreatorCells();   // re-derives the label
+                updateCreatorHeader();
+            }
             scheduleRebuild();
         });
     connect(m_skinTone, &QComboBox::currentIndexChanged, this, [this](int) {
@@ -3759,6 +3769,7 @@ void WardrobeTab2::populateCreator()
         const int idx = saved.isEmpty() ? 0 : m_creator[i]->findData(saved);
         m_creator[i]->setCurrentIndex(idx > 0 ? idx : 0);
     }
+    updateMarkingDefaultLabel();   // name the Marking colour default before the grid is built
     if (m_creatorLayout) { fillCreatorGrid(); refreshCreatorCells(); }   // refill the Appearance cards
 }
 
@@ -5400,15 +5411,69 @@ void WardrobeTab2::refreshLookHighlights()
 }
 
 // Outline the creator card that belongs to the active theme (its marking / cosmetic).
+// The MarkingColor stem the currently-selected Marking shape authors as its own, or empty when no
+// marking is selected / the shape ships snoDefaultColor null (14 of 304 do). This is the colour
+// the renderer already falls back to; the UI just never said so.
+QString WardrobeTab2::markingAuthoredColorStem() const
+{
+    if (!m_creator[6]) return QString();
+    const QString shape = m_creator[6]->currentData().toString();
+    if (shape.isEmpty()) return QString();
+    // markingDef() has no cache and re-reads the .msh.json every call, and this now runs on every
+    // grid refill and every search keystroke. Memoised in RAM only, keyed by data dir so pointing
+    // the tool at a different d4data snapshot cannot serve a stale answer.
+    static QHash<QString, QString> cache;
+    const QString d4 = Config::d4dataDir();
+    const QString key = d4 + QLatin1Char('\x1f') + shape;
+    const auto it = cache.constFind(key);
+    if (it != cache.constEnd()) return it.value();
+    if (cache.size() > 512) cache.clear();          // bounded; 304 shapes ship today
+    const QString stem = markingDef(d4, shape).colorStem;
+    cache.insert(key, stem);
+    return stem;
+}
+
+// Relabel the Marking colour list's "(default)" entry so it names what default actually resolves
+// to — "(default - Blue Paint)". Data stays empty, so the render path still takes its own
+// snoDefaultColor fallback and an explicit pick still overrides it.
+void WardrobeTab2::updateMarkingDefaultLabel()
+{
+    if (!m_creator[7]) return;
+    const QString stem = markingAuthoredColorStem();
+    QString text = QStringLiteral("(default)");
+    if (!stem.isEmpty()) {
+        const bool male = m_gender && m_gender->currentData().toString() == QLatin1String("m");
+        static QHash<QString, QString> nameCache;    // same reasoning as markingAuthoredColorStem()
+        const QString d4 = Config::d4dataDir();
+        const QString key = d4 + QLatin1Char('\x1f') + (male ? QLatin1Char('m') : QLatin1Char('f')) + stem;
+        auto it = nameCache.constFind(key);
+        if (it == nameCache.constEnd()) {
+            if (nameCache.size() > 512) nameCache.clear();
+            const QString real = creatorRealName(d4, kCreator[7].folder, stem, male);
+            it = nameCache.insert(key, real.isEmpty() ? prettyCreatorName(stem) : real);
+        }
+        text = QStringLiteral("(default - %1)").arg(it.value());
+    }
+    if (m_creator[7]->count() > 0 && m_creator[7]->itemText(0) != text) {
+        QSignalBlocker block(m_creator[7]);
+        m_creator[7]->setItemText(0, text);
+    }
+}
+
 void WardrobeTab2::refreshCreatorHighlights()
 {
     if (!m_creatorGroup) return;
     QComboBox* cc = m_creator[m_activeCreator];
     const QString match = m_activeTheme.creator.value(m_activeCreator).toLower();
+    // In the Marking colour list, also mark the colour the selected Marking authors for itself.
+    const QString authored = (m_activeCreator == 7) ? markingAuthoredColorStem().toLower() : QString();
     for (QAbstractButton* ab : m_creatorGroup->buttons()) {
         const int k = m_creatorGroup->id(ab);
-        const bool m = (k > 0 && cc && !match.isEmpty() && cc->itemData(k).toString().toLower() == match);
-        ab->setStyleSheet(m ? kCardMatchQss : kCardBaseQss);
+        if (k <= 0 || !cc) { ab->setStyleSheet(kCardBaseQss); continue; }
+        const QString stem = cc->itemData(k).toString().toLower();
+        if (!match.isEmpty() && stem == match)          ab->setStyleSheet(kCardMatchQss);      // theme wins
+        else if (!authored.isEmpty() && stem == authored) ab->setStyleSheet(kCardAuthoredQss);
+        else                                              ab->setStyleSheet(kCardBaseQss);
     }
 }
 
@@ -5640,6 +5705,10 @@ bool WardrobeTab2::navGrid(QScrollArea* scroll, QGridLayout* layout, int cols, i
 void WardrobeTab2::fillCreatorGrid()
 {
     if (!m_creatorLayout || !m_creatorContent) return;
+    // Derived here rather than only from the combo's change signal: equipTheme() sets the Marking
+    // with m_restoring set, so the signal never fires and the label would name the PREVIOUS
+    // marking's colour while the green outline (recomputed live) pointed at the new one.
+    updateMarkingDefaultLabel();
     QComboBox* c = m_creator[m_activeCreator];
     if (!c) return;
     while (QLayoutItem* it = m_creatorLayout->takeAt(0)) { if (it->widget()) it->widget()->deleteLater(); delete it; }
@@ -5674,6 +5743,9 @@ void WardrobeTab2::fillCreatorGrid()
     });
     order.prepend(0);   // "(default)" always first
 
+    // Resolved ONCE: this opens the selected Marking's .msh.json, and the colour grid can hold
+    // 300+ tiles.
+    const QString authoredCol = (m_activeCreator == 7) ? markingAuthoredColorStem() : QString();
     int pos = 0;
     for (int k : order) {
         const QString stem = c->itemData(k).toString();
@@ -5684,9 +5756,17 @@ void WardrobeTab2::fillCreatorGrid()
         b->setIconSize(QSize(iconW, iconW));
         const QImage img = creatorIconImage(m_activeCreator, stem);
         if (!img.isNull()) { b->setIcon(QIcon(QPixmap::fromImage(img))); }
-        else { b->setToolButtonStyle(Qt::ToolButtonTextOnly); b->setText(k == 0 ? QStringLiteral("(default)") : c->itemText(k)); }
+        // Tile text stays short: colour categories draw 46px swatches, so the resolved
+        // "(default - Peacock Blue)" would be clipped to nothing. The full text is on the tooltip,
+        // in the header and on the Appearance card.
+        else { b->setToolButtonStyle(Qt::ToolButtonTextOnly);
+               b->setText(k == 0 ? QStringLiteral("(default)") : c->itemText(k)); }
         // Informational hover tooltip: display name + file (stem).
-        b->setToolTip(k == 0 ? QStringLiteral("(default)") : infoTip(0, c->itemText(k), QString(), stem));
+        b->setToolTip(k == 0 ? c->itemText(0) : infoTip(0, c->itemText(k), QString(), stem));
+        if (k > 0 && !authoredCol.isEmpty() && !stem.isEmpty()
+            && stem.compare(authoredCol, Qt::CaseInsensitive) == 0)
+            b->setToolTip(b->toolTip() + QStringLiteral("\n\nThe colour this Marking is authored to "
+                                                       "use. Markings are not recolourable in-game."));
         if (k == c->currentIndex()) b->setChecked(true);
         if (k > 0) {   // right-click -> equip / equip theme (same menu as the look grid)
             b->setContextMenuPolicy(Qt::CustomContextMenu);
@@ -5724,7 +5804,7 @@ void WardrobeTab2::fillCreatorGrid()
         if (m_creatorScroll) m_creatorScroll->setFocus();   // keep focus for arrow-key navigation
     });
     updateCreatorHeader();
-    refreshCreatorHighlights();   // outline the card matching the active theme
+    refreshCreatorHighlights();   // theme match + the Marking's authored colour
 }
 
 // Header: "<Category>  (count) - <selected option>" (parity with the Equipment LOOKS header).
@@ -5733,13 +5813,14 @@ void WardrobeTab2::updateCreatorHeader()
     if (!m_creatorHeader) return;
     QComboBox* c = m_creator[m_activeCreator];
     if (!c) return;
-    const QString sel = c->currentIndex() <= 0 ? QStringLiteral("(default)") : c->currentText();
+    const QString sel = c->currentIndex() <= 0 ? c->itemText(0) : c->currentText();
     m_creatorHeader->setText(QStringLiteral("%1  (%2) - %3")
         .arg(QString::fromLatin1(kCreator[m_activeCreator].label)).arg(c->count() - 1).arg(sel));
 }
 
 void WardrobeTab2::refreshCreatorCells()
 {
+    updateMarkingDefaultLabel();   // the cell tooltip prints itemText(0); keep it derived
     for (int i = 0; i < 9; ++i) {
         if (!m_creatorCells[i] || !m_creator[i]) continue;
         const QString stem = m_creator[i]->currentData().toString();
@@ -5750,7 +5831,8 @@ void WardrobeTab2::refreshCreatorCells()
             m_creatorCells[i]->setToolTip(infoTip(0, QString::fromLatin1(kCreator[i].label)
                                           + QStringLiteral(": ") + m_creator[i]->currentText(), QString(), stem));
         else
-            m_creatorCells[i]->setToolTip(QString::fromLatin1(kCreator[i].label) + QStringLiteral(": (default)"));
+            m_creatorCells[i]->setToolTip(QString::fromLatin1(kCreator[i].label)
+                                          + QStringLiteral(": ") + m_creator[i]->itemText(0));
     }
 }
 
@@ -6069,6 +6151,7 @@ void WardrobeTab2::equipTheme(int sno, const QString& appearanceName, ThemeScope
     refreshLookSelection();   // update checkmarks in place (preserves scroll position)
     refreshLookHighlights();
     refreshCreatorHighlights();
+    updateCreatorHeader();    // a theme can change the Marking, and the header names it
     // Camera Snap: frame the parts this theme scope touched (full body for a full theme).
     // Overrides rebuildOutfit()'s per-slot snap so the framing matches what was equipped.
     if (m_d4View) frameThemeScope(scope);
