@@ -65,6 +65,8 @@ struct WardrobeBuildCtx {
     int           baseOutfitCount = 0;
     QString       loadLog, skelDbg, weapDbg;
     QVector<QPair<QString,int>> pieceList;
+    QVector<int>                pieceSno;    // parallel to pieceList: each piece's appearance SNO,
+                                             // so a part can be traced back to the item it came from
     QString       keepAnim;
     int           keepFrame = 0;
     bool          wasPlaying = false;
@@ -285,6 +287,7 @@ private:
     QVector<int> m_partCovered;        // per merged-part: base-body region hidden by equipped armour
     QVector<int> m_partEye;            // per merged-part: 1 = eyeball (Hero_Eye shader / eyeball mat)
     QStringList m_partSource;          // per merged-part source piece name (for grouping)
+    QVector<int> m_partSourceSno;      // per merged-part source appearance SNO (context-menu export)
     QTreeWidget* m_partTree = nullptr; // per-part visibility tree (piece → submeshes)
     QWidget* m_sidebar = nullptr;      // right-side panel column (strip + splitter)
     QSplitter* m_rsplit = nullptr;     // vertical splitter: the visible panels, drag to resize
@@ -441,8 +444,9 @@ private:
                         QImage& orm, QImage& emis, float& emisMul, float& irisRough);
     void applyClothParams();               // read wardrobe/cloth/* → m_view->setClothParams
     void showPartContextMenu(int part, const QPoint& globalPos);   // viewport AND parts panel
-    void exportSinglePart(QTreeWidgetItem* item,
-                          const std::function<void(Qt::CheckState)>& setAll, bool toLast);
+    QVector<int> visibleParts() const;                          // parts drawn right now
+    QVector<int> partsOfSource(int part) const;                 // parts sharing one source item
+    void exportPartsSubset(const QVector<int>& parts, const QString& label, bool toLast);
     void reapplyOverlays();        // re-push ALL overlay state (master gate + each box)
     void loadClothTuning();                // read the equipped pieces' real Cloth/*.clt.json params
     void fillClothSimTuning(ModelGeometry& geo);   // per-ClothSim tuning from its Cloth/<name>_sim.clt.json
@@ -494,7 +498,7 @@ private:
     void collectExportAnims(QVector<AnimParser::DecodedAnim>& anims, QStringList& names);
     static QString exportMenuExtras(const QString& suffix);   // suffix minus "1 model"
     QString exportMenuSuffix(int sno, const QString& appr);   // "1 model + N anims + M raw" per settings
-    bool exportOutfitGlb(const QString& path);   // shared writer for the two outfit-export entry points
+    bool exportOutfitGlb(const QString& path, const QVector<int>& keep = {});   // shared writer for the two outfit-export entry points
     void applyAnimSpeed();
     void tickAnimation();
     void clearAnimationSelection();

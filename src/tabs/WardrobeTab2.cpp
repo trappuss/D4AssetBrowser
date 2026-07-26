@@ -6194,6 +6194,7 @@ void WardrobeTab2::rebuildOutfitImpl(bool async)
     QVector<ModelGeometry> parts;
     QVector<int> primSlot;   // per-primitive slot tag (0..4 armour, 5/6 weapons, -1 = not dyeable)
     QVector<QPair<QString, int>> pieceList;   // (display name, primitive count) for the parts tree
+    QVector<int> pieceSno;                    // parallel: the appearance SNO each piece came from
     int pieceCount = 0;
     qint64 totalV = 0, totalT = 0;
     QString skelDbg;
@@ -6282,6 +6283,7 @@ void WardrobeTab2::rebuildOutfitImpl(bool async)
                           .arg(cand.isEmpty() ? QStringLiteral("(none)") : cand.join(QStringLiteral(", ")));
         }
         pieceList.append({name, int(geo.primitives.size())});
+        pieceSno.append(sno);
         for (int pi = 0; pi < geo.primitives.size(); ++pi) primSlot.append(slot);   // dye-slot tag
         parts.append(geo);
         ++pieceCount;
@@ -6323,6 +6325,7 @@ void WardrobeTab2::rebuildOutfitImpl(bool async)
                     && !p.materialName.contains(QLatin1String("demonform"), Qt::CaseInsensitive)) { bodySkinMat = p.materialName; break; }
                             for (int pi = 0; pi < bg.primitives.size(); ++pi) primSlot.append(-1);
                             pieceList.append({ b0Name, int(bg.primitives.size()) });
+                            pieceSno.append(b0);
                             baseIsOutfit = true;
                             baseOutfitCount = int(bg.primitives.size());   // these lead `parts`/merged
                         } else {
@@ -6445,6 +6448,7 @@ void WardrobeTab2::rebuildOutfitImpl(bool async)
         seatWeapon(wgeo, hs.hand, itemType, wgender, hpMap, weapDbg, forceHash);
         for (const MeshPrimitive& p : wgeo.primitives) { totalV += p.vertices.size(); totalT += p.indices.size() / 3; }
         pieceList.append({weapName, int(wgeo.primitives.size())});
+        pieceSno.append(sno);
         for (int pi = 0; pi < wgeo.primitives.size(); ++pi) primSlot.append(hs.slot);
         parts.append(wgeo);
     }
@@ -6653,7 +6657,7 @@ void WardrobeTab2::rebuildOutfitImpl(bool async)
     // so when async it runs on a worker thread and the apply (GL/UI) runs back on the main thread.
     WardrobeBuildCtx ctx;
     ctx.merged = merged; ctx.primSlot = primSlot; ctx.baseOutfitCount = baseOutfitCount;
-    ctx.loadLog = loadLog; ctx.skelDbg = skelDbg; ctx.weapDbg = weapDbg; ctx.pieceList = pieceList;
+    ctx.loadLog = loadLog; ctx.skelDbg = skelDbg; ctx.weapDbg = weapDbg; ctx.pieceList = pieceList; ctx.pieceSno = pieceSno;
     ctx.keepAnim = keepAnim; ctx.keepFrame = keepFrame; ctx.wasPlaying = wasPlaying;
     ctx.pieceCount = pieceCount; ctx.totalV = totalV; ctx.totalT = totalT;
     const qint64 tGeom = geomT.elapsed();   // geometry parse/merge phase done
@@ -7146,8 +7150,14 @@ void WardrobeTab2::applyOutfit(const WardrobeBuildCtx& ctx, const WardrobeOutfit
         // Hidden by default; toggled via the FORM button like FX/SIM.
         m_partForm << (mn.contains(QLatin1String("demonform"), Qt::CaseInsensitive) ? 1 : 0);
     }
-    for (const auto& pc : pieceList)            // expand (name,count) → per-primitive source
-        for (int k = 0; k < pc.second; ++k) m_partSource << pc.first;
+    m_partSourceSno.clear();
+    for (int pi = 0; pi < pieceList.size(); ++pi) {   // expand (name,count) → per-primitive source
+        const int sno = ctx.pieceSno.value(pi, -1);
+        for (int k = 0; k < pieceList[pi].second; ++k) {
+            m_partSource << pieceList[pi].first;
+            m_partSourceSno << sno;                  // lets the context menu export the SOURCE item
+        }
+    }
     m_view->setPartFx(m_partFx);   // exclude FX submeshes from the cloth sim
     loadClothTuning();             // read the equipped pieces' real cloth params
     // The outfit just changed: new rig, new cloth build. Re-push EVERY overlay (this also calls
@@ -7332,26 +7342,47 @@ bool WardrobeTab2::hasExportSelection() const
 
 // Build a per-primitive material roster from the retained maps (each part keeps its own
 // textures) and write the skinned geometry — with the playing clip when enabled — to `path`.
-bool WardrobeTab2::exportOutfitGlb(const QString& path)
+// `keep` selects which merged primitives to write; empty = the whole assembled outfit.
+// The subset path is what the viewport/parts context menu uses for "Export Part" and
+// "Export Model" — previously those isolated parts in the tree and called this function, but
+// it reads m_lastMerged wholesale and never consulted the tree, so BOTH exported the full
+// outfit. Filtering here keeps one export path (dye/detail baking, anims, retarget) for all
+// three scopes instead of a second one to keep in sync.
+bool WardrobeTab2::exportOutfitGlb(const QString& path, const QVector<int>& keep)
 {
     if (!hasExportSelection() || path.isEmpty()) return false;
     const bool wantTex  = QSettings().value(QStringLiteral("export/includeTex"), true).toBool();
     const bool bakeDye_    = QSettings().value(QStringLiteral("export/bakeDye"), false).toBool();   // bake applied dye into base colour (default matches Export settings)
     const bool bakeDetail_ = QSettings().value(QStringLiteral("export/bakeDetail"), false).toBool(); // bake tiled detail into normal/ORM
     ModelGeometry geo = m_lastMerged;   // copy so we can give each primitive a unique material index
+    // src[i] maps exported primitive i back to its ORIGINAL merged index, which is what the
+    // per-part texture/dye/detail arrays (m_exp*, m_partSlot) are indexed by.
+    QVector<int> src;
+    for (int k = 0; k < (keep.isEmpty() ? geo.primitives.size() : keep.size()); ++k) {
+        const int si = keep.isEmpty() ? k : keep[k];
+        if (si >= 0 && si < geo.primitives.size()) src << si;
+    }
+    if (src.isEmpty()) return false;
+    if (!keep.isEmpty()) {
+        QVector<MeshPrimitive> sub;
+        sub.reserve(src.size());
+        for (int si : src) sub << m_lastMerged.primitives[si];
+        geo.primitives = sub;
+    }
     QVector<ModelExporter::ExportMaterial> mats;
     mats.reserve(geo.primitives.size());
     for (int i = 0; i < geo.primitives.size(); ++i) {
+        const int si = src[i];              // index into the per-part source arrays
         ModelExporter::ExportMaterial em;
         em.name = geo.primitives[i].materialName;
         em.doubleSided = geo.primitives[i].doubleSided;
         if (wantTex) {
-            if (i < m_expBase.size() && !m_expBase[i].isNull()) {
-                em.baseColor = m_expBase[i];
+            if (si < m_expBase.size() && !m_expBase[si].isNull()) {
+                em.baseColor = m_expBase[si];
                 // Bake the applied dye into the exported base colour (opt-in), so a dyed outfit exports
                 // dyed instead of in its undyed base. Per-part colours resolved exactly as applyAllDyes().
-                if (bakeDye_ && i < m_expDyeMask.size() && !m_expDyeMask[i].isNull() && i < m_partSlot.size()) {
-                    const int slot = m_partSlot[i];
+                if (bakeDye_ && si < m_expDyeMask.size() && !m_expDyeMask[si].isNull() && si < m_partSlot.size()) {
+                    const int slot = m_partSlot[si];
                     QStringList hex;
                     if (slot >= 0 && slot < kSlotCount && m_slotDye[slot].hex.size() == 4) hex = m_slotDye[slot].hex;
                     else if (m_dyeCombo && m_dyeCombo->currentIndex() > 0) hex = m_dyeCombo->currentData().toStringList();
@@ -7359,35 +7390,35 @@ bool WardrobeTab2::exportOutfitGlb(const QString& path)
                         float cols[12];
                         for (int k = 0; k < 4; ++k) { const QColor c(hex[k]);
                             cols[k*3+0] = float(c.redF()); cols[k*3+1] = float(c.greenF()); cols[k*3+2] = float(c.blueF()); }
-                        const QImage rmp = (i < m_expDyeRamp.size()) ? m_expDyeRamp[i] : QImage();
-                        em.baseColor = bakeDye(em.baseColor, m_expDyeMask[i], rmp, cols);
+                        const QImage rmp = (si < m_expDyeRamp.size()) ? m_expDyeRamp[si] : QImage();
+                        em.baseColor = bakeDye(em.baseColor, m_expDyeMask[si], rmp, cols);
                     }
                 }
             }
-            if (i < m_expNorm.size() && !m_expNorm[i].isNull()) em.normal    = m_expNorm[i];
-            if (i < m_expOrm.size()  && !m_expOrm[i].isNull())  em.orm        = m_expOrm[i];  // R=AO G=rough B=metal
+            if (si < m_expNorm.size() && !m_expNorm[si].isNull()) em.normal    = m_expNorm[si];
+            if (si < m_expOrm.size()  && !m_expOrm[si].isNull())  em.orm        = m_expOrm[si];  // R=AO G=rough B=metal
             // Bake the tiled/zone-routed detail grain into the exported normal + ORM (opt-in), so a
             // Blender model carries the leather/fabric/brushed-metal surface texture, not a smooth base.
-            if (bakeDetail_ && !em.normal.isNull() && i < m_expDetN[0].size()) {
-                const QImage dN[3] = { m_expDetN[0].value(i), m_expDetN[1].value(i), m_expDetN[2].value(i) };
-                const QImage dR[3] = { m_expDetR[0].value(i), m_expDetR[1].value(i), m_expDetR[2].value(i) };
+            if (bakeDetail_ && !em.normal.isNull() && si < m_expDetN[0].size()) {
+                const QImage dN[3] = { m_expDetN[0].value(si), m_expDetN[1].value(si), m_expDetN[2].value(si) };
+                const QImage dR[3] = { m_expDetR[0].value(si), m_expDetR[1].value(si), m_expDetR[2].value(si) };
                 if (!dN[0].isNull() || !dN[1].isNull() || !dN[2].isNull())
-                    bakeDetail(em.normal, em.orm, m_expDyeMask.value(i), dN, dR,
-                               m_expDScale.value(i, QVector3D(8, 8, 8)),
-                               m_expDZoneMap.value(i, QVector4D(-1, 0, 1, 2)),
-                               m_expDBands.value(i, QVector4D(0.063f, 0.345f, 0.596f, 0.831f)),
-                               m_expDMetalLayer.value(i, -1), m_expDNInt.value(i, 1.0f),
-                               m_expDRInt.value(i, 1.0f), m_expDROff.value(i, 0.0f));
+                    bakeDetail(em.normal, em.orm, m_expDyeMask.value(si), dN, dR,
+                               m_expDScale.value(si, QVector3D(8, 8, 8)),
+                               m_expDZoneMap.value(si, QVector4D(-1, 0, 1, 2)),
+                               m_expDBands.value(si, QVector4D(0.063f, 0.345f, 0.596f, 0.831f)),
+                               m_expDMetalLayer.value(si, -1), m_expDNInt.value(si, 1.0f),
+                               m_expDRInt.value(si, 1.0f), m_expDROff.value(si, 0.0f));
             }
             // Emissive only where the part actually glows (mask + strength), matching the preview:
             // emission = emissive map × emisCol × emisMult. No glow → nothing written (no blow-out).
-            if (i < m_expEmis.size() && !m_expEmis[i].isNull()
-                && i < m_expEmisMul.size() && m_expEmisMul[i] > 0.0f) {
-                em.emissive = m_expEmis[i];
+            if (si < m_expEmis.size() && !m_expEmis[si].isNull()
+                && si < m_expEmisMul.size() && m_expEmisMul[si] > 0.0f) {
+                em.emissive = m_expEmis[si];
                 em.hasEmissive = true;
-                em.emisMult = m_expEmisMul[i];
-                if (3 * i + 2 < m_expEmisCol.size()) {
-                    em.emisR = m_expEmisCol[3 * i]; em.emisG = m_expEmisCol[3 * i + 1]; em.emisB = m_expEmisCol[3 * i + 2];
+                em.emisMult = m_expEmisMul[si];
+                if (3 * si + 2 < m_expEmisCol.size()) {
+                    em.emisR = m_expEmisCol[3 * si]; em.emisG = m_expEmisCol[3 * si + 1]; em.emisB = m_expEmisCol[3 * si + 2];
                 }
             }
             // Alpha-cutout detection: a base colour with transparent texels (hair strands, cut-out
@@ -7430,6 +7461,20 @@ bool WardrobeTab2::exportOutfitGlb(const QString& path)
     return ok;
 }
 
+// Parts currently drawn in the viewport. The outfit export used to ignore the parts tree
+// entirely, so unchecking a piece changed the preview but not the .glb — Models tab has always
+// filtered on partVisible(), and this brings Wardrobe in line: what you see is what you get.
+QVector<int> WardrobeTab2::visibleParts() const
+{
+    QVector<int> out;
+    if (!m_view) return out;                       // no viewport → export everything
+    const int n = m_lastMerged.primitives.size();
+    for (int i = 0; i < n; ++i)
+        if (m_view->partVisible(i)) out << i;
+    if (out.size() == n) out.clear();              // all visible → whole-outfit fast path
+    return out;
+}
+
 void WardrobeTab2::exportSelection()
 {
     if (!hasExportSelection()) return;
@@ -7439,7 +7484,7 @@ void WardrobeTab2::exportSelection()
     const QString path = QFileDialog::getSaveFileName(this, QStringLiteral("Export outfit .glb"),
                                                       suggest, QStringLiteral("glTF binary (*.glb)"));
     if (path.isEmpty()) return;
-    if (exportOutfitGlb(path))
+    if (exportOutfitGlb(path, visibleParts()))
         QSettings().setValue(QStringLiteral("wardrobe2/lastExportDir"), QFileInfo(path).absolutePath());
 }
 
@@ -7448,7 +7493,7 @@ void WardrobeTab2::exportSelectionToLast()
     if (!hasExportSelection()) return;
     const QString dir = QSettings().value(QStringLiteral("wardrobe2/lastExportDir")).toString();
     if (dir.isEmpty()) { exportSelection(); return; }   // no remembered folder → prompt
-    exportOutfitGlb(QDir(dir).filePath(classPrefix() + QStringLiteral("_outfit.glb")));
+    exportOutfitGlb(QDir(dir).filePath(classPrefix() + QStringLiteral("_outfit.glb")), visibleParts());
 }
 
 // (exportScreenshot / exportTurntableGif removed — image and turntable capture run through the
@@ -7621,25 +7666,42 @@ void WardrobeTab2::applyClothParams()
 // Export ONE part: isolate it in the parts tree, run the tab's normal export (which honours the
 // tree's check states), then restore. Reusing the real export path means no second exporter to
 // keep in sync — and restoration happens however the export ends.
-void WardrobeTab2::exportSinglePart(QTreeWidgetItem* item, const std::function<void(Qt::CheckState)>& setAll,
-                                    bool toLast)
+// All merged parts that came from the SAME source appearance as `part` — i.e. the "model" the
+// part belongs to (one equipped item), not the whole assembled outfit. Matched on the source
+// SNO where known so two pieces sharing a display name don't merge.
+QVector<int> WardrobeTab2::partsOfSource(int part) const
 {
-    if (!m_partTree || !item) return;
-    QVector<Qt::CheckState> saved;
-    for (int r = 0; r < m_partTree->topLevelItemCount(); ++r) {
-        QTreeWidgetItem* root = m_partTree->topLevelItem(r);
-        for (int c = 0; c < root->childCount(); ++c) saved << root->child(c)->checkState(0);
+    QVector<int> out;
+    if (part < 0 || part >= m_partSource.size()) return out;
+    const int  sno  = m_partSourceSno.value(part, -1);
+    const QString nm = m_partSource.value(part);
+    for (int i = 0; i < m_partSource.size(); ++i) {
+        const bool same = (sno > 0 && m_partSourceSno.value(i, -1) == sno)
+                       || (sno <= 0 && m_partSource.value(i) == nm);
+        if (same) out << i;
     }
-    setAll(Qt::Unchecked);
-    item->setCheckState(0, Qt::Checked);
-    if (toLast) exportSelectionToLast();
-    else        exportSelection();
-    int k = 0;
-    for (int r = 0; r < m_partTree->topLevelItemCount(); ++r) {
-        QTreeWidgetItem* root = m_partTree->topLevelItem(r);
-        for (int c = 0; c < root->childCount(); ++c)
-            if (k < saved.size()) root->child(c)->setCheckState(0, saved[k++]);
+    return out;
+}
+
+// Export an arbitrary subset of merged parts. `label` seeds the suggested filename.
+void WardrobeTab2::exportPartsSubset(const QVector<int>& parts, const QString& label, bool toLast)
+{
+    if (parts.isEmpty() || !hasExportSelection()) return;
+    QString base = label.isEmpty() ? classPrefix() : label;
+    base.replace(QRegularExpression(QStringLiteral("[^A-Za-z0-9_.-]+")), QStringLiteral("_"));
+    if (base.isEmpty()) base = QStringLiteral("part");
+    const QString last = QSettings().value(QStringLiteral("wardrobe2/lastExportDir")).toString();
+    if (toLast && !last.isEmpty()) {
+        exportOutfitGlb(QDir(last).filePath(base + QStringLiteral(".glb")), parts);
+        return;
     }
+    const QString dir = last.isEmpty()
+        ? QStandardPaths::writableLocation(QStandardPaths::DocumentsLocation) : last;
+    const QString path = QFileDialog::getSaveFileName(this, QStringLiteral("Export .glb"),
+        QDir(dir).filePath(base + QStringLiteral(".glb")), QStringLiteral("glTF binary (*.glb)"));
+    if (path.isEmpty()) return;
+    if (exportOutfitGlb(path, parts))
+        QSettings().setValue(QStringLiteral("wardrobe2/lastExportDir"), QFileInfo(path).absolutePath());
 }
 
 // ONE part menu, shown from BOTH the 3D viewport right-click and the PARTS PANEL, so the panel
@@ -7666,10 +7728,13 @@ void WardrobeTab2::showPartContextMenu(int part, const QPoint& gp)
         ViewportPartMenu::Info in;
         ViewportPartMenu::Actions act;
         QTreeWidgetItem* item = nullptr;
+        // "Model" scope = the source item the picked part belongs to (empty space → whole outfit).
+        const QVector<int> modelParts = partsOfSource(part);
         int modelTris = 0;
-        for (int i = 0; i < m_partTris.size(); ++i) modelTris += m_partTris[i];
-        // The "model" here is the assembled outfit; its per-part SOURCE piece is the useful name,
-        // so the title shows the piece under the cursor rather than a generic label.
+        if (modelParts.isEmpty()) { for (int i = 0; i < m_partTris.size(); ++i) modelTris += m_partTris[i]; }
+        else                      { for (int i : modelParts) modelTris += m_partTris.value(i); }
+        // The title names the SOURCE piece under the cursor, and "Export Model" is scoped to
+        // that same piece — right-clicking a cape exports the cape, not the whole outfit.
         in.sourceModel   = (part >= 0 && part < m_partSource.size() && !m_partSource[part].isEmpty())
                              ? m_partSource[part] : QStringLiteral("Outfit");
         in.modelTris     = modelTris;
@@ -7697,11 +7762,18 @@ void WardrobeTab2::showPartContextMenu(int part, const QPoint& gp)
                 if (m_view->partsBounds(QVector<int>{part}, c, r))
                     m_view->frameRegionKeepRotation(c, r, /*animate=*/true);
             };
-            act.exportPart        = [this, item, setAll] { exportSinglePart(item, setAll, false); };
-            act.exportPartLastDir = [this, item, setAll] { exportSinglePart(item, setAll, true); };
+            const QString pn = in.partName.isEmpty() ? QStringLiteral("part") : in.partName;
+            act.exportPart        = [this, part, pn] { exportPartsSubset(QVector<int>{part}, pn, false); };
+            act.exportPartLastDir = [this, part, pn] { exportPartsSubset(QVector<int>{part}, pn, true); };
         }
-        act.exportModel        = [this] { exportSelection(); };
-        act.exportModelLastDir = [this] { exportSelectionToLast(); };
+        if (modelParts.isEmpty()) {                       // empty space → the assembled outfit
+            act.exportModel        = [this] { exportSelection(); };
+            act.exportModelLastDir = [this] { exportSelectionToLast(); };
+        } else {                                          // a part was picked → just its source item
+            const QString sn = in.sourceModel;
+            act.exportModel        = [this, modelParts, sn] { exportPartsSubset(modelParts, sn, false); };
+            act.exportModelLastDir = [this, modelParts, sn] { exportPartsSubset(modelParts, sn, true); };
+        }
         act.showAll = [setAll] { setAll(Qt::Checked); };
         act.hideAll = [setAll] { setAll(Qt::Unchecked); };
         act.invert  = [this] {
@@ -7714,6 +7786,9 @@ void WardrobeTab2::showPartContextMenu(int part, const QPoint& gp)
                 }
             }
         };
+        // The right-click outline is transient: it marks what the menu acts on and must go
+        // when the menu does. Persistent selection is the tree/highlight, not this.
+        act.closed = [this] { if (m_view) m_view->setPickedPart(-1); };
         ViewportPartMenu::exec(this, gp, in, act);
 }
 

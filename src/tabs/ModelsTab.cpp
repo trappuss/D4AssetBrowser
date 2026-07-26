@@ -3123,6 +3123,9 @@ ModelsTab::ModelsTab(QWidget* parent) : BrowserTab(parent)
             for (auto it = all.constBegin(); it != all.constEnd(); ++it) m_treeModel->setPartCheck(it.key(), !it.value());
             recomputePartVisibility();
         };
+        // The right-click outline is transient: it marks what the menu acts on and must go
+        // when the menu does. Persistent selection is the tree/highlight, not this.
+        act.closed = [this] { if (m_modelView) m_modelView->setPickedPart(-1); };
         ViewportPartMenu::exec(this, gp, in, act);
     });
     // Double-click = expand/collapse, everywhere, deterministically. The stock

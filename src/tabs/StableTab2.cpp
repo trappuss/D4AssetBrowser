@@ -1499,7 +1499,7 @@ void StableTab2::fillGrid()
                         // Match the Wardrobe/viewport wording: destination + size, not "1 model".
                         {
                             const QString exDir = ViewportPartMenu::condensePath(
-                                QSettings().value(QStringLiteral("stable2/lastExportDir")).toString());
+                                QSettings().value(QStringLiteral("stable2/exportDir")).toString());
                             QStringList ex = exSuffix.split(QStringLiteral(" + "), Qt::SkipEmptyParts);
                             for (int i = ex.size() - 1; i >= 0; --i)
                                 if (ex[i].trimmed() == QLatin1String("1 model")) ex.removeAt(i);
@@ -4340,7 +4340,7 @@ void StableTab2::showPartContextMenu(int part, const QPoint& gp)
             for (int i = 0; i < m_lastGeo.primitives.size(); ++i) modelTris += m_view->partTriangles(i);
         in.sourceModel   = QStringLiteral("Mount");
         in.modelTris     = modelTris;
-        in.lastExportDir = QSettings().value(QStringLiteral("stable2/lastExportDir")).toString();
+        in.lastExportDir = QSettings().value(QStringLiteral("stable2/exportDir")).toString();
         if (part >= 0 && part < m_lastGeo.primitives.size()) {
             item = itemForPart(part);
             in.part         = part;
@@ -4362,11 +4362,12 @@ void StableTab2::showPartContextMenu(int part, const QPoint& gp)
                 if (m_view->partsBounds(QVector<int>{part}, c, r))
                     m_view->frameRegionKeepRotation(c, r, /*animate=*/true);
             };
-            act.exportPart        = [this, item, setAll] { exportSinglePart(item, setAll); };
-            act.exportPartLastDir = [this, item, setAll] { exportSinglePart(item, setAll); };
+            const QString pn = in.partName.isEmpty() ? QStringLiteral("part") : in.partName;
+            act.exportPart        = [this, part, pn] { exportMount(QVector<int>{part}, pn, false); };
+            act.exportPartLastDir = [this, part, pn] { exportMount(QVector<int>{part}, pn, true); };
         }
         act.exportModel        = [this] { exportMount(); };
-        act.exportModelLastDir = [this] { exportMount(); };
+        act.exportModelLastDir = [this] { exportMount(QVector<int>(), QString(), true); };
         act.showAll = [setAll] { setAll(Qt::Checked); };
         act.hideAll = [setAll] { setAll(Qt::Unchecked); };
         act.invert  = [this] {
@@ -4378,28 +4379,12 @@ void StableTab2::showPartContextMenu(int part, const QPoint& gp)
                 }
             }
         };
+        // The right-click outline is transient: it marks what the menu acts on and must go
+        // when the menu does. Persistent selection is the tree/highlight, not this.
+        act.closed = [this] { if (m_view) m_view->setPickedPart(-1); };
         ViewportPartMenu::exec(this, gp, in, act);
 }
 
-void StableTab2::exportSinglePart(QTreeWidgetItem* item,
-                                  const std::function<void(Qt::CheckState)>& setAll)
-{
-    if (!m_partTree || !item) return;
-    QVector<Qt::CheckState> saved;
-    for (int r = 0; r < m_partTree->topLevelItemCount(); ++r) {
-        QTreeWidgetItem* root = m_partTree->topLevelItem(r);
-        for (int c = 0; c < root->childCount(); ++c) saved << root->child(c)->checkState(0);
-    }
-    setAll(Qt::Unchecked);
-    item->setCheckState(0, Qt::Checked);
-    exportMount();
-    int k = 0;
-    for (int r = 0; r < m_partTree->topLevelItemCount(); ++r) {
-        QTreeWidgetItem* root = m_partTree->topLevelItem(r);
-        for (int c = 0; c < root->childCount(); ++c)
-            if (k < saved.size()) root->child(c)->setCheckState(0, saved[k++]);
-    }
-}
 
 void StableTab2::reapplyOverlays()
 {
@@ -4464,16 +4449,29 @@ void StableTab2::undo()
 }
 
 // ── Export ──────────────────────────────────────────────────────────────────────
-void StableTab2::exportMount()
+// `keep` selects which primitives to write; empty = the whole mount. The subset path backs the
+// context menu's "Export Part" — that used to isolate parts in the tree and call this function,
+// but the exporter reads m_lastGeo wholesale and never consulted the tree, so it silently wrote
+// the entire mount instead. `toLast` skips the file dialog and reuses the remembered folder.
+void StableTab2::exportMount(const QVector<int>& keep, const QString& label, bool toLast)
 {
     if (!m_lastGeo.valid || m_lastGeo.primitives.isEmpty()) {
         QMessageBox::information(this, QStringLiteral("Export"), QStringLiteral("No mount to export.")); return;
     }
-    const QString base = m_slotName[SlotMount].isEmpty() ? QStringLiteral("mount") : m_slotName[SlotMount];
+    QString base = label.isEmpty()
+        ? (m_slotName[SlotMount].isEmpty() ? QStringLiteral("mount") : m_slotName[SlotMount])
+        : label;
+    base.replace(QRegularExpression(QStringLiteral("[^A-Za-z0-9_.-]+")), QStringLiteral("_"));
+    if (base.isEmpty()) base = QStringLiteral("mount");
     const QString dir = QSettings().value(QStringLiteral("stable2/exportDir"), QDir::homePath()).toString();
-    QString path = QFileDialog::getSaveFileName(this, QStringLiteral("Export mount"),
-                       dir + QStringLiteral("/") + base + QStringLiteral(".glb"),
-                       QStringLiteral("glTF Binary (*.glb)"));
+    QString path;
+    if (toLast && !QSettings().value(QStringLiteral("stable2/exportDir")).toString().isEmpty()) {
+        path = QDir(dir).filePath(base + QStringLiteral(".glb"));
+    } else {
+        path = QFileDialog::getSaveFileName(this, QStringLiteral("Export mount"),
+                   dir + QStringLiteral("/") + base + QStringLiteral(".glb"),
+                   QStringLiteral("glTF Binary (*.glb)"));
+    }
     if (path.isEmpty()) return;
     if (!path.endsWith(QStringLiteral(".glb"), Qt::CaseInsensitive)) path += QStringLiteral(".glb");
     // Include the currently-playing clip so the exported mount is animated in Blender.
@@ -4485,10 +4483,30 @@ void StableTab2::exportMount()
     }
     const ModelExporter::Options opt = ModelExporter::optionsFromSettings();
     ModelGeometry geoCopy = m_lastGeo;   // copy so retarget/rename never touches the live preview
+    QVector<ModelExporter::ExportMaterial> mats = m_exportMats;
+    QVector<int> keepEff = keep;
+    if (keepEff.isEmpty() && m_view) {          // whole-mount export honours the parts tree, as
+        const int n = m_lastGeo.primitives.size();   // Models tab does — unchecking a part in the
+        for (int i = 0; i < n; ++i)                  // panel now affects the .glb, not just the view
+            if (m_view->partVisible(i)) keepEff << i;
+        if (keepEff.size() == n) keepEff.clear();
+    }
+    if (!keepEff.isEmpty()) {               // subset: primitives and materials stay index-aligned
+        QVector<MeshPrimitive> sub;
+        QVector<ModelExporter::ExportMaterial> subMats;
+        for (int si : keepEff) {
+            if (si < 0 || si >= m_lastGeo.primitives.size()) continue;
+            sub << m_lastGeo.primitives[si];
+            subMats << m_exportMats.value(si);
+        }
+        if (sub.isEmpty()) return;
+        geoCopy.primitives = sub;
+        mats = subMats;
+    }
     Retarget::applyFromSettings(geoCopy);
     if (opt.blenderFriendly)
         GLModelWidget::blenderizeSkeletonNames(geoCopy.skeleton);
-    const bool ok = ModelExporter::exportGlb(geoCopy, path, m_exportMats, anims, animNames, opt);
+    const bool ok = ModelExporter::exportGlb(geoCopy, path, mats, anims, animNames, opt);
     const QString folder = QFileInfo(path).absolutePath();
     QSettings().setValue(QStringLiteral("stable2/exportDir"), folder);
     if (ok)

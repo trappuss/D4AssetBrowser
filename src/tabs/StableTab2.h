@@ -55,7 +55,7 @@ public:
     GLModelWidget* previewWidget() override { return m_view; }
     bool    hasExportSelection() const override { return m_lastGeo.valid && !m_lastGeo.primitives.isEmpty(); }
     void    exportSelection() override { exportMount(); }
-    void    exportSelectionToLast() override { exportMount(); }
+    void    exportSelectionToLast() override { exportMount(QVector<int>(), QString(), true); }
     QString exportNoun() const override { return QStringLiteral("mount"); }
 
 protected:
@@ -161,7 +161,7 @@ private:
     void applyDetailConfig();      // push saved stable2/detail/* to the viewport
     void applyClothParams();       // push saved stable2/cloth/* to the viewport
     void showPartContextMenu(int part, const QPoint& globalPos);   // viewport AND parts panel
-    void exportSinglePart(QTreeWidgetItem* item, const std::function<void(Qt::CheckState)>& setAll);
+
     void reapplyOverlays();        // re-push ALL overlay state (master gate + each box)
     void linkColliderToggles();    // mirror the Overlays + Physics "collision model" boxes
     void showPopup(QWidget* panel, QWidget* anchor);   // strip buttons open LEFTward
@@ -181,7 +181,7 @@ private:
     void toggleFullscreen(bool on);                 // hide chrome, viewport fills the tab (Esc)
 
     // ── Export ───────────────────────────────────────────────────────────────
-    void exportMount();
+    void exportMount(const QVector<int>& keep = {}, const QString& label = {}, bool toLast = false);
 
     // Icon for an appearance SNO (inventory icon if the game has one; else null).
     QImage slotIcon(int sno) const;

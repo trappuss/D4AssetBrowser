@@ -59,6 +59,10 @@ struct Actions {
     std::function<void()>     showAll;
     std::function<void()>     hideAll;
     std::function<void()>     invert;
+    // Called once the menu is dismissed, however it closes (action chosen, Esc, click-away).
+    // Callers use it to drop the transient right-click outline: the menu highlights the part it
+    // acts on, and without this the outline survived until the next right-click on empty space.
+    std::function<void()>     closed;
 };
 
 inline void copyText(const QString& s)
@@ -177,7 +181,8 @@ inline void exec(QWidget* parent, const QPoint& globalPos, const Info& in, const
         if (act.invert)  menu.addAction(QStringLiteral("Invert"), parent, act.invert);
     }
 
-    if (!menu.isEmpty()) menu.exec(globalPos);
+    if (!menu.isEmpty()) menu.exec(globalPos);   // blocking: returns once the menu is dismissed
+    if (act.closed) act.closed();                // fires even for an empty menu, so state always clears
 }
 
 }  // namespace ViewportPartMenu
