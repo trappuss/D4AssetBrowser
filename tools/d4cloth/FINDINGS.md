@@ -169,6 +169,33 @@ ClothData only; render geometry lives in the appearance payload and is parsed ap
 (`ModelGeometry`/`MeshPrimitive`). Options: (a) teach the harness to read render submeshes, or
 (b) dump the cape's `_sim` submesh from the app once and validate against that dump offline.
 
+## F7 — the `_sim` submesh IS the cage; render/cage share one space (M1.2)
+
+Measured on `barF_base03_TRS` against the corpus bytes (appearance meta+payload), mirroring
+`ModelParser`'s vertex-buffer scan.
+
+- The appearance has **2 vertex buffers**, both stride 44 (skinned): VB@6976 (4675 verts) and
+  VB@7056 (10124 verts). Submeshes index ranges inside them; there is no per-submesh VB.
+- **VB@6976 contains a render vertex coincident with every one of the 77 cage verts — at
+  0.000 mm (exact, all 77/77).** VB@7056 does not (21/77 within 20 mm, median 16.7 mm) — it is a
+  different part/LOD.
+- Cage `triangleCount` = **120** = the tri count the app's Parts panel reports for
+  `barF_base03_TRS_cape_sim`. Same vert set, same tri count: **the `_sim` submesh is the cage.**
+- **Coordinate space: identical.** Cage `ptBindVertices` are byte-identical to render positions —
+  both **z-up, no axis conversion, no scale** at rest. (`zUpToYUp` is a display-time transform,
+  not a data-space difference.)
+
+**M1.2 validation target is met, and is degenerate:** reconstructing `_sim` render verts at rest
+from the cage is exact (0.000 mm) because they *are* the cage verts. The `_sim` submesh needs no
+binding — it is the simulation mesh drawn directly. This also explains why hiding `[SIM]` parts
+matters visually and why they were never the source of the cape defects.
+
+**What actually needs binding (M2):** the VISIBLE garment submeshes (`barF_base03_TRS_mat` 2615
+tris, `barM_base03_TRS_fur_mat` 2924), which are *not* coincident with the cage. No stored
+render->cage binding array exists — all 27 ClothData slots are accounted for — so the binding must
+be **computed at load** (nearest cage triangle + barycentric coords + offset along the normal),
+with `ptDeltaFrames` supplying the per-particle rotation for transporting normals/tangents.
+
 ## Remaining unknowns (decoded shape, purpose pending — none block the solver)
 
 - `ptDeltaFrames`: one 4×4 matrix per vert (pure rotation + identity row) — per-particle
