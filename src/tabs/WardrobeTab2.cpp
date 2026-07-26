@@ -7467,30 +7467,43 @@ bool WardrobeTab2::exportOutfitGlb(const QString& path, const QVector<int>& keep
 QVector<int> WardrobeTab2::visibleParts() const
 {
     QVector<int> out;
-    if (!m_view) return out;                       // no viewport → export everything
     const int n = m_lastMerged.primitives.size();
+    // Always an explicit list, never an "all visible" empty shorthand: exportOutfitGlb reads empty
+    // as "the whole outfit", so hiding every part would have exported everything instead of
+    // nothing. With a real list, empty means empty and the callers can say so.
+    if (!m_view) { for (int i = 0; i < n; ++i) out << i; return out; }
     for (int i = 0; i < n; ++i)
         if (m_view->partVisible(i)) out << i;
-    if (out.size() == n) out.clear();              // all visible → whole-outfit fast path
     return out;
 }
 
 void WardrobeTab2::exportSelection()
 {
     if (!hasExportSelection()) return;
+    const QVector<int> vis = visibleParts();
+    if (vis.isEmpty()) {
+        QMessageBox::information(this, QStringLiteral("Export"),
+            QStringLiteral("Every part is hidden — nothing to export."));
+        return;
+    }
     const QString dir = QSettings().value(QStringLiteral("wardrobe2/lastExportDir"),
         QStandardPaths::writableLocation(QStandardPaths::DocumentsLocation)).toString();
     const QString suggest = QDir(dir).filePath(classPrefix() + QStringLiteral("_outfit.glb"));
     const QString path = QFileDialog::getSaveFileName(this, QStringLiteral("Export outfit .glb"),
                                                       suggest, QStringLiteral("glTF binary (*.glb)"));
     if (path.isEmpty()) return;
-    if (exportOutfitGlb(path, visibleParts()))
+    if (exportOutfitGlb(path, vis))
         QSettings().setValue(QStringLiteral("wardrobe2/lastExportDir"), QFileInfo(path).absolutePath());
 }
 
 void WardrobeTab2::exportSelectionToLast()
 {
     if (!hasExportSelection()) return;
+    if (visibleParts().isEmpty()) {
+        QMessageBox::information(this, QStringLiteral("Export"),
+            QStringLiteral("Every part is hidden — nothing to export."));
+        return;
+    }
     const QString dir = QSettings().value(QStringLiteral("wardrobe2/lastExportDir")).toString();
     if (dir.isEmpty()) { exportSelection(); return; }   // no remembered folder → prompt
     exportOutfitGlb(QDir(dir).filePath(classPrefix() + QStringLiteral("_outfit.glb")), visibleParts());
@@ -7663,9 +7676,6 @@ void WardrobeTab2::applyClothParams()
 // Single place that pushes overlay state to the viewport: master gate AND each box's own state.
 // Anything needing overlays refreshed calls THIS — never setShow*() directly, or the master gate
 // gets bypassed (that is exactly how physics-panel edits used to switch overlays back on).
-// Export ONE part: isolate it in the parts tree, run the tab's normal export (which honours the
-// tree's check states), then restore. Reusing the real export path means no second exporter to
-// keep in sync — and restoration happens however the export ends.
 // All merged parts that came from the SAME source appearance as `part` — i.e. the "model" the
 // part belongs to (one equipped item), not the whole assembled outfit. Matched on the source
 // SNO where known so two pieces sharing a display name don't merge.

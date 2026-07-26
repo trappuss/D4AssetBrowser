@@ -509,7 +509,13 @@ vec3 dyeZoneColor(vec2 uv, float sh, vec3 baseRgb) {
 void main() {
     // Flat unlit fill for the selection silhouette — the outline must be one solid colour, not a
     // shaded surface, or the ring reads as another lit copy of the mesh.
-    if (uSolid==1) { FragColor = vec4(uBase, 1.0); return; }
+    if (uSolid==1) {
+        // Same thresholds as the opaque cutout below (no fwidth coverage — the silhouette wants a
+        // hard in/out decision), so the outline follows the visible strands, not the card quad.
+        if (uHasTex==1 && texture(uTex, vUV).a < ((uIsHair==1) ? 0.16 : 0.35)) discard;
+        FragColor = vec4(uBase, 1.0);
+        return;
+    }
     vec4 base = (uHasTex==1) ? texture(uTex, vUV) : vec4(uBase, 1.0);
     // Mesh FX: unlit emissive, alpha = texture-alpha × scrolling noise × fresnel edge. Drawn in
     // a separate blended, two-sided pass; bypasses lighting and the opaque alpha cutout below.
@@ -4341,24 +4347,45 @@ void main() { o = vec4(mix(uBot, uTop, clamp(vT, 0.0, 1.0)), 1.0); })";
             if (!outline.isEmpty()) {
                 // Queried inside the guard: a glGet is a driver round-trip, and nothing is
                 // selected on most frames.
+                // The attachment enum DIFFERS by target: GL_STENCIL is only legal for the default
+                // framebuffer, GL_STENCIL_ATTACHMENT only for a named one. QOpenGLWidget normally
+                // renders into its own FBO, so asking for GL_STENCIL there raises
+                // GL_INVALID_OPERATION and leaves the result untouched — which reads as "no
+                // stencil" and silently disables this whole pass.
+                GLint drawFbo = 0;
+                glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &drawFbo);
                 GLint stencilAttach = GL_NONE;
-                glGetFramebufferAttachmentParameteriv(GL_DRAW_FRAMEBUFFER, GL_STENCIL,
-                                                      GL_FRAMEBUFFER_ATTACHMENT_OBJECT_TYPE, &stencilAttach);
+                glGetFramebufferAttachmentParameteriv(
+                    GL_DRAW_FRAMEBUFFER, drawFbo == 0 ? GL_STENCIL : GL_STENCIL_ATTACHMENT,
+                    GL_FRAMEBUFFER_ATTACHMENT_OBJECT_TYPE, &stencilAttach);
                 const bool haveStencil = (stencilAttach != GL_NONE) && m_fbW > 0 && m_fbH > 0;
                 glDisable(GL_DEPTH_TEST);
                 glDepthMask(GL_FALSE);        // never write depth: later FX depth-test against the mesh
                 glDisable(GL_CULL_FACE);      // stamp the whole projected shape, front and back faces
                 glDisable(GL_BLEND);
-                glUniform1i(uHasTex, 0); glUniform1i(uHasNormal, 0); glUniform1i(uHasEmissive, 0);
+                glUniform1i(uHasNormal, 0); glUniform1i(uHasEmissive, 0);
                 glUniform1i(uHasDyeMask, 0); glUniform1i(uHasDyeRamp, 0); glUniform1i(uPbr, 0);
                 // uSolid short-circuits the fragment shader but NOT the vertex shader: leftover fur
                 // extrusion would puff the stamped footprint away from the real mesh silhouette.
                 glUniform1i(uFurEnabled, 0); glUniform1f(uFurShell, 0.0f);
 
+                // The base texture stays bound so the shader can honour the alpha cutout: without
+                // it the outline of hair, fur trim and cut-out cloth traces the card RECTANGLES
+                // rather than the strands you can actually see.
                 auto drawParts = [&](int colour) {
                     for (const auto& o : outline) {
                         if (o.second != colour) continue;
-                        const Part& p = m_parts[o.first];
+                        const int idx = o.first;
+                        const GLuint tex = (idx < m_partTex.size()) ? m_partTex[idx] : 0;
+                        if (tex && m_showTex) {
+                            glActiveTexture(GL_TEXTURE0);
+                            glBindTexture(GL_TEXTURE_2D, tex);
+                            glUniform1i(uHasTex, 1);
+                            glUniform1i(uIsHair, (idx < m_partHair.size()) ? m_partHair[idx] : 0);
+                        } else {
+                            glUniform1i(uHasTex, 0);
+                        }
+                        const Part& p = m_parts[idx];
                         glDrawElements(GL_TRIANGLES, p.count, GL_UNSIGNED_INT,
                                        reinterpret_cast<void*>(qintptr(p.offset) * sizeof(quint32)));
                     }
@@ -4366,7 +4393,8 @@ void main() { o = vec4(mix(uBot, uTop, clamp(vT, 0.0, 1.0)), 1.0); })";
 
                 if (haveStencil) {
                     glUniform1i(uSolid, 1);
-                    glEnable(GL_STENCIL_TEST);
+                    glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);   // wireframe mode would otherwise
+                    glEnable(GL_STENCIL_TEST);                   // stamp only the triangle edges
                     glStencilMask(0xFF);
                     // Outline half-width in DEVICE pixels, so it looks the same on a hi-dpi display.
                     const float r = 2.0f * float(devicePixelRatioF());
@@ -4404,6 +4432,7 @@ void main() { o = vec4(mix(uBot, uTop, clamp(vT, 0.0, 1.0)), 1.0); })";
                     glUniform2f(uNdcOffset, 0.0f, 0.0f);
                     glUniform1i(uSolid, 0);
                     glDisable(GL_STENCIL_TEST);
+                    glPolygonMode(GL_FRONT_AND_BACK, m_wireframe ? GL_LINE : GL_FILL);
                 } else {
                     glPolygonMode(GL_FRONT_AND_BACK, GL_LINE);
                     glLineWidth(1.0f);
@@ -4414,11 +4443,13 @@ void main() { o = vec4(mix(uBot, uTop, clamp(vT, 0.0, 1.0)), 1.0); })";
                         glDrawElements(GL_TRIANGLES, p.count, GL_UNSIGNED_INT,
                                        reinterpret_cast<void*>(qintptr(p.offset) * sizeof(quint32)));
                     }
-                    glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
+                    glPolygonMode(GL_FRONT_AND_BACK, m_wireframe ? GL_LINE : GL_FILL);
                 }
                 glEnable(GL_CULL_FACE);
                 glDepthMask(GL_TRUE);
                 glEnable(GL_DEPTH_TEST);
+                glUniform1i(uHasTex, 0);            // the cutout bind above left these per-part;
+                glUniform1i(uIsHair, 0);            // the FX pass does not set uIsHair itself
                 glUniform1i(uPbr, m_pbr ? 1 : 0);   // restore for later passes
             }
         }

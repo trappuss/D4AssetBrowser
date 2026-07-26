@@ -4311,7 +4311,6 @@ void StableTab2::applyClothParams()
 // Single place that pushes overlay state to the viewport: master gate AND each box's own state.
 // Anything needing overlays refreshed calls THIS — never setShow*() directly, or the master gate
 // gets bypassed.
-// Isolate one part, run exportMount() (which honours the parts-tree checks), then restore.
 // ONE part menu, shown from BOTH the 3D viewport and the PARTS PANEL.
 void StableTab2::showPartContextMenu(int part, const QPoint& gp)
 {
@@ -4458,6 +4457,18 @@ void StableTab2::exportMount(const QVector<int>& keep, const QString& label, boo
     if (!m_lastGeo.valid || m_lastGeo.primitives.isEmpty()) {
         QMessageBox::information(this, QStringLiteral("Export"), QStringLiteral("No mount to export.")); return;
     }
+    // Resolved BEFORE the file dialog so an all-hidden mount fails before asking for a filename.
+    QVector<int> keepEff = keep;
+    if (keepEff.isEmpty() && m_view) {          // whole-mount export honours the parts tree, as
+        const int n = m_lastGeo.primitives.size();   // Models tab does — unchecking a part in the
+        for (int i = 0; i < n; ++i)                  // panel now affects the .glb, not just the view
+            if (m_view->partVisible(i)) keepEff << i;
+        if (keepEff.isEmpty()) {
+            QMessageBox::information(this, QStringLiteral("Export"),
+                QStringLiteral("Every part is hidden — nothing to export."));
+            return;
+        }
+    }
     QString base = label.isEmpty()
         ? (m_slotName[SlotMount].isEmpty() ? QStringLiteral("mount") : m_slotName[SlotMount])
         : label;
@@ -4484,21 +4495,15 @@ void StableTab2::exportMount(const QVector<int>& keep, const QString& label, boo
     const ModelExporter::Options opt = ModelExporter::optionsFromSettings();
     ModelGeometry geoCopy = m_lastGeo;   // copy so retarget/rename never touches the live preview
     QVector<ModelExporter::ExportMaterial> mats = m_exportMats;
-    QVector<int> keepEff = keep;
-    if (keepEff.isEmpty() && m_view) {          // whole-mount export honours the parts tree, as
-        const int n = m_lastGeo.primitives.size();   // Models tab does — unchecking a part in the
-        for (int i = 0; i < n; ++i)                  // panel now affects the .glb, not just the view
-            if (m_view->partVisible(i)) keepEff << i;
-        if (keepEff.size() == n) keepEff.clear();
-    }
     if (!keepEff.isEmpty()) {               // subset: primitives and materials stay index-aligned
         QVector<MeshPrimitive> sub;
         QVector<ModelExporter::ExportMaterial> subMats;
         for (int si : keepEff) {
             if (si < 0 || si >= m_lastGeo.primitives.size()) continue;
             sub << m_lastGeo.primitives[si];
-            subMats << m_exportMats.value(si);
-        }
+            sub.last().materialIndex = sub.size() - 1;   // ModelExporter looks materials up BY
+            subMats << m_exportMats.value(si);           // materialIndex, not by position: leaving
+        }                                                // the full-mount index here drops textures
         if (sub.isEmpty()) return;
         geoCopy.primitives = sub;
         mats = subMats;
