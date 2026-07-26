@@ -349,6 +349,38 @@ DruF_stor249_LEG) and compare clipping against the default. Note this interacts 
 Capsule-size slider's meaning: with the flag on, that slider governs only skin-fit capsules, as
 originally intended.
 
+## F11 — capsule ORIENTATION, not size, is the live defect (D4_CAPS_FULL user test)
+
+Test of the F10 change (`D4_CAPS_FULL=1`, authored capsules at 1.0x) on two skirt repros:
+
+- `spiF_stor211_LEG`: **completely rigid** — "as if it has no physics bones". Consistent with
+  particles being engulfed by oversized capsules: once every particle is inside a collider, the
+  positional solve pins them all to the surface and nothing can move.
+- `spiF_stor210_LEG`: **still clipping badly**, physics otherwise fine.
+
+**This refutes "size alone" as the fix.** Correctly placed capsules that get BIGGER must reduce
+clipping; instead one asset got rigid and the other stayed exposed. Both symptoms are explained by
+capsules that are in the wrong ORIENTATION.
+
+**Root cause candidate (code, not inference):** `m_capAxis` defaults to **3 = "bone-dir"**
+(`GLModelWidget.h:418`; the tabs default `cloth/capAxis` to 3). The authored quaternion IS parsed
+and axis-swapped, then **overridden** — the capsule's long axis is taken from the bone direction
+instead of from the authored rotation. Axis 0/1/2 (X/Y/Z of the authored quat) exist but are not
+the default, i.e. the convention was never pinned down. That is exactly the kind of standing guess
+the 0.52 multiplier would have been tuned to compensate for.
+
+**Recommendation:** leave `D4_CAPS_FULL` OFF (it is off by default) until the axis is resolved —
+full-size radii only help once the orientation is right. Resolve the axis FIRST, then re-test size.
+
+**Cheapest decisive experiment (no code change):** the Physics panel already has a capsule-axis
+cycle button. With `D4_CAPS_FULL=1`, try axis X / Y / Z / bone-dir on both assets and record which
+combination stops 210 clipping WITHOUT making 211 rigid. Four combinations, two assets, existing UI.
+
+**Offline alternative (stronger, needs work):** at the bind pose the authored cloth should not be
+inside the authored capsules. Transform each capsule into cage space for each candidate axis and
+count particle interpenetrations — the correct axis minimises them. Blocked on skeleton parsing in
+the harness (bone rest transforms), which `tools/d4cloth` does not yet do.
+
 ## Remaining unknowns (decoded shape, purpose pending — none block the solver)
 
 - `ptDeltaFrames`: one 4×4 matrix per vert (pure rotation + identity row) — per-particle
