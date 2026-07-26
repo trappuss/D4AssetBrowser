@@ -646,6 +646,50 @@ QImage hairGradientMap(QImage img, const QVector<QColor>& ramp, float influence 
     return img;
 }
 
+// D4_DUMP_HAIRMASK=1 — per-channel statistics of a hair MASK_PRIMARY.
+//
+// Purpose: HairColor ships TWO 3-stop sets, rgbaColors and rgbaColors2, and only the first is
+// decoded. The open question is what selects between them. If one channel is a smooth 0..255
+// sweep it is the root→tip gradient we already use; a channel that is BIMODAL (mass piled at both
+// ends, little in between) would be a per-strand selector, which is how a hair shader gets
+// strand-to-strand colour variation — and would identify what rgbaColors2 is for.
+//
+// Prints coverage-weighted stats: texels where the base is fully transparent are not hair and
+// would otherwise swamp the histogram with background.
+void dumpHairMask(const QString& mat, const QImage& maskIn, const QImage& base)
+{
+    if (!qEnvironmentVariableIsSet("D4_DUMP_HAIRMASK") || maskIn.isNull()) return;
+    static QSet<QString> seen;              // once per material per run; hair parts repeat
+    if (seen.contains(mat)) return;
+    if (seen.size() > 64) return;           // bounded
+    seen.insert(mat);
+    const QImage m = maskIn.convertToFormat(QImage::Format_RGBA8888);
+    QImage a = base.isNull() ? QImage() : base.convertToFormat(QImage::Format_RGBA8888);
+    if (!a.isNull() && a.size() != m.size())
+        a = a.scaled(m.size(), Qt::IgnoreAspectRatio, Qt::SmoothTransformation);
+    qint64 hist[4][16] = {};
+    qint64 n = 0;
+    for (int y = 0; y < m.height(); ++y) {
+        const uchar* s = m.constScanLine(y);
+        const uchar* p = a.isNull() ? nullptr : a.constScanLine(y);
+        for (int x = 0; x < m.width(); ++x) {
+            if (p && p[x*4+3] < 16) continue;          // transparent → not a strand
+            ++n;
+            for (int c = 0; c < 4; ++c) hist[c][s[x*4+c] >> 4]++;
+        }
+    }
+    if (!n) { qInfo("[hairmask] %s: no opaque texels", qPrintable(mat)); return; }
+    static const char* kCh[4] = { "R", "G", "B", "A" };
+    qInfo("[hairmask] %s  %dx%d  %lld opaque texels", qPrintable(mat), m.width(), m.height(), n);
+    for (int c = 0; c < 4; ++c) {
+        QString bars;
+        for (int b = 0; b < 16; ++b) bars += QStringLiteral("%1 ").arg(hist[c][b] * 100 / n, 3);
+        // ends = mass in the bottom and top 1/16th. High ends + low middle ⇒ a selector, not a ramp.
+        const qint64 ends = hist[c][0] + hist[c][15];
+        qInfo("  %s  %s  | ends %lld%%", kCh[c], qPrintable(bars), ends * 100 / n);
+    }
+}
+
 // D4's ACTUAL hair colouring. The base _Color is a flat white strand-SHAPE map (no shading); the
 // MASK_PRIMARY carries the root→tip gradient (dark roots at the scalp → light tips). D4 walks the
 // HairColor ramp by that mask coordinate — dark-maroon roots → bright-copper mid-length → medium
@@ -6153,7 +6197,11 @@ void WardrobeTab2::equipTheme(int sno, const QString& appearanceName, ThemeScope
             if (idx < 0) idx = cc->findText(nm);
             if (idx <= 0) { cc->addItem(nm, nm); idx = cc->count() - 1; }   // add store-specific items
             cc->setCurrentIndex(idx);
-            QSettings().setValue(QStringLiteral("wardrobe2/creator/%1").arg(cat), cc->itemText(idx));
+            // Persist the STEM (item data), not the display text: populateCreator restores with
+            // findData against the stem, so saving "Auburn Red  (018AuburnRed)" here matched
+            // nothing on the next launch and every theme-applied creator pick was silently lost.
+            QSettings().setValue(QStringLiteral("wardrobe2/creator/%1").arg(cat),
+                                 cc->itemData(idx).toString());
             ++marks;
         }
         if (marks) { matched << QStringLiteral("markings"); count += marks; }
@@ -6869,6 +6917,7 @@ void WardrobeTab2::rebuildOutfitImpl(bool async)
                 // Walk the ramp by the MASK_PRIMARY root→tip gradient (D4's real method) — this is
                 // where the hair's depth/AO lives, not in the flat white base.
                 const QImage hairMask = MaterialDecode::byRole(m_reader, d4, effMat, "MASK_PRIMARY");
+                dumpHairMask(effMat, hairMask, base);   // D4_DUMP_HAIRMASK=1 → channel histograms
                 base = hairColorFromMask(base, hairMask, hairRamp, hairInfl);
             } else if (hairTint.isValid()) base = tintImage(base, hairTint);   // fallback: flat tint
         }
