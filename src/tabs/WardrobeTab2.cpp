@@ -611,10 +611,16 @@ QVector<QColor> hairColorRamp(const QString& d4, const QString& stem)
 // Gradient-map a grayscale strand base through the hair ramp: each texel's luminance walks the ramp
 // (dark gaps/roots → first stop, bright lit strands → last stop). This is D4's own hair-colour
 // method and restores the tonal depth a flat tint destroys. Alpha (the strand cutout) is preserved.
-QImage hairGradientMap(QImage img, const QVector<QColor>& ramp, float influence = 1.0f)
+// `outAo`, when given, receives the strand occlusion as a grayscale image instead of it being
+// multiplied into the returned colour. Albedo must not carry shading: the shader lights it and
+// AO-darkens it again, so a baked-in multiply is applied twice. Fed to the ORM's AO channel.
+QImage hairGradientMap(QImage img, const QVector<QColor>& ramp, float influence = 1.0f,
+                       QImage* outAo = nullptr)
 {
+    if (outAo) *outAo = QImage();          // always defined, even on the early-outs
     if (img.isNull() || ramp.size() < 2) return img;
     img = img.convertToFormat(QImage::Format_RGBA8888);
+    if (outAo) { *outAo = QImage(img.size(), QImage::Format_Grayscale8); outAo->fill(255); }
     QRgb lut[256];
     const int N = ramp.size();
     for (int i = 0; i < 256; ++i) {
@@ -627,18 +633,23 @@ QImage hairGradientMap(QImage img, const QVector<QColor>& ramp, float influence 
     }
     for (int y = 0; y < img.height(); ++y) {
         uchar* s = img.scanLine(y);
+        uchar* ao = outAo ? outAo->scanLine(y) : nullptr;
         for (int x = 0; x < img.width(); ++x) {
             const int lum = (s[x*4]*30 + s[x*4+1]*59 + s[x*4+2]*11) / 100;
             const QRgb c = lut[lum & 0xFF];
-            // Mild contact darkening only. The ramp's first stop is the AUTHORED shadow colour, so
-            // luminance already picks the dark end for gaps and roots; the old 0.12→1.0 curve
-            // multiplied that same coordinate in a second time and crushed roots to near-black.
+            // Occlusion goes to the AO channel, NOT into the colour: the ramp's first stop is the
+            // authored shadow colour, so darkening the albedo by the same coordinate applied it
+            // twice, and the shader then lit and AO-darkened it a third time. Applied once now, so
+            // the range can be honest about how occluded a strand root actually is.
             const float ln = lum / 255.0f;
-            const float shade = 0.78f + 0.22f * ln;
             const float inf = qBound(0.0f, influence, 1.0f);
+            // Occlusion strength follows flHairColorInfluence as it did when it multiplied the
+            // colour: an influence-0 hair used to come out completely untouched.
+            if (ao) { const float k = 0.70f + 0.30f * ln;
+                      ao[x] = uchar(qBound(0, int((1.0f - inf + k * inf) * 255.0f), 255)); }
             for (int k = 0; k < 3; ++k) {
                 const int src = s[x*4+k];
-                const int col = int((k == 0 ? qRed(c) : k == 1 ? qGreen(c) : qBlue(c)) * shade);
+                const int col = (k == 0 ? qRed(c) : k == 1 ? qGreen(c) : qBlue(c));
                 s[x*4+k] = uchar(qBound(0, int(src * (1.0f - inf) + col * inf), 255));   // alpha kept
             }
         }
@@ -696,11 +707,13 @@ void dumpHairMask(const QString& mat, const QImage& maskIn, const QImage& base)
 // tips — AND uses the mask as strand AO (roots occluded). That mask is the hair's real depth; the
 // base only supplies the alpha cutout. Falls back to the base-luminance map when no mask exists.
 QImage hairColorFromMask(QImage base, const QImage& maskIn, const QVector<QColor>& ramp,
-                         float influence = 1.0f)
+                         float influence = 1.0f, QImage* outAo = nullptr)
 {
+    if (outAo) *outAo = QImage();
     if (base.isNull() || ramp.size() < 2) return base;
     base = base.convertToFormat(QImage::Format_RGBA8888);
-    if (maskIn.isNull()) return hairGradientMap(base, ramp, influence);
+    if (maskIn.isNull()) return hairGradientMap(base, ramp, influence, outAo);
+    if (outAo) { *outAo = QImage(base.size(), QImage::Format_Grayscale8); outAo->fill(255); }
     QImage m = maskIn.convertToFormat(QImage::Format_RGBA8888);
     if (m.size() != base.size())          // the mask shares the base's UVs; align its grid
         m = m.scaled(base.size(), Qt::IgnoreAspectRatio, Qt::SmoothTransformation);
@@ -716,17 +729,21 @@ QImage hairColorFromMask(QImage base, const QImage& maskIn, const QVector<QColor
     }
     for (int y = 0; y < base.height(); ++y) {
         uchar* d = base.scanLine(y); const uchar* s = m.constScanLine(y);
+        uchar* ao = outAo ? outAo->scanLine(y) : nullptr;
         for (int x = 0; x < base.width(); ++x) {
             const int mv = (s[x*4]*30 + s[x*4+1]*59 + s[x*4+2]*11) / 100;   // root(0) → tip(255)
             const QRgb c = lut[mv & 0xFF];
-            // Same reasoning as hairGradientMap: the ramp's shadow stop already darkens the roots,
-            // so the old 0.42 floor darkened them twice and flattened the tonal range the ramp
-            // exists to provide.
-            const float ao = 0.82f + 0.18f * (mv / 255.0f);
+            // Occlusion to the AO channel, not the albedo — see hairGradientMap.
             const float inf = qBound(0.0f, influence, 1.0f);
+            // Kept close to the 0.82 floor the old albedo multiply produced: this is a correctness
+            // fix, not a relighting. AO now also reaches terms the baked-in multiply never could
+            // (ambient specular, and the Scheuermann primary lobe, which albedo does not tint), so
+            // an equal-looking curve already yields more depth than before.
+            if (ao) { const float k = 0.75f + 0.25f * (mv / 255.0f);
+                      ao[x] = uchar(qBound(0, int((1.0f - inf + k * inf) * 255.0f), 255)); }
             for (int k = 0; k < 3; ++k) {
                 const int src = d[x*4+k];
-                const int col = int((k == 0 ? qRed(c) : k == 1 ? qGreen(c) : qBlue(c)) * ao);
+                const int col = (k == 0 ? qRed(c) : k == 1 ? qGreen(c) : qBlue(c));
                 d[x*4+k] = uchar(qBound(0, int(src * (1.0f - inf) + col * inf), 255));
             }                                                              // base alpha (cutout) kept
         }
@@ -6911,6 +6928,7 @@ void WardrobeTab2::rebuildOutfitImpl(bool async)
                             || effShader.contains(QLatin1String("Hero_Eye"), Qt::CaseInsensitive);
         const bool isSkin = isBody || isHead || effMat.contains(QLatin1String("skin"), Qt::CaseInsensitive);
         QImage base = cached(cBase, "base", effMat, [&] { return MaterialDecode::baseColor(m_reader, d4, effMat); });
+        QImage hairAo;                              // strand occlusion → ORM.R, never the albedo
         if (isHair) base = deriveHairAlpha(base);   // alpha from strand mask FIRST (untinted)
         if (isHair) {                               // colour the strands (alpha kept either way)
             if (hairRamp.size() >= 2) {
@@ -6918,7 +6936,7 @@ void WardrobeTab2::rebuildOutfitImpl(bool async)
                 // where the hair's depth/AO lives, not in the flat white base.
                 const QImage hairMask = MaterialDecode::byRole(m_reader, d4, effMat, "MASK_PRIMARY");
                 dumpHairMask(effMat, hairMask, base);   // D4_DUMP_HAIRMASK=1 → channel histograms
-                base = hairColorFromMask(base, hairMask, hairRamp, hairInfl);
+                base = hairColorFromMask(base, hairMask, hairRamp, hairInfl, &hairAo);
             } else if (hairTint.isValid()) base = tintImage(base, hairTint);   // fallback: flat tint
         }
         if (isSkin && !isHair && skinCol.isValid()) base = skinRecolor(base, skinCol);   // skin tone
@@ -6954,12 +6972,45 @@ void WardrobeTab2::rebuildOutfitImpl(bool async)
                            .arg(hasRoughTex ? QStringLiteral("YES") : QStringLiteral("no"))
                            .arg(hasNormTex ? QStringLiteral("YES") : QStringLiteral("no"));
         }
-        // Hair: skip the ORM so the matte base roughness (uRough=0.92, set above) actually applies —
-        // otherwise the shader would override it with the ORM's G channel (~0.6, still glossy). Hair's
-        // depth comes from the mask/ramp + strand sheen, not an ORM.
-        QImage partOrm = isHair ? QImage()
-                       : (isEye && !eyeOrmImg.isNull()) ? eyeOrmImg
-                                                        : cached(cOrm, "orm", effMat, [&] { return MaterialDecode::orm(m_reader, d4, effMat); });
+        // Hair does not use the material's own ORM: its G channel (~0.6, still glossy) would
+        // override the matte hair roughness set above. But the shader reads AO from ORM.R and
+        // defaults it to 1.0 when there is no ORM at all, which is why the strand occlusion used to
+        // be multiplied into the albedo — where it got lit and AO-darkened a second time. Synthesise
+        // an ORM instead: R = the occlusion the colouring pass just measured, G/B = the roughness
+        // and metalness this part would otherwise have taken from the uniforms, so nothing else
+        // changes. Exported .glb picks this up too, so albedo lands in Blender as true albedo.
+        QImage partOrm;
+        if (isHair) {
+            if (!hairAo.isNull()) {
+                // Hair carried NO ORM before, so this is a new upload per hair part. The channel is
+                // a root→tip gradient plus two constants — low frequency — so cap the long edge:
+                // a 4K strand mask would otherwise cost 64 MB of VRAM to say very little.
+                QImage ao8 = hairAo;
+                const int kMaxAo = 1024;
+                if (qMax(ao8.width(), ao8.height()) > kMaxAo) {
+                    // convertToFormat is REQUIRED, not tidiness: Qt's smooth scaler has no 8-bit
+                    // path, so scaling a Grayscale8 returns RGB32 and the byte-per-pixel read below
+                    // would walk BGRA bytes — producing a garbage AO on exactly the >1024 textures
+                    // this cap exists for, and nowhere else.
+                    ao8 = ao8.scaled(QSize(kMaxAo, kMaxAo), Qt::KeepAspectRatio, Qt::SmoothTransformation)
+                             .convertToFormat(QImage::Format_Grayscale8);
+                }
+                hairAo = ao8;
+                partOrm = QImage(hairAo.size(), QImage::Format_RGBA8888);
+                const int gq = qBound(0, int(rg * 255.0f + 0.5f), 255);
+                const int bq = qBound(0, int(mt * 255.0f + 0.5f), 255);
+                for (int y = 0; y < hairAo.height(); ++y) {
+                    const uchar* a8 = hairAo.constScanLine(y);
+                    uchar* o = partOrm.scanLine(y);
+                    for (int x = 0; x < hairAo.width(); ++x) {
+                        o[x*4+0] = a8[x]; o[x*4+1] = uchar(gq); o[x*4+2] = uchar(bq); o[x*4+3] = 255;
+                    }
+                }
+            }
+        } else {
+            partOrm = (isEye && !eyeOrmImg.isNull()) ? eyeOrmImg
+                    : cached(cOrm, "orm", effMat, [&] { return MaterialDecode::orm(m_reader, d4, effMat); });
+        }
         QImage markEmis; float markEmisMul = 0.0f;     // marking glow (skin only)
         // Markings carry a FULL D4 paint material: albedo tint through the ramp (mask R=coverage,
         // G=ink→gold), the authored roughness + gold-only metalness driven into the ORM, plus (for
@@ -7071,7 +7122,11 @@ void WardrobeTab2::rebuildOutfitImpl(bool async)
         // map; that's why female base01 authors nothing yet must still show detail like the male
         // variant that authors 0.6/1.0). Offsets default 0. Only PRESENT maps count, so the
         // composite returns the true summed strengths (dOvN/dOvR) + roughness bias (dROff).
-        const bool detOk = !isFx;
+        // Hair is excluded now that it carries a synthesised ORM: bakeDetail() is gated on the ORM
+        // being present, so a hair material with a detail map would newly take that branch and
+        // upscale the capped 1024 AO back to normal-map size while writing detail roughness over
+        // the authored hair roughness. Hair depth comes from the strand ramp and sheen, not detail.
+        const bool detOk = !isFx && !isHair;
         DetailCacheEntry de;
         if (detOk) {
             const auto it = cDetail.constFind(effMat);
