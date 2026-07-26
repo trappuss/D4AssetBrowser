@@ -136,12 +136,38 @@ Measured on `barF_base03_TRS_cape` (vertexCount 77, capacity 80), raw bytes, no 
 ("delta") suggests the rotation is relative to another frame rather than absolute, which is
 consistent with X being absolute-looking while the roll is not.
 
-**Blocker for the next test:** `ptDriverBindPose` is 48 B per driver (10 drivers = 480 B) and is
-NOT a plain 3x4 matrix — the third row reads `(1,1,1,1)` on every driver, so it is more likely
-pos/quat/scale in some packing. Decoding it is the prerequisite for testing "delta = rotation
-relative to the driver frame", which is the leading remaining hypothesis. A test run against the
-assumed 3x4 layout returned 0.906 mean error and is reported here as INVALID (wrong layout
-assumed), not as a refutation.
+**`ptDriverBindPose` — DECODED** (was the blocker): 48 B per driver = three float4s,
+`position (x,y,z,0) | quaternion (x,y,z,w) | scale (1,1,1,1)`. All 10 quats unit to 1e-7, every
+`pos.w` exactly 0, every scale exactly 1. Driver 0 is the null/root driver (zero pos, identity
+quat). Positions read as z-up bind locations (driver 1 z=1.17 = chest height).
+
+**Roll about X — five hypothesis families refuted, all with measured residuals:**
+
+| Candidate | mean `1-\|cos\|` | verdict |
+|---|---|---|
+| `ptBindNormals` | 0.306 | refuted |
+| Cage triangle normal (area-weighted) | 0.306 | refuted (== bindNormals, as expected) |
+| Tangent partner (`ptTangentIndices`) | 0.269 | refuted |
+| World-axis up-reference | degenerate | refuted — `\|X . worldZ\| >= 0.9` for ALL 77 verts |
+| Warp / Weft / Shear / Bend constraint directions | 0.282-0.343 | refuted (no class better than chance) |
+| Driver bind rotation (`Q`, `Q*R`, `R*Q`, `Qt*R`, `R*Qt`) | >= 77 deg on every composition | refuted (correct layout) |
+
+**Conclusion: the roll is not derivable from the cage data.** X is fixed by the chain
+(parent -> vertex, residual 0.0016) and `Y = Z x X`, but the roll about X matches no cage-geometric
+quantity available in the ClothData block. The most consistent reading is that it is **authored**
+— carried over from the source garment's tangent space (UV-derived) in the DCC export, which the
+cage does not retain.
+
+**Design consequence (M2):** do not attempt to reconstruct these frames — *use them*. They are
+per-cage-vert authored rotations to be posed by the runtime and applied to render verts. That is
+also why the app can ignore them today without visible error in the cage sim itself: they carry
+render-binding information, not simulation state.
+
+**M1.2 is blocked on inputs, not analysis.** Reconstructing SIM-submesh render verts needs the
+RENDER mesh (positions + skin weights), which the harness does not parse — `tools/d4cloth` reads
+ClothData only; render geometry lives in the appearance payload and is parsed app-side
+(`ModelGeometry`/`MeshPrimitive`). Options: (a) teach the harness to read render submeshes, or
+(b) dump the cape's `_sim` submesh from the app once and validate against that dump offline.
 
 ## Remaining unknowns (decoded shape, purpose pending — none block the solver)
 
