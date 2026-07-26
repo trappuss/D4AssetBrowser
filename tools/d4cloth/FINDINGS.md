@@ -196,6 +196,76 @@ render->cage binding array exists — all 27 ClothData slots are accounted for �
 be **computed at load** (nearest cage triangle + barycentric coords + offset along the normal),
 with `ptDeltaFrames` supplying the per-particle rotation for transporting normals/tangents.
 
+## F8 — `definitions.json` is the authoritative schema (tooling unlock + 2 self-corrections)
+
+`d4data/definitions.json` (mounted locally; github.com/DiabloTools/d4data) contains the FULL type
+graph: every field carries `[arrayType, elemType, tail]` hashes, and each hash resolves to a named
+struct with field names, offsets and sizes. Reverse-engineering layouts by inspection is no longer
+necessary — look them up.
+
+**`ClothData` (hash 2666466548, size 720)** — all 27 slots confirmed, element types named:
+
+| slot | element type |
+|---|---|
+| ptBindVertices / ptBindNormals / ptWeights | `DT_VECTOR4D` |
+| ptDeltaFrames | **`dmMtxMirror`** (64 B) |
+| ptDriverBindPose | **`dmFrameMirror`** (48 B) |
+| ptWarp/Weft/Shear/BendClusters | **`dmConstraintClusterMirror`** (4 B) |
+| ptCapsuleDefs | **`dmClothCapsuleDefMirror`** (80 B) |
+| ptPlaneDefs | **`dmClothPlaneDefMirror`** (48 B) |
+
+**`dmMtxMirror` = `rx`@0, `ry`@16, `rz`@32, `p`@48.** Confirms F6's measured layout and names it:
+rows 0-2 ARE the basis vectors, and the 4th vec4 is a **position** (not a homogeneous row). On the
+barF cape `p` is `(0,0,0,1)` — zero translation — but it is a real field and may be non-zero
+elsewhere.
+
+### Correction 1 — cluster fields are `(startIndex, endIndex)`, NOT `(offset, count)`
+
+`dmConstraintClusterMirror = {startIndex@0, endIndex@2}`. F6's constraint-direction test indexed
+them as `(offset, count)` and therefore scanned garbage ranges; that result was **INVALID, not a
+refutation**. Re-run with correct semantics: ranges are contiguous and partition `[0,320)` exactly
+(Shear 0-72, Bend 72-176, Weft 176-248, Warp 248-320), independently re-confirming F4's partition
+claim. The roll test still fails (0.276-0.369 across all four classes) — so the refutation stands,
+now on valid data.
+
+### Correction 2 — serialized order is `position, quaternion`, NOT the declared `q, p`
+
+`dmFrameMirror` declares `q`@0, `p`@16, `s`@32. **The data says otherwise**, consistently across
+three independent structs:
+
+- `ptDriverBindPose`: vec4#1 has `w == 0` exactly on all 10 drivers and reads as a bind location
+  (z = 1.17 = chest height); vec4#2 is **unit to 1e-7 on all 10**. Position first.
+- `ptCapsuleDefs.localTransform`: vec4#1 `w == 0`; vec4#2 contains 0.707 / 0.5 components
+  (half-angle quaternions). Position first.
+- `ptPlaneDefs.localTransform`: vec4#1 `w == 0`; vec4#2 is exactly `(0,0,0,1)` = identity quat.
+
+Three structs agree, so the measurement wins over the declared field order. Treat `definitions.json`
+as authoritative for **names, sizes and offsets**, but verify component order against data.
+
+### Capsules — the app ignores authored fields and substitutes a constant
+
+`dmClothCapsuleDefMirror = localTransform@0(32) | scale@32(vec4) | radius1@48 | radius2@52 |
+height@56 | friction@60 | boneIndex@64 | solver@66 | hide@67`.
+
+On the barF cape (7 capsules): **`scale` = (1,1,1,1)** on every one, **`radius1 == radius2`** (no
+taper: 0.160/0.220/0.198/0.270), `friction` = 0.10 authored, `solver` = 2, **`hide` = 0**.
+
+The app multiplies every radius by a hardcoded **0.52**. The authored data carries a real `scale`
+field (unused) and a `hide` flag (unused, and the obvious mechanism for capsules that should not
+collide at all). A global constant standing in for per-capsule authored data contradicts the
+"no per-model constants" guardrail and is the leading suspect for residual clipping. **Not changed
+here** — 0.52 is visually verified and reverting it blind previously caused a regression.
+
+### Planes — struct decoded; every corpus plane is identical in form
+
+`dmClothPlaneDefMirror = localTransform@0(32) | stiffness@32 | friction@36 | boneIndex@40 |
+padding@42`. Measured over every plane in the corpus (druF_stor249 cloth+tabard, spiF_stor210 b+c,
+spiF_stor211 loin+skirt+cape): **rotation is the identity quaternion `(0,0,0,1)` in all cases**,
+position is `(0, 0, d, 0)` with d = 0.034-0.070, `stiffness` = 1.000, `friction` = 0.100,
+`boneIndex` = 0 — uniformly. So a plane is a fixed offset along one local axis of bone 0 with no
+rotation; the remaining unknown is only WHICH axis is the normal and what bone 0 is in that space.
+This is strictly more than was known when planes were disabled.
+
 ## Remaining unknowns (decoded shape, purpose pending — none block the solver)
 
 - `ptDeltaFrames`: one 4×4 matrix per vert (pure rotation + identity row) — per-particle
