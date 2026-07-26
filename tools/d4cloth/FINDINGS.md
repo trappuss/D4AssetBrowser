@@ -349,18 +349,31 @@ DruF_stor249_LEG) and compare clipping against the default. Note this interacts 
 Capsule-size slider's meaning: with the flag on, that slider governs only skin-fit capsules, as
 originally intended.
 
-## F11 — capsule ORIENTATION, not size, is the live defect (D4_CAPS_FULL user test)
+## F11 — capsule ORIENTATION is the leading defect (**premise CORRECTED — see warning**)
 
-Test of the F10 change (`D4_CAPS_FULL=1`, authored capsules at 1.0x) on two skirt repros:
+> **WARNING — this section's original framing was INVALID.** It was written as "the result of
+> enabling `D4_CAPS_FULL=1`", but `D4_CAPS_FULL` is an ENVIRONMENT VARIABLE and there is no
+> evidence it was set when the observations were made. With it unset, the F10 change is a no-op
+> (`rScale` is byte-identical to before), so the observations below are the **BASELINE** symptoms
+> of the shipping default (authored capsules at 0.52x, capsule axis = bone-dir), **not** the effect
+> of full-size capsules. Re-test with `Test Capsules Full.bat` (which sets the variable and prints
+> `cloth-caps: ... APPLIED x1.00` so the setting can be confirmed live) before drawing size
+> conclusions. The orientation argument below stands on the CODE (`m_capAxis` default), which is
+> independent of the test.
+
+Observed on two skirt repros (baseline build, default settings):
 
 - `spiF_stor211_LEG`: **completely rigid** — "as if it has no physics bones". Consistent with
   particles being engulfed by oversized capsules: once every particle is inside a collider, the
   positional solve pins them all to the surface and nothing can move.
 - `spiF_stor210_LEG`: **still clipping badly**, physics otherwise fine.
 
-**This refutes "size alone" as the fix.** Correctly placed capsules that get BIGGER must reduce
-clipping; instead one asset got rigid and the other stayed exposed. Both symptoms are explained by
-capsules that are in the wrong ORIENTATION.
+**What can and cannot be concluded.** If the observations are baseline (variable unset), they say
+only that the shipping default clips on 210 and is over-constrained on 211 — a useful baseline, but
+NOT a refutation of the size hypothesis. If the variable WAS set, then correctly placed capsules
+getting bigger must reduce clipping, and the observed rigid/still-clipping pair would refute
+size-alone and implicate orientation. **Determine which by re-running with the .bat and checking
+the `cloth-caps:` line.**
 
 **Root cause candidate (code, not inference):** `m_capAxis` defaults to **3 = "bone-dir"**
 (`GLModelWidget.h:418`; the tabs default `cloth/capAxis` to 3). The authored quaternion IS parsed
