@@ -1,0 +1,118 @@
+{
+  "cases": {
+    "cape-solo": {
+      "pieces": [
+        "barF_base03_TRS"
+      ],
+      "anims": []
+    },
+    "cape-outfit": {
+      "pieces": [
+        "barF_base00",
+        "barF_base03_TRS",
+        "barF_base03_HLM",
+        "barF_base03_LEG",
+        "barF_base03_GLV",
+        "barF_base03_BTS"
+      ],
+      "anims": [
+        "barF_2HM_nav_idle"
+      ]
+    },
+    "two-capes": {
+      "pieces": [
+        "barF_base00",
+        "barF_stor161_TRS",
+        "barF_base03_HLM"
+      ],
+      "anims": [
+        "barF_2HM_nav_idle"
+      ]
+    },
+    "fur-regression": {
+      "pieces": [
+        "barF_base00",
+        "barF_stor151_TRS"
+      ],
+      "anims": [
+        "barF_2HM_nav_idle"
+      ]
+    },
+    "helm-15": {
+      "pieces": [
+        "BarF_base15_HLM"
+      ],
+      "anims": []
+    },
+    "skirt": {
+      "pieces": [
+        "barF_base00",
+        "barF_base03_LEG"
+      ],
+      "anims": [
+        "barF_2HM_nav_idle"
+      ]
+    },
+    "hair": {
+      "pieces": [
+        "palF_stor151_HLM"
+      ],
+      "anims": []
+    },
+    "spi-explosion": {
+      "pieces": [
+        "spiF_base00",
+        "spiF_stor210_LEG"
+      ],
+      "anims": [
+        "spiF_gla_nav_Idle"
+      ]
+    },
+    "spi-explosion2": {
+      "pieces": [
+        "spiF_base00",
+        "spiF_stor211_TRS",
+        "spiF_stor211_LEG"
+      ],
+      "anims": [
+        "spiF_gla_nav_Idle"
+      ]
+    },
+    "dru-explosion": {
+      "pieces": [
+        "druF_base00",
+        "DruF_stor249_LEG"
+      ],
+      "anims": [
+        "druF_1hsOh_nav_idle"
+      ]
+    },
+    "sor-sag-crest": {
+      "pieces": [
+        "sorF_base00",
+        "sorF_stor269_HLM"
+      ],
+      "anims": [
+        "sorF_hth_nav_idle"
+      ]
+    },
+    "sor-feather-good": {
+      "pieces": [
+        "sorF_base00",
+        "sorF_stor211_HLM"
+      ],
+      "anims": [
+        "sorF_hth_nav_idle"
+      ]
+    },
+    "rog-sag-feather": {
+      "pieces": [
+        "rogF_base00",
+        "rogF_stor214_HLM"
+      ],
+      "anims": [
+        "rogF_bow_nav_idle"
+      ]
+    }
+  }
+}

@@ -1,0 +1,81 @@
+name: Release
+
+# Build the portable Windows folder and publish it.
+#   * Push a tag like v2.1.0  -> builds + attaches D4AssetBrowser.zip to a GitHub Release.
+#   * Or run manually (Actions -> Release -> Run workflow) to just get the zip as an artifact.
+#
+# Qt6 comes from a PREBUILT binary install (fast, ~a few minutes) instead of being compiled from
+# source via vcpkg. vcpkg is used only for the four small deps (zlib, lz4, fastgltf, tinygltf).
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write        # needed to create the GitHub Release on a tag
+
+jobs:
+  windows-portable:
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up MSVC (x64)
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      # Prebuilt Qt6 (Widgets/OpenGL are in qtbase; add SVG + image formats). Sets QT_ROOT_DIR
+      # and puts qmake/windeployqt on PATH.
+      - name: Install prebuilt Qt6
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: '6.7.3'
+          host: windows
+          target: desktop
+          arch: win64_msvc2019_64
+          modules: 'qtimageformats'
+          add-tools-to-path: true
+
+      # The tool's small non-Qt dependencies, from vcpkg (classic mode — fast, prebuilt binaries).
+      - name: Install deps (vcpkg)
+        shell: cmd
+        run: '"%VCPKG_INSTALLATION_ROOT%\vcpkg" install zlib lz4 fastgltf tinygltf --triplet x64-windows'
+
+      - name: Configure
+        shell: cmd
+        run: >
+          cmake -S . -B build/release -G Ninja
+          -DCMAKE_BUILD_TYPE=Release
+          -DVCPKG_MANIFEST_MODE=OFF
+          -DVCPKG_TARGET_TRIPLET=x64-windows
+          -DCMAKE_TOOLCHAIN_FILE=%VCPKG_INSTALLATION_ROOT%/scripts/buildsystems/vcpkg.cmake
+          -DCMAKE_PREFIX_PATH=%QT_ROOT_DIR%
+
+      - name: Build
+        shell: cmd
+        run: cmake --build build/release
+
+      - name: Deploy Qt runtime into dist (windeployqt)
+        shell: cmd
+        run: cmake --install build/release --prefix dist/D4AssetBrowser
+
+      - name: Stage README + zip
+        shell: pwsh
+        run: |
+          Copy-Item RELEASE_README.txt dist/D4AssetBrowser/README.txt -Force
+          Compress-Archive -Path dist/D4AssetBrowser -DestinationPath dist/D4AssetBrowser.zip -Force
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: D4AssetBrowser-portable
+          path: dist/D4AssetBrowser.zip
+
+      - name: Publish GitHub Release (on tag)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/D4AssetBrowser.zip
+          generate_release_notes: true

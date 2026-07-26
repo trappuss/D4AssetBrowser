@@ -1,0 +1,26 @@
+{
+  "$schema": "https://raw.githubusercontent.com/microsoft/vcpkg/master/scripts/vcpkg.schema.json",
+  "name": "diablo4assetbrowsernative",
+  "version": "2.1.0",
+  "description": "Native C++/Qt6 Diablo IV asset browser — a rewrite in d4analyzer's exact code stack (C++17, Qt6 Widgets, OpenGL, CascLib, fastgltf, tinygltf, Draco).",
+  "homepage": "https://github.com/DiabloTools/Diablo4Tools-Releases",
+  "dependencies": [
+    {
+      "name": "qtbase",
+      "default-features": false,
+      "features": [
+        "widgets",
+        "opengl",
+        "gui",
+        "png",
+        "jpeg"
+      ]
+    },
+    "qtsvg",
+    "fastgltf",
+    "tinygltf",
+    "zlib",
+    "lz4"
+  ],
+  "builtin-baseline": "40f3c709db80acf154ac4b17a1f83c564ebd022e"
+}

@@ -1,0 +1,3 @@
+// Application icon for the Windows executable (Explorer / taskbar / Alt-Tab).
+// The runtime window icon is set independently in main.cpp from res/app_256.png.
+IDI_ICON1 ICON "app.ico"

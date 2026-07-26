@@ -1,0 +1,42 @@
+{
+  "version": 3,
+  "cmakeMinimumRequired": { "major": 3, "minor": 21, "patch": 0 },
+  "configurePresets": [
+    {
+      "name": "windows-msvc-release",
+      "displayName": "Windows MSVC x64 (Release, vcpkg)",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/release",
+      "architecture": { "value": "x64", "strategy": "external" },
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_TOOLCHAIN_FILE": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake",
+        "VCPKG_TARGET_TRIPLET": "x64-windows",
+        "CMAKE_OBJECT_PATH_MAX": "240",
+        "VCPKG_INSTALL_OPTIONS": "--x-buildtrees-root=C:/Users/notso/vbt"
+      }
+    },
+    {
+      "name": "windows-msvc-debug",
+      "inherits": "windows-msvc-release",
+      "displayName": "Windows MSVC x64 (Debug, vcpkg)",
+      "binaryDir": "${sourceDir}/build/debug",
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug" }
+    },
+    {
+      "name": "windows-static-release",
+      "inherits": "windows-msvc-release",
+      "displayName": "Windows MSVC x64 (Static single-exe, Release)",
+      "binaryDir": "${sourceDir}/build/static",
+      "cacheVariables": {
+        "VCPKG_TARGET_TRIPLET": "x64-windows-static",
+        "VCPKG_HOST_TRIPLET": "x64-windows-static"
+      }
+    }
+  ],
+  "buildPresets": [
+    { "name": "release", "configurePreset": "windows-msvc-release" },
+    { "name": "debug",   "configurePreset": "windows-msvc-debug" },
+    { "name": "static",  "configurePreset": "windows-static-release" }
+  ]
+}

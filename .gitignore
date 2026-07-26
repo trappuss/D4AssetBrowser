@@ -1,0 +1,31 @@
+# Build output / deps
+build/
+tools/d4cloth/build/
+vcpkg_installed/
+*.obj
+*.exe
+*.dll
+*.pdb
+*.ilk
+
+# Local backups (already snapshotted by backup-src.bat)
+.Backups/
+_backups/
+
+# Large captured data + archives
+*.tgz
+tools/d4cloth/corpus/
+tools/d4cloth/reports/
+
+# Logs and generated diagnostics
+build_log.txt
+build_errors.txt
+d4browser_log_*.txt
+cloth_console.txt
+cloth_overlay_report.txt
+cloth_parse.txt
+cloth_cage_diag.txt
+cloth_audit.csv
+cloth_audit_summary.txt
+icon_audit.txt
+detail_mask_probe.txt
