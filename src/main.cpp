@@ -127,6 +127,9 @@ int main(int argc, char** argv)
     fmt.setProfile(QSurfaceFormat::CoreProfile);
     fmt.setSamples(4);   // 4x MSAA: smooths mesh silhouettes and anti-aliases fur strand
                          // edges (the shell pass uses alpha-to-coverage, which needs MSAA).
+    fmt.setStencilBufferSize(8);   // selection silhouette masks the part into stencil, then draws
+                                   // the outline only where stencil is clear. Without this Qt
+                                   // allocates depth-only and GLModelWidget falls back to wireframe.
     QSurfaceFormat::setDefaultFormat(fmt);
 
     // Two QOpenGLWidgets live at once (texture preview + model viewport). Sharing

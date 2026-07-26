@@ -245,6 +245,11 @@ uniform int   uFxMode;           // mesh-FX pass active
 uniform float uFxWobble;         // FX vertex undulation amount (model units)
 uniform float uTime;
 uniform sampler2D uFxNoise;
+// Selection silhouette: shifts the projected vertex by a whole number of screen pixels so the
+// outline has CONSTANT width. Multiplying by w cancels the perspective divide, so the offset is
+// in NDC/screen space, not model space — unlike a normal-push hull it cannot tear on the split
+// normals D4 meshes carry at UV seams.
+uniform vec2  uNdcOffset;
 out vec3 vNormal;
 out vec2 vUV;
 out vec3 vTangent;
@@ -273,6 +278,7 @@ void main() {
     }
     vWorldPos = vec3(uModel * vec4(pos, 1.0));
     gl_Position = uMVP * vec4(pos, 1.0);
+    gl_Position.xy += uNdcOffset * gl_Position.w;   // silhouette jitter (zero for every other pass)
 }
 )";
 
@@ -282,6 +288,7 @@ in vec2 vUV;
 in vec3 vTangent;
 in vec3 vWorldPos;
 out vec4 FragColor;
+uniform int  uSolid;        // 1 = emit uBase flat and skip all lighting (selection silhouette)
 uniform vec3 uLightDir;     // key light direction (world), surface → light
 uniform vec3 uViewPos;      // camera world position
 uniform vec3 uBase;
@@ -500,6 +507,9 @@ vec3 dyeZoneColor(vec2 uv, float sh, vec3 baseRgb) {
 
 )" R"(
 void main() {
+    // Flat unlit fill for the selection silhouette — the outline must be one solid colour, not a
+    // shaded surface, or the ring reads as another lit copy of the mesh.
+    if (uSolid==1) { FragColor = vec4(uBase, 1.0); return; }
     vec4 base = (uHasTex==1) ? texture(uTex, vUV) : vec4(uBase, 1.0);
     // Mesh FX: unlit emissive, alpha = texture-alpha × scrolling noise × fresnel edge. Drawn in
     // a separate blended, two-sided pass; bypasses lighting and the opaque alpha cutout below.
@@ -3880,6 +3890,8 @@ void main() { o = vec4(mix(uBot, uTop, clamp(vT, 0.0, 1.0)), 1.0); })";
     glUniform3f(uni(m_prog, "uViewPos"), eye.x(), eye.y(), eye.z());
 
     const GLint uBase = uni(m_prog, "uBase");
+    const GLint uSolid = uni(m_prog, "uSolid");            // selection silhouette: flat fill
+    const GLint uNdcOffset = uni(m_prog, "uNdcOffset");    // selection silhouette: pixel jitter
     const GLint uHasTex = uni(m_prog, "uHasTex");
     const GLint uHasNormal = uni(m_prog, "uHasNormal");
     const GLint uPbr = uni(m_prog, "uPbr");
@@ -4295,13 +4307,20 @@ void main() { o = vec4(mix(uBot, uTop, clamp(vT, 0.0, 1.0)), 1.0); })";
         }
         glDisable(GL_SAMPLE_ALPHA_TO_COVERAGE);   // end alpha-cutout pass
 
-        // ── Selection OUTLINE pass ────────────────────────────────────────────────────────
+        // ── Selection SILHOUETTE pass ─────────────────────────────────────────────────────
         // Selected parts keep their real material (a flat tint hid the textures you are trying
-        // to inspect) and instead get a wireframe overlay drawn with the DEPTH TEST OFF, so the
-        // selection stays visible even when the part is buried inside the body or behind armour.
+        // to inspect). Instead the part is stamped into the STENCIL buffer, then redrawn as a
+        // flat colour offset by a few screen pixels in eight directions with the stencil test
+        // rejecting the interior — what survives is a constant-width ring hugging the outline.
+        //
+        // This replaces a wireframe overlay, whose apparent thickness scaled with triangle
+        // density: on a high-poly cape every edge drew and the "outline" read as a solid mesh.
+        // Screen-space offsets also avoid the normal-push hull's failure mode — D4 meshes have
+        // split normals at UV seams, which would tear such a hull open.
+        //
+        // Depth test stays OFF, so a part buried inside the body still shows.
         // RED  = parts-list / programmatic highlight.
-        // BLUE = the part you right-clicked in the viewport.
-        // Blue wins where both apply, because that is the one the open menu refers to.
+        // BLUE = the part you right-clicked in the viewport; drawn last so it wins on overlap.
         {
             QVector<QPair<int, int>> outline;   // (part, 0 = red, 1 = blue)
             for (int i : m_highlight)
@@ -4313,22 +4332,92 @@ void main() { o = vec4(mix(uBot, uTop, clamp(vT, 0.0, 1.0)), 1.0); })";
                     if (outline[k].first == m_pickedPart) outline.removeAt(k);
                 outline.push_back({m_pickedPart, 1});
             }
+            // No stencil attachment → the stencil test always passes and the jittered draws would
+            // paint eight solid copies of the part. Fall back to the old wireframe in that case.
+            // Ask the BOUND framebuffer, not the requested surface format: QOpenGLWidget renders
+            // into its own FBO, and a driver may hand back a context whose format differs from
+            // what main.cpp asked for. The OBJECT_TYPE query is legal with no attachment present,
+            // so it answers without pushing GL_INVALID_OPERATION onto the error queue.
             if (!outline.isEmpty()) {
+                // Queried inside the guard: a glGet is a driver round-trip, and nothing is
+                // selected on most frames.
+                GLint stencilAttach = GL_NONE;
+                glGetFramebufferAttachmentParameteriv(GL_DRAW_FRAMEBUFFER, GL_STENCIL,
+                                                      GL_FRAMEBUFFER_ATTACHMENT_OBJECT_TYPE, &stencilAttach);
+                const bool haveStencil = (stencilAttach != GL_NONE) && m_fbW > 0 && m_fbH > 0;
                 glDisable(GL_DEPTH_TEST);
-                glDisable(GL_CULL_FACE);
-                glPolygonMode(GL_FRONT_AND_BACK, GL_LINE);
-                glLineWidth(1.0f);
+                glDepthMask(GL_FALSE);        // never write depth: later FX depth-test against the mesh
+                glDisable(GL_CULL_FACE);      // stamp the whole projected shape, front and back faces
+                glDisable(GL_BLEND);
                 glUniform1i(uHasTex, 0); glUniform1i(uHasNormal, 0); glUniform1i(uHasEmissive, 0);
                 glUniform1i(uHasDyeMask, 0); glUniform1i(uHasDyeRamp, 0); glUniform1i(uPbr, 0);
-                for (const auto& o : outline) {
-                    if (o.second == 1) glUniform3f(uBase, 0.25f, 0.60f, 1.00f);   // blue = picked
-                    else               glUniform3f(uBase, 1.00f, 0.15f, 0.15f);   // red  = highlight
-                    const Part& p = m_parts[o.first];
-                    glDrawElements(GL_TRIANGLES, p.count, GL_UNSIGNED_INT,
-                                   reinterpret_cast<void*>(qintptr(p.offset) * sizeof(quint32)));
+                // uSolid short-circuits the fragment shader but NOT the vertex shader: leftover fur
+                // extrusion would puff the stamped footprint away from the real mesh silhouette.
+                glUniform1i(uFurEnabled, 0); glUniform1f(uFurShell, 0.0f);
+
+                auto drawParts = [&](int colour) {
+                    for (const auto& o : outline) {
+                        if (o.second != colour) continue;
+                        const Part& p = m_parts[o.first];
+                        glDrawElements(GL_TRIANGLES, p.count, GL_UNSIGNED_INT,
+                                       reinterpret_cast<void*>(qintptr(p.offset) * sizeof(quint32)));
+                    }
+                };
+
+                if (haveStencil) {
+                    glUniform1i(uSolid, 1);
+                    glEnable(GL_STENCIL_TEST);
+                    glStencilMask(0xFF);
+                    // Outline half-width in DEVICE pixels, so it looks the same on a hi-dpi display.
+                    const float r = 2.0f * float(devicePixelRatioF());
+                    const float sx = 2.0f * r / float(m_fbW);
+                    const float sy = 2.0f * r / float(m_fbH);
+                    static const float kDir[8][2] = {
+                        { 1.0f, 0.0f}, {-1.0f, 0.0f}, {0.0f,  1.0f}, { 0.0f, -1.0f},
+                        { 0.707f, 0.707f}, {-0.707f, 0.707f}, {0.707f, -0.707f}, {-0.707f, -0.707f},
+                    };
+                    // Red first, blue second: each group gets a fresh mask, so blue paints over red
+                    // where two selected parts overlap on screen.
+                    for (int colour = 0; colour <= 1; ++colour) {
+                        bool any = false;
+                        for (const auto& o : outline) if (o.second == colour) { any = true; break; }
+                        if (!any) continue;
+                        glClear(GL_STENCIL_BUFFER_BIT);
+                        // Pass A — stamp the part's screen footprint into stencil, colour off.
+                        glStencilFunc(GL_ALWAYS, 1, 0xFF);
+                        glStencilOp(GL_KEEP, GL_KEEP, GL_REPLACE);
+                        glColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE);
+                        glUniform2f(uNdcOffset, 0.0f, 0.0f);
+                        drawParts(colour);
+                        // Pass B — ring: only outside the stamped footprint. Overlapping jitters
+                        // rewrite the same opaque colour, so no stencil bookkeeping is needed.
+                        glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+                        glStencilFunc(GL_NOTEQUAL, 1, 0xFF);
+                        glStencilOp(GL_KEEP, GL_KEEP, GL_KEEP);
+                        if (colour == 1) glUniform3f(uBase, 0.25f, 0.60f, 1.00f);   // blue = picked
+                        else             glUniform3f(uBase, 1.00f, 0.15f, 0.15f);   // red  = highlight
+                        for (const auto& d : kDir) {
+                            glUniform2f(uNdcOffset, d[0] * sx, d[1] * sy);
+                            drawParts(colour);
+                        }
+                    }
+                    glUniform2f(uNdcOffset, 0.0f, 0.0f);
+                    glUniform1i(uSolid, 0);
+                    glDisable(GL_STENCIL_TEST);
+                } else {
+                    glPolygonMode(GL_FRONT_AND_BACK, GL_LINE);
+                    glLineWidth(1.0f);
+                    for (const auto& o : outline) {
+                        if (o.second == 1) glUniform3f(uBase, 0.25f, 0.60f, 1.00f);
+                        else               glUniform3f(uBase, 1.00f, 0.15f, 0.15f);
+                        const Part& p = m_parts[o.first];
+                        glDrawElements(GL_TRIANGLES, p.count, GL_UNSIGNED_INT,
+                                       reinterpret_cast<void*>(qintptr(p.offset) * sizeof(quint32)));
+                    }
+                    glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
                 }
-                glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
                 glEnable(GL_CULL_FACE);
+                glDepthMask(GL_TRUE);
                 glEnable(GL_DEPTH_TEST);
                 glUniform1i(uPbr, m_pbr ? 1 : 0);   // restore for later passes
             }
