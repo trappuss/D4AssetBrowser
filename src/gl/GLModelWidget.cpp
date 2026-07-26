@@ -2114,6 +2114,12 @@ void GLModelWidget::springBoneStep(QVector<Mat4>& global)
     // this the whole of the discrepancy. Opt-in for now (D4_CAPS_FULL=1) because 0.52 is visually
     // verified on the current build and a blind flip regressed before; A/B it, then decide.
     const float rScale = (m_colAuthored && m_capsFullSize) ? 1.0f : m_cloth.capsuleRadius;
+    // PER-CAPSULE scale = global rScale x the capsule's body-region trim. The region was resolved
+    // once at build time (m_colRegion); this is a array lookup per capsule, not a per-frame search.
+    auto capScale = [this, rScale](int i) {
+        const quint8 rg = (i < m_colRegion.size()) ? m_colRegion[i] : quint8(ClothParams::CapOther);
+        return rScale * ((rg < ClothParams::CapRegionCount) ? m_cloth.capRegion[rg] : 1.0f);
+    };
 
     // ── User-driven inertia ("React to rotation") ───────────────────────────────────────────
     // Orbiting the camera is, to the eye, spinning the MODEL — so give the cloth the fictitious
@@ -2212,7 +2218,7 @@ void GLModelWidget::springBoneStep(QVector<Mat4>& global)
     // with tiny colliders doesn't freeze the cloth solid.
     float minColR = 1e30f;
     for (int i = 0; i < m_colR0.size(); ++i)
-        minColR = qMin(minColR, qMin(m_colR0[i], m_colR1[i]) * rScale);
+        minColR = qMin(minColR, qMin(m_colR0[i], m_colR1[i]) * capScale(i));
     const float maxStep = (minColR < 1e29f) ? qMax(0.01f, minColR * 0.75f) : 1e30f;
     auto clampStep = [maxStep](const float* from, float& nx, float& ny, float& nz) {
         const float dx=nx-from[0], dy=ny-from[1], dz=nz-from[2];
@@ -2233,7 +2239,7 @@ void GLModelWidget::springBoneStep(QVector<Mat4>& global)
             const float cx=p0[0]+sx*t, cy=p0[1]+sy*t, cz=p0[2]+sz*t;
             float dx=P[0]-cx, dy=P[1]-cy, dz=P[2]-cz;
             float d = std::sqrt(dx*dx+dy*dy+dz*dz);
-            const float r = (m_colR0[i]+(m_colR1[i]-m_colR0[i])*t)*rScale + kMargin;
+            const float r = (m_colR0[i]+(m_colR1[i]-m_colR0[i])*t)*capScale(i) + kMargin;
             if (d >= r) continue;                       // outside this capsule — nothing to do
             // ENTRY normal: the direction the particle occupied one step ago. Using it instead of
             // the (possibly reversed) current offset is what stops deep penetrations exiting the
@@ -2280,7 +2286,7 @@ void GLModelWidget::springBoneStep(QVector<Mat4>& global)
         if (mv2 < 1e-8f) return;
         for (int i = 0; i < m_colR0.size(); ++i) {
             const float* p0=m_colP0.constData()+i*3; const float* p1=m_colP1.constData()+i*3;
-            const float r = qMax(m_colR0[i], m_colR1[i])*rScale + kMargin;
+            const float r = qMax(m_colR0[i], m_colR1[i])*capScale(i) + kMargin;
             // Coarse reject: segment midpoint vs capsule bounding sphere.
             const float bcx=(p0[0]+p1[0])*0.5f, bcy=(p0[1]+p1[1])*0.5f, bcz=(p0[2]+p1[2])*0.5f;
             const float hx=p1[0]-bcx, hy=p1[1]-bcy, hz=p1[2]-bcz;
@@ -2299,7 +2305,7 @@ void GLModelWidget::springBoneStep(QVector<Mat4>& global)
                 if (qal2 > 1e-8f) qt = qBound(0.f, ((Q[0]-p0[0])*qax+(Q[1]-p0[1])*qay+(Q[2]-p0[2])*qaz)/qal2, 1.f);
                 const float qcx=p0[0]+qax*qt, qcy=p0[1]+qay*qt, qcz=p0[2]+qaz*qt;
                 const float qdx=Q[0]-qcx, qdy=Q[1]-qcy, qdz=Q[2]-qcz;
-                const float qr=(m_colR0[i]+(m_colR1[i]-m_colR0[i])*qt)*rScale + kMargin;
+                const float qr=(m_colR0[i]+(m_colR1[i]-m_colR0[i])*qt)*capScale(i) + kMargin;
                 if (qdx*qdx+qdy*qdy+qdz*qdz <= qr*qr) continue;   // started inside → not tunnelling
             }
             // Sample the segment; first sample inside → step back to just before it.
@@ -2313,7 +2319,7 @@ void GLModelWidget::springBoneStep(QVector<Mat4>& global)
                 if (al2 > 1e-8f) tt = qBound(0.f, ((X[0]-p0[0])*ax+(X[1]-p0[1])*ay+(X[2]-p0[2])*az)/al2, 1.f);
                 const float ccx=p0[0]+ax*tt, ccy=p0[1]+ay*tt, ccz=p0[2]+az*tt;
                 const float ddx=X[0]-ccx, ddy=X[1]-ccy, ddz=X[2]-ccz;
-                const float rr=(m_colR0[i]+(m_colR1[i]-m_colR0[i])*tt)*rScale + kMargin;
+                const float rr=(m_colR0[i]+(m_colR1[i]-m_colR0[i])*tt)*capScale(i) + kMargin;
                 if (ddx*ddx+ddy*ddy+ddz*ddz < rr*rr) {   // entered here → clamp the step
                     P[0]=X[0]; P[1]=X[1]; P[2]=X[2];
                     return;
@@ -3103,7 +3109,7 @@ void GLModelWidget::buildClothSim()
     // Reset capsule state up-front so an early return (a model with no cloth) can't leave the
     // previous model's capsules OR the authored-radius flag stale for the next collide()/overlay.
     m_colBoneA.clear(); m_colBoneB.clear();
-    m_colP0Bind.clear(); m_colP1Bind.clear(); m_colR0.clear(); m_colR1.clear();
+    m_colP0Bind.clear(); m_colP1Bind.clear(); m_colR0.clear(); m_colR1.clear(); m_colRegion.clear();
     m_colP0.clear(); m_colP1.clear();
     m_colAuthored = false;
     m_vCloth.clear(); m_clothVerts.clear(); m_clothTris.clear();
@@ -3234,7 +3240,7 @@ void GLModelWidget::buildClothSim()
 
     // ── Body-collision capsules, fitted from the body skin per bone ──────────────
     m_colBoneA.clear(); m_colBoneB.clear();
-    m_colP0Bind.clear(); m_colP1Bind.clear(); m_colR0.clear(); m_colR1.clear();
+    m_colP0Bind.clear(); m_colP1Bind.clear(); m_colR0.clear(); m_colR1.clear(); m_colRegion.clear();
     const int nb = m_skeleton.size();
     if (nb <= 0) return;
     // Rest-pose world transform per bone (same compose+hierarchy as the skinning).
@@ -3255,6 +3261,36 @@ void GLModelWidget::buildClothSim()
     // capsuleRadius slider (that slider compensates the heuristic skin fit). m_colAuthored
     // makes collide()/the overlay use them at 1.0×; a 0.55× default was silently shrinking
     // the thigh capsules to half size, letting skirts clip into the legs.
+    // ── Per-capsule BODY REGION ───────────────────────────────────────────────────────────────
+    // The rig's shared player bones have stable hashes (same table blenderizeSkeletonNames uses),
+    // so a capsule's bone identifies the body part it guards. Capsules often sit on an unnamed
+    // child (a twist/roll bone), so walk up parents until a known hash is found — that is why this
+    // is a lookup and not a name match. Unknown ⇒ CapOther, which defaults to 1.0 and changes
+    // nothing. Region is resolved ONCE per geometry, not per frame.
+    auto regionOfBone = [this](int b) -> quint8 {
+        const int nb2 = m_skeleton.size();
+        for (int g = 0, j = b; g < 64 && j >= 0 && j < nb2; ++g, j = m_skeleton[j].parent) {
+            switch (m_skeleton[j].nameHash) {
+                case 0x1289E8B3u: case 0x121D55ADu:   // thigh L/R
+                case 0xB9CFD755u: case 0xB963444Fu:   // shin  L/R
+                case 0x9CAC595Du: case 0x9C3FC657u:   // ankle L/R
+                case 0x34EFB08Du: case 0x34831D87u:   // foot  L/R
+                    return ClothParams::CapLegs;
+                case 0x32FF39ADu:                     // pelvis
+                    return ClothParams::CapWaist;
+                case 0xD2322EEBu: case 0x20365219u:   // chest, center
+                    return ClothParams::CapTorso;
+                case 0xF51D6140u: case 0xF4B0CE3Au:   // upperArm L/R
+                case 0x8E911E73u: case 0x8E248B6Du:   // forearm  L/R
+                case 0xF54A1413u: case 0xF4DD810Du:   // hand     L/R
+                    return ClothParams::CapArms;
+                case 0xB0076FACu: case 0xD12DD5D1u:   // head, mouth
+                    return ClothParams::CapHead;
+                default: break;
+            }
+        }
+        return ClothParams::CapOther;
+    };
     m_colAuthored = !m_authoredCaps.isEmpty();
     m_capsFullSize = qEnvironmentVariableIsSet("D4_CAPS_FULL");
     if (m_colAuthored && qEnvironmentVariableIsSet("D4_DUMP_CLOTH")) {
@@ -3262,6 +3298,14 @@ void GLModelWidget::buildClothSim()
         const float applied = m_capsFullSize ? 1.0f : m_cloth.capsuleRadius;
         float mn = 1e9f, mx = 0.0f;
         for (const ClothCapsule& c : m_authoredCaps) { mn = qMin(mn, c.radius1); mx = qMax(mx, c.radius1); }
+        static const char* kRgn[] = { "legs", "waist", "torso", "arms", "head", "other" };
+        int rc[ClothParams::CapRegionCount] = {0};
+        for (quint8 r : m_colRegion) if (r < ClothParams::CapRegionCount) ++rc[r];
+        QString rs;
+        for (int r = 0; r < ClothParams::CapRegionCount; ++r)
+            if (rc[r]) rs += QStringLiteral(" %1=%2x%3").arg(QLatin1String(kRgn[r]))
+                                 .arg(rc[r]).arg(double(m_cloth.capRegion[r]), 0, 'f', 2);
+        qInfo("cloth-caps regions:%s", qPrintable(rs));
         qInfo("cloth-caps: %lld authored | radius1 %.3f..%.3f wu | slider %.2f | APPLIED x%.2f "
               "-> %.3f..%.3f wu%s",
               (long long)m_authoredCaps.size(), double(mn), double(mx),
@@ -3313,6 +3357,7 @@ void GLModelWidget::buildClothSim()
             m_colP0Bind.push_back(p0[0]); m_colP0Bind.push_back(p0[1]); m_colP0Bind.push_back(p0[2]);
             m_colP1Bind.push_back(p1[0]); m_colP1Bind.push_back(p1[1]); m_colP1Bind.push_back(p1[2]);
             m_colR0.push_back(r0); m_colR1.push_back(r1);
+            m_colRegion.push_back(regionOfBone(c.boneIndex));   // authored: region from its bone
         }
         m_colP0.fill(0.0f, m_colR0.size() * 3);
         m_colP1.fill(0.0f, m_colR0.size() * 3);
@@ -3388,6 +3433,7 @@ void GLModelWidget::buildClothSim()
         m_colP0Bind.push_back(p0x); m_colP0Bind.push_back(p0y); m_colP0Bind.push_back(p0z);
         m_colP1Bind.push_back(p1x); m_colP1Bind.push_back(p1y); m_colP1Bind.push_back(p1z);
         m_colR0.push_back(r0); m_colR1.push_back(r1);
+        m_colRegion.push_back(regionOfBone(b));   // skin-fit: same lookup, same index
     }
     m_colP0.fill(0.0f, m_colR0.size() * 3);
     m_colP1.fill(0.0f, m_colR0.size() * 3);
@@ -6047,7 +6093,10 @@ void GLModelWidget::buildColliderLines()
         const float* p1 = (anim ? m_colP1.constData() : m_colP1Bind.constData()) + i*3;
         // Must mirror the solver's rScale exactly, or the Collision-model overlay draws capsules
         // the solver isn't using — a debug view that lies is worse than none.
-        const float ovScale = (m_colAuthored && m_capsFullSize) ? 1.0f : m_cloth.capsuleRadius;
+        // Includes the per-region trim, so the overlay shows what the region sliders actually do.
+        const quint8 rg = (i < m_colRegion.size()) ? m_colRegion[i] : quint8(ClothParams::CapOther);
+        const float ovScale = ((m_colAuthored && m_capsFullSize) ? 1.0f : m_cloth.capsuleRadius)
+                            * ((rg < ClothParams::CapRegionCount) ? m_cloth.capRegion[rg] : 1.0f);
         const float r0 = m_colR0[i] * ovScale;   // tapered radius (live-scaled if skin-fit)
         const float r1 = m_colR1[i] * ovScale;
         float dx = p1[0]-p0[0], dy = p1[1]-p0[1], dz = p1[2]-p0[2];

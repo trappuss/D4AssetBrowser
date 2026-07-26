@@ -7578,6 +7578,12 @@ void WardrobeTab2::applyClothParams()
     p.friction         = f(QStringLiteral("friction"), d.friction);
     p.backstop         = f(QStringLiteral("backstop"), d.backstop);
     p.capsuleRadius    = f(QStringLiteral("capScale"), d.capsuleRadius);   // one knob for all capsules
+    p.capRegion[0]     = f(QStringLiteral("capLegs"),  d.capRegion[0]);
+    p.capRegion[1]     = f(QStringLiteral("capWaist"), d.capRegion[1]);
+    p.capRegion[2]     = f(QStringLiteral("capTorso"), d.capRegion[2]);
+    p.capRegion[3]     = f(QStringLiteral("capArms"),  d.capRegion[3]);
+    p.capRegion[4]     = f(QStringLiteral("capHead"),  d.capRegion[4]);
+    p.capRegion[5]     = f(QStringLiteral("capOther"), d.capRegion[5]);
     p.boneTracking     = f(QStringLiteral("tracking"), d.boneTracking);
     p.actorTracking    = d.actorTracking;
     p.horizStiffness   = d.horizStiffness;

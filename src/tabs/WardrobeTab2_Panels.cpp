@@ -1172,6 +1172,23 @@ void WardrobeTab2::buildPhysicsPanel()
                        "~0.52 (the default) is what matches the body mesh: the authored radii describe a "
                        "collision volume larger than the visible body, so 1.0 inflates it and splays "
                        "garments open. Raise a little if a piece clips; lower if it stands off the body."));
+
+    // Per-region capsule trim (see ClothParams::capRegion). The game authors a radius PER CAPSULE
+    // PER BONE, so a skirt clipping the thighs is a LEGS problem; the global knob above also
+    // inflates chest and arms, which is why tuning it alone never lands. 1.0 = authored size.
+    row(QStringLiteral("capLegs"),  QStringLiteral("  · Legs"),  20, 300, 100.0, d.capRegion[0],
+        QStringLiteral("Thigh / shin / ankle / foot capsules only. Raise to stop a skirt or hem "
+                       "clipping through the legs without inflating the torso."));
+    row(QStringLiteral("capWaist"), QStringLiteral("  · Waist"), 20, 300, 100.0, d.capRegion[1],
+        QStringLiteral("Pelvis capsules only — where most skirts and loincloths anchor."));
+    row(QStringLiteral("capTorso"), QStringLiteral("  · Torso"), 20, 300, 100.0, d.capRegion[2],
+        QStringLiteral("Chest / centre capsules only — capes and tabards ride on these."));
+    row(QStringLiteral("capArms"),  QStringLiteral("  · Arms"),  20, 300, 100.0, d.capRegion[3],
+        QStringLiteral("Upper arm / forearm / hand capsules only."));
+    row(QStringLiteral("capHead"),  QStringLiteral("  · Head"),  20, 300, 100.0, d.capRegion[4],
+        QStringLiteral("Head capsules only — hoods, hair and feathers."));
+    row(QStringLiteral("capOther"), QStringLiteral("  · Other"), 20, 300, 100.0, d.capRegion[5],
+        QStringLiteral("Capsules on bones outside the shared player rig (mounts, monsters, props)."));
     row(QStringLiteral("margin"),  QStringLiteral("Collide margin"),0, 50, 1000.0, d.collisionMargin,
         QStringLiteral("Extra clearance kept from the body capsules. Raise if limbs poke through the cloth."));
     row(QStringLiteral("friction"),QStringLiteral("Friction"),      0, 100, 100.0, d.friction,

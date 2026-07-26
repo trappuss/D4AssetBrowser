@@ -4179,6 +4179,23 @@ void StableTab2::buildPhysicsPanel()
                        "the body mesh — the authored radii are larger than the visible body, so 1.0 "
                        "inflates it and splays garments open. Raise "
                        "to push cloth further off the body."));
+
+    // Per-region capsule trim (see ClothParams::capRegion). The game authors a radius PER CAPSULE
+    // PER BONE, so a skirt clipping the thighs is a LEGS problem; the global knob above also
+    // inflates chest and arms, which is why tuning it alone never lands. 1.0 = authored size.
+    row(QStringLiteral("capLegs"),  QStringLiteral("  · Legs"),  20, 300, 100.0, d.capRegion[0],
+        QStringLiteral("Thigh / shin / ankle / foot capsules only. Raise to stop a skirt or hem "
+                       "clipping through the legs without inflating the torso."));
+    row(QStringLiteral("capWaist"), QStringLiteral("  · Waist"), 20, 300, 100.0, d.capRegion[1],
+        QStringLiteral("Pelvis capsules only — where most skirts and loincloths anchor."));
+    row(QStringLiteral("capTorso"), QStringLiteral("  · Torso"), 20, 300, 100.0, d.capRegion[2],
+        QStringLiteral("Chest / centre capsules only — capes and tabards ride on these."));
+    row(QStringLiteral("capArms"),  QStringLiteral("  · Arms"),  20, 300, 100.0, d.capRegion[3],
+        QStringLiteral("Upper arm / forearm / hand capsules only."));
+    row(QStringLiteral("capHead"),  QStringLiteral("  · Head"),  20, 300, 100.0, d.capRegion[4],
+        QStringLiteral("Head capsules only — hoods, hair and feathers."));
+    row(QStringLiteral("capOther"), QStringLiteral("  · Other"), 20, 300, 100.0, d.capRegion[5],
+        QStringLiteral("Capsules on bones outside the shared player rig (mounts, monsters, props)."));
     row(QStringLiteral("margin"), QStringLiteral("Collide margin"), 0, 50, 1000.0, d.collisionMargin,
         QStringLiteral("Extra clearance kept from the body capsules."));
     row(QStringLiteral("friction"), QStringLiteral("Friction"), 0, 100, 100.0, d.friction,
@@ -4276,6 +4293,12 @@ void StableTab2::applyClothParams()
     p.friction         = f(QStringLiteral("friction"), d.friction);
     p.backstop         = f(QStringLiteral("backstop"), d.backstop);
     p.capsuleRadius    = f(QStringLiteral("capScale"), d.capsuleRadius);   // one knob for all capsules
+    p.capRegion[0]     = f(QStringLiteral("capLegs"),  d.capRegion[0]);
+    p.capRegion[1]     = f(QStringLiteral("capWaist"), d.capRegion[1]);
+    p.capRegion[2]     = f(QStringLiteral("capTorso"), d.capRegion[2]);
+    p.capRegion[3]     = f(QStringLiteral("capArms"),  d.capRegion[3]);
+    p.capRegion[4]     = f(QStringLiteral("capHead"),  d.capRegion[4]);
+    p.capRegion[5]     = f(QStringLiteral("capOther"), d.capRegion[5]);
     p.boneTracking     = f(QStringLiteral("tracking"), d.boneTracking);
     p.dragFactor       = f(QStringLiteral("drag"), 0.0);
     p.boneStiffness    = f(QStringLiteral("bonestiff"), d.boneStiffness);

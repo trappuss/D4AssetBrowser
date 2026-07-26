@@ -228,6 +228,11 @@ public:
                                            // body and splays skirts open with the legs showing through
                                            // the gap. Raise only if a piece grazes; lower if a garment
                                            // stands off the body.
+        // PER-REGION capsule trim, applied ON TOP of capsuleRadius. The game authors a radius per
+        // capsule per bone, so a skirt clipping the thighs is a LEGS problem — the global knob also
+        // inflates the chest and arms, which is why tuning it alone never lands. 1.0 = untouched.
+        enum CapRegion { CapLegs = 0, CapWaist, CapTorso, CapArms, CapHead, CapOther, CapRegionCount };
+        float capRegion[CapRegionCount] = { 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f };
         // ── From the game's Cloth definition (.clt.json / dmClothTuningMirror). The cloth
         // mostly tracks the authored bone-skinned pose; physics is a light correction. ──
         float boneTracking    = 0.45f;     // flBoneTrackingFactor: blend toward skinned pose
@@ -712,6 +717,10 @@ private:
     bool             m_capturing = false;                // export capture in progress (see setCaptureMode)
     bool             m_orphanLegacy = false;             // D4_CLOTH_LEGACY_ORPHANS=1: restore the old
                                                          // cage-less = hair treatment (rigid) path
+    // Per-capsule body region, so the collision size can be tuned per body part instead of one
+    // global multiplier. The game authors a radius PER CAPSULE PER BONE (thigh 0.27, chest 0.16…),
+    // so this exposes a distinction the data already makes. Index = m_colR0 index.
+    QVector<quint8>  m_colRegion;                        // ClothParams::CapRegion per capsule
     bool             m_capsFullSize = false;             // D4_CAPS_FULL=1: authored capsules at 1.0x
                                                          // (ignore the Capsule-size slider) — see rScale
     int              m_subStepsSaved = 0;                // solver subSteps to restore after capture
