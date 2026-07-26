@@ -8,10 +8,11 @@
 // a Stable part has no dye) and leaves the rest empty/null; empty fields and null callbacks are
 // simply omitted, so no tab shows an action it cannot perform.
 
-#include <QApplication>
+#include <QAction>
 #include <QClipboard>
 #include <QGuiApplication>
 #include <QMenu>
+#include <QPoint>
 #include <QString>
 #include <QStringList>
 #include <QWidget>

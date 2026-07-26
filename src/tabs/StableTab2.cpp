@@ -1,4 +1,5 @@
 #include "tabs/StableTab2.h"
+#include "util/ViewportPartMenu.h"
 
 #include "app/ExportNotifier.h"
 #include "util/HoverInfo.h"

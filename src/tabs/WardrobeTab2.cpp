@@ -1,4 +1,5 @@
 #include "tabs/WardrobeTab2.h"
+#include "util/ViewportPartMenu.h"
 #include "app/AppPaths.h"         // ensemble thumbnails live in the portable data folder
 #include "tabs/PanelBox.h"        // the stacking-toggle panel system, shared with the Models tab
 #include "tabs/ModelOutliner.h"   // kindIcon — the same strip glyphs the Models tab uses

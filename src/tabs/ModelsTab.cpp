@@ -1,4 +1,5 @@
 #include "tabs/ModelsTab.h"
+#include "util/ViewportPartMenu.h"
 
 #include "app/AppPaths.h"
 #include "app/Config.h"
