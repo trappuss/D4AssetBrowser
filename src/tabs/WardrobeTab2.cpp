@@ -7622,10 +7622,11 @@ void WardrobeTab2::applyClothParams()
     // cloth IS asking for the sim, so a saved "userSpin on + physics off" pair (impossible to fix
     // from the UI, since the checkbox already reads on and fires no toggle) resolves to physics on.
     bool clothOn = s.value(QStringLiteral("wardrobe2/cloth/enabled"), true).toBool();
-    if (p.userSpin && !clothOn) {
-        clothOn = true;
-        s.setValue(QStringLiteral("wardrobe2/cloth/enabled"), true);
-    }
+    // NOTE: "React to rotation" no longer force-enables cloth HERE. This runs on every apply — and
+    // on every model load — so with userSpin on, an explicit decision to switch physics OFF was
+    // silently reverted (and persisted) each time, e.g. loading a new hair model brought physics
+    // back until the master toggle was cycled. The convergence now happens once, in the userSpin
+    // toggle handler, which is the moment the user actually asks for rotation-driven cloth.
     m_view->setClothEnabled(clothOn);
     m_view->setCapsuleAxis(s.value(QStringLiteral("wardrobe2/cloth/capAxis"), 3).toInt());   // default: bone
     m_view->setClothParams(p);

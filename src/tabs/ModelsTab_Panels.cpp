@@ -964,13 +964,17 @@ void ModelsTab::applyClothParams()
     // rotation-driven cloth IS asking for the sim, so converge the state once and PERSIST it — the
     // master checkbox then shows the truth instead of an impossible combination.
     bool clothOn = s.value(QStringLiteral("models/clothSim"), false).toBool();
-    if (p.userSpin && !clothOn) {
-        clothOn = true;
-        s.setValue(QStringLiteral("models/clothSim"), true);
-    }
+    // NOTE: "React to rotation" no longer force-enables cloth HERE. This runs on every apply — and
+    // on every model load — so with userSpin on, an explicit decision to switch physics OFF was
+    // silently reverted (and persisted) each time, e.g. loading a new hair model brought physics
+    // back until the master toggle was cycled. The convergence now happens once, in the userSpin
+    // toggle handler, which is the moment the user actually asks for rotation-driven cloth.
     m_modelView->setClothEnabled(clothOn);
     m_modelView->setClothParams(p);
-    m_modelView->setShowColliders(s.value(QStringLiteral("models/cloth/showColliders"), false).toBool());
+    // MASTER GATE: this runs on every physics edit and on model load, so an ungated push
+    // re-enabled the collider overlay behind the master toggle (same defect class as applyModelRig).
+    m_modelView->setShowColliders(m_overlaysOn
+        && s.value(QStringLiteral("models/cloth/showColliders"), false).toBool());
 }
 
 // ── Fullscreen ────────────────────────────────────────────────────────────────

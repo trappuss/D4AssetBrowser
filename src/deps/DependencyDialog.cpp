@@ -1,6 +1,7 @@
 #include "deps/DependencyDialog.h"
 
 #include "app/Config.h"
+#include "casc/CascReader.h"
 #include "deps/D4DataDownloader.h"
 
 #include <QDialogButtonBox>
@@ -86,11 +87,27 @@ void DependencyDialog::refreshStatus()
     const bool installed = !core.isEmpty() && QFile::exists(core);
 
     if (installed) {
-        QString detail;
+        // buildVersion.txt is the build d4data was EXTRACTED FROM — not the installed game's build.
+        // Labelling it "game build" read as "you are up to date" while the status bar simultaneously
+        // warned "d4data behind game", because only the status bar actually compared the two. Do the
+        // same comparison here so there is one answer, using the same last-dotted-component rule.
+        QString d4Ver;
         QFile bv(QDir(dir).filePath(QStringLiteral("buildVersion.txt")));
-        if (bv.open(QIODevice::ReadOnly))
-            detail = QStringLiteral("  ·  game build ")
-                   + QString::fromUtf8(bv.readAll()).trimmed().left(24);
+        if (bv.open(QIODevice::ReadOnly)) d4Ver = QString::fromUtf8(bv.readAll()).trimmed().left(24);
+        const QString gameVer = CascReader::gameVersion(Config::gameDir());
+        auto buildNum = [](const QString& v) -> qlonglong {
+            bool ok = false; const qlonglong n = v.section(QLatin1Char('.'), -1).toLongLong(&ok);
+            return ok ? n : 0;
+        };
+        const qlonglong g = buildNum(gameVer), d = buildNum(d4Ver);
+        QString detail;
+        if (!d4Ver.isEmpty())  detail += QStringLiteral("\nd4data extracted from build %1").arg(d4Ver);
+        if (!gameVer.isEmpty()) detail += QStringLiteral("\nGame installed build %1").arg(gameVer);
+        if (g > 0 && d > 0)
+            detail += (g > d)
+                ? QStringLiteral("\n\n⚠ d4data is BEHIND the game — items added since build %1 may be "
+                                 "missing names/icons. Update below.").arg(d4Ver)
+                : QStringLiteral("\n\n✓ Up to date with the installed game.");
         m_status->setText(QStringLiteral("Installed: %1%2").arg(dir, detail));
         m_btn->setText(QStringLiteral("Update d4data"));
     } else {

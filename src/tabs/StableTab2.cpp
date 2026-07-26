@@ -4307,10 +4307,11 @@ void StableTab2::applyClothParams()
     p.userSpinForce    = f(QStringLiteral("spinForce"), d.userSpinForce);
     // Master switch, converged the same way as the other tabs (see WardrobeTab2::applyClothParams).
     bool clothOn = s.value(QStringLiteral("stable2/cloth/enabled"), true).toBool();
-    if (p.userSpin && !clothOn) {
-        clothOn = true;
-        s.setValue(QStringLiteral("stable2/cloth/enabled"), true);
-    }
+    // NOTE: "React to rotation" no longer force-enables cloth HERE. This runs on every apply — and
+    // on every model load — so with userSpin on, an explicit decision to switch physics OFF was
+    // silently reverted (and persisted) each time, e.g. loading a new hair model brought physics
+    // back until the master toggle was cycled. The convergence now happens once, in the userSpin
+    // toggle handler, which is the moment the user actually asks for rotation-driven cloth.
     m_view->setClothEnabled(clothOn);
     m_view->setCapsuleAxis(s.value(QStringLiteral("stable2/cloth/capAxis"), 3).toInt());
     m_view->setClothParams(p);

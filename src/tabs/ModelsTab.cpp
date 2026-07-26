@@ -7140,7 +7140,9 @@ void ModelsTab::reapplyOverlays()
     if (!m_modelView) return;
     for (const auto& e : m_overlayChks)
         if (e.first) e.second(m_overlaysOn && e.first->isChecked());
-    applyModelRig();   // rig flags share the same gate (see applyModelRig)
+    applyModelRig();       // rig flags share the same gate (see applyModelRig)
+    applyClothParams();    // cloth/collider flags too — matches WardrobeTab2/StableTab2, and
+                           // guarantees a newly loaded model honours the persisted physics state
 }
 
 // Build the Blender-style subtree under the loaded model's row in the outliner:
@@ -7760,6 +7762,9 @@ void ModelsTab::applyPartMaterials()
     auto roleCached = [&](const QString& mn, const char* role) -> QImage {
         return cached(role, mn, [&] { return textureByRole(mn, role); });
     };
+    // Base-colour-only mode: one texture decode per material instead of ten. Shared by the
+    // prefetch list and the per-part gather so the two can never disagree.
+    const bool baseOnly = QSettings().value(QStringLiteral("perf/baseColorOnly"), false).toBool();
     // Fur: dwFlags bit 5 (0x20), a fur shader-map, or a "_fur" material name — parity with the
     // Wardrobe's isFurMaterial. The Models tab previously never marked fur parts, so fur props like
     // trophy_bar032_stor (…_mat_fur) rendered with no shells.
@@ -7813,14 +7818,18 @@ void ModelsTab::applyPartMaterials()
     // the UI thread, so the cache itself is never touched concurrently. Shortens the click→textured
     // stall to roughly 1/cores for every map, base/ORM included.
     {
-        static const char* const kPrefetchRoles[] = { "BASE", "NORM", "ORM", "EMIS",
+        static const char* const kAllRoles[] = { "BASE", "NORM", "ORM", "EMIS",
             "DETAIL_NORMAL", "DETAIL_ROUGHNESS", "TRANSLUCENCY", "MASK_PRIMARY", "DYE_MASK", "DYE_RAMP" };
+        static const char* const kBaseOnlyRoles[] = { "BASE" };
+        const char* const* kPrefetchRoles = baseOnly ? kBaseOnlyRoles : kAllRoles;
+        const int kPrefetchCount = baseOnly ? 1 : int(sizeof(kAllRoles)/sizeof(kAllRoles[0]));
         QStringList keys; QSet<QString> seenKeys;
         for (int i = 0; i < nParts; ++i) {
             QString um = m_appMatNames.value(m_curGeo.primitives[i].materialIndex);
             if (um.isEmpty()) um = fallbackMat;
             if (um.isEmpty()) continue;
-            for (const char* r : kPrefetchRoles) {
+            for (int ri = 0; ri < kPrefetchCount; ++ri) {
+                const char* r = kPrefetchRoles[ri];
                 const QString key = QString::fromLatin1(r) + QLatin1Char('|') + um;
                 if (m_texCache.contains(key) || seenKeys.contains(key)) continue;   // already have / queued
                 seenKeys.insert(key);
@@ -7878,16 +7887,22 @@ void ModelsTab::applyPartMaterials()
         int hair = 0, skin = 0;
         if (!usedMat.isEmpty()) {
             base = decodeBase(usedMat);
-            norm = decodeNorm(usedMat);
-            orm  = decodeOrm(usedMat);
-            emis = decodeEmis(usedMat);
-            dN = roleCached(usedMat, "DETAIL_NORMAL");
-            dR = roleCached(usedMat, "DETAIL_ROUGHNESS");
-            tr = roleCached(usedMat, "TRANSLUCENCY");
-            mk = roleCached(usedMat, "MASK_PRIMARY");
-            dm = roleCached(usedMat, "DYE_MASK");
-            rp = roleCached(usedMat, "DYE_RAMP");
-            if (!dm.isNull() && dm.width() <= 8) { dm = QImage(); rp = QImage(); }  // 4×4 placeholder = no dye
+            // "Base colour only" (Settings ▸ Performance): decode ONE map per material instead of
+            // ten. Every other role is left null, which the shader already treats as "no map", so
+            // the model still renders — flat-lit, no normals/ORM/emissive/detail/dye. This is the
+            // single gather point for all of them, so one guard covers the whole set.
+            if (!baseOnly) {
+                norm = decodeNorm(usedMat);
+                orm  = decodeOrm(usedMat);
+                emis = decodeEmis(usedMat);
+                dN = roleCached(usedMat, "DETAIL_NORMAL");
+                dR = roleCached(usedMat, "DETAIL_ROUGHNESS");
+                tr = roleCached(usedMat, "TRANSLUCENCY");
+                mk = roleCached(usedMat, "MASK_PRIMARY");
+                dm = roleCached(usedMat, "DYE_MASK");
+                rp = roleCached(usedMat, "DYE_RAMP");
+                if (!dm.isNull() && dm.width() <= 8) { dm = QImage(); rp = QImage(); }  // 4×4 placeholder = no dye
+            }
             const QString lm = usedMat.toLower();
             hair = lm.contains(QLatin1String("hair")) ? 1 : 0;
             skin = (skinFilled || lm.contains(QLatin1String("skin"))
