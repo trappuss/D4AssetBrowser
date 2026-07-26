@@ -710,6 +710,8 @@ private:
     QVector<std::array<float, 16>> m_boneGlobalSim;      // post-cloth-sim bone world matrices
     bool             m_showColliders = false;            // draw cloth collision capsules
     bool             m_capturing = false;                // export capture in progress (see setCaptureMode)
+    bool             m_capsFullSize = false;             // D4_CAPS_FULL=1: authored capsules at 1.0x
+                                                         // (ignore the Capsule-size slider) — see rScale
     int              m_subStepsSaved = 0;                // solver subSteps to restore after capture
     float            m_captureTime = 0.0f;               // deterministic FX time while capturing
     bool             m_backfaceCull = true;              // cull back faces of the solid mesh

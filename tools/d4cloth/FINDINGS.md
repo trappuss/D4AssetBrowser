@@ -313,6 +313,42 @@ concrete lead is the capsule one from F8 — authored `scale`, `hide`, per-capsu
 `height` and `friction` exist and the app substitutes a hardcoded 0.52 radius multiplier for all
 of it.
 
+## F10 — capsule lead: mostly REFUTED, but `m_colAuthored` is dead code (a real defect)
+
+Corpus sweep, **143 authored capsules** across all 21 pieces:
+
+| authored field | measured | verdict |
+|---|---|---|
+| `hide` | **0 of 143 set** | ignoring it costs nothing — refuted |
+| `scale` | **0 of 143 non-unit** (all 1,1,1,1) | ignoring it costs nothing — refuted |
+| `solver` | **2 on all 143** (constant) | nothing to honour — refuted |
+| `friction` | **0.10 on all 143**; app defaults to 0.1f | already matches — refuted |
+| `radius1 != radius2` | **39 of 143 tapered (27%)** | app DOES interpolate r0->r1 along the axis — already correct |
+| `radius1` | 70-331 mm (median 137) | **see below** |
+
+So my F8 framing ("the app ignores authored capsule fields") is **wrong** for everything except
+radius — the other fields carry no information in this corpus. Radius is the only authored quantity
+that varies, which narrows the lead rather than killing it.
+
+**The real defect: `m_colAuthored` is set and logged, but never read.** It exists specifically to
+stop the Capsule-size slider scaling the game's exact radii — its own comment says *"a 0.55x
+default was silently shrinking the thigh capsules to half size, letting skirts clip into the
+legs"*, and `GLModelWidget.h:495` repeats the intent (*"capsuleRadius slider only scales SKIN-FIT
+ones"*). But `springBoneStep` computed `rScale = m_cloth.capsuleRadius` unconditionally, so with
+the 0.52 default **every authored capsule has been colliding at 52% of its authored size** — 70-331
+mm applied as 36-172 mm. The documented fix was never wired.
+
+**Change made (opt-in, default unchanged):** `rScale` (and the Collision-model overlay, which must
+mirror it) now honour the flag when `D4_CAPS_FULL=1`. Default behaviour is byte-identical to
+before, because 0.52 is visually verified on the current build and a blind flip regressed
+previously. `D4_DUMP_CLOTH=1` prints `cloth-caps:` with authored vs APPLIED radii so the
+discrepancy is visible rather than inferred.
+
+**To evaluate:** run with `D4_CAPS_FULL=1` on a skirt/leg repro (spiF_stor210/211_LEG,
+DruF_stor249_LEG) and compare clipping against the default. Note this interacts with the
+Capsule-size slider's meaning: with the flag on, that slider governs only skin-fit capsules, as
+originally intended.
+
 ## Remaining unknowns (decoded shape, purpose pending — none block the solver)
 
 - `ptDeltaFrames`: one 4×4 matrix per vert (pure rotation + identity row) — per-particle

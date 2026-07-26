@@ -2075,7 +2075,15 @@ void GLModelWidget::springBoneStep(QVector<Mat4>& global)
     // One "Capsule size" knob scales every collision capsule. Authored capsules store the game's
     // exact radii and skin-fit capsules already bake in the 0.55 heuristic, so 1.0 = natural size
     // for both; raising it pushes cloth further off the body.
-    const float rScale = m_cloth.capsuleRadius;
+    // AUTHORED CAPSULES vs THE SLIDER. m_colAuthored was introduced to stop the slider shrinking
+    // the game's exact radii (see the comment where it is set, and GLModelWidget.h:495) — but it
+    // was only ever set and logged, never read here, so authored capsules have been running at the
+    // 0.52 default ever since: the game's 70-331 mm radii applied at 52%. Measured across the
+    // corpus, authored capsules carry no scale/hide/solver variation (all 143 are scale=1, hide=0,
+    // solver=2, friction=0.10), so radius is the only authored quantity that matters — which makes
+    // this the whole of the discrepancy. Opt-in for now (D4_CAPS_FULL=1) because 0.52 is visually
+    // verified on the current build and a blind flip regressed before; A/B it, then decide.
+    const float rScale = (m_colAuthored && m_capsFullSize) ? 1.0f : m_cloth.capsuleRadius;
 
     // ── User-driven inertia ("React to rotation") ───────────────────────────────────────────
     // Orbiting the camera is, to the eye, spinning the MODEL — so give the cloth the fictitious
@@ -3211,6 +3219,19 @@ void GLModelWidget::buildClothSim()
     // makes collide()/the overlay use them at 1.0×; a 0.55× default was silently shrinking
     // the thigh capsules to half size, letting skirts clip into the legs.
     m_colAuthored = !m_authoredCaps.isEmpty();
+    m_capsFullSize = qEnvironmentVariableIsSet("D4_CAPS_FULL");
+    if (m_colAuthored && qEnvironmentVariableIsSet("D4_DUMP_CLOTH")) {
+        // Authored vs APPLIED radius, so the discrepancy is visible instead of inferred.
+        const float applied = m_capsFullSize ? 1.0f : m_cloth.capsuleRadius;
+        float mn = 1e9f, mx = 0.0f;
+        for (const ClothCapsule& c : m_authoredCaps) { mn = qMin(mn, c.radius1); mx = qMax(mx, c.radius1); }
+        qInfo("cloth-caps: %lld authored | radius1 %.3f..%.3f wu | slider %.2f | APPLIED x%.2f "
+              "-> %.3f..%.3f wu%s",
+              (long long)m_authoredCaps.size(), double(mn), double(mx),
+              double(m_cloth.capsuleRadius), double(applied),
+              double(mn*applied), double(mx*applied),
+              m_capsFullSize ? "  [D4_CAPS_FULL=1]" : "");
+    }
     if (!m_authoredCaps.isEmpty()) {
         QString capDbg;
         for (const ClothCapsule& c : m_authoredCaps) {
@@ -5987,7 +6008,9 @@ void GLModelWidget::buildColliderLines()
     for (int i = 0; i < n; ++i) {
         const float* p0 = (anim ? m_colP0.constData() : m_colP0Bind.constData()) + i*3;
         const float* p1 = (anim ? m_colP1.constData() : m_colP1Bind.constData()) + i*3;
-        const float ovScale = m_cloth.capsuleRadius;   // one Capsule-size knob for all capsules
+        // Must mirror the solver's rScale exactly, or the Collision-model overlay draws capsules
+        // the solver isn't using — a debug view that lies is worse than none.
+        const float ovScale = (m_colAuthored && m_capsFullSize) ? 1.0f : m_cloth.capsuleRadius;
         const float r0 = m_colR0[i] * ovScale;   // tapered radius (live-scaled if skin-fit)
         const float r1 = m_colR1[i] * ovScale;
         float dx = p1[0]-p0[0], dy = p1[1]-p0[1], dz = p1[2]-p0[2];
