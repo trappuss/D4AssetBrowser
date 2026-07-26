@@ -4315,22 +4315,6 @@ void StableTab2::applyClothParams()
 // ONE part menu, shown from BOTH the 3D viewport and the PARTS PANEL.
 void StableTab2::showPartContextMenu(int part, const QPoint& gp)
 {
-    if (!m_partTree) return;
-    auto itemForPart = [this](int p) -> QTreeWidgetItem* {
-        for (int r = 0; r < m_partTree->topLevelItemCount(); ++r) {
-            QTreeWidgetItem* root = m_partTree->topLevelItem(r);
-            for (int c = 0; c < root->childCount(); ++c)
-                if (root->child(c)->data(0, Qt::UserRole).toInt() == p) return root->child(c);
-        }
-        return nullptr;
-    };
-    auto setAll = [this](Qt::CheckState st) {
-        for (int r = 0; r < m_partTree->topLevelItemCount(); ++r) {
-            QTreeWidgetItem* root = m_partTree->topLevelItem(r);
-            for (int c = 0; c < root->childCount(); ++c) root->child(c)->setCheckState(0, st);
-        }
-    };
-
         if (!m_partTree) return;
         auto itemForPart = [this](int p) -> QTreeWidgetItem* {
             for (int r = 0; r < m_partTree->topLevelItemCount(); ++r) {

@@ -12,11 +12,18 @@ call "%~dp0backup-src.bat"
 
 :: Pre-build source checks (verify-src.py): delimiter balance, MISSING #include for the
 :: header-only helpers, printf/qInfo format-vs-arg mismatches, Qt macro name collisions.
-:: These are cheap and catch the mistakes that otherwise cost a full MSVC cycle to discover.
-:: Non-blocking by design: a checker false positive must never stop you building.
-where python >nul 2>&1
-if not errorlevel 1 (
-    python "%~dp0verify-src.py" --quiet
+:: Cheap, and catches mistakes that otherwise cost a full MSVC cycle to discover.
+:: Non-blocking: a checker false positive must never stop you building.
+::
+:: NOTE: plain `python` on Windows usually resolves to the Microsoft Store *alias*, which is not
+:: an interpreter — it prints an install advert and returns success. Prefer the `py` launcher and
+:: verify the interpreter actually runs before using it; otherwise skip the checks silently.
+set "PYEXE="
+py -3 -c "import sys" >nul 2>&1 && set "PYEXE=py -3"
+if not defined PYEXE python -c "import sys" >nul 2>&1 && set "PYEXE=python"
+if not defined PYEXE python3 -c "import sys" >nul 2>&1 && set "PYEXE=python3"
+if defined PYEXE (
+    %PYEXE% "%~dp0verify-src.py" --quiet
     if errorlevel 1 (
         echo.
         echo  ^>^> verify-src found problems ^(listed above^). Building anyway - Ctrl+C to stop.

@@ -250,6 +250,43 @@ def check_qt_macro_names(path: Path, code: str) -> list[str]:
     return problems
 
 
+BODY = re.compile(r"^(?:\w[\w:<>,~\s\*&]*?)\b(\w+::\w+)\s*\([^;{]*\)\s*(?:const\s*)?\{", re.M)
+LOCAL = re.compile(r"^\s{4,}auto\s+(\w+)\s*=\s*\[", re.M)
+
+
+def check_duplicate_locals(path: Path, code: str) -> list[str]:
+    """Two `auto NAME = [...]` at the same brace depth inside one function body.
+
+    Splicing a lambda body into a new member function easily duplicates the helper lambdas it
+    already declared — MSVC reports 'redefinition; multiple initialization' for each, three
+    errors per name, and it costs a whole build cycle to find out. Cheap to catch here.
+    """
+    problems = []
+    for m in BODY.finditer(code):
+        start = m.end() - 1
+        depth, i, n = 0, start, len(code)
+        while i < n:
+            if code[i] == "{":
+                depth += 1
+            elif code[i] == "}":
+                depth -= 1
+                if depth == 0:
+                    break
+            i += 1
+        body = code[start:i]
+        seen = {}
+        for d in LOCAL.finditer(body):
+            name = d.group(1)
+            if name in seen:
+                line = code[:start + d.start()].count("\n") + 1
+                problems.append(
+                    f"line {line}: `{name}` declared twice in {m.group(1)}() — "
+                    f"duplicate lambda (MSVC: 'redefinition; multiple initialization')")
+            else:
+                seen[name] = True
+    return problems
+
+
 def main() -> int:
     args = [a for a in sys.argv[1:] if not a.startswith("--")]
     quiet = "--quiet" in sys.argv
@@ -273,7 +310,8 @@ def main() -> int:
         problems = (check_balance(f, code)
                     + check_header_only_includes(f, raw, code)
                     + check_format_args(f, raw)
-                    + check_qt_macro_names(f, code))
+                    + check_qt_macro_names(f, code)
+                    + check_duplicate_locals(f, code))
         if problems:
             total += len(problems)
             rel = f.relative_to(ROOT) if ROOT in f.parents or f.is_relative_to(ROOT) else f
@@ -284,7 +322,7 @@ def main() -> int:
     if total == 0:
         if not quiet:
             print(f"verify-src: OK — {len(files)} file(s) clean "
-                  f"(balance, header-only includes, format args, Qt macro names)")
+                  f"(balance, header-only includes, format args, Qt macro names, duplicate lambdas)")
         return 0
     print(f"\nverify-src: {total} problem(s) in {len(files)} file(s) — fix before building.")
     return 1

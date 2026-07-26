@@ -7646,22 +7646,6 @@ void WardrobeTab2::exportSinglePart(QTreeWidgetItem* item, const std::function<v
 // can copy/export exactly like the viewport. part < 0 = clicked empty space (all-parts actions only).
 void WardrobeTab2::showPartContextMenu(int part, const QPoint& gp)
 {
-    if (!m_partTree) return;
-    auto itemForPart = [this](int p) -> QTreeWidgetItem* {
-        for (int r = 0; r < m_partTree->topLevelItemCount(); ++r) {
-            QTreeWidgetItem* root = m_partTree->topLevelItem(r);
-            for (int c2 = 0; c2 < root->childCount(); ++c2)
-                if (root->child(c2)->data(0, Qt::UserRole).toInt() == p) return root->child(c2);
-        }
-        return nullptr;
-    };
-    auto setAll = [this](Qt::CheckState st) {
-        for (int r = 0; r < m_partTree->topLevelItemCount(); ++r) {
-            QTreeWidgetItem* root = m_partTree->topLevelItem(r);
-            for (int c2 = 0; c2 < root->childCount(); ++c2) root->child(c2)->setCheckState(0, st);
-        }
-    };
-
         if (!m_partTree) return;
         auto itemForPart = [this](int p) -> QTreeWidgetItem* {
             for (int r = 0; r < m_partTree->topLevelItemCount(); ++r) {
