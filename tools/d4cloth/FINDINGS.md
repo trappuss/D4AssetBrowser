@@ -266,6 +266,53 @@ position is `(0, 0, d, 0)` with d = 0.034-0.070, `stiffness` = 1.000, `friction`
 rotation; the remaining unknown is only WHICH axis is the normal and what bone 0 is in that space.
 This is strictly more than was known when planes were disabled.
 
+## F9 — M2's premise is UNFOUNDED: render verts are bone-skinned, not cage-skinned
+
+Measured on `barF_base03_TRS` with a full LOD0 submesh parse (mirrors `ModelParser`'s
+VB/segment/sub-object scan). LOD0 submeshes match the app's Parts panel exactly:
+mat0 = 77 verts/120 tris (the cage), mat1 = 1860 tris (armor_skin), mat2 = 2924 (fur),
+mat3 = 2615 (torso).
+
+**Distance from each visible submesh to the cage surface (point-to-triangle, mm):**
+
+| submesh | verts | min | p5 | p25 | median | max | <1 mm |
+|---|---|---|---|---|---|---|---|
+| mat0 (cage/`_sim`) | 77 | 0.00 | 0.00 | 0.00 | **0.00** | 0.00 | 77/77 |
+| mat1 (armor_skin) | 1079 | 77.5 | 90.3 | 135.4 | 175.7 | 312.1 | 0 |
+| mat2 (fur) | 1797 | **0.26** | 8.8 | 43.0 | 79.1 | 319.4 | 11 |
+| mat3 (torso) | 1722 | 54.3 | 85.2 | 168.6 | 265.3 | 436.9 | 0 |
+
+Only the **fur** (mat2) is cage-adjacent, and only partly: 225/1797 verts within 20 mm, 529 within
+50 mm — a continuum with no natural cutoff. mat1 and mat3 never come within 54 mm.
+
+**Decisive: the near-cage render verts carry BONE skin weights.** Reading `BLENDINDICES`/
+`BLENDWEIGHTS` through the segment bone palette (66 entries, globals 4-250), verts within 50 mm of
+the cage reference global bones 5, 104, 134 and a dense run of **191-250** (the high-index cloth
+bones). There is **no bone used exclusively by near-cage verts** — the same bones drive near and
+far geometry.
+
+**Therefore the game deforms this cloth the way the app already does: cage sim -> cloth bones ->
+ordinary skinning.** Supporting evidence, all from M1:
+
+1. No authored render->cage binding exists — all 27 `ClothData` slots are named via
+   `definitions.json` (F8) and none maps render verts.
+2. `ptDeltaFrames` is per-CAGE-vert and a pure rotation (F6) — consistent with normal/tangent
+   transport for the cage/`_sim` mesh, not a render binding.
+3. The `_sim` submesh IS the cage (F7), so the only geometry with an exact cage relationship is
+   the simulation mesh itself.
+
+**Recommendation: do not build M2 as briefed.** Any cage->render binding would have to be a
+proximity heuristic over that 0.26-319 mm continuum — precisely the class of distance-threshold
+heuristic that produced the shared-cage and cross-garment defects already documented. The authored
+mechanism (driver skinning + follower bone drive) is already ported per PORTPLAN.md and is present
+in the app (`followerBone`/`drvInf`/`drvBone`/`nRealVerts`/`kinRoots` in ModelGeometry.h,
+ModelParser.cpp, GLModelWidget.cpp).
+
+**Where the remaining quality gap actually is:** collision, not skinning topology. The leading
+concrete lead is the capsule one from F8 — authored `scale`, `hide`, per-capsule `radius1/2`,
+`height` and `friction` exist and the app substitutes a hardcoded 0.52 radius multiplier for all
+of it.
+
 ## Remaining unknowns (decoded shape, purpose pending — none block the solver)
 
 - `ptDeltaFrames`: one 4×4 matrix per vert (pure rotation + identity row) — per-particle
