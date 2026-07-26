@@ -1770,6 +1770,7 @@ void StableTab2::rebuildMount()
     // Parse each selected slot into its own appearance geometry (roster-named), in
     // draw order: mount body → barding → trophy.
     QVector<ModelGeometry> parts;
+    QVector<int> pieceSlot;          // parallel to `parts`: which slot each piece came from
     QStringList loaded;
     QVector<ModelJoint> mountSkel;   // captured from the base mount, to seat the trophy
     QString trophyDbg;
@@ -1804,11 +1805,13 @@ void StableTab2::rebuildMount()
                                        : QStringLiteral(" · trophy → %1").arg(bone);
         }
         parts.append(geo);
+        pieceSlot.append(s);
         loaded << m_slotName[s];
     }
     if (parts.isEmpty()) {
         m_view->clearGeometry();
         m_lastGeo = ModelGeometry();
+        m_partSource.clear(); m_partSourceSno.clear(); m_partSourceSlot.clear();
         if (m_status) m_status->setText(QStringLiteral("No mount selected."));
         return;
     }
@@ -1818,6 +1821,7 @@ void StableTab2::rebuildMount()
         [&]() { geo = (parts.size() == 1) ? parts[0] : ModelParser::mergeGeometries(parts); });
     if (!merged || !geo.valid || geo.primitives.isEmpty()) {
         m_view->clearGeometry(); m_lastGeo = ModelGeometry();
+        m_partSource.clear(); m_partSourceSno.clear(); m_partSourceSlot.clear();
         if (m_status) m_status->setText(QStringLiteral("Assembly failed."));
         return;
     }
@@ -1825,11 +1829,36 @@ void StableTab2::rebuildMount()
     // after the multi-appearance merge (indices can otherwise collide across pieces).
     for (int i = 0; i < geo.primitives.size(); ++i) geo.primitives[i].materialIndex = i;
 
+    // Trace each merged primitive back to the appearance it came from. mergeGeometries concatenates
+    // primitives in piece order, so expanding the per-piece counts reproduces the mapping — the same
+    // approach WardrobeTab2 uses. If the totals ever disagree the assumption is broken, so fall back
+    // to attributing everything to the mount rather than mislabelling parts.
+    m_partSource.clear(); m_partSourceSno.clear(); m_partSourceSlot.clear();
+    int pieceTotal = 0;
+    for (const ModelGeometry& g : parts) pieceTotal += int(g.primitives.size());
+    if (pieceTotal == geo.primitives.size()) {
+        for (int k = 0; k < parts.size(); ++k) {
+            const int sl = pieceSlot.value(k, SlotMount);
+            for (int j = 0; j < parts[k].primitives.size(); ++j) {
+                m_partSource     << m_slotName[sl];
+                m_partSourceSno  << m_slotSel[sl];
+                m_partSourceSlot << sl;
+            }
+        }
+    } else {
+        for (int i = 0; i < geo.primitives.size(); ++i) {
+            m_partSource     << m_slotName[SlotMount];
+            m_partSourceSno  << m_slotSel[SlotMount];
+            m_partSourceSlot << int(SlotMount);
+        }
+    }
+
     m_lastGeo = geo;
     // Guard the GPU upload (flatten + VBO/IBO + cloth build) — the stage that most often faults.
     const bool gpuOk = seh::runGuarded("stableGpu", [&]() { m_view->setGeometry(geo, m_framed); });
     if (!gpuOk) {
         m_view->clearGeometry(); m_lastGeo = ModelGeometry();
+        m_partSource.clear(); m_partSourceSno.clear(); m_partSourceSlot.clear();
         if (m_status) m_status->setText(QStringLiteral("Couldn't display this model — skipped."));
         return;
     }
@@ -2108,25 +2137,42 @@ void StableTab2::rebuildPartList()
     // stale part indices would re-highlight an unrelated part in the new mesh.
     m_partTree->clearSelection();
     if (m_view) m_view->setHighlightParts({});
-    qint64 totalT = 0;
-    for (const MeshPrimitive& p : m_lastGeo.primitives) totalT += p.indices.size() / 3;
-    auto* root = new QTreeWidgetItem(m_partTree,
-        QStringList{ QStringLiteral("mount"), QString::number(totalT) });
-    root->setData(0, Qt::UserRole, -1);
-    root->setFlags(root->flags() | Qt::ItemIsUserCheckable | Qt::ItemIsAutoTristate);
-    root->setCheckState(0, Qt::Checked);
+    // One group per equipped appearance (mount / barding / trophy), matching Wardrobe's tree, so a
+    // part's owning item is visible at a glance and "Export Model" has an obvious meaning. With a
+    // bare mount that is a single group and looks exactly as it did before.
+    static const char* kSlotLabel[SlotCount] = { "mount", "barding", "trophy" };
+    QTreeWidgetItem* root = nullptr;
+    int rootSlot = -2;
+    qint64 rootT = 0;
+    auto closeGroup = [&] { if (root) root->setText(1, QString::number(rootT)); };
     for (int i = 0; i < m_lastGeo.primitives.size(); ++i) {
+        const int sl = m_partSourceSlot.value(i, SlotMount);
+        if (sl != rootSlot) {
+            closeGroup();
+            rootSlot = sl; rootT = 0;
+            const QString appName = m_partSource.value(i);
+            const QString label = (sl >= 0 && sl < SlotCount)
+                ? (appName.isEmpty() ? QString::fromLatin1(kSlotLabel[sl])
+                                     : QStringLiteral("%1  ·  %2").arg(QString::fromLatin1(kSlotLabel[sl]), appName))
+                : QStringLiteral("parts");
+            root = new QTreeWidgetItem(m_partTree, QStringList{ label, QString() });
+            root->setData(0, Qt::UserRole, -1);
+            root->setFlags(root->flags() | Qt::ItemIsUserCheckable | Qt::ItemIsAutoTristate);
+            root->setCheckState(0, Qt::Checked);
+        }
         QString name = m_lastGeo.primitives[i].materialName;
         if (name.isEmpty()) name = QStringLiteral("part %1").arg(i);
         if (i < m_partFx.size() && m_partFx[i]) name += QStringLiteral("  [FX]");
         if (i < m_partSim.size() && m_partSim[i]) name += QStringLiteral("  [SIM]");
         const int tris = int(m_lastGeo.primitives[i].indices.size() / 3);
+        rootT += tris;
         auto* child = new QTreeWidgetItem(root, QStringList{ name, QString::number(tris) });
         child->setData(0, Qt::UserRole, i);
         child->setTextAlignment(1, Qt::AlignRight | Qt::AlignVCenter);
         child->setFlags(child->flags() | Qt::ItemIsUserCheckable);
         child->setCheckState(0, Qt::Checked);
     }
+    closeGroup();
     m_partTree->expandAll();
     fillMaterialsPanel();
     updateTexTiles(-1);
@@ -4334,10 +4380,17 @@ void StableTab2::showPartContextMenu(int part, const QPoint& gp)
         ViewportPartMenu::Info in;
         ViewportPartMenu::Actions act;
         QTreeWidgetItem* item = nullptr;
+        // "Model" scope = the equipped appearance the picked part belongs to (empty space → all).
+        const QVector<int> modelParts = partsOfSource(part);
         int modelTris = 0;
-        if (m_view)
-            for (int i = 0; i < m_lastGeo.primitives.size(); ++i) modelTris += m_view->partTriangles(i);
-        in.sourceModel   = QStringLiteral("Mount");
+        if (m_view) {
+            if (modelParts.isEmpty())
+                for (int i = 0; i < m_lastGeo.primitives.size(); ++i) modelTris += m_view->partTriangles(i);
+            else
+                for (int i : modelParts) modelTris += m_view->partTriangles(i);
+        }
+        in.sourceModel   = (part >= 0 && part < m_partSource.size() && !m_partSource[part].isEmpty())
+                             ? m_partSource[part] : QStringLiteral("Mount");
         in.modelTris     = modelTris;
         in.lastExportDir = QSettings().value(QStringLiteral("stable2/exportDir")).toString();
         if (part >= 0 && part < m_lastGeo.primitives.size()) {
@@ -4345,6 +4398,9 @@ void StableTab2::showPartContextMenu(int part, const QPoint& gp)
             in.part         = part;
             in.partName     = m_lastGeo.primitives[part].materialName;
             in.partFileName = in.partName;
+            in.sourceFileName = m_partSource.value(part);   // the equipped piece this part came from
+            in.sourceName     = m_partSource.value(part);
+            in.sno            = m_partSourceSno.value(part, 0);
             in.partTris     = m_view ? m_view->partTriangles(part) : 0;
             in.visible      = !item || item->checkState(0) == Qt::Checked;
             in.isSim        = part < m_partSim.size() && m_partSim[part];
@@ -4365,8 +4421,14 @@ void StableTab2::showPartContextMenu(int part, const QPoint& gp)
             act.exportPart        = [this, part, pn] { exportMount(QVector<int>{part}, pn, false); };
             act.exportPartLastDir = [this, part, pn] { exportMount(QVector<int>{part}, pn, true); };
         }
-        act.exportModel        = [this] { exportMount(); };
-        act.exportModelLastDir = [this] { exportMount(QVector<int>(), QString(), true); };
+        if (modelParts.isEmpty()) {                       // empty space → the whole assembled mount
+            act.exportModel        = [this] { exportMount(); };
+            act.exportModelLastDir = [this] { exportMount(QVector<int>(), QString(), true); };
+        } else {                                          // a part was picked → just its source item
+            const QString sn = in.sourceModel;
+            act.exportModel        = [this, modelParts, sn] { exportMount(modelParts, sn, false); };
+            act.exportModelLastDir = [this, modelParts, sn] { exportMount(modelParts, sn, true); };
+        }
         act.showAll = [setAll] { setAll(Qt::Checked); };
         act.hideAll = [setAll] { setAll(Qt::Unchecked); };
         act.invert  = [this] {
@@ -4448,10 +4510,28 @@ void StableTab2::undo()
 }
 
 // ── Export ──────────────────────────────────────────────────────────────────────
+// All merged parts belonging to the same equipped appearance as `part` — the "model" that owns it
+// (mount, barding or trophy), not the whole assembled mount.
+QVector<int> StableTab2::partsOfSource(int part) const
+{
+    QVector<int> out;
+    if (part < 0 || part >= m_partSourceSlot.size()) return out;
+    const int sl = m_partSourceSlot[part];
+    for (int i = 0; i < m_partSourceSlot.size(); ++i)
+        if (m_partSourceSlot[i] == sl) out << i;
+    return out;
+}
+
 // `keep` selects which primitives to write; empty = the whole mount. The subset path backs the
-// context menu's "Export Part" — that used to isolate parts in the tree and call this function,
-// but the exporter reads m_lastGeo wholesale and never consulted the tree, so it silently wrote
-// the entire mount instead. `toLast` skips the file dialog and reuses the remembered folder.
+// context menu's "Export Part" and its source-scoped "Export Model" — those used to isolate parts
+// in the tree and call this function, but the exporter reads m_lastGeo wholesale and never
+// consulted the tree, so it silently wrote the entire mount instead.
+//
+// SCOPE RULE, shared with WardrobeTab2: an explicit `keep` is the user pointing at something in the
+// viewport, so it is written verbatim, hidden parts included. Only the no-subset path is the
+// "export what you see" scope that filters on partVisible().
+//
+// `toLast` skips the file dialog and reuses the remembered folder.
 void StableTab2::exportMount(const QVector<int>& keep, const QString& label, bool toLast)
 {
     if (!m_lastGeo.valid || m_lastGeo.primitives.isEmpty()) {

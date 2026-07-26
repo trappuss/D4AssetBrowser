@@ -7694,6 +7694,11 @@ QVector<int> WardrobeTab2::partsOfSource(int part) const
 }
 
 // Export an arbitrary subset of merged parts. `label` seeds the suggested filename.
+//
+// SCOPE RULE, shared with StableTab2: the subset is written verbatim, hidden parts included —
+// it comes from the user pointing at a part or its source item in the viewport. Only the
+// whole-outfit path (exportSelection) is the "export what you see" scope that filters on
+// partVisible().
 void WardrobeTab2::exportPartsSubset(const QVector<int>& parts, const QString& label, bool toLast)
 {
     if (parts.isEmpty() || !hasExportSelection()) return;
@@ -7756,6 +7761,7 @@ void WardrobeTab2::showPartContextMenu(int part, const QPoint& gp)
             in.partFileName   = in.partName;
             in.sourceFileName = m_partSource.value(part);     // the outfit piece this part came from
             in.sourceName     = m_partSource.value(part);
+            in.sno            = m_partSourceSno.value(part, -1);   // enables "Copy source SNO ID"
             in.partTris       = m_partTris.value(part);
             in.visible        = !item || item->checkState(0) == Qt::Checked;
             in.isSim          = part < m_partSim.size() && m_partSim[part];

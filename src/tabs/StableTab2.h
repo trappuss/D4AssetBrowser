@@ -181,6 +181,7 @@ private:
     void toggleFullscreen(bool on);                 // hide chrome, viewport fills the tab (Esc)
 
     // ── Export ───────────────────────────────────────────────────────────────
+    QVector<int> partsOfSource(int part) const;   // merged parts sharing one equipped appearance
     void exportMount(const QVector<int>& keep = {}, const QString& label = {}, bool toLast = false);
 
     // Icon for an appearance SNO (inventory icon if the game has one; else null).
@@ -264,6 +265,12 @@ private:
     QHash<int, QStringList> m_animCache;   // carrier SNO → clip rows
 
     QVector<int>  m_partFx, m_partSim, m_partHidden;   // per-primitive FX / simulated / force-hidden (collision) flags
+    // Per merged primitive: which of the up-to-three equipped appearances it came from. The mount,
+    // barding and trophy are merged into one geometry, so without this a right-clicked part cannot
+    // be traced back to the item that owns it.
+    QStringList   m_partSource;                       // source appearance name
+    QVector<int>  m_partSourceSno;                    // source appearance SNO
+    QVector<int>  m_partSourceSlot;                   // SlotMount / SlotBarding / SlotTrophy
     ModelGeometry m_lastGeo;
     QVector<ModelExporter::ExportMaterial> m_exportMats;
     // Session-wide raw material-decode cache (bounded, in-memory only; cleared on reset()/reload).

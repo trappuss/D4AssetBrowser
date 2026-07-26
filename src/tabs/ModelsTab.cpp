@@ -3107,11 +3107,14 @@ ModelsTab::ModelsTab(QWidget* parent) : BrowserTab(parent)
                     m_modelView->frameRegionKeepRotation(c, r, /*animate=*/true);
             };
             act.selectPart  = [this, part] { selectPartInOutliner(part); };
-            act.exportPart        = [this, part] { exportSinglePart(part, /*toLast=*/false); };
-            act.exportPartLastDir = [this, part] { exportSinglePart(part, /*toLast=*/true); };
+            const QString pn = in.partName.isEmpty() ? QStringLiteral("part") : in.partName;
+            act.exportPart        = [this, part, pn] { exportCurrentModelGlb(QVector<int>{part}, pn, false); };
+            act.exportPartLastDir = [this, part, pn] { exportCurrentModelGlb(QVector<int>{part}, pn, true); };
         }
-        act.exportModel        = [this] { exportSelectedGlb(); };
-        act.exportModelLastDir = [this] { exportSelectionToLast(); };
+        // Scoped to the model under the cursor. exportSelectedGlb/exportSelectionToLast take the
+        // LIST selection as their scope and would export other selected rows too.
+        act.exportModel        = [this] { exportCurrentModelGlb(QVector<int>(), QString(), false); };
+        act.exportModelLastDir = [this] { exportCurrentModelGlb(QVector<int>(), QString(), true); };
         act.showAll = [showAll] { showAll(); };
         act.hideAll = [this] {
             QHash<int, bool> all; m_treeModel->partChecks(all);
@@ -9248,22 +9251,6 @@ void ModelsTab::selectPartInOutliner(int part)
     m_list->scrollTo(ix);
 }
 
-// Export ONE part by isolating it and reusing the tab's normal export, which already filters on
-// partVisible() — so there is no second export path to keep in sync. Visibility is restored
-// afterwards regardless of how the export ends.
-void ModelsTab::exportSinglePart(int part, bool toLast)
-{
-    if (!m_treeModel || part < 0) return;
-    QHash<int, bool> saved; m_treeModel->partChecks(saved);
-    for (auto it = saved.constBegin(); it != saved.constEnd(); ++it)
-        m_treeModel->setPartCheck(it.key(), it.key() == part);
-    recomputePartVisibility();
-    if (toLast) exportSelectionToLast();
-    else        exportSelectedGlb();
-    for (auto it = saved.constBegin(); it != saved.constEnd(); ++it)
-        m_treeModel->setPartCheck(it.key(), it.value());
-    recomputePartVisibility();
-}
 
 void ModelsTab::applyModelRig()
 {

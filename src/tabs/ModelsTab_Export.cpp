@@ -41,6 +41,7 @@
 #include <QDialog>
 #include <QDialogButtonBox>
 #include <QDir>
+#include <QRegularExpression>
 #include <QFile>
 #include <QFileDialog>
 #include <QFileInfo>
@@ -182,9 +183,6 @@ static QString fmtBytes(quint64 b)
 
 void ModelsTab::exportSelectedGlb()
 {
-    const QString d4 = Config::d4dataDir();
-    const bool wantTex = m_exportTex && m_exportTex->isChecked() && m_reader && m_reader->isReady();
-
     // Distinct selected models (besides the current one) → batch export to a folder.
     QVector<QPair<int, QString>> others;   // (sno, name) excluding the current model
     if (m_list && m_list->selectionModel()) {
@@ -211,6 +209,22 @@ void ModelsTab::exportSelectedGlb()
     }
 
     // ── Single current model: look-aware, visible parts, Save-As dialog. ──
+    exportCurrentModelGlb(QVector<int>(), QString(), /*toLast=*/false);
+}
+
+// Write the CURRENT model as .glb. `keep` restricts the export to specific part indices (empty =
+// every visible, export-enabled part); `label` overrides the suggested filename; `toLast` skips
+// the Save-As dialog and reuses models/lastExportDir.
+//
+// The viewport context menu routes here rather than through exportSelectedGlb/exportSelectionToLast.
+// Those two treat the LIST selection as the scope: they batch-export every selected row by SNO,
+// re-parsing each from the archive. That path cannot see the parts tree at all, so "Export Part"
+// isolated a part and then exported the whole model anyway — and "Export Model" on a multi-row
+// selection exported models you never right-clicked.
+void ModelsTab::exportCurrentModelGlb(const QVector<int>& keep, const QString& label, bool toLast)
+{
+    const QString d4 = Config::d4dataDir();
+    const bool wantTex = m_exportTex && m_exportTex->isChecked() && m_reader && m_reader->isReady();
     if (!m_curGeo.valid || m_curGeo.primitives.isEmpty()) {
         QMessageBox::warning(this, QStringLiteral("Export .glb"),
                              QStringLiteral("No exportable geometry for this model "
@@ -225,9 +239,19 @@ void ModelsTab::exportSelectedGlb()
     // narrows the old "export what's visible" rule, it never widens it (default: all on).
     QHash<int, bool> expOn;
     if (m_treeModel) m_treeModel->partExportFlags(expOn);
-    for (int i = 0; i < m_curGeo.primitives.size(); ++i)
-        if ((!m_modelView || m_modelView->partVisible(i)) && expOn.value(i, true))
-            geo.primitives.push_back(m_curGeo.primitives[i]);
+    // An explicit `keep` is the user pointing at specific parts in the viewport menu, so it is
+    // honoured verbatim — neither viewport visibility NOR the outliner camera/export toggle filters
+    // it. Right-clicking a part and choosing Export exports that part, hidden or not. The
+    // no-subset path is the "export what you see" scope and still applies both filters.
+    if (keep.isEmpty()) {
+        for (int i = 0; i < m_curGeo.primitives.size(); ++i)
+            if ((!m_modelView || m_modelView->partVisible(i)) && expOn.value(i, true))
+                geo.primitives.push_back(m_curGeo.primitives[i]);
+    } else {
+        for (int i : keep)
+            if (i >= 0 && i < m_curGeo.primitives.size())
+                geo.primitives.push_back(m_curGeo.primitives[i]);
+    }
     if (geo.primitives.isEmpty()) {
         QMessageBox::warning(this, QStringLiteral("Export .glb"),
                              QStringLiteral("Every part is hidden or export-disabled (camera "
@@ -235,13 +259,29 @@ void ModelsTab::exportSelectedGlb()
         return;
     }
 
-    const QString suggested = (m_curName.isEmpty() ? QStringLiteral("model")
-                                                   : NameTemplate::model(m_curName, m_curSno)) + QStringLiteral(".glb");
-    const QString path = QFileDialog::getSaveFileName(
-        this, QStringLiteral("Export .glb"), suggested,
-        QStringLiteral("glTF binary (*.glb)"));
+    QString stem;
+    if (label.isEmpty()) {
+        // NameTemplate honours the user's export/nameModel pattern and does its own path-illegal
+        // stripping. Sanitising it here would eat the spaces, brackets and separators the template
+        // exists to produce, so only the context-menu `label` (a raw material name) is scrubbed.
+        stem = m_curName.isEmpty() ? QStringLiteral("model") : NameTemplate::model(m_curName, m_curSno);
+    } else {
+        stem = label;
+        stem.replace(QRegularExpression(QStringLiteral("[^A-Za-z0-9_.-]+")), QStringLiteral("_"));
+    }
+    if (stem.isEmpty()) stem = QStringLiteral("model");
+    const QString lastDir = QSettings().value(QStringLiteral("models/lastExportDir")).toString();
+    QString path;
+    if (toLast && !lastDir.isEmpty()) {
+        path = QDir(lastDir).filePath(stem + QStringLiteral(".glb"));
+    } else {
+        path = QFileDialog::getSaveFileName(
+            this, QStringLiteral("Export .glb"), QDir(lastDir).filePath(stem + QStringLiteral(".glb")),
+            QStringLiteral("glTF binary (*.glb)"));
+    }
     if (path.isEmpty())
         return;
+    QSettings().setValue(QStringLiteral("models/lastExportDir"), QFileInfo(path).absolutePath());
 
     if (QSettings().value(QStringLiteral("retarget/fitReference"), false).toBool())
         appendFitReferenceBody(m_reader, m_listModel, m_curName, geo);
@@ -837,7 +877,6 @@ void ModelsTab::exportSelectionToLast()
 {
     const QString dir = QSettings().value(QStringLiteral("models/lastExportDir")).toString();
     if (dir.isEmpty()) { exportSelectedGlb(); return; }   // no remembered folder → prompt
-    // Gather the current model plus any other selected rows and batch-export to the last folder.
     QVector<QPair<int, QString>> all;
     if (m_curSno >= 0 && !m_curName.isEmpty()) all.append({m_curSno, m_curName});
     if (m_list && m_list->selectionModel())
@@ -845,5 +884,12 @@ void ModelsTab::exportSelectionToLast()
             if (const SnoEntry* e = m_listModel->entryAt(idx.row()))
                 if (e->snoId != m_curSno) all.append({e->snoId, e->name});
     if (all.isEmpty()) { exportSelectedGlb(); return; }
+    // Only a multi-row selection is a batch. For the current model alone, go through the
+    // look-aware, visible-parts writer — exportModels() re-parses from the archive with the
+    // DEFAULT look and every part, which is not the model the user is looking at.
+    if (all.size() == 1 && all.first().first == m_curSno) {
+        exportCurrentModelGlb(QVector<int>(), QString(), /*toLast=*/true);
+        return;
+    }
     exportModels(all, dir);
 }

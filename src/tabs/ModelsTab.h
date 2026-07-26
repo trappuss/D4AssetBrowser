@@ -165,7 +165,6 @@ private:
     void   buildDyePanel();              // construct the Pigment (dye-zone) popup
     void   toggleDyePanel();             // show/hide it under the Pigment button
     void   selectPartInOutliner(int part);   // select in the tree; never moves the camera
-    void   exportSinglePart(int part, bool toLast);   // isolate → normal export → restore
     void   applyModelRig();              // push saved models/rig/* flags to m_modelView
     void   reapplyOverlays();            // re-push ALL overlay state (master gate + each box)
     // Shared row context-menu builders — list AND thumbnail grid compose from these,
@@ -211,6 +210,10 @@ private:
     void rebuildAssembledGeometry(); // base + active attachments → seated + textured in the viewport
     void loadDeferredMeta();
     void exportSelectedGlb();
+    // Current model only, optionally restricted to specific parts — what the viewport context
+    // menu uses, bypassing the list-selection batch path.
+    void exportCurrentModelGlb(const QVector<int>& keep = {}, const QString& label = {},
+                               bool toLast = false);
     void showDependencies(int sno, const QString& name);   // model → materials → textures tree
     void setInfo(const QString& key, const QString& value);
     void applyCategoryFilter();   // class/gender/type → model (tag-based when ready)
