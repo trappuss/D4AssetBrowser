@@ -10,6 +10,20 @@ taskkill /im D4AssetBrowser.exe /f >nul 2>&1
 :: bad edit/refactor/truncation). Best-effort: never blocks the build.
 call "%~dp0backup-src.bat"
 
+:: Pre-build source checks (verify-src.py): delimiter balance, MISSING #include for the
+:: header-only helpers, printf/qInfo format-vs-arg mismatches, Qt macro name collisions.
+:: These are cheap and catch the mistakes that otherwise cost a full MSVC cycle to discover.
+:: Non-blocking by design: a checker false positive must never stop you building.
+where python >nul 2>&1
+if not errorlevel 1 (
+    python "%~dp0verify-src.py" --quiet
+    if errorlevel 1 (
+        echo.
+        echo  ^>^> verify-src found problems ^(listed above^). Building anyway - Ctrl+C to stop.
+        echo.
+    )
+)
+
 :: Fast incremental rebuild: recompiles only changed source files and relinks.
 :: Does NOT rebuild vcpkg dependencies (Qt6 etc.) — those are already cached.
 :: Use this for the edit -> test loop; use build.bat only for the first build or

@@ -3098,6 +3098,19 @@ ModelsTab::ModelsTab(QWidget* parent) : BrowserTab(parent)
                 if (m_modelView->partsBounds(QVector<int>{part}, c, r))
                     m_modelView->frameRegionKeepRotation(c, r, /*animate=*/true);
             };
+            // Export just this part by ISOLATING it and reusing the normal export path — the
+            // exporter already filters on partVisible(), so there is no second export code path
+            // to keep in sync. Visibility is restored afterwards whatever happens.
+            act.exportPart  = [this, part] {
+                QHash<int, bool> saved; m_treeModel->partChecks(saved);
+                for (auto it = saved.constBegin(); it != saved.constEnd(); ++it)
+                    m_treeModel->setPartCheck(it.key(), it.key() == part);
+                recomputePartVisibility();
+                exportSelectedGlb();
+                for (auto it = saved.constBegin(); it != saved.constEnd(); ++it)
+                    m_treeModel->setPartCheck(it.key(), it.value());
+                recomputePartVisibility();
+            };
         }
         act.showAll = [showAll] { showAll(); };
         act.hideAll = [this] {

@@ -649,6 +649,24 @@ StableTab2::StableTab2(QWidget* parent) : BrowserTab(parent)
                 if (m_view->partsBounds(QVector<int>{part}, c, r))
                     m_view->frameRegionKeepRotation(c, r, /*animate=*/true);
             };
+            // Isolate → export → restore, reusing exportMount() so there is one export path.
+            act.exportPart  = [this, item, setAll] {
+                if (!m_partTree) return;
+                QVector<Qt::CheckState> saved;
+                for (int r = 0; r < m_partTree->topLevelItemCount(); ++r) {
+                    QTreeWidgetItem* root = m_partTree->topLevelItem(r);
+                    for (int c = 0; c < root->childCount(); ++c) saved << root->child(c)->checkState(0);
+                }
+                setAll(Qt::Unchecked);
+                if (item) item->setCheckState(0, Qt::Checked);
+                exportMount();
+                int k = 0;
+                for (int r = 0; r < m_partTree->topLevelItemCount(); ++r) {
+                    QTreeWidgetItem* root = m_partTree->topLevelItem(r);
+                    for (int c = 0; c < root->childCount(); ++c)
+                        if (k < saved.size()) root->child(c)->setCheckState(0, saved[k++]);
+                }
+            };
         }
         act.showAll = [setAll] { setAll(Qt::Checked); };
         act.hideAll = [setAll] { setAll(Qt::Unchecked); };

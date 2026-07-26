@@ -2085,6 +2085,25 @@ WardrobeTab2::WardrobeTab2(QWidget* parent) : BrowserTab(parent)
                 if (m_view->partsBounds(QVector<int>{part}, c, r))
                     m_view->frameRegionKeepRotation(c, r, /*animate=*/true);
             };
+            // Isolate → export → restore, reusing the tab's normal export (which honours the
+            // part-tree check states), so no separate per-part export path can drift.
+            act.exportPart  = [this, item, setAll] {
+                if (!m_partTree) return;
+                QVector<Qt::CheckState> saved;
+                for (int r = 0; r < m_partTree->topLevelItemCount(); ++r) {
+                    QTreeWidgetItem* root = m_partTree->topLevelItem(r);
+                    for (int c2 = 0; c2 < root->childCount(); ++c2) saved << root->child(c2)->checkState(0);
+                }
+                setAll(Qt::Unchecked);
+                if (item) item->setCheckState(0, Qt::Checked);
+                exportSelection();
+                int k = 0;
+                for (int r = 0; r < m_partTree->topLevelItemCount(); ++r) {
+                    QTreeWidgetItem* root = m_partTree->topLevelItem(r);
+                    for (int c2 = 0; c2 < root->childCount(); ++c2)
+                        if (k < saved.size()) root->child(c2)->setCheckState(0, saved[k++]);
+                }
+            };
         }
         act.showAll = [setAll] { setAll(Qt::Checked); };
         act.hideAll = [setAll] { setAll(Qt::Unchecked); };

@@ -728,6 +728,8 @@ private:
     bool             m_backfaceCull = true;              // cull back faces of the solid mesh
     GLuint           m_colVao = 0, m_colVbo = 0;
     int              m_colLineVerts = 0;
+    // One-past-last collider-overlay vertex per body region, so paintGL can colour each group.
+    QVector<int>     m_colRegionSpan;
     void buildGrid();
     void buildSkeleton();
     void buildPhysBones();

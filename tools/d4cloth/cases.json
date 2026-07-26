@@ -78,6 +78,15 @@
         "spiF_gla_nav_Idle"
       ]
     },
+    "thigh-through-hem": {
+      "pieces": [
+        "spiF_base00",
+        "spiF_stor214_LEG"
+      ],
+      "anims": [
+        "spiF_gla_nav_Idle"
+      ]
+    },
     "dru-explosion": {
       "pieces": [
         "druF_base00",

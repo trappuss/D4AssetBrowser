@@ -4401,9 +4401,31 @@ void main() { o = vec4(mix(uBot, uTop, clamp(vT, 0.0, 1.0)), 1.0); })";
             glDisable(GL_DEPTH_TEST);
             glUniform1i(uHasTex, 0); glUniform1i(uHasNormal, 0); glUniform1i(uHasEmissive, 0);
             glUniform1i(uHasDyeMask, 0); glUniform1i(uHasDyeRamp, 0); glUniform1i(uPbr, 0);
-            glUniform3f(uBase, 1.0f, 0.55f, 0.15f);   // orange capsules
             glBindVertexArray(m_colVao);
-            glDrawArrays(GL_LINES, 0, m_colLineVerts);
+            // One draw per BODY REGION, each in its own colour, so the region sliders are
+            // visually attributable and an all-"Other" rig is obvious at a glance.
+            // legs, waist, torso, arms, head, other
+            static const float kRegionRGB[ClothParams::CapRegionCount][3] = {
+                {0.25f, 0.75f, 1.00f},   // legs   — cyan
+                {1.00f, 0.80f, 0.20f},   // waist  — amber
+                {0.45f, 0.95f, 0.45f},   // torso  — green
+                {1.00f, 0.45f, 0.85f},   // arms   — pink
+                {0.75f, 0.60f, 1.00f},   // head   — violet
+                {1.00f, 0.55f, 0.15f},   // other  — the original orange
+            };
+            int first = 0;
+            for (int r = 0; r < ClothParams::CapRegionCount; ++r) {
+                const int end = (r < m_colRegionSpan.size()) ? m_colRegionSpan[r] : m_colLineVerts;
+                if (end > first) {
+                    glUniform3f(uBase, kRegionRGB[r][0], kRegionRGB[r][1], kRegionRGB[r][2]);
+                    glDrawArrays(GL_LINES, first, end - first);
+                }
+                first = qMax(first, end);
+            }
+            if (first < m_colLineVerts) {        // safety: draw any ungrouped remainder
+                glUniform3f(uBase, 1.0f, 0.55f, 0.15f);
+                glDrawArrays(GL_LINES, first, m_colLineVerts - first);
+            }
             glBindVertexArray(0);
             glEnable(GL_DEPTH_TEST);
         }
@@ -6088,7 +6110,26 @@ void GLModelWidget::buildColliderLines()
     };
     auto seg = [&](const float* a, const float* b) { push(a[0],a[1],a[2]); push(b[0],b[1],b[2]); };
     constexpr int N = 14;
-    for (int i = 0; i < n; ++i) {
+    // Emit capsules GROUPED BY BODY REGION into contiguous vertex ranges, so paintGL can draw one
+    // colour per region (same technique the phys-bone overlay uses for contact state). Without
+    // this the six region sliders are unattributable — you cannot see which capsule a slider moved,
+    // and a rig whose capsules all fall to "Other" looks identical to one that is correctly
+    // classified. m_colRegionSpan[r] = one-past-the-last vertex of region r.
+    m_colRegionSpan.fill(0, ClothParams::CapRegionCount);
+    QVector<int> order;
+    order.reserve(n);
+    for (int r = 0; r < ClothParams::CapRegionCount; ++r)
+        for (int i = 0; i < n; ++i) {
+            const quint8 rg = (i < m_colRegion.size()) ? m_colRegion[i] : quint8(ClothParams::CapOther);
+            if (rg == r) order.push_back(i);
+        }
+    int emitted = 0, curRegion = 0;
+    for (int oi = 0; oi < order.size(); ++oi) {
+        const int i = order[oi];
+        {
+            const quint8 rg = (i < m_colRegion.size()) ? m_colRegion[i] : quint8(ClothParams::CapOther);
+            while (curRegion < rg) m_colRegionSpan[curRegion++] = emitted;
+        }
         const float* p0 = (anim ? m_colP0.constData() : m_colP0Bind.constData()) + i*3;
         const float* p1 = (anim ? m_colP1.constData() : m_colP1Bind.constData()) + i*3;
         // Must mirror the solver's rScale exactly, or the Collision-model overlay draws capsules
@@ -6115,6 +6156,7 @@ void GLModelWidget::buildColliderLines()
         }
         for (int k = 0; k < N; ++k) { seg(ring0[k], ring0[k+1]); seg(ring1[k], ring1[k+1]); }
         for (int k = 0; k < N; k += N/4) seg(ring0[k], ring1[k]);   // 4 longitudinal lines
+        emitted = v.size() / 11;          // running end-of-region marker
     }
     if (v.isEmpty()) return;
     if (m_colVao == 0) glGenVertexArrays(1, &m_colVao);
@@ -6131,6 +6173,7 @@ void GLModelWidget::buildColliderLines()
     glEnableVertexAttribArray(3);
     glVertexAttribPointer(3, 3, GL_FLOAT, GL_FALSE, 11 * sizeof(float), reinterpret_cast<void*>(8 * sizeof(float)));
     glBindVertexArray(0);
+    while (curRegion < ClothParams::CapRegionCount) m_colRegionSpan[curRegion++] = emitted;
     m_colLineVerts = v.size() / 11;
 }
 
