@@ -104,6 +104,45 @@ to stretching/horizontal to be pinned down in M2 by edge-direction statistics), 
 - Unit system: consistent with 1 wu ≈ 1 m (constraint rests 0.09–0.35 wu on a cape,
   hem tethers ≈ 1.0 wu, capsule radii 0.03–0.15 wu).
 
+## F6 — `ptDeltaFrames` row layout: DECODED (M1.1); frame roll still open
+
+Brief (DELTAFRAMES.md) says "add as F4", but F4/F5 are taken — filed as F6.
+Measured on `barF_base03_TRS_cape` (vertexCount 77, capacity 80), raw bytes, no harness rebuild.
+
+**Settled — each row is a pure rotation, one per CAGE vert:**
+
+| Property | Measurement |
+|---|---|
+| Size | capacity x 64 B (80 rows); rows `[vertexCount, capacity)` are **identity** |
+| Translation | none — col 3 of rows 0-2 is exactly 0, row 3 is `(0,0,0,1)` |
+| Orthonormal | worst \|dot-delta\| = **3.04e-07** across all 77 |
+| Determinant | **+1.000000** for all 77 (proper rotation, no reflection) |
+| Handedness | **Y = Z x X**, worst component error **1.78e-07** (only X and Z are independent) |
+| **X axis** | **direction parent -> vertex**: mean `1-\|cos\|` = **0.00156**, worst 0.0274, n=63 (verts with a valid parent; `sign(X . (parent-vert)) = -0.998`) |
+
+**Refuted by measurement (do not retry):**
+
+- `ptBindNormals` as any axis — mean `1-\|cos\|` 0.306 (Z), 0.316 (Y).
+- Cage **triangle normal** (area-weighted, from `ptTriangles`) — 0.306/0.315, i.e. identical to
+  bindNormals, which it should be; both are simply not the frame's second axis.
+- **Tangent-partner direction** (`ptTangentIndices`) — 0.269 (Z) / 0.341 (Y), before and after
+  Gram-Schmidt against X.
+- **World-axis up-reference** (Z = normalise(up - (up.X)X)). The apparent 0.081 fit against worldZ
+  is an ARTEFACT: `\|X . worldZ\| >= 0.9` for **all 77** verts (the cape hangs vertically, so the
+  chain direction is near-parallel to world Z everywhere) — the projection is degenerate for every
+  vertex, so the statistic is meaningless. worldX/worldY: 0.295-0.327.
+
+**Open — the roll about X.** No cage-geometric quantity tested accounts for it. The array name
+("delta") suggests the rotation is relative to another frame rather than absolute, which is
+consistent with X being absolute-looking while the roll is not.
+
+**Blocker for the next test:** `ptDriverBindPose` is 48 B per driver (10 drivers = 480 B) and is
+NOT a plain 3x4 matrix — the third row reads `(1,1,1,1)` on every driver, so it is more likely
+pos/quat/scale in some packing. Decoding it is the prerequisite for testing "delta = rotation
+relative to the driver frame", which is the leading remaining hypothesis. A test run against the
+assumed 3x4 layout returned 0.906 mean error and is reported here as INVALID (wrong layout
+assumed), not as a refutation.
+
 ## Remaining unknowns (decoded shape, purpose pending — none block the solver)
 
 - `ptDeltaFrames`: one 4×4 matrix per vert (pure rotation + identity row) — per-particle
