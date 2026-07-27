@@ -6736,7 +6736,23 @@ void WardrobeTab2::rebuildOutfitImpl(bool async)
                     // its own bones at all is the first thing Phase 2 turns on.
                     const int trophyBones = g.skeleton.size();
                     dumpTrophyAnim(btAppr, g.skeleton);   // D4_DUMP_TROPHYANIM=1
-                    const QString bone = seatBackTrophy(g, m_bodySkeleton, hpMap, d4, btAppr);
+                    // ONLY bake boneless trophies. ModelAttach::seat pins every vert to the attach
+                    // bone and then CLEARS the child's skeleton — correct for a static prop, and the
+                    // only thing that works for one with no rig (trophy_rog001_stor has 0 bones and
+                    // merged at the origin without it). But a rigged trophy loses everything that
+                    // could ever move: trophy_glo014_stor carries 35 bones (5 base + 30 cloth) and a
+                    // 48-particle 'WingsVFX' sim cage, so baking it guarantees a frozen mesh.
+                    //
+                    // A rigged piece goes through the ordinary armour merge instead, which is how
+                    // every cloth-bearing garment already works: mergeGeometries keys on bone-name
+                    // hash, so the trophy's base bones fuse with the body's and its own bones append
+                    // past them — inheriting body motion and becoming eligible for the cloth solver.
+                    QString bone;
+                    if (trophyBones == 0) {
+                        bone = seatBackTrophy(g, m_bodySkeleton, hpMap, d4, btAppr);
+                    } else {
+                        bone = QStringLiteral("(rigged — merged, not baked)");
+                    }
                     loadLog += bone.isEmpty()
                         ? QStringLiteral("\nback trophy %1: NO body socket (left at origin), %2 own bones")
                               .arg(btAppr).arg(trophyBones)
