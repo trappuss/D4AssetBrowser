@@ -4156,6 +4156,45 @@ static quint32 sheathHardpointFor(const QString& itemType, bool offHand,
     return 0;
 }
 
+// D4_DUMP_TROPHYANIM=1 — does a back trophy have a rig, and do its clips drive it?
+//
+// These are the two unknowns blocking skeletal attachment. Today the trophy is seated by baking
+// its verts onto the attach bone, so any internal rig is discarded; before reworking that it is
+// worth knowing (a) whether trophies carry bones at all in the CASC payload — d4data's JSON shows
+// ptBoneData empty, which proves nothing since the tool parses rigs from the payload — and (b)
+// whether the clips target the TROPHY's bone hashes or the BODY's. A clip that turns out to drive
+// body bones would mean the trophy animates via the character rig and needs no sub-rig at all.
+//
+// Reports the overlap both ways rather than a verdict, so the data decides.
+void WardrobeTab2::dumpTrophyAnim(const QString& appr, const QVector<ModelJoint>& trophySkel)
+{
+    if (!qEnvironmentVariableIsSet("D4_DUMP_TROPHYANIM")) return;
+    QSet<quint32> own, body;
+    for (const ModelJoint& j : trophySkel) own.insert(j.nameHash);
+    for (const ModelJoint& j : m_bodySkeleton) body.insert(j.nameHash);
+    qInfo("[trophyanim] %s: %d own bones, body rig has %d",
+          qPrintable(appr), int(trophySkel.size()), int(m_bodySkeleton.size()));
+    for (int i = 0; i < trophySkel.size() && i < 12; ++i)
+        qInfo("    bone[%d] %s  hash=%u%s", i, qPrintable(trophySkel[i].name),
+              trophySkel[i].nameHash, body.contains(trophySkel[i].nameHash) ? "  (ALSO on body)" : "");
+    for (const BackTrophyIndex::Entry& t : BackTrophyIndex::instance().entries()) {
+        if (t.appearance.compare(appr, Qt::CaseInsensitive) != 0) continue;
+        for (const BackTrophyIndex::Clip& c : t.clips) {
+            const AnimParser::DecodedAnim d = decodeAnimForSkeleton(c.name, trophySkel);
+            if (!d.valid) { qInfo("    clip %s: DECODE FAILED", qPrintable(c.name)); continue; }
+            int hitOwn = 0, hitBody = 0, hitNeither = 0;
+            for (const AnimParser::DecodedBone& b : d.bones) {
+                if (own.contains(b.boneHash))       ++hitOwn;
+                else if (body.contains(b.boneHash)) ++hitBody;
+                else                                ++hitNeither;
+            }
+            qInfo("    clip %s: %d frames, %d tracks -> %d trophy, %d body, %d unmatched",
+                  qPrintable(c.name), d.frameCount, int(d.bones.size()), hitOwn, hitBody, hitNeither);
+        }
+        break;
+    }
+}
+
 // Seat a BACK TROPHY on the body. Back cosmetics ship no skeleton that matches the body rig, so
 // the normal armour merge left them unweighted at the model origin — the trophy rendered on the
 // floor between the character's feet.
@@ -6674,10 +6713,16 @@ void WardrobeTab2::rebuildOutfitImpl(bool async)
             if (btSno > 0) {
                 const QString btAppr = m_backTrophy->currentData(Qt::UserRole + 1).toString();
                 addPiece(btSno, btAppr, false, 9, [&](ModelGeometry& g) {
+                    // Recorded BEFORE seating, which bakes the rig away: whether a trophy carries
+                    // its own bones at all is the first thing Phase 2 turns on.
+                    const int trophyBones = g.skeleton.size();
+                    dumpTrophyAnim(btAppr, g.skeleton);   // D4_DUMP_TROPHYANIM=1
                     const QString bone = seatBackTrophy(g, m_bodySkeleton, hpMap, d4, btAppr);
                     loadLog += bone.isEmpty()
-                        ? QStringLiteral("\nback trophy %1: NO body socket (left at origin)").arg(btAppr)
-                        : QStringLiteral("\nback trophy %1 → %2").arg(btAppr, bone);
+                        ? QStringLiteral("\nback trophy %1: NO body socket (left at origin), %2 own bones")
+                              .arg(btAppr).arg(trophyBones)
+                        : QStringLiteral("\nback trophy %1 → %2, %3 own bones")
+                              .arg(btAppr, bone).arg(trophyBones);
                 });
             }
         }
@@ -8609,9 +8654,18 @@ void WardrobeTab2::fillAnimList()
 // export path can decode clips that aren't playing (scope "All of the model's animations").
 AnimParser::DecodedAnim WardrobeTab2::decodeAnimByName(const QString& animName)
 {
+    return decodeAnimForSkeleton(animName, m_lastMerged.skeleton);
+}
+
+// Decode a clip against an ARBITRARY rig. The rest pose is only a per-bone fallback for empty
+// curves, so the returned DecodedBone::boneHash values are the clip's own targets regardless of
+// which skeleton is passed — which is what makes this usable to ask "whose bones does this clip
+// actually drive?" before committing to a way of attaching the mesh.
+AnimParser::DecodedAnim WardrobeTab2::decodeAnimForSkeleton(const QString& animName,
+                                                            const QVector<ModelJoint>& skel)
+{
     AnimParser::DecodedAnim invalid;
-    if (animName.isEmpty() || m_lastMerged.skeleton.isEmpty()
-        || !m_reader || !m_reader->isReady())
+    if (animName.isEmpty() || skel.isEmpty() || !m_reader || !m_reader->isReady())
         return invalid;
     const QString d4 = Config::d4dataDir();
     QFile jf(QStringLiteral("%1/json/base/meta/Anim/%2.ani.json").arg(d4, animName));
@@ -8632,7 +8686,7 @@ AnimParser::DecodedAnim WardrobeTab2::decodeAnimByName(const QString& animName)
     if (payload.isEmpty()) return invalid;
 
     QHash<quint32, AnimParser::RestTRS> rest;
-    for (const ModelJoint& j : m_lastMerged.skeleton) {
+    for (const ModelJoint& j : skel) {
         AnimParser::RestTRS t; t.q = j.restQ; t.t = j.restT; t.s = j.restS;
         rest.insert(j.nameHash, t);
     }

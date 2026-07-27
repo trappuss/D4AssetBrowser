@@ -496,7 +496,12 @@ private:
     void populateAnims();                  // list animations for the current body rig
     void fillAnimList();                   // (re)build the list applying filter + sort + search
     void playAnimByName(const QString& animName);
-    AnimParser::DecodedAnim decodeAnimByName(const QString& animName);  // meta+payload → clip (invalid on failure)
+    AnimParser::DecodedAnim decodeAnimByName(const QString& animName);
+    // D4_DUMP_TROPHYANIM=1: report a trophy's own rig and whose bones its clips drive.
+    void dumpTrophyAnim(const QString& appr, const QVector<ModelJoint>& trophySkel);
+    // Same, against an explicit rig — lets a clip be inspected before the merged rig exists.
+    AnimParser::DecodedAnim decodeAnimForSkeleton(const QString& animName,
+                                                  const QVector<ModelJoint>& skel);  // meta+payload → clip (invalid on failure)
     // Gather clips per Settings ▸ Export ▸ "Animations to embed": the playing clip, or
     // EVERY clip in the (filtered) ANIMATIONS list. Falls back to the selected list entry
     // when nothing is playing, so "Embed animation" never silently exports none.
