@@ -57,7 +57,10 @@ struct Reader {
     const quint8* d = nullptr;
     int n = 0;
     Reader(const QByteArray& b) : d(reinterpret_cast<const quint8*>(b.constData())), n(b.size()) {}
-    bool in(int off, int len) const { return d && off >= 0 && len >= 0 && off + len <= n; }
+    // 64-bit sum: `off + len` in int WRAPS for file-derived offsets near INT_MAX, so the guard
+    // returned true and the accessor read far past the buffer.
+    bool in(int off, int len) const
+    { return d && off >= 0 && len >= 0 && qint64(off) + qint64(len) <= qint64(n); }
     quint8  u8(int o)  const { return in(o, 1) ? d[o] : quint8(0); }
     quint16 u16(int o) const { return in(o, 2) ? quint16(quint16(d[o]) | (quint16(d[o+1])<<8)) : quint16(0); }
     quint32 u32(int o) const {
@@ -170,8 +173,11 @@ QVector<VB> scanVertexBuffers(const Reader& meta, int payloadSize)
         if (stride != STRIDE_SIMPLE && stride != STRIDE_SKINNED) continue;
         const int dataOffset = int(meta.u32(off + 0x38));
         const int dataSize   = int(meta.u32(off + 0x3C));
-        if (dataOffset == 0 || dataSize == 0) continue;
-        if (dataOffset + dataSize > payloadSize) continue;
+        if (dataOffset <= 0 || dataSize <= 0) continue;
+        // 64-bit: two file-derived values near 2^31 wrapped to a negative sum and passed, after
+        // which vcount = dataSize / stride became tens of millions and the vertex allocation
+        // asked for gigabytes (bad_alloc, which this tool's crash log shows every time).
+        if (qint64(dataOffset) + qint64(dataSize) > qint64(payloadSize)) continue;
         if (dataSize % stride != 0) continue;
         const quint32 fOpt = meta.u32(off + 0x4C);
         if (fOpt != 0 && fOpt != 1) continue;
@@ -212,9 +218,9 @@ QVector<IB> scanIndexBuffers(const Reader& meta, int payloadSize, const QVector<
         if (meta.u32(off) != 0 || meta.u32(off + 4) != 0) continue;
         const int dataOffset = int(meta.u32(off + 0x08));
         const int dataSize   = int(meta.u32(off + 0x0C));
-        if (dataOffset == 0 || dataSize == 0) continue;
+        if (dataOffset <= 0 || dataSize <= 0) continue;
         if (dataOffset <= meta.n) continue;            // meta-resident, not an ibuf
-        if (dataOffset + dataSize > payloadSize) continue;
+        if (qint64(dataOffset) + qint64(dataSize) > qint64(payloadSize)) continue;   // see above
         if (dataSize % 2 != 0) continue;
         const qint32 ibid = meta.i32(off + 0x10);
         const quint32 fOpt = meta.u32(off + 0x14);
@@ -242,9 +248,19 @@ QVector<int> readBonePalette(const Reader& meta, int structOffset)
     const quint32 doff = meta.u32(structOffset + 8);
     const quint32 dsz  = meta.u32(structOffset + 12);
     if (doff == 0 || dsz == 0 || dsz % 4 != 0) return out;
-    const int base = int(doff) + 16;
-    if (base < 0 || base + int(dsz) > meta.n) return out;
-    const int n = int(dsz) / 4;
+    // All arithmetic in 64-bit and the count clamped to what the buffer can hold. `dsz` is a
+    // file-derived u32: any value with bit 31 set still satisfies `% 4 == 0`, and int(dsz) is then
+    // NEGATIVE, so the old `base + int(dsz) > meta.n` test passed and `QVector<int> vals(n)` was
+    // constructed with a negative size. scanSegments calls this for EVERY 4-byte offset in the
+    // meta blob that looks segment-shaped, and a negative float (0xBF800000 etc.) is exactly that
+    // bit pattern — so one false positive anywhere in a large meta was enough to fault. Every
+    // other count in this file is clamped against the buffer before allocating; this one was not.
+    const qint64 base64 = qint64(doff) + 16;
+    const qint64 end64  = base64 + qint64(dsz);
+    if (base64 < 0 || end64 > qint64(meta.n)) return out;
+    const int base = int(base64);
+    const int n = int(qint64(dsz) / 4);
+    if (n <= 0) return out;
     QVector<int> vals(n);
     for (int i = 0; i < n; ++i) {
         const qint32 v = meta.i32(base + i * 4);
@@ -430,7 +446,12 @@ void parseSkeleton(const Reader& meta, const Reader& payload, ModelGeometry& geo
     if (refOff >= 4 && refOff + 20 <= meta.n) {
         const quint32 nBase  = meta.u32(refOff - 4);
         const quint32 nCloth = meta.u32(refOff + 16);
-        if (nBase > 0 && int(nBase + nCloth) == count) {
+        // Summed as 64-bit and range-checked BEFORE narrowing. `nBase + nCloth` wrapped in u32,
+        // so e.g. nBase = 0xFFFFFFFF still passed `nBase > 0` and narrowed to -1, and the loop
+        // then wrote before the start of the array. The counts are also required to be sane
+        // rather than merely to add up.
+        const qint64 sum = qint64(nBase) + qint64(nCloth);
+        if (nBase > 0 && nBase <= quint32(count) && sum == qint64(count)) {
             for (int i = int(nBase); i < count; ++i) geo.skeleton[i].cloth = true;
             if (geo.nBaseBones <= 0) geo.nBaseBones = int(nBase);
         }
@@ -510,7 +531,13 @@ void parseClothCapsules(const Reader& meta, const Reader& payload, QVector<Cloth
             };
             int bvO,bvS, imO,imS, ciO,ciS, clO,clS, trO,trS, dmO,dmS, plO,plS;
             arr(288,bvO,bvS); arr(320,imO,imS); arr(528,ciO,ciS); arr(544,clO,clS); arr(512,trO,trS); arr(704,dmO,dmS); arr(672,plO,plS);
-            const int nCage = bvS / 16, nMass = imS / 4, nPair = ciS / 2 / 2, nLen = clS / 4, nTri = trS / 2 / 3, nMap = dmS / 2, nPlane = plS / 48;
+            // Every count clamped at 0: these divide file-derived i32 sizes, and a negative one
+            // reaches QList::fill()/reserve() below (conClass.fill(255, nPair)) where a negative
+            // size is not merely wrong but faults. Same defect class as readBonePalette's.
+            auto cnt = [](int bytes, int per) { return (bytes > 0 && per > 0) ? bytes / per : 0; };
+            const int nCage = cnt(bvS, 16), nMass = cnt(imS, 4), nPair = cnt(ciS, 4),
+                      nLen  = cnt(clS, 4),  nTri  = cnt(trS, 6), nMap  = cnt(dmS, 2),
+                      nPlane = cnt(plS, 48);
             ClothSim sim;
             const Reader* rbv = rdr(bvO,bvS); const Reader* rim = rdr(imO,imS);
             const Reader* rci = rdr(ciO,ciS); const Reader* rcl = rdr(clO,clS); const Reader* rtr = rdr(trO,trS);

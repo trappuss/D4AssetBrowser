@@ -6577,10 +6577,17 @@ void WardrobeTab2::rebuildOutfitImpl(bool async)
             return false;
         }
         ModelGeometry geo;   // guarded: a malformed equipped piece must not crash the process
-        if (!seh::runGuarded("w2Parse", [&]() { geo = ModelParser::parseApp(meta, payload, name); })) {
+        // Capture the fault text: runGuarded also catches std::exception, so "FAULTED" alone
+        // cannot distinguish an access violation from a bad_alloc — and those point at completely
+        // different defects. The ModelsTab path already reports it; this one silently did not.
+        seh::HardwareFault fault;
+        if (!seh::runGuarded("w2Parse", [&]() { geo = ModelParser::parseApp(meta, payload, name); },
+                             &fault)) {
             loadLog += QStringLiteral("\n%1: parse FAULT (pay=%2)").arg(name).arg(payload.size());
-            qWarning("wardrobe piece %s (sno %d, slot %d): parse FAULTED (payload=%lld)",
-                     qPrintable(name), sno, slot, qint64(payload.size()));
+            qWarning("wardrobe piece %s (sno %d, slot %d): parse FAULTED [%s] (payload=%lld)",
+                     qPrintable(name), sno, slot,
+                     fault.what.isEmpty() ? "no detail" : qPrintable(fault.what),
+                     qint64(payload.size()));
             return false;
         }
         if (!geo.valid) {
