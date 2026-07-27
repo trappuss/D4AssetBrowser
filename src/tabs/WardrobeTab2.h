@@ -302,6 +302,8 @@ private:
     QLabel*      m_attachWho   = nullptr;
     QListWidget* m_attachAnims = nullptr;
     QCheckBox*   m_attachPlay  = nullptr;
+    QLabel*      m_attachHint  = nullptr;
+    QToolButton* m_attachRestart = nullptr;
     void refreshAttachAnimList();   // repopulate from the equipped attachment
     int   m_btAttachFrom = -1;
     int   m_btAttachFrames = 0;

@@ -81,6 +81,7 @@
 #include <QMouseEvent>
 #include <QPair>
 #include <QPainter>
+#include <QPen>
 #include <QPixmap>
 #include <QPolygonF>
 #include <QSpinBox>
@@ -124,13 +125,13 @@ constexpr int kGroupTexture = 44;
 
 // Painter-drawn playback transport icons — 0 play · 1 pause · 2 step-back · 3 step-forward.
 // (Copied verbatim from the Models tab so the Wardrobe transport bar matches it exactly.)
-QIcon transportGlyph(int kind)
+QIcon transportGlyph(int kind, const QColor& tint = QColor(210, 205, 190))
 {
     QPixmap pm(16, 16);
     pm.fill(Qt::transparent);
     QPainter p(&pm);
     p.setRenderHint(QPainter::Antialiasing);
-    const QColor c(210, 205, 190);
+    const QColor c = tint;
     p.setPen(Qt::NoPen);
     p.setBrush(c);
     switch (kind) {
@@ -139,6 +140,26 @@ QIcon transportGlyph(int kind)
     case 2:   p.drawRect(3, 3, 2, 10); p.drawPolygon(QPolygonF({{13.0, 3.0}, {13.0, 13.0}, {6.0, 8.0}})); break;  // step back
     case 3:   p.drawPolygon(QPolygonF({{3.0, 3.0}, {3.0, 13.0}, {10.0, 8.0}})); p.drawRect(11, 3, 2, 10); break;  // step fwd
     }
+    return QIcon(pm);
+}
+
+// Strip/panel glyph for ATTACHED animations: the play triangle in the attachment accent, orbited
+// by a ring — it reads as "a second, separate playhead" rather than a duplicate of the ANIMATIONS
+// button, which is what a same-shaped icon in a vertical strip of glyphs looks like.
+const QColor kAttachAccent(120, 200, 255);
+
+QIcon attachedGlyph()
+{
+    QPixmap pm(16, 16);
+    pm.fill(Qt::transparent);
+    QPainter p(&pm);
+    p.setRenderHint(QPainter::Antialiasing);
+    p.setPen(QPen(kAttachAccent, 1.4));
+    p.setBrush(Qt::NoBrush);
+    p.drawEllipse(QRectF(1.4, 1.4, 13.2, 13.2));
+    p.setPen(Qt::NoPen);
+    p.setBrush(kAttachAccent);
+    p.drawPolygon(QPolygonF({{6.0, 4.6}, {6.0, 11.4}, {11.4, 8.0}}));
     return QIcon(pm);
 }
 
@@ -1468,26 +1489,52 @@ WardrobeTab2::WardrobeTab2(QWidget* parent) : BrowserTab(parent)
     auto* al = new QVBoxLayout(m_attachPanel);
     al->setContentsMargins(0, 0, 0, 0);
     al->setSpacing(3);
-    m_attachWho = new QLabel(QStringLiteral("(nothing attached)"), m_attachPanel);
+    // Header: which model these clips belong to. Accent-coloured and left-ruled so the panel reads
+    // as a different subject from ANIMATIONS at a glance rather than on a second look.
+    m_attachWho = new QLabel(QStringLiteral("Nothing attached"), m_attachPanel);
     m_attachWho->setWordWrap(true);
-    m_attachWho->setStyleSheet(QStringLiteral("color:#9aa0a6;"));
+    m_attachWho->setStyleSheet(QStringLiteral(
+        "QLabel{color:#78c8ff;border-left:2px solid #78c8ff;padding:2px 0 2px 6px;}"));
     al->addWidget(m_attachWho);
+    // Secondary line: what the panel DOES. New concept ("second timeline"), so it earns one line
+    // of explanation rather than hiding in a tooltip nobody hovers.
+    m_attachHint = new QLabel(m_attachPanel);
+    m_attachHint->setWordWrap(true);
+    m_attachHint->setStyleSheet(QStringLiteral("color:#8a8f96;font-size:11px;"));
+    m_attachHint->setText(QStringLiteral("Runs on its own loop, independent of the character clip."));
+    al->addWidget(m_attachHint);
     m_attachAnims = new QListWidget(m_attachPanel);
     m_attachAnims->setAlternatingRowColors(true);
     m_attachAnims->setMinimumHeight(80);
+    m_attachAnims->setSelectionMode(QAbstractItemView::SingleSelection);
+    // The accent follows through to the selection, so it is obvious which list a highlighted row
+    // belongs to when both panels are up.
+    m_attachAnims->setStyleSheet(QStringLiteral(
+        "QListWidget::item:selected{background:#1d4b66;color:#eaf6ff;}"
+        "QListWidget::item{padding:2px 4px;}"));
     m_attachAnims->setToolTip(QStringLiteral(
         "Clips shipped with the attached model. Selecting one plays it on its OWN looping "
         "timeline — independent of the character clip, so mismatched lengths do not fight."));
     al->addWidget(m_attachAnims, 1);
     {
-        auto* row = new QHBoxLayout(); row->setSpacing(4);
+        auto* row = new QHBoxLayout(); row->setSpacing(6);
         m_attachPlay = new QCheckBox(QStringLiteral("Play"), m_attachPanel);
         m_attachPlay->setChecked(true);
-        m_attachPlay->setToolTip(QStringLiteral("Stop to freeze the attachment on its first frame"));
+        m_attachPlay->setToolTip(QStringLiteral("Off freezes the attachment on its first frame"));
         row->addWidget(m_attachPlay);
         row->addStretch(1);
+        // Restart is genuinely useful here: the attachment loops on its own clock, so there is
+        // otherwise no way to see a one-shot clip (a killstreak) from the top on demand.
+        m_attachRestart = new QToolButton(m_attachPanel);
+        m_attachRestart->setText(QStringLiteral("Restart"));
+        m_attachRestart->setToolTip(QStringLiteral("Play the selected clip from its first frame"));
+        m_attachRestart->setAutoRaise(true);
+        row->addWidget(m_attachRestart);
         al->addLayout(row);
     }
+    connect(m_attachRestart, &QToolButton::clicked, this, [this] {
+        if (!m_playingAnim.isEmpty()) playAnimByName(m_playingAnim);   // re-arms the attach clock
+    });
     // Re-arm playback with whatever is selected now. Goes through the normal clip path so the
     // character clip is rebuilt and the attachment range re-declared in one place.
     connect(m_attachAnims, &QListWidget::currentItemChanged, this,
@@ -2475,8 +2522,10 @@ WardrobeTab2::WardrobeTab2(QWidget* parent) : BrowserTab(parent)
     section(QStringLiteral("ANIMATIONS"), QStringLiteral("ANIMATIONS"), m_animPanel,
             transportGlyph(0).pixmap(QSize(16, 16)),
             QStringLiteral("Animations — the model's clip list (filter, search, select to play)"));
+    // Own colour AND own shape: the strip is a column of small monochrome glyphs, so a tint alone
+    // is easy to miss — the ring marks it as "the other timeline" at a glance.
     section(QStringLiteral("ATTACHED"), QStringLiteral("ATTACHED"), m_attachPanel,
-            transportGlyph(0).pixmap(QSize(16, 16)),
+            attachedGlyph().pixmap(QSize(16, 16)),
             QStringLiteral("Attached animations — clips owned by an attached model (back trophy), "
                            "played on their own independent timeline"));
     m_rstripLay->addStretch(1);   // registrations are done — pin the strip buttons to the top
@@ -8951,16 +9000,34 @@ void WardrobeTab2::refreshAttachAnimList()
         : QSettings().value(QStringLiteral("wardrobe2/attachClip")).toString();
     QSignalBlocker block(m_attachAnims);
     m_attachAnims->clear();
+    // Controls are only meaningful with something animated attached; leaving them live invites a
+    // click that silently does nothing.
+    auto setControls = [this](bool on) {
+        if (m_attachPlay)    m_attachPlay->setEnabled(on);
+        if (m_attachRestart) m_attachRestart->setEnabled(on);
+        if (m_attachAnims)   m_attachAnims->setEnabled(on);
+    };
     if (m_btSubRigAppr.isEmpty()) {
-        // Either nothing is equipped, or what is equipped is a static prop that was baked in
-        // place — say which, because "no clips" and "not attached" look identical otherwise.
+        // Three distinct states that all look like "empty list" unless spelled out: nothing in the
+        // slot, something in the slot that is a static prop, or an index that has not landed yet.
         const bool equipped = m_backTrophy && m_backTrophy->currentData().toInt() > 0;
-        m_attachWho->setText(equipped
-            ? QStringLiteral("Equipped back item has no animation of its own.")
-            : QStringLiteral("(nothing attached)"));
-        m_attachPanel->setEnabled(true);
+        const QString what = equipped ? m_backTrophy->currentText().section(QStringLiteral("  ("), 0, 0)
+                                      : QString();
+        if (!equipped) {
+            m_attachWho->setText(QStringLiteral("Nothing attached"));
+            m_attachHint->setText(QStringLiteral("Equip a Back item to see its own clips here."));
+        } else if (!BackTrophyIndex::instance().ready()) {
+            m_attachWho->setText(what);
+            m_attachHint->setText(QStringLiteral("Scanning for clips…"));
+        } else {
+            m_attachWho->setText(what);
+            m_attachHint->setText(QStringLiteral("This item is a static prop — it ships no animation "
+                                                 "of its own. Most back items do not."));
+        }
+        setControls(false);
         return;
     }
+    setControls(true);
     QString label = m_btSubRigAppr;
     for (const BackTrophyIndex::Entry& t : BackTrophyIndex::instance().entries()) {
         if (t.appearance.compare(m_btSubRigAppr, Qt::CaseInsensitive) != 0) continue;
@@ -8971,15 +9038,24 @@ void WardrobeTab2::refreshAttachAnimList()
             QString kind = c.name.mid(m_btSubRigAppr.size());
             if (kind.startsWith(QLatin1Char('_'))) kind = kind.mid(1);
             if (kind.isEmpty()) kind = QStringLiteral("default");
+            // Seconds, not just frames: "4.0s" answers "how long is this loop" directly, which is
+            // the question the number is actually being read for.
+            const double secs = c.frames > 0 ? c.frames / 30.0 : 0.0;
             auto* it = new QListWidgetItem(
-                c.frames > 0 ? QStringLiteral("%1  ·  %2 frames").arg(kind).arg(c.frames) : kind,
+                c.frames > 0 ? QStringLiteral("%1   ·   %2 frames  (%3s)")
+                                   .arg(kind).arg(c.frames).arg(secs, 0, 'f', 1)
+                             : kind,
                 m_attachAnims);
             it->setData(Qt::UserRole, c.name);
-            it->setToolTip(c.name);
+            it->setToolTip(QStringLiteral("%1\nPlays on its own %2-frame loop.").arg(c.name).arg(c.frames));
         }
         break;
     }
-    m_attachWho->setText(QStringLiteral("%1 — %2 clip(s)").arg(label).arg(m_attachAnims->count()));
+    const int n = m_attachAnims->count();
+    m_attachWho->setText(label);
+    m_attachHint->setText(n == 1
+        ? QStringLiteral("1 clip · own loop, independent of the character")
+        : QStringLiteral("%1 clips · own loop, independent of the character").arg(n));
     // Restore the previous pick when the same clip still exists, else take the first.
     int row = 0;
     for (int i = 0; i < m_attachAnims->count(); ++i)
