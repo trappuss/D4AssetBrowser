@@ -198,6 +198,9 @@ public:
     void setAnimation(const AnimParser::DecodedAnim& anim);
     void clearAnimation();
     void setFrame(int f);
+    // Marks tracks [from, end) of the current animation as an attached model's, played on their own
+    // looping timeline rather than the body clip's. Reset by every setAnimation().
+    void setAttachAnimRange(int from, int frames, float fps);
     int   animFrameCount() const { return m_hasAnim ? m_anim.frameCount : 0; }
     // Copy the CURRENT on-screen pose (the CPU-skinned verts) back into `geo` — positions +
     // normals, primitives walked in setGeometry's flatten order — and zero the skinning data so
@@ -412,6 +415,15 @@ private:
     QVector<ModelJoint>            m_skeleton;
     AnimParser::DecodedAnim        m_anim;
     QHash<quint32,int>             m_animByHash;  // bone hash → anim bone index
+    // An ATTACHED model's clip rides in the same DecodedAnim (its tracks appended after the body's)
+    // but on its OWN timeline. Projecting it onto the body clip's frame count made it restart every
+    // time the body clip looped — a 130-frame trophy idle on a 56-frame body idle only ever played
+    // its first 56 frames. Tracks at or past m_animAttachFrom are indexed by m_frameAttach instead,
+    // derived from wall-clock at the clip's authored rate and wrapped on ITS own length.
+    int                            m_animAttachFrom = -1;   // first attached track (-1 = none)
+    int                            m_animAttachFrames = 0;
+    float                          m_animAttachFps = 30.0f;
+    int                            m_frameAttach = 0;
     bool                           m_hasAnim = false;
     int                            m_frame = 0;
 

@@ -8906,6 +8906,7 @@ void WardrobeTab2::collectExportAnims(QVector<AnimParser::DecodedAnim>& anims, Q
 // plays at its authored speed and repeats for as long as the body clip runs.
 void WardrobeTab2::mergeBackTrophyIdle(AnimParser::DecodedAnim& anim)
 {
+    m_btAttachFrom = -1; m_btAttachFrames = 0;
     if (m_btSubRigAppr.isEmpty() || m_btPreSaltSkel.isEmpty()
         || !anim.valid || anim.frameCount <= 0) return;
     QString idle;
@@ -8924,25 +8925,25 @@ void WardrobeTab2::mergeBackTrophyIdle(AnimParser::DecodedAnim& anim)
     if (!tr.valid || tr.bones.isEmpty() || tr.frameCount <= 0) return;
 
     const quint32 salt = backTrophySalt(m_btSubRigAppr);
+    const int from = anim.bones.size();   // attached tracks start here, and run on their own clock
     int added = 0;
     for (const AnimParser::DecodedBone& src : tr.bones) {
-        AnimParser::DecodedBone b;
+        // Appended at their AUTHORED length, not resampled onto the body clip. Resampling with
+        // `f % tr.frameCount` tied the trophy to the body's frame index, so every time the body
+        // clip looped back to 0 the trophy restarted too — a 130-frame idle under a 56-frame body
+        // idle never played past its 56th frame. The viewport indexes these by m_frameAttach.
+        AnimParser::DecodedBone b = src;
         b.boneHash = ModelAttach::saltBoneHash(src.boneHash, salt);
-        b.translations.reserve(anim.frameCount);
-        b.rotations.reserve(anim.frameCount);
-        b.scales.reserve(anim.frameCount);
-        for (int f = 0; f < anim.frameCount; ++f) {
-            const int sf = f % tr.frameCount;      // wrap, so a short body clip still loops it
-            if (sf < src.translations.size()) b.translations.push_back(src.translations[sf]);
-            if (sf < src.rotations.size())    b.rotations.push_back(src.rotations[sf]);
-            if (sf < src.scales.size())       b.scales.push_back(src.scales[sf]);
-        }
         if (b.rotations.isEmpty() && b.translations.isEmpty()) continue;
         anim.bones.push_back(b);
         ++added;
     }
-    qInfo("back trophy %s: merged clip %s (%d frames, %d body frames) — %d tracks",
-          qPrintable(m_btSubRigAppr), qPrintable(idle), tr.frameCount, anim.frameCount, added);
+    m_btAttachFrom   = added ? from : -1;      // handed to the viewport after setAnimation()
+    m_btAttachFrames = added ? tr.frameCount : 0;
+    m_btAttachFps    = tr.frameRate > 1.0f ? tr.frameRate : 30.0f;
+    qInfo("back trophy %s: clip %s on its own timeline — %d frames @ %.0f fps (body clip %d frames), %d tracks",
+          qPrintable(m_btSubRigAppr), qPrintable(idle), tr.frameCount, double(m_btAttachFps),
+          anim.frameCount, added);
 }
 
 void WardrobeTab2::playAnimByName(const QString& animName)
@@ -8957,6 +8958,8 @@ void WardrobeTab2::playAnimByName(const QString& animName)
     m_curAnim = anim;   // retained for "include animation" .glb export
     QSettings().setValue(QStringLiteral("wardrobe2/anim"), animName);   // remember selection
     if (!seh::runGuarded("w2SetAnim", [&]() { m_view->setAnimation(anim); })) return;
+    // AFTER setAnimation, which clears any previous range.
+    m_view->setAttachAnimRange(m_btAttachFrom, m_btAttachFrames, m_btAttachFps);
     m_timeline->setVisible(true);   // (restored) timeline shows once a clip is playing
     m_animSlider->blockSignals(true);
     m_animSlider->setRange(0, anim.frameCount - 1);

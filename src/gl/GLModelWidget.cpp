@@ -1341,8 +1341,18 @@ void GLModelWidget::clearGeometry()
     update();
 }
 
+void GLModelWidget::setAttachAnimRange(int from, int frames, float fps)
+{
+    m_animAttachFrom   = (from >= 0 && frames > 0) ? from : -1;
+    m_animAttachFrames = qMax(0, frames);
+    m_animAttachFps    = (fps > 1.0f) ? fps : 30.0f;
+    m_frameAttach      = 0;
+}
+
 void GLModelWidget::setAnimation(const AnimParser::DecodedAnim& anim)
 {
+    // A new clip invalidates the attached range; the caller re-declares it after installing.
+    m_animAttachFrom = -1; m_animAttachFrames = 0; m_frameAttach = 0;
     m_anim = anim;
     m_animByHash.clear();
     for (int i = 0; i < anim.bones.size(); ++i)
@@ -1449,6 +1459,13 @@ void GLModelWidget::setFrame(int f)
     if (!m_hasAnim) return;
     m_frame = qBound(0, f, m_anim.frameCount - 1);
     if (!m_clothClock.isValid()) m_clothClock.start();
+    // Wall-clock, wrapped on the attached clip's OWN length: it neither restarts when the body
+    // clip loops nor stretches to match it, so it runs at its authored speed.
+    if (m_animAttachFrames > 0) {
+        const qint64 ms = m_clothClock.elapsed();
+        const qint64 fr = qint64(double(ms) * double(m_animAttachFps) / 1000.0);
+        m_frameAttach = int(fr % qint64(m_animAttachFrames));
+    }
     m_lastFrameStep = m_clothClock.elapsed();   // mark playback so the idle timer stands down
     applySkinning();
     // Camera Snap + follow: pan the target to the followed slot's live position (keep zoom/angle),
@@ -3000,10 +3017,12 @@ void GLModelWidget::applySkinning()
         // static channels legitimately carry fewer keyframes than the rotation track.
         if (ai >= 0 && ai < m_anim.bones.size()) {
             const auto& ba = m_anim.bones[ai];
+            // Attached tracks run on their own clock (see m_animAttachFrom).
+            const int fa = (m_animAttachFrom >= 0 && ai >= m_animAttachFrom) ? m_frameAttach : f;
             if (!ba.rotations.isEmpty() && !ba.translations.isEmpty() && !ba.scales.isEmpty()) {
-                const int rf = qBound(0, f, int(ba.rotations.size())    - 1);
-                const int tf = qBound(0, f, int(ba.translations.size()) - 1);
-                const int sf = qBound(0, f, int(ba.scales.size())       - 1);
+                const int rf = qBound(0, fa, int(ba.rotations.size())    - 1);
+                const int tf = qBound(0, fa, int(ba.translations.size()) - 1);
+                const int sf = qBound(0, fa, int(ba.scales.size())       - 1);
                 local[j] = composeTRS(ba.rotations[rf].data(), ba.translations[tf].data(), ba.scales[sf].data());
                 continue;
             }

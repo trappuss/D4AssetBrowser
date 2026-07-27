@@ -296,6 +296,10 @@ private:
     // The trophy's skeleton BEFORE its bones were re-hashed. Its clips must be decoded against
     // these original hashes or the decoder substitutes a zero rest pose for every bone.
     QVector<ModelJoint> m_btPreSaltSkel;
+    // Where the attached trophy's tracks start in the played clip, and their own length/rate.
+    int   m_btAttachFrom = -1;
+    int   m_btAttachFrames = 0;
+    float m_btAttachFps = 30.0f;
     QTreeWidget* m_partTree = nullptr; // per-part visibility tree (piece → submeshes)
     QWidget* m_sidebar = nullptr;      // right-side panel column (strip + splitter)
     QSplitter* m_rsplit = nullptr;     // vertical splitter: the visible panels, drag to resize
