@@ -30,6 +30,7 @@
 #include "model/AnimParser.h"
 #include "model/Material.h"
 #include "model/Retarget.h"
+#include "model/Attachments.h"
 #include "model/Hardpoints.h"
 #include "model/MaterialDecode.h"
 #include "tabs/MarkingCompose.h"
@@ -4138,6 +4139,51 @@ static quint32 sheathHardpointFor(const QString& itemType, bool offHand,
     return 0;
 }
 
+// Seat a BACK TROPHY on the body. Back cosmetics ship no skeleton that matches the body rig, so
+// the normal armour merge left them unweighted at the model origin — the trophy rendered on the
+// floor between the character's feet.
+//
+// Unlike mount trophies, a back trophy's actor authors NO attachment hardpoint
+// (ptItemData[0].tAttachmentHardpointLink.tInfo.dwHash is 0 on every one in the snapshot), and
+// ItemType/CosmeticBack ships empty tHardpointOffsets. The socket therefore has to come from the
+// BODY rig, which carries HP_chestBack: on the chest bone, offset behind it, with a ~180° Z
+// rotation baked into its quaternion so a mesh seated there faces backwards — exactly a
+// back-mount. It is also the socket the sheathed-weapon code already falls back to.
+//
+// The authored hash is still read first, so if a future patch starts filling that field this
+// follows it instead of the fallback.
+static QString seatBackTrophy(ModelGeometry& geo, const QVector<ModelJoint>& bodySkel,
+                              const QHash<quint32, QPair<int, std::array<float,16>>>& hp,
+                              const QString& d4, const QString& trophyAppr)
+{
+    if (geo.primitives.isEmpty() || hp.isEmpty()) return QString();
+    quint32 authored = 0;
+    if (!d4.isEmpty() && !trophyAppr.isEmpty()) {
+        QFile af(d4 + QStringLiteral("/json/base/meta/Actor/") + trophyAppr + QStringLiteral(".acr.json"));
+        if (af.open(QIODevice::ReadOnly)) {
+            const QJsonArray items = QJsonDocument::fromJson(af.readAll()).object()
+                                         .value(QStringLiteral("ptItemData")).toArray();
+            if (!items.isEmpty())
+                authored = quint32(items.first().toObject()
+                                       .value(QStringLiteral("tAttachmentHardpointLink")).toObject()
+                                       .value(QStringLiteral("tInfo")).toObject()
+                                       .value(QStringLiteral("dwHash")).toVariant().toULongLong());
+        }
+    }
+    QVector<quint32> order;
+    if (authored) order << authored;
+    order << 899481535u  /*HP_chestBack*/ << 1373172648u /*HP_back*/
+          << 4168202000u /*HP_spineMid*/  << 2366464462u /*HP_chest*/;
+    for (quint32 hash : order) {
+        if (!hash || !hp.contains(hash)) continue;
+        ModelAttach::Attachment at;
+        at.hpHash = hash;                     // identity grip: the socket carries the orientation
+        ModelAttach::seat(geo, bodySkel, hp, at);
+        return Hardpoints::nameForHash(hash);
+    }
+    return QString();
+}
+
 // Seat one parsed weapon into a hand using real attach data: the weapon's ItemType
 // names the hardpoint (dwHash) + a grip offset; the body hardpoint maps that hash to
 // a bone + bone-local transform. Final world = boneWorld · T_hp · T_off, re-expressed
@@ -6445,7 +6491,14 @@ void WardrobeTab2::rebuildOutfitImpl(bool async)
 
     // Parse + register a piece into `parts`. Returns true only if it produced geometry,
     // so callers can fall through to the next candidate when a parse fails. Logs each step.
-    auto addPiece = [&](int sno, const QString& nameIn, bool isBody, int slot = -1) -> bool {
+    // Body hardpoint map (hash → bone + bone-local transform) for this class/gender. At function
+    // scope because BOTH the back trophy and the weapon pass seat against it.
+    const auto hpMap = loadBodyHardpoints(d4);
+    // `onGeo`, when supplied, runs on the parsed geometry BEFORE it is merged — the hook the back
+    // trophy uses to seat itself on a body hardpoint. It must not change the primitive count, which
+    // pieceList/primSlot are about to be sized from.
+    auto addPiece = [&](int sno, const QString& nameIn, bool isBody, int slot = -1,
+                        const std::function<void(ModelGeometry&)>& onGeo = {}) -> bool {
         if (sno <= 0) return false;
         // Resolve a missing name from the SNO index (an empty name crashed appearanceRoster).
         QString name = nameIn;
@@ -6497,6 +6550,7 @@ void WardrobeTab2::rebuildOutfitImpl(bool async)
                           .arg(geo.skeleton.size())
                           .arg(cand.isEmpty() ? QStringLiteral("(none)") : cand.join(QStringLiteral(", ")));
         }
+        if (onGeo) onGeo(geo);
         pieceList.append({name, int(geo.primitives.size())});
         pieceSno.append(sno);
         for (int pi = 0; pi < geo.primitives.size(); ++pi) primSlot.append(slot);   // dye-slot tag
@@ -6592,14 +6646,23 @@ void WardrobeTab2::rebuildOutfitImpl(bool async)
                 if (addPiece(nudeSno, nudeName, false)) break;   // first that parses wins
             }
         }
-        // Back trophy (player back cosmetic): a "back_*" appearance rigged to the spine — merges
-        // onto the body like an armour piece. Tagged slot 9 so framing/selection find it.
+        // Back trophy (player back cosmetic). It carries no body-matching rig, so it is SEATED on
+        // the body's HP_chestBack socket rather than merged like armour — merging left it
+        // unweighted at the model origin, i.e. lying on the floor. Tagged slot 9 so
+        // framing/selection find it.
         if (m_backTrophy) {
             const int btSno = m_backTrophy->currentData().toInt();
             // The APPEARANCE name, not currentText(): the label is "<localized name>  (<stem>)"
             // and appearanceRoster/parseApp key off the appearance stem.
-            if (btSno > 0)
-                addPiece(btSno, m_backTrophy->currentData(Qt::UserRole + 1).toString(), false, 9);
+            if (btSno > 0) {
+                const QString btAppr = m_backTrophy->currentData(Qt::UserRole + 1).toString();
+                addPiece(btSno, btAppr, false, 9, [&](ModelGeometry& g) {
+                    const QString bone = seatBackTrophy(g, m_bodySkeleton, hpMap, d4, btAppr);
+                    loadLog += bone.isEmpty()
+                        ? QStringLiteral("\nback trophy %1: NO body socket (left at origin)").arg(btAppr)
+                        : QStringLiteral("\nback trophy %1 → %2").arg(btAppr, bone);
+                });
+            }
         }
         // Creator mesh pieces (additive appearances, like equipment):
         //   Hair style → <pref>_H<NN>   ·   Jewelry → jwl<NN>_<pref>
@@ -6637,7 +6700,6 @@ void WardrobeTab2::rebuildOutfitImpl(bool async)
     // Weapons: parse the main-hand + off-hand models and seat each on its real body
     // hardpoint (bone + grip transform) from game data — full rotation, not just position.
     QString weapDbg;
-    const auto hpMap = loadBodyHardpoints(d4);
     const QString wgender = (m_gender && m_gender->currentData().toString() == QLatin1String("m"))
                                 ? QStringLiteral("Male") : QStringLiteral("Female");
     // Held main/off (slots 5/6) seat in-hand; sheathed main/off (slots 7/8) seat rigidly on the
