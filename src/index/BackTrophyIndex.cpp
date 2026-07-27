@@ -9,14 +9,13 @@
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
-#include <QRegularExpression>
 #include <QSet>
 
 #include <algorithm>
 #include <thread>
 
 namespace {
-constexpr int kCacheVersion = 2;   // v2 adds per-trophy clips
+constexpr int kCacheVersion = 3;   // v3 resolves clips by snoAppearance, not by name
 
 // The ItemType every back trophy points at. Matched against the sno reference's target path, not
 // against the item's own filename — that distinction is the whole point of this index.
@@ -52,15 +51,6 @@ QString normStem(const QString& s)
     return out.toLower();
 }
 
-// Keyframe count of a clip, read once at index time. 0 when absent — the UI just omits it.
-int clipFrames(const QString& path)
-{
-    QFile f(path);
-    if (!f.open(QIODevice::ReadOnly)) return 0;
-    static const QRegularExpression rx(QStringLiteral("\"nKeyframeCount\":\\s*(\\d+)"));
-    const auto m = rx.match(QString::fromUtf8(f.readAll()));
-    return m.hasMatch() ? m.captured(1).toInt() : 0;
-}
 
 // One line describing an index result, used by BOTH the cache-hit and the fresh-build paths.
 // They reported different things before: a warm start printed only the trophy count, so the
@@ -219,39 +209,51 @@ void BackTrophyIndex::ensureBuilt(const QString& d4dataDir)
             out.push_back(e);
         }
 
-        // Pass 3 — the trophy's own clips. One directory listing, then a normalised stem match:
-        // a clip belongs to a trophy when its name IS the appearance stem or extends it with a
-        // "_<clip>" suffix (_idle, _killstreak, _anim). Anything that matches nothing is logged
-        // rather than force-fitted — an unexplained clip is a signal, not a row to invent.
+        // Pass 3 — the trophy's own clips, resolved by the clip's OWN snoAppearance reference.
+        //
+        // This replaces a name match. Every one of the shipped trophy clips declares
+        // snoAppearance, and the declaration disagrees with the filename often enough to matter:
+        // trophy_glo12_stor_idle belongs to appearance trophy_glo012_stor (padding), and
+        // trophy_sor_emotes_031_stor belongs to trophy_sor035_stor — which no name rule could
+        // ever have found, and which the old code correctly refused to guess at and logged.
+        //
+        // The filename prefix survives only as a cheap gate: the Anim folder holds ~45k files and
+        // parsing all of them to read one field would dominate the build. A clip that owns a
+        // trophy appearance but is NOT named trophy_* is therefore still missed; that is a
+        // deliberate performance trade, not an assumption about ownership.
         {
-            struct AniFile { QString stem, norm, path; };
-            QVector<AniFile> anis;
+            QHash<QString, Entry*> byAppr;
+            for (Entry& e : out) byAppr.insert(e.appearance.toLower(), &e);
             QDirIterator ai(animDir, {QStringLiteral("*.ani.json")}, QDir::Files);
             while (ai.hasNext()) {
                 const QString fp = ai.next();
-                AniFile a;
-                a.stem = QFileInfo(fp).fileName().section(QStringLiteral(".ani.json"), 0, 0);
-                if (!a.stem.startsWith(QLatin1String("trophy"), Qt::CaseInsensitive)) continue;
-                a.norm = normStem(a.stem);
-                a.path = fp;
-                anis.push_back(a);
-            }
-            QSet<QString> claimed;
-            for (Entry& e : out) {
-                const QString en = normStem(e.appearance);
-                for (const AniFile& a : anis) {
-                    if (a.norm != en && !a.norm.startsWith(en + QLatin1Char('_'))) continue;
-                    Clip c;
-                    c.name   = a.stem;
-                    c.frames = clipFrames(a.path);
-                    e.clips.push_back(c);
-                    claimed.insert(a.stem);
+                const QString stem = QFileInfo(fp).fileName().section(QStringLiteral(".ani.json"), 0, 0);
+                if (!stem.startsWith(QLatin1String("trophy"), Qt::CaseInsensitive)) continue;
+                QFile f(fp);
+                if (!f.open(QIODevice::ReadOnly)) continue;
+                const QJsonObject o = QJsonDocument::fromJson(f.readAll()).object();
+                QString owner = refBaseName(o.value(QStringLiteral("snoAppearance")));
+                // Only if the clip declares no owner do we fall back to the old name rule.
+                if (owner.isEmpty()) {
+                    const QString n = normStem(stem);
+                    for (auto it = byAppr.constBegin(); it != byAppr.constEnd(); ++it)
+                        if (n == normStem(it.key()) || n.startsWith(normStem(it.key()) + QLatin1Char('_')))
+                            { owner = it.value()->appearance; break; }
                 }
+                Entry* e = owner.isEmpty() ? nullptr : byAppr.value(owner.toLower(), nullptr);
+                if (!e) {
+                    qInfo("back-trophy index: clip %s owns appearance '%s', which is not a back trophy",
+                          qPrintable(stem), qPrintable(owner.isEmpty() ? QStringLiteral("(none)") : owner));
+                    continue;
+                }
+                Clip c;
+                c.name   = stem;
+                // Keyframes from the permutation already parsed here, rather than re-reading.
+                const QJsonArray perms = o.value(QStringLiteral("ptPermutations")).toArray();
+                c.frames = perms.isEmpty() ? 0
+                    : perms.first().toObject().value(QStringLiteral("nKeyframeCount")).toInt();
+                e->clips.push_back(c);
             }
-            for (const AniFile& a : anis)
-                if (!claimed.contains(a.stem))
-                    qInfo("back-trophy index: clip %s matches no trophy appearance",
-                          qPrintable(a.stem));
         }
 
         std::sort(out.begin(), out.end(), [](const Entry& a, const Entry& b) {
