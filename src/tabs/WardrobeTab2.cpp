@@ -336,6 +336,10 @@ const ClassDef kClasses[8] = {
 constexpr int kNumClasses = 8;
 
 
+// Marks a row in the animation list as the equipped back trophy's own clip rather than a body
+// clip, so selection can refuse to play it against the body rig.
+constexpr int kTrophyClipRole = Qt::UserRole + 7;
+
 // The nine character-creator categories: UI label, SNO folder, file extension.
 struct CreatorCat { const char* label; const char* folder; const char* ext; };
 const CreatorCat kCreator[9] = {
@@ -1407,6 +1411,9 @@ WardrobeTab2::WardrobeTab2(QWidget* parent) : BrowserTab(parent)
         {"Attack", "attk"}, {"Navigation", "nav"}, {"Turn", "turn"}, {"Sheathe", "sheath"},
         {"Reaction", "reac"}, {"Emote", "emote,emotes"}, {"UI", "_ui_"}, {"Wardrobe", "wardrobe"},
         {"Mount", "mount,horse"}, {"Two-Hand", "2h"}, {"Dual Wield", "dw_"}, {"One-Hand", "1h"},
+        // The equipped back trophy's OWN clips, appended to the list below. Every trophy clip is
+        // named trophy_*, so the plain token isolates them without any special-casing here.
+        {"Back trophy", "trophy"},
     };
     for (const auto& c : kAnimCats)
         m_animFilter->addItem(QString::fromLatin1(c.label), QString::fromLatin1(c.token));
@@ -2225,6 +2232,15 @@ WardrobeTab2::WardrobeTab2(QWidget* parent) : BrowserTab(parent)
             [this](QListWidgetItem* it, QListWidgetItem*) {
         if (!it) return;
         const QString name = it->data(Qt::UserRole).toString();
+        // Trophy clips drive the TROPHY's bones, which the current seating bakes away. Playing one
+        // against the body rig would decode to nothing and silently stop whatever was running, so
+        // say why instead of pretending.
+        if (it->data(kTrophyClipRole).toBool()) {
+            if (m_status)
+                m_status->setText(QStringLiteral("%1 is the back trophy's own clip — it animates the "
+                                                 "trophy's rig, which isn't preserved yet.").arg(name));
+            return;
+        }
         if (name != m_playingAnim) { playAnimByName(name); m_animJustSelected = true; }
     });
     // Re-clicking the ALREADY-selected clip unselects it (stops + clears). But a first click
@@ -2670,6 +2686,7 @@ WardrobeTab2::WardrobeTab2(QWidget* parent) : BrowserTab(parent)
         if (m_restoring) return;
         QSettings().setValue(QStringLiteral("wardrobe2/backTrophy"),
                              QString::number(m_backTrophy->currentData().toInt()));
+        fillAnimList();   // the list carries this trophy's own clips
         scheduleRebuild();
     });
     // Build both popups eagerly so m_env (Preview) and m_fovSlider (Camera) exist for
@@ -2755,7 +2772,7 @@ void WardrobeTab2::refresh()
     // is empty until this lands, so refill the slot lists when it does.
     BackTrophyIndex::instance().ensureBuilt(Config::d4dataDir());
     connect(&BackTrophyIndex::instance(), &BackTrophyIndex::readyChanged, this,
-            [this] { populateSlots(); });
+            [this] { populateSlots(); fillAnimList(); });
     // Appearance-icon atlas index (same trigger point as the Models tab). Refill the grid/cells
     // when it finishes; show the live percentage while it scans.
     IconIndex::instance().ensureBuilt(Config::d4dataDir());
@@ -8501,7 +8518,9 @@ void WardrobeTab2::fillAnimList()
 {
     if (!m_anims) return;
     const QStringList rows = m_animCache.value(classPrefix());
-    struct A { QString display, name; int frames; };
+    // `forced` overrides the AnimActionIndex action label: trophy clips are not in any AnimSet, so
+    // that index has nothing to say about them and they would otherwise render as bare filenames.
+    struct A { QString display, name; int frames; QString forced; };
     QVector<A> items;
     items.reserve(rows.size());
     for (const QString& r : rows) {
@@ -8510,6 +8529,27 @@ void WardrobeTab2::fillAnimList()
         const QString tail = r.section(QStringLiteral("  ·  "), 1, 1);   // "N frames"
         a.frames = tail.isEmpty() ? 0 : tail.section(QLatin1Char(' '), 0, 0).toInt();
         items << a;
+    }
+    // The equipped back trophy's own clips. Listed but NOT yet playable on the body rig: the
+    // trophy is seated by baking its verts onto the attach bone, which leaves no internal rig for
+    // a clip to drive. Surfacing them first makes the name mapping verifiable against real data
+    // before the seating is reworked to preserve the trophy's skeleton.
+    if (m_backTrophy && m_backTrophy->currentData().toInt() > 0) {
+        const QString appr = m_backTrophy->currentData(Qt::UserRole + 1).toString();
+        for (const BackTrophyIndex::Entry& t : BackTrophyIndex::instance().entries()) {
+            if (t.appearance.compare(appr, Qt::CaseInsensitive) != 0) continue;
+            for (const BackTrophyIndex::Clip& c : t.clips) {
+                A a;
+                a.name    = c.name;
+                a.frames  = c.frames;
+                a.display = c.frames > 0
+                    ? QStringLiteral("%1  ·  %2 frames").arg(c.name).arg(c.frames)
+                    : c.name;
+                a.forced  = QStringLiteral("Back trophy");
+                items << a;
+            }
+            break;
+        }
     }
     const int sort = m_animSort ? m_animSort->currentIndex() : 0;
     std::sort(items.begin(), items.end(), [sort](const A& x, const A& y) {
@@ -8541,17 +8581,25 @@ void WardrobeTab2::fillAnimList()
             for (const QString& t : tokens) if (low.contains(t)) { hit = true; break; }
             if (!hit) continue;
         }
-        const QString action = aai.action(low);
+        const QString action = a.forced.isEmpty() ? aai.action(low) : a.forced;
         const QString label = action.isEmpty() ? a.display
                                                : QStringLiteral("%1   —   %2").arg(action, a.display);
         if (!search.isEmpty() && !label.toLower().contains(search)) continue;   // match action too
         auto* it = new QListWidgetItem(label, m_anims);
         it->setData(Qt::UserRole, a.name);
-        const QString set = aai.animSet(low);
-        if (!action.isEmpty() || !set.isEmpty())
-            it->setToolTip(QStringLiteral("Action: %1\nAnimSet: %2")
-                               .arg(action.isEmpty() ? QStringLiteral("—") : action,
-                                    set.isEmpty() ? QStringLiteral("—") : set));
+        it->setData(kTrophyClipRole, !a.forced.isEmpty());
+        if (!a.forced.isEmpty()) {
+            it->setToolTip(QStringLiteral("Animation shipped with the equipped back trophy.\n"
+                                          "Listed for reference — not yet playable, because the "
+                                          "trophy is baked onto its attach bone and keeps no rig "
+                                          "of its own."));
+        } else {
+            const QString set = aai.animSet(low);
+            if (!action.isEmpty() || !set.isEmpty())
+                it->setToolTip(QStringLiteral("Action: %1\nAnimSet: %2")
+                                   .arg(action.isEmpty() ? QStringLiteral("—") : action,
+                                        set.isEmpty() ? QStringLiteral("—") : set));
+        }
         if (a.name == sel) m_anims->setCurrentItem(it);
     }
     m_anims->blockSignals(false);

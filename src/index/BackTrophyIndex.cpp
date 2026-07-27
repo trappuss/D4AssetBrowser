@@ -9,12 +9,14 @@
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
+#include <QRegularExpression>
+#include <QSet>
 
 #include <algorithm>
 #include <thread>
 
 namespace {
-constexpr int kCacheVersion = 1;
+constexpr int kCacheVersion = 2;   // v2 adds per-trophy clips
 
 // The ItemType every back trophy points at. Matched against the sno reference's target path, not
 // against the item's own filename — that distinction is the whole point of this index.
@@ -28,6 +30,36 @@ QString refBaseName(const QJsonValue& v)
     const QString t = v.toObject().value(QStringLiteral("__targetFileName__")).toString();
     if (t.isEmpty()) return {};
     return QFileInfo(t).completeBaseName();
+}
+
+// Collapse leading zeros inside every digit run: "trophy_glo012_stor" -> "trophy_glo12_stor".
+// The clip files are inconsistently padded against the appearance stems they belong to —
+// trophy_glo12_stor_idle/_killstreak, trophy_glo13_*, trophy_glo14_* are the clips of appearances
+// trophy_glo012/013/014_stor. Matching raw strings silently drops five of the ~25 shipped clips.
+QString normStem(const QString& s)
+{
+    QString out;
+    out.reserve(s.size());
+    for (int i = 0; i < s.size(); ) {
+        if (!s[i].isDigit()) { out += s[i++]; continue; }
+        int j = i;
+        while (j < s.size() && s[j].isDigit()) ++j;
+        int k = i;
+        while (k < j - 1 && s[k] == QLatin1Char('0')) ++k;   // keep at least one digit
+        out += QStringView(s).mid(k, j - k);
+        i = j;
+    }
+    return out.toLower();
+}
+
+// Keyframe count of a clip, read once at index time. 0 when absent — the UI just omits it.
+int clipFrames(const QString& path)
+{
+    QFile f(path);
+    if (!f.open(QIODevice::ReadOnly)) return 0;
+    static const QRegularExpression rx(QStringLiteral("\"nKeyframeCount\":\\s*(\\d+)"));
+    const auto m = rx.match(QString::fromUtf8(f.readAll()));
+    return m.hasMatch() ? m.captured(1).toInt() : 0;
 }
 
 // Localized item name. TransmogName is what the game's wardrobe shows when it differs from the
@@ -82,25 +114,28 @@ void BackTrophyIndex::ensureBuilt(const QString& d4dataDir)
     m_building = true;
 
     const QString actorDir = d4dataDir + QStringLiteral("/json/base/meta/Actor");
+    const QString animDir  = d4dataDir + QStringLiteral("/json/base/meta/Anim");
     const QString stlDir   = d4dataDir + QStringLiteral("/json/enUS_Text/meta/StringList");
     const QString cachePath = AppPaths::dataDir()
                               + QStringLiteral("/back_trophy_v%1.json").arg(kCacheVersion);
 
     const int gen = m_generation;
-    std::thread([this, gen, itemDir, actorDir, stlDir, cachePath, d4dataDir]() {
+    std::thread([this, gen, itemDir, actorDir, animDir, stlDir, cachePath, d4dataDir]() {
         // Signature: the counts of BOTH directories this index reads, plus the snapshot's build
         // stamp. Any patch / d4data commit changes at least one → automatic rebuild, never stale.
         QString sig;
         {
-            int nItm = 0, nAcr = 0;
+            int nItm = 0, nAcr = 0, nAni = 0;
             { QDirIterator c(itemDir, {QStringLiteral("*.itm.json")}, QDir::Files); while (c.hasNext()) { c.next(); ++nItm; } }
             // Actor counts too: the appearance comes from Actor/*.acr.json, so a snoAppearance
             // retarget with an unchanged item count would otherwise serve a stale mapping.
             { QDirIterator c(actorDir, {QStringLiteral("*.acr.json")}, QDir::Files); while (c.hasNext()) { c.next(); ++nAcr; } }
+            // Anim too, now that clips are indexed: a patch adding a trophy idle changes nothing else.
+            { QDirIterator c(animDir, {QStringLiteral("*.ani.json")}, QDir::Files); while (c.hasNext()) { c.next(); ++nAni; } }
             QString bv;
             QFile f(d4dataDir + QStringLiteral("/buildVersion.txt"));
             if (f.open(QIODevice::ReadOnly | QIODevice::Text)) bv = QString::fromUtf8(f.readAll()).trimmed();
-            sig = QStringLiteral("%1|%2|%3").arg(nItm).arg(nAcr).arg(bv);
+            sig = QStringLiteral("%1|%2|%3|%4").arg(nItm).arg(nAcr).arg(nAni).arg(bv);
         }
 
         QVector<Entry> out;
@@ -115,6 +150,13 @@ void BackTrophyIndex::ensureBuilt(const QString& d4dataDir)
                         e.appearance  = o.value(QStringLiteral("a")).toString();
                         e.itemStem    = o.value(QStringLiteral("i")).toString();
                         e.displayName = o.value(QStringLiteral("n")).toString();
+                        for (const QJsonValue& cv : o.value(QStringLiteral("c")).toArray()) {
+                            const QJsonObject co = cv.toObject();
+                            Clip c;
+                            c.name   = co.value(QStringLiteral("n")).toString();
+                            c.frames = co.value(QStringLiteral("f")).toInt();
+                            if (!c.name.isEmpty()) e.clips.push_back(c);
+                        }
                         if (!e.appearance.isEmpty()) out.push_back(e);
                     }
                     qInfo("back-trophy index: %d trophies (cached)", int(out.size()));
@@ -162,6 +204,41 @@ void BackTrophyIndex::ensureBuilt(const QString& d4dataDir)
             out.push_back(e);
         }
 
+        // Pass 3 — the trophy's own clips. One directory listing, then a normalised stem match:
+        // a clip belongs to a trophy when its name IS the appearance stem or extends it with a
+        // "_<clip>" suffix (_idle, _killstreak, _anim). Anything that matches nothing is logged
+        // rather than force-fitted — an unexplained clip is a signal, not a row to invent.
+        {
+            struct AniFile { QString stem, norm, path; };
+            QVector<AniFile> anis;
+            QDirIterator ai(animDir, {QStringLiteral("*.ani.json")}, QDir::Files);
+            while (ai.hasNext()) {
+                const QString fp = ai.next();
+                AniFile a;
+                a.stem = QFileInfo(fp).fileName().section(QStringLiteral(".ani.json"), 0, 0);
+                if (!a.stem.startsWith(QLatin1String("trophy"), Qt::CaseInsensitive)) continue;
+                a.norm = normStem(a.stem);
+                a.path = fp;
+                anis.push_back(a);
+            }
+            QSet<QString> claimed;
+            for (Entry& e : out) {
+                const QString en = normStem(e.appearance);
+                for (const AniFile& a : anis) {
+                    if (a.norm != en && !a.norm.startsWith(en + QLatin1Char('_'))) continue;
+                    Clip c;
+                    c.name   = a.stem;
+                    c.frames = clipFrames(a.path);
+                    e.clips.push_back(c);
+                    claimed.insert(a.stem);
+                }
+            }
+            for (const AniFile& a : anis)
+                if (!claimed.contains(a.stem))
+                    qInfo("back-trophy index: clip %s matches no trophy appearance",
+                          qPrintable(a.stem));
+        }
+
         std::sort(out.begin(), out.end(), [](const Entry& a, const Entry& b) {
             const QString an = a.displayName.isEmpty() ? a.itemStem : a.displayName;
             const QString bn = b.displayName.isEmpty() ? b.itemStem : b.displayName;
@@ -175,6 +252,12 @@ void BackTrophyIndex::ensureBuilt(const QString& d4dataDir)
             for (const Entry& e : out) {
                 QJsonObject o{{QStringLiteral("a"), e.appearance}, {QStringLiteral("i"), e.itemStem}};
                 if (!e.displayName.isEmpty()) o.insert(QStringLiteral("n"), e.displayName);
+                if (!e.clips.isEmpty()) {
+                    QJsonArray ca;
+                    for (const Clip& c : e.clips)
+                        ca.append(QJsonObject{{QStringLiteral("n"), c.name}, {QStringLiteral("f"), c.frames}});
+                    o.insert(QStringLiteral("c"), ca);
+                }
                 arr.append(o);
             }
             QDir().mkpath(QFileInfo(cachePath).absolutePath());
@@ -183,7 +266,10 @@ void BackTrophyIndex::ensureBuilt(const QString& d4dataDir)
                 f.write(QJsonDocument(QJsonObject{{QStringLiteral("sig"), sig},
                                                   {QStringLiteral("trophies"), arr}})
                             .toJson(QJsonDocument::Compact));
-            qInfo("back-trophy index: %d trophies", int(out.size()));
+            int withClips = 0, nClips = 0;
+            for (const Entry& e : out) { if (!e.clips.isEmpty()) ++withClips; nClips += e.clips.size(); }
+            qInfo("back-trophy index: %d trophies, %d with animation (%d clips)",
+                  int(out.size()), withClips, nClips);
             install(std::move(out));
         }, Qt::QueuedConnection);
     }).detach();

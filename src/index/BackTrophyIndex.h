@@ -33,10 +33,22 @@
 class BackTrophyIndex : public QObject {
     Q_OBJECT
 public:
+    // One animation clip owned by a trophy. Frame count is captured at build time so the UI never
+    // has to open a .ani.json to draw the list.
+    struct Clip {
+        QString name;
+        int     frames = 0;
+    };
+
     struct Entry {
         QString appearance;    // Appearance stem — what the Wardrobe actually loads
         QString itemStem;      // source Item stem (shown as the file, and used for hover joins)
         QString displayName;   // localized item name; empty ⇒ caller falls back to the stem
+        // The trophy's OWN clips. Most trophies are static props and have none; ~15 of the ~100 in
+        // the snapshot ship an idle and/or a killstreak. Matched by name, NOT via an AnimSet — a
+        // trophy actor references no AnimSet at all, and going through sets is what floods the
+        // Models tab's clip list with tens of thousands of foreign rows.
+        QVector<Clip> clips;
     };
 
     static BackTrophyIndex& instance();
