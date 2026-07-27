@@ -62,6 +62,50 @@ bool seat(ModelGeometry& childGeo,
           const QHash<quint32, QPair<int, std::array<float, 16>>>& hpMap,
           const Attachment& a);
 
+// Bone-name hashes of an attached sub-rig are remapped through this so mergeGeometries — which
+// unifies skeletons BY hash — cannot fuse them onto same-named parent bones. Shipped back trophies
+// share up to 5 of their bones with the 293-bone character rig AND their clips drive exactly those,
+// so fusing would let a trophy's idle drag the character's spine around.
+//
+// The SAME function must be applied to a clip's DecodedBone::boneHash before that clip can drive an
+// attached sub-rig, because clips bind to bones by hash. Exposed for precisely that reason.
+inline quint32 saltBoneHash(quint32 h, quint32 salt)
+{
+    return (h * 2654435761u) ^ (salt + 0x9E3779B9u);
+}
+
+// Attach `childGeo` at a hardpoint while KEEPING its own rig, IN PLACE — the counterpart to seat()
+// for a child that has to keep moving after it is attached.
+//
+// seat() bakes the child's vertices into model space and clears its skeleton: right for a static
+// prop, fatal for anything animatable. This instead re-expresses the child's ROOT bones relative to
+// the attach bone, so at rest the mesh lands exactly where seat() would have put it while every
+// bone survives and can still be driven.
+//
+// Entirely in D4-native (z-up) space: jointWorldMat and the hardpoint transform are both native,
+// and the renderer applies the z-up→y-up swap itself when it rebuilds each bone from its rest TRS.
+// Mixing the two spaces is the single easiest way to get this wrong.
+//
+//   worldWanted = Mz · worldOld,  worldNew = attachWorld · localNew
+//     ⇒ localNew = attachWorld⁻¹ · Mz · localOld        (a root's local IS its world)
+//
+// Writes the rest TRS, not just localMatrix: the viewport recomposes every bone from restQ/restT/
+// restS each frame and never reads localMatrix, so writing only the matrix places nothing.
+//
+// Returns false (childGeo untouched) when the child has no rig or the hardpoint does not resolve —
+// the caller should fall back to seat().
+// `outPreSalt`, when given, receives the child's skeleton as it was BEFORE re-hashing. A clip must
+// be decoded against those original hashes: the decoder uses the rig only to supply a per-bone rest
+// pose for channels the clip leaves empty (D4 authors rotation-only tracks routinely), and decoding
+// against the salted rig silently substitutes a zero translation for every bone — collapsing the
+// child's chain to a point the moment it plays.
+bool attachSubRig(ModelGeometry& childGeo,
+                  const QVector<ModelJoint>& parentSkel,
+                  const QHash<quint32, QPair<int, std::array<float, 16>>>& hpMap,
+                  quint32 hpHash,
+                  quint32 salt,
+                  QVector<ModelJoint>* outPreSalt = nullptr);
+
 // Place a MOUNT mesh under its rider, IN PLACE: the rider stays at the origin and the mount is
 // positioned so its own saddle hardpoint (HP_saddle) lands at the origin — i.e. the mount is
 // transformed by inverse(saddleWorld). `mountHpMap`/`mountSkel` are the MOUNT's own hardpoint map

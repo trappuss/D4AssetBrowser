@@ -290,6 +290,12 @@ private:
     QVector<int> m_partEye;            // per merged-part: 1 = eyeball (Hero_Eye shader / eyeball mat)
     QStringList m_partSource;          // per merged-part source piece name (for grouping)
     QVector<int> m_partSourceSno;      // per merged-part source appearance SNO (context-menu export)
+    // Set when the equipped back trophy was attached as a SUB-RIG (kept its bones) rather than
+    // baked. Empty otherwise. Its idle clip is merged into whatever clip is playing.
+    QString      m_btSubRigAppr;
+    // The trophy's skeleton BEFORE its bones were re-hashed. Its clips must be decoded against
+    // these original hashes or the decoder substitutes a zero rest pose for every bone.
+    QVector<ModelJoint> m_btPreSaltSkel;
     QTreeWidget* m_partTree = nullptr; // per-part visibility tree (piece → submeshes)
     QWidget* m_sidebar = nullptr;      // right-side panel column (strip + splitter)
     QSplitter* m_rsplit = nullptr;     // vertical splitter: the visible panels, drag to resize
@@ -497,6 +503,8 @@ private:
     void fillAnimList();                   // (re)build the list applying filter + sort + search
     void playAnimByName(const QString& animName);
     AnimParser::DecodedAnim decodeAnimByName(const QString& animName);
+    // Appends the equipped back trophy's idle tracks (salted to match its attached sub-rig).
+    void mergeBackTrophyIdle(AnimParser::DecodedAnim& anim);
     // D4_DUMP_TROPHYANIM=1: report a trophy's own rig and whose bones its clips drive.
     void dumpTrophyAnim(const QString& appr, const QVector<ModelJoint>& trophySkel);
     // Same, against an explicit rig — lets a clip be inspected before the merged rig exists.

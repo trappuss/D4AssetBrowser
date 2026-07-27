@@ -270,6 +270,111 @@ bool ModelAttach::seat(ModelGeometry& childGeo,
     return resolved;
 }
 
+bool ModelAttach::attachSubRig(ModelGeometry& childGeo,
+                              const QVector<ModelJoint>& parentSkel,
+                              const QHash<quint32, QPair<int, std::array<float, 16>>>& hpMap,
+                              quint32 hpHash,
+                              quint32 salt,
+                              QVector<ModelJoint>* outPreSalt)
+{
+    if (childGeo.skeleton.isEmpty() || !hpHash || !hpMap.contains(hpHash)) return false;
+    const QPair<int, std::array<float, 16>> bh = hpMap.value(hpHash);
+    const int bone = bh.first;
+    if (bone < 0 || bone >= parentSkel.size()) return false;
+    const Mat4 hpMat = bh.second;
+    if (outPreSalt) *outPreSalt = childGeo.skeleton;   // for decoding the child's own clips
+
+    // ALL NATIVE (z-up). jointWorldMat and the hardpoint transform are both native, and the
+    // renderer applies the z-up→y-up swap itself when it rebuilds a bone from its rest TRS.
+    // Conjugation is a homomorphism, so a native premultiply survives that swap intact.
+    // Same authored-vs-identity rule seat() uses, so both paths agree on where the socket is.
+    const Mat4 attachWorld = RigMath::jointWorldMat(parentSkel, bone);
+    const Mat4 base = hpIsAuthored(hpMat)
+                          ? Mat4{{1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1}}
+                          : attachWorld;
+    const Mat4 Mz      = RigMath::mat4mul(base, hpMat);
+    const Mat4 rootPre = RigMath::mat4mul(RigMath::invert(attachWorld), Mz);
+
+    QVector<ModelJoint> out;
+    out.reserve(childGeo.skeleton.size() + 2);
+
+    // [0] the attach bone, ORIGINAL hash so mergeGeometries fuses it onto the parent's copy — that
+    // fusion is what makes the child inherit parent animation.
+    ModelJoint anchor = parentSkel[bone];
+    anchor.parent = -1;
+    anchor.cloth  = false;
+    out.append(anchor);
+
+    // [1] a dedicated PLACEMENT bone holding rootPre.
+    //
+    // This cannot live on the child's own roots. The renderer prefers a clip track over the rest
+    // pose, and the child's clip is salted to bind to exactly those roots — so a root carrying the
+    // placement in its rest TRS would have it overwritten the instant the clip played, dropping the
+    // trophy back onto the raw spine bone. A bone the clip cannot address is the only place the
+    // placement is safe.
+    ModelJoint place;
+    place.name     = QStringLiteral("bt_attach");
+    place.nameHash = saltBoneHash(0xB7A77AC4u, salt);   // fixed sentinel: no clip can target it
+    place.parent   = 0;
+    place.cloth    = false;
+    RigMath::decomposeTRS(rootPre, place.restT, place.restQ, place.restS);
+    place.localMatrix = RigMath::mat4mul(RigMath::mat4mul(RigMath::kSwapZtoY, rootPre),
+                                         RigMath::kSwapYtoZ);
+    place.inverseBind = anchor.inverseBind;   // unused: no vertex is weighted to this bone
+    out.append(place);
+
+    for (int i = 0; i < childGeo.skeleton.size(); ++i) {
+        ModelJoint j = childGeo.skeleton[i];
+        const int p = j.parent;
+        const bool isRoot = (p < 0 || p >= childGeo.skeleton.size());
+        j.parent = isRoot ? 1 : p + 2;         // roots hang off the placement bone
+        // Rest TRS deliberately UNCHANGED — the placement lives on the bone above, so a clip track
+        // for this bone replaces only the child's own authored pose, never the attachment.
+        j.nameHash = saltBoneHash(j.nameHash, salt);
+        j.name = QStringLiteral("bt_") + j.name;
+        // The authored cloth cage is in the child's own space and its particles are matched to
+        // bones by a few-centimetre proximity test, which cannot succeed once the rig is placed on
+        // the body. Leaving these flagged would enrol them in the solver with no constraints and no
+        // pins — the documented free-fall failure. Clearing the flag keeps them animation-driven,
+        // which is strictly no worse than the bake this replaces.
+        j.cloth = false;
+        out.append(j);
+    }
+
+    // Every index into the child's OWN skeleton shifts by TWO for the prepended anchor + placement.
+    for (MeshPrimitive& prim : childGeo.primitives)
+        for (MeshVertex& v : prim.vertices) {
+            float wsum = 0.0f;
+            for (int k = 0; k < 4; ++k) wsum += v.weights[k];
+            if (wsum <= 0.0f) {
+                // seat() baked unweighted verts into place; skinning skips them entirely, so they
+                // would be left behind at the child's origin. Bind them rigidly to the placement
+                // bone, which carries exactly the transform the bake would have applied.
+                v.joints[0] = 1; v.joints[1] = v.joints[2] = v.joints[3] = 0;
+                v.weights[0] = 1.0f; v.weights[1] = v.weights[2] = v.weights[3] = 0.0f;
+                continue;
+            }
+            for (int k = 0; k < 4; ++k)
+                v.joints[k] = (v.weights[k] > 0.0f) ? quint16(v.joints[k] + 2) : quint16(0);
+        }
+    for (ClothCapsule& c : childGeo.clothCapsules) if (c.boneIndex >= 0) c.boneIndex += 2;
+    for (ClothSim& sim : childGeo.clothSims) {
+        for (ClothPlane& pl : sim.planes) if (pl.boneIndex >= 0) pl.boneIndex += 2;
+        for (int& b : sim.followerBone) if (b >= 0) b += 2;
+        for (int& b : sim.drvBone)      if (b >= 0) b += 2;
+    }
+    for (ModelHardpoint& h : childGeo.hardpoints) {
+        if (h.boneIndex >= 0) h.boneIndex += 2;
+        if (h.boneHash) h.boneHash = saltBoneHash(h.boneHash, salt);
+    }
+    // Not consumed for an attached child today, but wrong the moment this is reused elsewhere.
+    for (int& b : childGeo.pinnedBones) if (b >= 0) b += 2;
+    if (childGeo.nBaseBones > 0) childGeo.nBaseBones += 2;
+
+    childGeo.skeleton = out;
+    return true;
+}
+
 bool ModelAttach::seatMount(ModelGeometry& mountGeo,
                             const QHash<quint32, QPair<int, std::array<float, 16>>>& mountHpMap,
                             const QVector<ModelJoint>& mountSkel)

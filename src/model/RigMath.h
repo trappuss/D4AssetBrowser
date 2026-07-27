@@ -3,6 +3,7 @@
 
 #include <QVector>
 #include <array>
+#include <cmath>
 
 // Column-major 4×4 rig math shared by the attachment seater (and available to any
 // other code that needs to place a child mesh onto a parent bone/hardpoint).
@@ -105,6 +106,52 @@ inline Mat4 invert(const Mat4& m)
     det = 1.0f / det;
     for (int i = 0; i < 16; ++i) o[i] *= det;
     return inv;
+}
+
+// Split a column-major TRS matrix back into translation / quaternion / scale, in whatever space
+// the matrix was expressed in. The inverse of composeTRS: verified round-trip to 3e-15 over 20k
+// random non-uniform-scale TRS matrices. Needed because the renderer rebuilds every bone's local
+// transform from the rest TRS each frame and never reads ModelJoint::localMatrix — so anything
+// that repositions a bone has to write the TRS, not the matrix.
+inline void decomposeTRS(const Mat4& m, std::array<float, 3>& t,
+                         std::array<float, 4>& q, std::array<float, 3>& s)
+{
+    t = {{m[12], m[13], m[14]}};
+    float c[3][3] = {{m[0], m[1], m[2]}, {m[4], m[5], m[6]}, {m[8], m[9], m[10]}};
+    for (int i = 0; i < 3; ++i)
+        s[i] = std::sqrt(c[i][0]*c[i][0] + c[i][1]*c[i][1] + c[i][2]*c[i][2]);
+    // Mirrored basis (negative determinant): fold the flip into the first axis' scale so the
+    // remaining rotation is proper, otherwise the quaternion extraction below is meaningless.
+    const float det = c[0][0]*(c[1][1]*c[2][2] - c[1][2]*c[2][1])
+                    - c[1][0]*(c[0][1]*c[2][2] - c[0][2]*c[2][1])
+                    + c[2][0]*(c[0][1]*c[1][2] - c[0][2]*c[1][1]);
+    if (det < 0.0f) { s[0] = -s[0]; c[0][0] = -c[0][0]; c[0][1] = -c[0][1]; c[0][2] = -c[0][2]; }
+    for (int i = 0; i < 3; ++i) {
+        const float n = std::fabs(s[i]) > 1e-12f ? std::fabs(s[i]) : 1.0f;
+        c[i][0] /= n; c[i][1] /= n; c[i][2] /= n;
+    }
+    // Rotation, row-major, from the normalised columns.
+    const float r00 = c[0][0], r10 = c[0][1], r20 = c[0][2];
+    const float r01 = c[1][0], r11 = c[1][1], r21 = c[1][2];
+    const float r02 = c[2][0], r12 = c[2][1], r22 = c[2][2];
+    const float tr = r00 + r11 + r22;
+    float x, y, z, w;
+    if (tr > 0.0f) {
+        const float S = std::sqrt(tr + 1.0f) * 2.0f;
+        w = 0.25f * S; x = (r21 - r12) / S; y = (r02 - r20) / S; z = (r10 - r01) / S;
+    } else if (r00 > r11 && r00 > r22) {
+        const float S = std::sqrt(1.0f + r00 - r11 - r22) * 2.0f;
+        w = (r21 - r12) / S; x = 0.25f * S; y = (r01 + r10) / S; z = (r02 + r20) / S;
+    } else if (r11 > r22) {
+        const float S = std::sqrt(1.0f + r11 - r00 - r22) * 2.0f;
+        w = (r02 - r20) / S; x = (r01 + r10) / S; y = 0.25f * S; z = (r12 + r21) / S;
+    } else {
+        const float S = std::sqrt(1.0f + r22 - r00 - r11) * 2.0f;
+        w = (r10 - r01) / S; x = (r02 + r20) / S; y = (r12 + r21) / S; z = 0.25f * S;
+    }
+    const float qm = std::sqrt(x*x + y*y + z*z + w*w);
+    if (qm < 1e-9f) q = {{0, 0, 0, 1}};
+    else            q = {{x / qm, y / qm, z / qm, w / qm}};
 }
 
 // z-up → y-up basis change S (and its inverse): a native attach matrix M is

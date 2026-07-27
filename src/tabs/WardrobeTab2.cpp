@@ -4224,11 +4224,11 @@ void WardrobeTab2::dumpTrophyAnim(const QString& appr, const QVector<ModelJoint>
 //
 // The authored hash is still read first, so if a future patch starts filling that field this
 // follows it instead of the fallback.
-static QString seatBackTrophy(ModelGeometry& geo, const QVector<ModelJoint>& bodySkel,
-                              const QHash<quint32, QPair<int, std::array<float,16>>>& hp,
-                              const QString& d4, const QString& trophyAppr)
+// The body socket a back trophy attaches to, or 0 when the rig has none. Shared by BOTH attach
+// paths so they can never disagree about where the trophy goes.
+static quint32 backTrophySocket(const QHash<quint32, QPair<int, std::array<float,16>>>& hp,
+                                const QString& d4, const QString& trophyAppr)
 {
-    if (geo.primitives.isEmpty() || hp.isEmpty()) return QString();
     quint32 authored = 0;
     if (!d4.isEmpty() && !trophyAppr.isEmpty()) {
         QFile af(d4 + QStringLiteral("/json/base/meta/Actor/") + trophyAppr + QStringLiteral(".acr.json"));
@@ -4246,14 +4246,28 @@ static QString seatBackTrophy(ModelGeometry& geo, const QVector<ModelJoint>& bod
     if (authored) order << authored;
     order << 899481535u  /*HP_chestBack*/ << 1373172648u /*HP_back*/
           << 4168202000u /*HP_spineMid*/  << 2366464462u /*HP_chest*/;
-    for (quint32 hash : order) {
-        if (!hash || !hp.contains(hash)) continue;
-        ModelAttach::Attachment at;
-        at.hpHash = hash;                     // identity grip: the socket carries the orientation
-        ModelAttach::seat(geo, bodySkel, hp, at);
-        return Hardpoints::nameForHash(hash);
-    }
-    return QString();
+    for (quint32 h : order) if (h && hp.contains(h)) return h;
+    return 0;
+}
+
+// Stable per-trophy salt: the same appearance must always produce the same bone hashes, or a clip
+// decoded in one rebuild would not bind in the next.
+static quint32 backTrophySalt(const QString& appr)
+{
+    return quint32(qHash(appr.toLower()));
+}
+
+static QString seatBackTrophy(ModelGeometry& geo, const QVector<ModelJoint>& bodySkel,
+                              const QHash<quint32, QPair<int, std::array<float,16>>>& hp,
+                              const QString& d4, const QString& trophyAppr)
+{
+    if (geo.primitives.isEmpty() || hp.isEmpty()) return QString();
+    const quint32 hash = backTrophySocket(hp, d4, trophyAppr);
+    if (!hash) return QString();
+    ModelAttach::Attachment at;
+    at.hpHash = hash;                     // identity grip: the socket carries the orientation
+    ModelAttach::seat(geo, bodySkel, hp, at);
+    return Hardpoints::nameForHash(hash);
 }
 
 // Seat one parsed weapon into a hand using real attach data: the weapon's ItemType
@@ -6742,6 +6756,11 @@ void WardrobeTab2::rebuildOutfitImpl(bool async)
         // unweighted at the model origin, i.e. lying on the floor. Tagged slot 9 so
         // framing/selection find it.
         if (m_backTrophy) {
+            // Cleared unconditionally: addPiece returns early on no-data/parse-fault, so a clear
+            // inside the geometry hook would leave a previous trophy's state live after unequipping
+            // or after a failed load — and its tracks would keep riding into every exported clip.
+            m_btSubRigAppr.clear();
+            m_btPreSaltSkel.clear();
             const int btSno = m_backTrophy->currentData().toInt();
             // The APPEARANCE name, not currentText(): the label is "<localized name>  (<stem>)"
             // and appearanceRoster/parseApp key off the appearance stem.
@@ -6752,7 +6771,25 @@ void WardrobeTab2::rebuildOutfitImpl(bool async)
                     // its own bones at all is the first thing Phase 2 turns on.
                     const int trophyBones = g.skeleton.size();
                     dumpTrophyAnim(btAppr, g.skeleton);   // D4_DUMP_TROPHYANIM=1
-                    const QString bone = seatBackTrophy(g, m_bodySkeleton, hpMap, d4, btAppr);
+                    // A trophy with BOTH its own bones and its own clip keeps its rig so the clip
+                    // has something to drive. Everything else takes the bake, which places all 117
+                    // correctly today — only the ~17 animated ones gain anything from the new path,
+                    // so the blast radius of getting it wrong is those 17.
+                    bool animated = false;
+                    for (const BackTrophyIndex::Entry& t : BackTrophyIndex::instance().entries())
+                        if (t.appearance.compare(btAppr, Qt::CaseInsensitive) == 0)
+                            { animated = !t.clips.isEmpty(); break; }
+                    QString bone;
+                    if (trophyBones > 0 && animated) {
+                        const quint32 hpHash = backTrophySocket(hpMap, d4, btAppr);
+                        if (ModelAttach::attachSubRig(g, m_bodySkeleton, hpMap, hpHash,
+                                                      backTrophySalt(btAppr), &m_btPreSaltSkel)) {
+                            bone = Hardpoints::nameForHash(hpHash) + QStringLiteral(" (sub-rig)");
+                            m_btSubRigAppr = btAppr;   // → its idle is merged into the played clip
+                        }
+                    }
+                    if (bone.isEmpty())   // static, unrigged, or the socket did not resolve
+                        bone = seatBackTrophy(g, m_bodySkeleton, hpMap, d4, btAppr);
                     loadLog += bone.isEmpty()
                         ? QStringLiteral("\nback trophy %1: NO body socket (left at origin), %2 own bones")
                               .arg(btAppr).arg(trophyBones)
@@ -8853,12 +8890,68 @@ void WardrobeTab2::collectExportAnims(QVector<AnimParser::DecodedAnim>& anims, Q
     }
 }
 
+// Append the equipped back trophy's idle to a body clip, so the trophy animates while the
+// character plays whatever the user selected.
+//
+// The two are independent timelines targeting DISJOINT bones — the body clip drives the character
+// rig, the trophy clip drives the attached sub-rig — so they can share one DecodedAnim: the
+// renderer looks each bone's track up by hash, and a bone with no track simply keeps its rest pose.
+//
+// The trophy's track hashes are salted with the SAME function the attach used, because that is the
+// only thing that makes them resolve against the re-hashed sub-rig bones.
+//
+// A trophy loop is usually longer than a body idle (111 vs 56 frames is typical), and the sampler
+// bails per bone when the frame index passes the end of that bone's track — which would freeze the
+// trophy part-way. So the trophy's frames are RESAMPLED onto the body clip's length, wrapping: it
+// plays at its authored speed and repeats for as long as the body clip runs.
+void WardrobeTab2::mergeBackTrophyIdle(AnimParser::DecodedAnim& anim)
+{
+    if (m_btSubRigAppr.isEmpty() || m_btPreSaltSkel.isEmpty()
+        || !anim.valid || anim.frameCount <= 0) return;
+    QString idle;
+    for (const BackTrophyIndex::Entry& t : BackTrophyIndex::instance().entries()) {
+        if (t.appearance.compare(m_btSubRigAppr, Qt::CaseInsensitive) != 0) continue;
+        for (const BackTrophyIndex::Clip& c : t.clips)          // prefer an explicit _idle
+            if (c.name.endsWith(QLatin1String("_idle"), Qt::CaseInsensitive)) { idle = c.name; break; }
+        if (idle.isEmpty() && !t.clips.isEmpty()) idle = t.clips.first().name;
+        break;
+    }
+    if (idle.isEmpty()) return;
+    // Against the PRE-SALT skeleton. The decoder uses the rig to supply a rest pose for channels
+    // the clip leaves empty, and D4 authors rotation-only tracks routinely — decoding against the
+    // salted rig would miss every lookup and substitute a zero translation, collapsing the chain.
+    const AnimParser::DecodedAnim tr = decodeAnimForSkeleton(idle, m_btPreSaltSkel);
+    if (!tr.valid || tr.bones.isEmpty() || tr.frameCount <= 0) return;
+
+    const quint32 salt = backTrophySalt(m_btSubRigAppr);
+    int added = 0;
+    for (const AnimParser::DecodedBone& src : tr.bones) {
+        AnimParser::DecodedBone b;
+        b.boneHash = ModelAttach::saltBoneHash(src.boneHash, salt);
+        b.translations.reserve(anim.frameCount);
+        b.rotations.reserve(anim.frameCount);
+        b.scales.reserve(anim.frameCount);
+        for (int f = 0; f < anim.frameCount; ++f) {
+            const int sf = f % tr.frameCount;      // wrap, so a short body clip still loops it
+            if (sf < src.translations.size()) b.translations.push_back(src.translations[sf]);
+            if (sf < src.rotations.size())    b.rotations.push_back(src.rotations[sf]);
+            if (sf < src.scales.size())       b.scales.push_back(src.scales[sf]);
+        }
+        if (b.rotations.isEmpty() && b.translations.isEmpty()) continue;
+        anim.bones.push_back(b);
+        ++added;
+    }
+    qInfo("back trophy %s: merged clip %s (%d frames, %d body frames) — %d tracks",
+          qPrintable(m_btSubRigAppr), qPrintable(idle), tr.frameCount, anim.frameCount, added);
+}
+
 void WardrobeTab2::playAnimByName(const QString& animName)
 {
     if (!m_view)
         return;
-    const AnimParser::DecodedAnim anim = decodeAnimByName(animName);
+    AnimParser::DecodedAnim anim = decodeAnimByName(animName);
     if (!anim.valid) return;
+    mergeBackTrophyIdle(anim);   // the trophy's own loop rides alongside the body clip
 
     m_playingAnim = animName;
     m_curAnim = anim;   // retained for "include animation" .glb export
