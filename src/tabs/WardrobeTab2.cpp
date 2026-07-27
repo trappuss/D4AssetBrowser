@@ -1459,6 +1459,49 @@ WardrobeTab2::WardrobeTab2(QWidget* parent) : BrowserTab(parent)
     buildEnsemblePanel();                     // Ensembles: under the item browser
     if (m_ensemblePanel) ll->addWidget(m_ensemblePanel);   // compact (list is height-capped) — no
                                                            // stretch, so the item grid fills instead
+    // ── ATTACHED ANIMATIONS — clips owned by an ATTACHED model (currently the back trophy)
+    //    rather than by the character. Separate from the list above because they are a separate
+    //    thing: they drive the attachment's own bones on their own looping timeline, so they do
+    //    not belong in a list whose selection replaces what the CHARACTER is doing.
+    //    Without this the code auto-picked "_idle" and a trophy's _killstreak was unreachable.
+    m_attachPanel = new QWidget;
+    auto* al = new QVBoxLayout(m_attachPanel);
+    al->setContentsMargins(0, 0, 0, 0);
+    al->setSpacing(3);
+    m_attachWho = new QLabel(QStringLiteral("(nothing attached)"), m_attachPanel);
+    m_attachWho->setWordWrap(true);
+    m_attachWho->setStyleSheet(QStringLiteral("color:#9aa0a6;"));
+    al->addWidget(m_attachWho);
+    m_attachAnims = new QListWidget(m_attachPanel);
+    m_attachAnims->setAlternatingRowColors(true);
+    m_attachAnims->setMinimumHeight(80);
+    m_attachAnims->setToolTip(QStringLiteral(
+        "Clips shipped with the attached model. Selecting one plays it on its OWN looping "
+        "timeline — independent of the character clip, so mismatched lengths do not fight."));
+    al->addWidget(m_attachAnims, 1);
+    {
+        auto* row = new QHBoxLayout(); row->setSpacing(4);
+        m_attachPlay = new QCheckBox(QStringLiteral("Play"), m_attachPanel);
+        m_attachPlay->setChecked(true);
+        m_attachPlay->setToolTip(QStringLiteral("Stop to freeze the attachment on its first frame"));
+        row->addWidget(m_attachPlay);
+        row->addStretch(1);
+        al->addLayout(row);
+    }
+    // Re-arm playback with whatever is selected now. Goes through the normal clip path so the
+    // character clip is rebuilt and the attachment range re-declared in one place.
+    connect(m_attachAnims, &QListWidget::currentItemChanged, this,
+            [this](QListWidgetItem*, QListWidgetItem*) {
+        if (m_restoring) return;
+        if (m_attachAnims->currentItem())
+            QSettings().setValue(QStringLiteral("wardrobe2/attachClip"),
+                                 m_attachAnims->currentItem()->data(Qt::UserRole).toString());
+        if (!m_playingAnim.isEmpty()) playAnimByName(m_playingAnim);
+    });
+    connect(m_attachPlay, &QCheckBox::toggled, this, [this](bool) {
+        if (!m_restoring && !m_playingAnim.isEmpty()) playAnimByName(m_playingAnim);
+    });
+
     // (m_animPanel is NOT added here — it's registered as a RIGHT-side panel; the transport bar
     //  m_timeline is placed under the viewport in the centre column. Both happen below.)
 
@@ -2432,6 +2475,10 @@ WardrobeTab2::WardrobeTab2(QWidget* parent) : BrowserTab(parent)
     section(QStringLiteral("ANIMATIONS"), QStringLiteral("ANIMATIONS"), m_animPanel,
             transportGlyph(0).pixmap(QSize(16, 16)),
             QStringLiteral("Animations — the model's clip list (filter, search, select to play)"));
+    section(QStringLiteral("ATTACHED"), QStringLiteral("ATTACHED"), m_attachPanel,
+            transportGlyph(0).pixmap(QSize(16, 16)),
+            QStringLiteral("Attached animations — clips owned by an attached model (back trophy), "
+                           "played on their own independent timeline"));
     m_rstripLay->addStretch(1);   // registrations are done — pin the strip buttons to the top
 
     // ── Restore the panel layout: which panels are up, their order, their heights. Same scheme
@@ -2687,7 +2734,7 @@ WardrobeTab2::WardrobeTab2(QWidget* parent) : BrowserTab(parent)
         QSettings().setValue(QStringLiteral("wardrobe2/backTrophy"),
                              QString::number(m_backTrophy->currentData().toInt()));
         fillAnimList();   // the list carries this trophy's own clips
-        scheduleRebuild();
+        scheduleRebuild();   // the ATTACHED panel refreshes from the rebuild, once m_btSubRigAppr is set
     });
     // Build both popups eagerly so m_env (Preview) and m_fovSlider (Camera) exist for
     // restore/rebuild before the user ever opens either panel.
@@ -2772,7 +2819,7 @@ void WardrobeTab2::refresh()
     // is empty until this lands, so refill the slot lists when it does.
     BackTrophyIndex::instance().ensureBuilt(Config::d4dataDir());
     connect(&BackTrophyIndex::instance(), &BackTrophyIndex::readyChanged, this,
-            [this] { populateSlots(); fillAnimList(); });
+            [this] { populateSlots(); fillAnimList(); refreshAttachAnimList(); });
     // Appearance-icon atlas index (same trigger point as the Models tab). Refill the grid/cells
     // when it finishes; show the live percentage while it scans.
     IconIndex::instance().ensureBuilt(Config::d4dataDir());
@@ -7696,6 +7743,9 @@ void WardrobeTab2::applyOutfit(const WardrobeBuildCtx& ctx, const WardrobeOutfit
     if (m_env) m_view->setEnvironment(m_env->currentIndex());
     populateAnims();   // refresh the animation list for the current body rig
 
+    // The attachment (and therefore its clip list) is only settled once the rebuild has run, so
+    // refresh the ATTACHED panel here — BEFORE replaying the clip, which reads its selection.
+    refreshAttachAnimList();
     // Re-apply the animation that was running before this rebuild (setGeometry cleared
     // it), restoring the frame + play/pause state so equipping/creator changes don't
     // interrupt playback.
@@ -8890,6 +8940,53 @@ void WardrobeTab2::collectExportAnims(QVector<AnimParser::DecodedAnim>& anims, Q
     }
 }
 
+// Repopulate the ATTACHED panel from whatever is currently attached. Kept deliberately dumb: the
+// index already knows every clip an attachment owns, so this is a straight listing — no matching,
+// no guessing which one is "the" clip.
+void WardrobeTab2::refreshAttachAnimList()
+{
+    if (!m_attachAnims || !m_attachWho) return;
+    const QString prev = m_attachAnims->currentItem()
+        ? m_attachAnims->currentItem()->data(Qt::UserRole).toString()
+        : QSettings().value(QStringLiteral("wardrobe2/attachClip")).toString();
+    QSignalBlocker block(m_attachAnims);
+    m_attachAnims->clear();
+    if (m_btSubRigAppr.isEmpty()) {
+        // Either nothing is equipped, or what is equipped is a static prop that was baked in
+        // place — say which, because "no clips" and "not attached" look identical otherwise.
+        const bool equipped = m_backTrophy && m_backTrophy->currentData().toInt() > 0;
+        m_attachWho->setText(equipped
+            ? QStringLiteral("Equipped back item has no animation of its own.")
+            : QStringLiteral("(nothing attached)"));
+        m_attachPanel->setEnabled(true);
+        return;
+    }
+    QString label = m_btSubRigAppr;
+    for (const BackTrophyIndex::Entry& t : BackTrophyIndex::instance().entries()) {
+        if (t.appearance.compare(m_btSubRigAppr, Qt::CaseInsensitive) != 0) continue;
+        if (!t.displayName.isEmpty()) label = t.displayName;
+        for (const BackTrophyIndex::Clip& c : t.clips) {
+            // Name the clip by its suffix (idle / killstreak / …) — the stem is the appearance and
+            // carries no information once the panel header already names the item.
+            QString kind = c.name.mid(m_btSubRigAppr.size());
+            if (kind.startsWith(QLatin1Char('_'))) kind = kind.mid(1);
+            if (kind.isEmpty()) kind = QStringLiteral("default");
+            auto* it = new QListWidgetItem(
+                c.frames > 0 ? QStringLiteral("%1  ·  %2 frames").arg(kind).arg(c.frames) : kind,
+                m_attachAnims);
+            it->setData(Qt::UserRole, c.name);
+            it->setToolTip(c.name);
+        }
+        break;
+    }
+    m_attachWho->setText(QStringLiteral("%1 — %2 clip(s)").arg(label).arg(m_attachAnims->count()));
+    // Restore the previous pick when the same clip still exists, else take the first.
+    int row = 0;
+    for (int i = 0; i < m_attachAnims->count(); ++i)
+        if (m_attachAnims->item(i)->data(Qt::UserRole).toString() == prev) { row = i; break; }
+    if (m_attachAnims->count() > 0) m_attachAnims->setCurrentRow(row);
+}
+
 // Append the equipped back trophy's idle to a body clip, so the trophy animates while the
 // character plays whatever the user selected.
 //
@@ -8909,12 +9006,20 @@ void WardrobeTab2::mergeBackTrophyIdle(AnimParser::DecodedAnim& anim)
     m_btAttachFrom = -1; m_btAttachFrames = 0;
     if (m_btSubRigAppr.isEmpty() || m_btPreSaltSkel.isEmpty()
         || !anim.valid || anim.frameCount <= 0) return;
-    QString idle;
+    // Whatever the ATTACHED panel has selected. Falling back to an explicit _idle, then to the
+    // first clip, keeps behaviour sane before the panel has ever been touched.
+    QString idle = (m_attachAnims && m_attachAnims->currentItem())
+                       ? m_attachAnims->currentItem()->data(Qt::UserRole).toString() : QString();
     for (const BackTrophyIndex::Entry& t : BackTrophyIndex::instance().entries()) {
         if (t.appearance.compare(m_btSubRigAppr, Qt::CaseInsensitive) != 0) continue;
-        for (const BackTrophyIndex::Clip& c : t.clips)          // prefer an explicit _idle
-            if (c.name.endsWith(QLatin1String("_idle"), Qt::CaseInsensitive)) { idle = c.name; break; }
-        if (idle.isEmpty() && !t.clips.isEmpty()) idle = t.clips.first().name;
+        bool have = false;
+        for (const BackTrophyIndex::Clip& c : t.clips) if (c.name == idle) { have = true; break; }
+        if (!have) {
+            idle.clear();
+            for (const BackTrophyIndex::Clip& c : t.clips)
+                if (c.name.endsWith(QLatin1String("_idle"), Qt::CaseInsensitive)) { idle = c.name; break; }
+            if (idle.isEmpty() && !t.clips.isEmpty()) idle = t.clips.first().name;
+        }
         break;
     }
     if (idle.isEmpty()) return;
@@ -8939,7 +9044,9 @@ void WardrobeTab2::mergeBackTrophyIdle(AnimParser::DecodedAnim& anim)
         ++added;
     }
     m_btAttachFrom   = added ? from : -1;      // handed to the viewport after setAnimation()
-    m_btAttachFrames = added ? tr.frameCount : 0;
+    // Play unticked pins it to frame 0: a one-frame range never advances.
+    const bool play = !m_attachPlay || m_attachPlay->isChecked();
+    m_btAttachFrames = added ? (play ? tr.frameCount : 1) : 0;
     m_btAttachFps    = tr.frameRate > 1.0f ? tr.frameRate : 30.0f;
     qInfo("back trophy %s: clip %s on its own timeline — %d frames @ %.0f fps (body clip %d frames), %d tracks",
           qPrintable(m_btSubRigAppr), qPrintable(idle), tr.frameCount, double(m_btAttachFps),

@@ -297,6 +297,12 @@ private:
     // these original hashes or the decoder substitutes a zero rest pose for every bone.
     QVector<ModelJoint> m_btPreSaltSkel;
     // Where the attached trophy's tracks start in the played clip, and their own length/rate.
+    // ATTACHED panel: the attached model's own clip list + transport.
+    QWidget*     m_attachPanel = nullptr;
+    QLabel*      m_attachWho   = nullptr;
+    QListWidget* m_attachAnims = nullptr;
+    QCheckBox*   m_attachPlay  = nullptr;
+    void refreshAttachAnimList();   // repopulate from the equipped attachment
     int   m_btAttachFrom = -1;
     int   m_btAttachFrames = 0;
     float m_btAttachFps = 30.0f;
