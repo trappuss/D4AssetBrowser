@@ -4156,29 +4156,45 @@ static quint32 sheathHardpointFor(const QString& itemType, bool offHand,
     return 0;
 }
 
-// D4_DUMP_TROPHYANIM=1 — does a back trophy have a rig, and do its clips drive it?
+// Does a back trophy have a rig, does that rig share bones with the body, and do its clips drive
+// the TROPHY's bones or the BODY's? Those three facts decide how a trophy can be attached, and
+// nothing else can answer them: the trophy's rig only exists here, in the window between parsing
+// and seating (seating bakes it away).
 //
-// These are the two unknowns blocking skeletal attachment. Today the trophy is seated by baking
-// its verts onto the attach bone, so any internal rig is discarded; before reworking that it is
-// worth knowing (a) whether trophies carry bones at all in the CASC payload — d4data's JSON shows
-// ptBoneData empty, which proves nothing since the tool parses rigs from the payload — and (b)
-// whether the clips target the TROPHY's bone hashes or the BODY's. A clip that turns out to drive
-// body bones would mean the trophy animates via the character rig and needs no sub-rig at all.
+// NOT env-gated, deliberately. It was, and the answer went unrecorded across several rebuilds
+// because it needed an environment variable AND an equipped trophy at the same time. It is a
+// handful of lines, only for back trophies, and memoised per appearance so re-equipping the same
+// one costs nothing — the clip decode is the only real work and it happens once per trophy.
 //
-// Reports the overlap both ways rather than a verdict, so the data decides.
+// Reports the overlap both ways rather than a verdict. A clip driving BODY bones would mean the
+// trophy animates through the character rig and needs no sub-rig; one driving its OWN bones means
+// the rig has to survive attachment. Set D4_DUMP_TROPHYANIM=1 for the full per-bone listing.
 void WardrobeTab2::dumpTrophyAnim(const QString& appr, const QVector<ModelJoint>& trophySkel)
 {
-    if (!qEnvironmentVariableIsSet("D4_DUMP_TROPHYANIM")) return;
+    static QSet<QString> seen;
+    const QString key = appr.toLower();
+    if (seen.contains(key)) return;
+    if (seen.size() > 256) seen.clear();          // bounded
+    seen.insert(key);
+
     QSet<quint32> own, body;
     for (const ModelJoint& j : trophySkel) own.insert(j.nameHash);
     for (const ModelJoint& j : m_bodySkeleton) body.insert(j.nameHash);
-    qInfo("[trophyanim] %s: %d own bones, body rig has %d",
-          qPrintable(appr), int(trophySkel.size()), int(m_bodySkeleton.size()));
-    for (int i = 0; i < trophySkel.size() && i < 12; ++i)
-        qInfo("    bone[%d] %s  hash=%u%s", i, qPrintable(trophySkel[i].name),
-              trophySkel[i].nameHash, body.contains(trophySkel[i].nameHash) ? "  (ALSO on body)" : "");
+    int shared = 0;
+    for (quint32 h : own) if (body.contains(h)) ++shared;
+    // `shared` is the fact that matters most: bones the trophy has in common with the body are
+    // what a plain merge would fuse on. Zero shared means merging can never place it — which is
+    // exactly what a rigged trophy did when the bake was skipped (it landed at its own origin).
+    qInfo("[trophyanim] %s: %d own bones, %d shared with the body rig (%d body bones)",
+          qPrintable(appr), int(trophySkel.size()), shared, int(m_bodySkeleton.size()));
+    if (qEnvironmentVariableIsSet("D4_DUMP_TROPHYANIM"))
+        for (int i = 0; i < trophySkel.size() && i < 24; ++i)
+            qInfo("    bone[%d] %s  hash=%u  parent=%d%s", i, qPrintable(trophySkel[i].name),
+                  trophySkel[i].nameHash, trophySkel[i].parent,
+                  body.contains(trophySkel[i].nameHash) ? "  (ALSO on body)" : "");
     for (const BackTrophyIndex::Entry& t : BackTrophyIndex::instance().entries()) {
         if (t.appearance.compare(appr, Qt::CaseInsensitive) != 0) continue;
+        if (t.clips.isEmpty()) qInfo("    (no clips of its own)");
         for (const BackTrophyIndex::Clip& c : t.clips) {
             const AnimParser::DecodedAnim d = decodeAnimForSkeleton(c.name, trophySkel);
             if (!d.valid) { qInfo("    clip %s: DECODE FAILED", qPrintable(c.name)); continue; }
