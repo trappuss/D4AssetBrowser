@@ -28,6 +28,7 @@
 #include <QMouseEvent>
 #include <QPainter>
 #include <QClipboard>
+#include <QGuiApplication>
 #include <QDesktopServices>
 #include <QSysInfo>
 #include <QUrl>
@@ -306,6 +307,15 @@ void MainWindow::buildMenu()
     // Post-patch triage: one screen that verifies storage, keys, d4data freshness, indexes and
     // live format probes — "what broke?" answered in seconds after a game update.
     help->addAction(QStringLiteral("&Health check…"), this, [this] { showHealthCheck(); });
+    // Same buffer as Export log, straight to the clipboard — pasting a log into a bug report or a
+    // chat is the common case, and writing a file first only to attach it is pure friction.
+    help->addAction(QStringLiteral("&Copy log to clipboard"), this, [this] {
+        const QString text = LogBuffer::instance().contents();
+        QGuiApplication::clipboard()->setText(text);
+        setStatus(QStringLiteral("Log copied to clipboard — %1 lines, %2 KB")
+                      .arg(text.count(QLatin1Char('\n')) + 1)
+                      .arg((text.toUtf8().size() + 512) / 1024));
+    });
     help->addAction(QStringLiteral("&Export log…"), this, [this] {
         const QString suggested = QStringLiteral("d4browser_log_%1.txt")
             .arg(QDateTime::currentDateTime().toString(QStringLiteral("yyyyMMdd_HHmmss")));
