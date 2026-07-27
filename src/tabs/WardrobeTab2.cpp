@@ -6561,20 +6561,32 @@ void WardrobeTab2::rebuildOutfitImpl(bool async)
         if (name.isEmpty() && m_index)
             for (const SnoEntry& e : m_index->entries(kGroupAppearance))
                 if (e.snoId == sno) { name = e.name; break; }
-        if (name.isEmpty()) { loadLog += QStringLiteral("\nsno %1: unnamed, skipped").arg(sno); return false; }
+        if (name.isEmpty()) {
+            loadLog += QStringLiteral("\nsno %1: unnamed, skipped").arg(sno);
+            qWarning("wardrobe piece sno %d (slot %d): no name in the index — skipped", sno, slot);
+            return false;
+        }
         const QByteArray meta = m_reader->readMetaBySno(quint64(sno));
         const QByteArray payload = m_reader->readPayloadBySno(quint64(sno));
         if (meta.isEmpty() || payload.isEmpty()) {
             loadLog += QStringLiteral("\n%1: NO DATA (pay=%2)").arg(name).arg(payload.size());
+            // Both sizes, because which one is empty separates "not in this build / encrypted"
+            // from "meta present but the mesh payload is not".
+            qWarning("wardrobe piece %s (sno %d, slot %d): NO DATA — meta=%lld payload=%lld",
+                     qPrintable(name), sno, slot, qint64(meta.size()), qint64(payload.size()));
             return false;
         }
         ModelGeometry geo;   // guarded: a malformed equipped piece must not crash the process
         if (!seh::runGuarded("w2Parse", [&]() { geo = ModelParser::parseApp(meta, payload, name); })) {
             loadLog += QStringLiteral("\n%1: parse FAULT (pay=%2)").arg(name).arg(payload.size());
+            qWarning("wardrobe piece %s (sno %d, slot %d): parse FAULTED (payload=%lld)",
+                     qPrintable(name), sno, slot, qint64(payload.size()));
             return false;
         }
         if (!geo.valid) {
             loadLog += QStringLiteral("\n%1: parse INVALID (pay=%2)").arg(name).arg(payload.size());
+            qWarning("wardrobe piece %s (sno %d, slot %d): parse returned INVALID (payload=%lld)",
+                     qPrintable(name), sno, slot, qint64(payload.size()));
             return false;
         }
         const QStringList roster = MaterialDecode::appearanceRoster(d4, name);
@@ -6712,7 +6724,7 @@ void WardrobeTab2::rebuildOutfitImpl(bool async)
             // and appearanceRoster/parseApp key off the appearance stem.
             if (btSno > 0) {
                 const QString btAppr = m_backTrophy->currentData(Qt::UserRole + 1).toString();
-                addPiece(btSno, btAppr, false, 9, [&](ModelGeometry& g) {
+                const bool btOk = addPiece(btSno, btAppr, false, 9, [&](ModelGeometry& g) {
                     // Recorded BEFORE seating, which bakes the rig away: whether a trophy carries
                     // its own bones at all is the first thing Phase 2 turns on.
                     const int trophyBones = g.skeleton.size();
@@ -6723,7 +6735,16 @@ void WardrobeTab2::rebuildOutfitImpl(bool async)
                               .arg(btAppr).arg(trophyBones)
                         : QStringLiteral("\nback trophy %1 → %2, %3 own bones")
                               .arg(btAppr, bone).arg(trophyBones);
+                    // qInfo as well as loadLog: loadLog is a tooltip string and never reaches
+                    // Help > Export log, so this answer was invisible in an exported log.
+                    qInfo("back trophy %s: socket=%s, %d own bones, %d prims",
+                          qPrintable(btAppr), bone.isEmpty() ? "(none)" : qPrintable(bone),
+                          trophyBones, int(g.primitives.size()));
                 });
+                if (!btOk)
+                    qWarning("back trophy %s (sno %d) did NOT load — see the piece warning above",
+                             qPrintable(btAppr.isEmpty() ? QStringLiteral("(no appearance name)") : btAppr),
+                             btSno);
             }
         }
         // Creator mesh pieces (additive appearances, like equipment):
