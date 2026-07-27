@@ -62,6 +62,21 @@ int clipFrames(const QString& path)
     return m.hasMatch() ? m.captured(1).toInt() : 0;
 }
 
+// One line describing an index result, used by BOTH the cache-hit and the fresh-build paths.
+// They reported different things before: a warm start printed only the trophy count, so the
+// clip coverage — the number the animation work actually turns on — was invisible unless the
+// cache happened to be cold.
+void logResult(const QVector<BackTrophyIndex::Entry>& e, const char* how)
+{
+    int withClips = 0, nClips = 0;
+    for (const BackTrophyIndex::Entry& t : e) {
+        if (!t.clips.isEmpty()) ++withClips;
+        nClips += t.clips.size();
+    }
+    qInfo("back-trophy index (%s): %d trophies, %d with animation (%d clips)",
+          how, int(e.size()), withClips, nClips);
+}
+
 // Localized item name. TransmogName is what the game's wardrobe shows when it differs from the
 // plain Name, so it wins. Empty ⇒ caller falls back to the file stem rather than inventing text.
 QString itemDisplayName(const QString& stlDir, const QString& stem)
@@ -159,7 +174,7 @@ void BackTrophyIndex::ensureBuilt(const QString& d4dataDir)
                         }
                         if (!e.appearance.isEmpty()) out.push_back(e);
                     }
-                    qInfo("back-trophy index: %d trophies (cached)", int(out.size()));
+                    logResult(out, "cached");
                     QMetaObject::invokeMethod(this, [this, gen, out]() mutable {
                         if (gen != generation()) return;      // d4data switched mid-build
                         install(std::move(out));
@@ -266,10 +281,7 @@ void BackTrophyIndex::ensureBuilt(const QString& d4dataDir)
                 f.write(QJsonDocument(QJsonObject{{QStringLiteral("sig"), sig},
                                                   {QStringLiteral("trophies"), arr}})
                             .toJson(QJsonDocument::Compact));
-            int withClips = 0, nClips = 0;
-            for (const Entry& e : out) { if (!e.clips.isEmpty()) ++withClips; nClips += e.clips.size(); }
-            qInfo("back-trophy index: %d trophies, %d with animation (%d clips)",
-                  int(out.size()), withClips, nClips);
+            logResult(out, "built");
             install(std::move(out));
         }, Qt::QueuedConnection);
     }).detach();
