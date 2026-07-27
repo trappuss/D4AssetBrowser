@@ -201,6 +201,11 @@ public:
     // Marks tracks [from, end) of the current animation as an attached model's, played on their own
     // looping timeline rather than the body clip's. Reset by every setAnimation().
     void setAttachAnimRange(int from, int frames, float fps);
+    // Which frame index track `ai` should be sampled at. Attached tracks run on their own clock, so
+    // every consumer of m_anim has to ask rather than reach for m_frame — the skeleton overlays
+    // reached, and drew the attachment a phase behind the mesh once the two timelines diverged.
+    int  animFrameFor(int ai) const
+    { return (m_animAttachFrom >= 0 && ai >= m_animAttachFrom) ? m_frameAttach : m_frame; }
     int   animFrameCount() const { return m_hasAnim ? m_anim.frameCount : 0; }
     // Copy the CURRENT on-screen pose (the CPU-skinned verts) back into `geo` — positions +
     // normals, primitives walked in setGeometry's flatten order — and zero the skinning data so

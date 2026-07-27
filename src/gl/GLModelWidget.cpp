@@ -5882,10 +5882,10 @@ void GLModelWidget::updateBoneLabels() {
     for (int j = 0; j < nb; ++j) {
         const ModelJoint& jt = m_skeleton[j];
         Mat4 local; const int ai = m_hasAnim ? m_animByHash.value(jt.nameHash, -1) : -1;
-        if (ai >= 0 && m_frame < m_anim.bones[ai].rotations.size())
-            local = composeTRS(m_anim.bones[ai].rotations[m_frame].data(),
-                               m_anim.bones[ai].translations[m_frame].data(),
-                               m_anim.bones[ai].scales[m_frame].data());
+        if (const int af = animFrameFor(ai); ai >= 0 && af < m_anim.bones[ai].rotations.size())
+            local = composeTRS(m_anim.bones[ai].rotations[af].data(),
+                               m_anim.bones[ai].translations[af].data(),
+                               m_anim.bones[ai].scales[af].data());
         else
             local = composeTRS(jt.restQ.data(), jt.restT.data(), jt.restS.data());
         const int p = jt.parent; global[j] = (p >= 0 && p < j) ? mat4mul(global[p], local) : local;
@@ -5953,10 +5953,10 @@ void GLModelWidget::buildSkeleton()
         const ModelJoint& jt = m_skeleton[j];
         Mat4 local;
         const int ai = m_hasAnim ? m_animByHash.value(jt.nameHash, -1) : -1;
-        if (ai >= 0 && m_frame < m_anim.bones[ai].rotations.size()) {
+        if (const int af = animFrameFor(ai); ai >= 0 && af < m_anim.bones[ai].rotations.size()) {
             const auto& ba = m_anim.bones[ai];
-            local = composeTRS(ba.rotations[m_frame].data(),
-                               ba.translations[m_frame].data(), ba.scales[m_frame].data());
+            local = composeTRS(ba.rotations[af].data(),
+                               ba.translations[af].data(), ba.scales[af].data());
         } else {
             local = composeTRS(jt.restQ.data(), jt.restT.data(), jt.restS.data());
         }
@@ -6014,10 +6014,10 @@ void GLModelWidget::buildHardpoints()
         const ModelJoint& jt = m_skeleton[j];
         Mat4 local;
         const int ai = m_hasAnim ? m_animByHash.value(jt.nameHash, -1) : -1;
-        if (ai >= 0 && m_frame < m_anim.bones[ai].rotations.size())
-            local = composeTRS(m_anim.bones[ai].rotations[m_frame].data(),
-                               m_anim.bones[ai].translations[m_frame].data(),
-                               m_anim.bones[ai].scales[m_frame].data());
+        if (const int af = animFrameFor(ai); ai >= 0 && af < m_anim.bones[ai].rotations.size())
+            local = composeTRS(m_anim.bones[ai].rotations[af].data(),
+                               m_anim.bones[ai].translations[af].data(),
+                               m_anim.bones[ai].scales[af].data());
         else
             local = composeTRS(jt.restQ.data(), jt.restT.data(), jt.restS.data());
         const int p = jt.parent;
@@ -6082,10 +6082,10 @@ void GLModelWidget::updateHardpointLabels()
         const ModelJoint& jt = m_skeleton[j];
         Mat4 local;
         const int ai = m_hasAnim ? m_animByHash.value(jt.nameHash, -1) : -1;
-        if (ai >= 0 && m_frame < m_anim.bones[ai].rotations.size())
-            local = composeTRS(m_anim.bones[ai].rotations[m_frame].data(),
-                               m_anim.bones[ai].translations[m_frame].data(),
-                               m_anim.bones[ai].scales[m_frame].data());
+        if (const int af = animFrameFor(ai); ai >= 0 && af < m_anim.bones[ai].rotations.size())
+            local = composeTRS(m_anim.bones[ai].rotations[af].data(),
+                               m_anim.bones[ai].translations[af].data(),
+                               m_anim.bones[ai].scales[af].data());
         else
             local = composeTRS(jt.restQ.data(), jt.restT.data(), jt.restS.data());
         const int p = jt.parent;
@@ -6142,9 +6142,9 @@ void GLModelWidget::buildPhysBones()
             const ModelJoint& jt = m_skeleton[j];
             Mat4 local;
             const int ai = m_hasAnim ? m_animByHash.value(jt.nameHash, -1) : -1;
-            if (ai >= 0 && m_frame < m_anim.bones[ai].rotations.size()) {
+            if (const int af = animFrameFor(ai); ai >= 0 && af < m_anim.bones[ai].rotations.size()) {
                 const auto& ba = m_anim.bones[ai];
-                local = composeTRS(ba.rotations[m_frame].data(), ba.translations[m_frame].data(), ba.scales[m_frame].data());
+                local = composeTRS(ba.rotations[af].data(), ba.translations[af].data(), ba.scales[af].data());
             } else {
                 local = composeTRS(jt.restQ.data(), jt.restT.data(), jt.restS.data());
             }
