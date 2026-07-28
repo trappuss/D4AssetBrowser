@@ -7,6 +7,7 @@
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QSet>
+#include <QVector>
 #include <thread>
 
 namespace {
@@ -101,13 +102,38 @@ void WardrobeAnimIndex::ensureBuilt(const QString& d4dataDir)
             byType.insert(stem.toLower(), v);
         }
 
-        // ── wardrobe AnimSets -> per (class prefix, weapon class) clips ──
-        // Selected by the "_ui_wardrobe" suffix, which is what every one of them carries; the
-        // weapon classes come from the file's own ptWeaponClasses rather than from its name, so a
-        // set covering several (rog_dw covers 1, 2, 9, 26, 29 and 30) registers under all of them.
+        // ── which wardrobe sets each character actually uses ──
+        // Followed by REFERENCE rather than by file name: PlayerClass names its male and female
+        // Actors, and each Actor lists the AnimSets it uses in arAnimSets. Globbing the AnimSet
+        // directory and trusting the prefix would have been close but not safe — "war_" is WARLOCK,
+        // not warrior, and nothing in the file name says so. Verified: all eight playable classes
+        // resolve, and the male and female lists are identical (gender is handled INSIDE each set
+        // by snoFemaleOverrideAnim, not by having separate sets).
         const QString asDir = QDir(root).filePath(QStringLiteral("json/base/meta/AnimSet"));
+        const QString pcDir = QDir(root).filePath(QStringLiteral("json/base/meta/PlayerClass"));
+        const QString acDir = QDir(root).filePath(QStringLiteral("json/base/meta/Actor"));
+        QSet<QString> wardrobeSets;   // set stems this game's characters actually reference
+        for (const QFileInfo& pf : QDir(pcDir).entryInfoList({QStringLiteral("*.pcl.json")}, QDir::Files)) {
+            const QJsonObject pc = readJson(pf.absoluteFilePath());
+            if (pc.isEmpty()) continue;
+            for (const char* k : {"snoActorMale", "snoActorFemale"}) {
+                const QString actor = refStem(pc.value(QLatin1String(k)));
+                if (actor.isEmpty()) continue;
+                const QJsonObject ac = readJson(QDir(acDir).filePath(actor + QStringLiteral(".acr.json")));
+                for (const QJsonValue& av : ac.value(QStringLiteral("arAnimSets")).toArray()) {
+                    const QString n = av.toObject().value(QStringLiteral("name")).toString();
+                    if (n.endsWith(QLatin1String("_ui_wardrobe"), Qt::CaseInsensitive)) wardrobeSets.insert(n.toLower());
+                }
+            }
+        }
+
         for (const QFileInfo& fi : QDir(asDir).entryInfoList({QStringLiteral("*_ui_wardrobe.ans.json")},
                                                              QDir::Files)) {
+            {   // only the sets a real character references
+                QString setStem = fi.fileName();
+                setStem.chop(9);   // ".ans.json"
+                if (!wardrobeSets.isEmpty() && !wardrobeSets.contains(setStem.toLower())) continue;
+            }
             const QJsonObject o = readJson(fi.absoluteFilePath());
             if (o.isEmpty()) continue;
             QString stem = fi.fileName();
@@ -134,9 +160,14 @@ void WardrobeAnimIndex::ensureBuilt(const QString& d4dataDir)
                 && female.idle.isEmpty() && female.unsheathe.isEmpty())
                 continue;   // e.g. bar_1hshth, which binds only the loading-screen pose
 
-            for (const QJsonValue& wv : o.value(QStringLiteral("ptWeaponClasses")).toArray()) {
-                const int wc = wv.toInt(-1);
-                if (wc < 0) continue;
+            // An EMPTY ptWeaponClasses means "no particular class" — dru/rog/sor/war spell their
+            // unarmed set that way where bar/nec/pal write 0 explicitly. Same meaning, so it is
+            // registered as 0 rather than dropped.
+            QVector<int> classes;
+            for (const QJsonValue& wv : o.value(QStringLiteral("ptWeaponClasses")).toArray())
+                if (wv.toInt(-1) >= 0) classes.push_back(wv.toInt());
+            if (classes.isEmpty()) classes.push_back(0);
+            for (int wc : classes) {
                 const QString k = key(prefix, wc);
                 // First writer wins. Several sets can claim one class (bar_oh_nw and bar_1hshth
                 // both claim 1); the one that actually binds the wardrobe Powers is kept, and the

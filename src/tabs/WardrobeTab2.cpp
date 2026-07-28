@@ -115,6 +115,7 @@
 #include <QVector3D>
 #include <QVector4D>
 
+#include <initializer_list>
 #include <algorithm>
 #include <cmath>
 #include <functional>
@@ -2902,12 +2903,71 @@ int WardrobeTab2::wardrobeWeaponClass() const
 
     if (mainC < 0 && offC < 0) return 0;                      // unarmed — every set calls this 0
     if (twoHanded(m_weapon)) return mainC;                    // a two-hander is its own class
-    if (mainC >= 0 && offC >= 0) {                            // a weapon in each hand
-        if (!wi.clipsFor(cls, 9, true).idle.isEmpty()
-            || !wi.clipsFor(cls, 9, false).idle.isEmpty()) return 9;
-        return mainC;
+
+    // The COMBINATION classes. No ItemType carries these: they describe a state, so the mapping was
+    // read off which set declares which class across all eight characters.
+    //
+    //   9      two one-handers (bar_dw, rog_dw)
+    //   14/15  one-hander + shield   (nec_1hsShd, pal_1hsOh)   — 14/15 ARE the Shield ItemTypes
+    //   16     shield, empty main    (nec_hthShd, pal_oh)      — 16 IS the ShieldHTH ItemType
+    //   25     off-hand item, empty main   (dru_oh_nw, sor_oh, war_OH, nec_hthOh)
+    //   26/30  one-hander + off-hand item  (dru_1hsOh, nec_1hsOh, sor_1hsOh, war_1HSoH)
+    //   27     wand + off-hand item        (sor_wndOh)
+    //   29     rogue-only variant          (rog_dw)
+    //
+    // Tried in order and CHECKED against what this character actually has a set for, rather than
+    // assumed — barbarian has none of them except 9, and asking for a class it lacks would other-
+    // wise silently pick nothing. Note bar_oh_nw declares class 1, not 25, despite the name: the
+    // barbarian has no off-hand items at all, so its "oh_nw" set really means "one weapon". Keying
+    // on the declared ID rather than the file name is what keeps that straight.
+    auto has = [&](int wc) {
+        const WardrobeAnimIndex::Clips c = wi.clipsFor(cls, wc, true);
+        return !(c.idle.isEmpty() && c.unsheathe.isEmpty());
+    };
+    auto firstAvailable = [&](std::initializer_list<int> cands, int fallback) {
+        for (int c : cands) if (has(c)) return c;
+        return fallback;
+    };
+
+    const bool offIsShield = offHandIsShieldLike();
+    if (mainC >= 0 && offC >= 0) {                            // something in each hand
+        if (offIsShield)              return firstAvailable({14, 15}, mainC);
+        if (mainC == 8)               return firstAvailable({27, 26, 30, 9}, mainC);   // wand + off-hand
+        if (offHandIsWeapon())        return firstAvailable({9, 29}, mainC);           // dual wield
+        return firstAvailable({26, 30, 25}, mainC);                                    // 1H + focus/totem
     }
-    return mainC >= 0 ? mainC : offC;                         // one hand filled
+    if (offC >= 0) {                                          // off hand only
+        if (offIsShield)              return firstAvailable({16}, offC);
+        return firstAvailable({25}, offC);
+    }
+    return mainC;                                             // main hand only
+}
+
+// Off-hand-ONLY item types (shield / focus / totem) are flagged in kWeapTypes; a one-hander that
+// merely happens to be in the off hand is not one of them, and that distinction is what separates
+// dual wield from "weapon + off-hand item".
+bool WardrobeTab2::offHandIsShieldLike() const
+{
+    if (!m_weapon2 || m_weapon2->currentIndex() <= 0) return false;
+    const QString appr = m_weapon2->currentData(Qt::UserRole + 1).toString().toLower();
+    for (const WeapTypeDef& w : kWeapTypes) {
+        const QString pfx = QString::fromLatin1(w.prefix).toLower() + QLatin1Char('_');
+        if (appr.startsWith(pfx))
+            return w.offHandOnly && QLatin1String(w.itemType).size() >= 6
+                   && QString::fromLatin1(w.itemType).startsWith(QLatin1String("Shield"), Qt::CaseInsensitive);
+    }
+    return false;
+}
+
+bool WardrobeTab2::offHandIsWeapon() const
+{
+    if (!m_weapon2 || m_weapon2->currentIndex() <= 0) return false;
+    const QString appr = m_weapon2->currentData(Qt::UserRole + 1).toString().toLower();
+    for (const WeapTypeDef& w : kWeapTypes) {
+        const QString pfx = QString::fromLatin1(w.prefix).toLower() + QLatin1Char('_');
+        if (appr.startsWith(pfx)) return !w.offHandOnly;   // a real weapon, not a shield/focus/totem
+    }
+    return false;
 }
 
 // Play what the game's wardrobe would play for the current loadout: the unsheathe once, then its

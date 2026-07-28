@@ -170,6 +170,8 @@ private:
     QString classPrefix() const;        // "<code><gender>" lowercase, e.g. "barf"
     // ── Auto Animate ──
     int  wardrobeWeaponClass() const;   // the game's eWeaponClass for the equipped hands
+    bool offHandIsShieldLike() const;   // shield family (drives weapon classes 14/15/16)
+    bool offHandIsWeapon() const;       // a real weapon, not a shield/focus/totem
     void autoAnimateForLoadout();       // play the game's own wardrobe unsheathe -> idle
     void maybeAutoAnimate();            // after a rebuild: act only if the weapon class moved
     QString m_autoFollowClip;           // queued behind the current one-shot (see tickAnimation)
