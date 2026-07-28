@@ -4535,9 +4535,12 @@ void WardrobeTab2::seatWeapon(ModelGeometry& wgeo, int hand, const QString& item
                              int* outBone, std::array<float,16>* outMz, bool bake)
 {
     constexpr quint32 kMain = 3636304447u, kOff = 4036545548u;
+    // Right-side socket → its left-side twin. The hip pair is NOT a "flail pair" as this once
+    // said — 924169363/543141696 are HP_rightHipSheath/HP_leftHipSheath, which is why a flail whose
+    // only authored offsets are hip sheaths ended up on the hip. Used for sheathed seating only.
     auto mirror = [](quint32 h) -> quint32 {
-        if (h == 3636304447u) return 4036545548u;   // weapon_R → weapon_L
-        if (h == 924169363u)  return 543141696u;    // flail pair
+        if (h == 3636304447u) return 4036545548u;   // HP_rightWeapon → HP_leftWeapon
+        if (h == 924169363u)  return 543141696u;    // HP_rightHipSheath → HP_leftHipSheath
         return h;
     };
     const QString d4 = Config::d4dataDir();
@@ -4602,33 +4605,37 @@ void WardrobeTab2::seatWeapon(ModelGeometry& wgeo, int hand, const QString& item
         QVector<Off> mine;
         for (const Off& o : offs) if (o.entry == fubc && hp.contains(o.hash)) mine.push_back(o);
 
-        // Within the class's row, a socket that is NOT the generic weapon mount is the one the
-        // class deliberately authored, and it wins. Polearm's Spiritborn row names both the generic
-        // mount (identity) and a Spiritborn socket carrying a 180° flip — preferring the generic
-        // one is exactly why the polearm came out upside down. Glaive and Quarterstaff name only
-        // their own socket, so they were landing on the generic mount with no offset at all.
-        QVector<Off> specific;
-        for (const Off& o : mine) if (o.hash != kMain && o.hash != kOff) specific.push_back(o);
-        const QVector<Off>& pool = specific.isEmpty() ? mine : specific;
+        // A row's other hashes are SHEATH sockets, not alternative grips — model/Hardpoints.cpp
+        // names them: 2338619876 HP_poleSheath, 3092546280 HP_staffSheath, 274763203
+        // HP_rightBackSheath, 924169363/543141696 HP_rightHipSheath/HP_leftHipSheath. Only
+        // HP_rightWeapon and HP_leftWeapon are hands.
+        //
+        // Taking any row entry that happened to come first therefore seated weapons AT THEIR
+        // SHEATH. Glaive and Quarterstaff author ONLY a staff/pole sheath offset and no grip at
+        // all, so they were being hung off the back; Flail authors only hip-sheath offsets, so it
+        // sat on the hip. That is the whole of the "wrong position" report.
+        //
+        // In-hand seating therefore considers the two weapon sockets and nothing else. A weapon
+        // with no authored grip for this class gets the socket with an identity offset, which is
+        // what an absent row means.
+        QVector<Off> pool;
+        for (const Off& o : mine) if (o.hash == kMain || o.hash == kOff) pool.push_back(o);
 
         if (!pool.isEmpty()) {
             // Main-side of a mirrored pair is the hash mirror() knows how to flip; Flail's row
             // lists both hands, and without this the off-hand grip could be chosen for the main.
-            const Off* main = nullptr;
-            for (const Off& o : pool) if (mirror(o.hash) != o.hash) { main = &o; break; }
-            if (!main) main = &pool.first();
-            hash = main->hash; Toff = main->m;
-            if (hand == 1) {
-                const quint32 want = mirror(main->hash);
-                const Off* dual = nullptr;
-                for (const Off& o : pool) if (o.hash == want && o.hash != main->hash) { dual = &o; break; }
-                if (!dual)
-                    for (const Off& o : pool) if (o.hash != main->hash) { dual = &o; break; }
-                if (dual) { hash = dual->hash; Toff = dual->m; }
-                else      { hash = want; Toff = {{1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1}}; }
-            }
-        } else if (hand == 1) {
-            hash = mirror(kMain);
+            // The hand decides the socket; the row only supplies its offset.
+            hash = (hand == 0) ? kMain : kOff;
+            const Off* want = nullptr;
+            for (const Off& o : pool) if (o.hash == hash) { want = &o; break; }
+            // Off hand with no left-hand grip authored: reuse the right-hand offset on the left
+            // socket, which is what the old mirror() did and is right for a one-hander held either
+            // way round.
+            if (!want && hand == 1)
+                for (const Off& o : pool) if (o.hash == kMain) { want = &o; break; }
+            if (want) Toff = want->m;
+        } else {
+            hash = (hand == 0) ? kMain : kOff;
         }
         dbg += QStringLiteral("\n%1: %2 class row %3 — socket %4%5")
                    .arg(QLatin1String(lbl), itemType).arg(fubc).arg(hash)
