@@ -228,6 +228,49 @@ StableTab2::StableTab2(QWidget* parent) : BrowserTab(parent)
         b->setText(QString::fromLatin1(kSlotLabels[i]));
         b->setToolTip(QStringLiteral("Select the %1 slot").arg(QString::fromLatin1(kSlotLabels[i])));
         m_slotCell[i] = b;
+        // Same menu the Wardrobe slot cells carry, for the same reason: a slot cell is a picture
+        // of one equipped item. Clear first — it is the action about the SLOT rather than the item
+        // in it, and the one people reach for.
+        b->setContextMenuPolicy(Qt::CustomContextMenu);
+        connect(b, &QWidget::customContextMenuRequested, this, [this, i, b](const QPoint& p) {
+            QMenu menu;
+            const int sno = m_slotSel[i];
+            QAction* aClear = menu.addAction(QStringLiteral("Clear"), this, [this, i] {
+                pushUndo();
+                m_slotSel[i] = 0; m_slotName[i].clear(); m_slotDisp[i].clear();
+                m_slotDesc[i].clear(); m_slotLook[i] = 0;
+                refreshSlotCells(); fillGrid(); rebuildMount();
+            });
+            aClear->setEnabled(sno > 0);
+            if (sno > 0) {
+                const QString appr = m_slotName[i];
+                const QString disp = m_slotDisp[i].isEmpty()
+                                       ? AppearanceMeta::instance().titleFor(sno) : m_slotDisp[i];
+                const QString coll = AppearanceMeta::instance().collectionFor(sno);
+                auto clip = [](const QString& s) { QGuiApplication::clipboard()->setText(s); };
+                auto prev = [](const QString& s) { return s.size() > 30 ? s.left(29) + QChar(0x2026) : s; };
+                menu.addSeparator();
+                const QString exDir = ViewportPartMenu::condensePath(
+                    QSettings().value(QStringLiteral("stable2/exportDir")).toString());
+                if (!exDir.isEmpty())
+                    menu.addAction(ViewportPartMenu::withValue(QStringLiteral("Export Model Last dir"), exDir),
+                                   this, [this, sno, appr] { exportAppearanceModel(sno, appr, true); });
+                menu.addAction(QStringLiteral("Export Model"), this,
+                               [this, sno, appr] { exportAppearanceModel(sno, appr, false); });
+                menu.addSeparator();
+                menu.addAction(QStringLiteral("Copy SNO id  (%1)").arg(sno), this,
+                               [sno, clip] { clip(QString::number(sno)); });
+                menu.addAction(QStringLiteral("Copy file name  (%1)").arg(prev(appr)), this,
+                               [appr, clip] { clip(appr); });
+                menu.addAction(QStringLiteral("Copy name  (%1)").arg(prev(disp)), this,
+                               [disp, clip] { clip(disp); });
+                QAction* aColl = menu.addAction(
+                    QStringLiteral("Copy collection name  (%1)").arg(prev(coll.isEmpty() ? QStringLiteral("—") : coll)),
+                    this, [coll, clip] { clip(coll); });
+                aColl->setEnabled(!coll.isEmpty());
+            }
+            menu.exec(b->mapToGlobal(p));
+        });
         m_slotCellGroup->addButton(b, i);
         cellRow->addWidget(b);
     }
@@ -1427,6 +1470,20 @@ void StableTab2::fillGrid()
             QToolButton* none = makeCard(QStringLiteral("(none)"), QString(), 0,
                                          QString(), m_slotSel[m_activeSlot] == 0);
             none->setProperty("eidx", -1);
+            // Every other card in this grid answers a right-click; this one silently did not.
+            none->setContextMenuPolicy(Qt::CustomContextMenu);
+            connect(none, &QWidget::customContextMenuRequested, this, [this, none](const QPoint& p) {
+                const int slot = m_activeSlot;
+                QMenu menu;
+                QAction* a = menu.addAction(QStringLiteral("Clear"), this, [this, slot] {
+                    pushUndo();
+                    m_slotSel[slot] = 0; m_slotName[slot].clear(); m_slotDisp[slot].clear();
+                    m_slotDesc[slot].clear(); m_slotLook[slot] = 0;
+                    refreshSlotCells(); fillGrid(); rebuildMount();
+                });
+                a->setEnabled(m_slotSel[slot] > 0);
+                menu.exec(none->mapToGlobal(p));
+            });
             m_gridGroup->addButton(none);
         }
         QString curCat;
@@ -4406,6 +4463,7 @@ void StableTab2::showPartContextMenu(int part, const QPoint& gp, int groupPart)
             in.sourceFileName = m_partSource.value(part);   // the equipped piece this part came from
             in.sourceName     = m_partSource.value(part);
             in.sno            = m_partSourceSno.value(part, 0);
+            in.collection     = AppearanceMeta::instance().collectionFor(in.sno);
             in.partTris     = m_view ? m_view->partTriangles(part) : 0;
             in.visible      = !item || item->checkState(0) == Qt::Checked;
             in.isSim        = part < m_partSim.size() && m_partSim[part];

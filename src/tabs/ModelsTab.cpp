@@ -6454,6 +6454,9 @@ void ModelsTab::showPartContextMenu(int part, const QPoint& gp)
     in.sourceFileName= m_curName;
     in.sourceName    = m_curName;
     in.sno           = m_curSno;
+    // Never assigned before, which made "Copy source collection name" unreachable in all six
+    // entry points — the action existed, checked for a non-empty string, and never got one.
+    in.collection    = AppearanceMeta::instance().collectionFor(m_curSno);
     in.modelTris     = modelTris;
     in.lastExportDir = QSettings().value(QStringLiteral("models/lastExportDir")).toString();
     if (part >= 0 && part < m_curGeo.primitives.size()) {
@@ -9219,7 +9222,13 @@ void ModelsTab::addRowExportCopyActions(QMenu& menu, const QList<int>& snos)
     auto prev = [](const QString& s) { return s.size() > 30 ? s.left(29) + QChar(0x2026) : s; };
     // Export queue count (this menu acts on the whole selection).
     const QString exCount = QStringLiteral("%1 model%2").arg(n).arg(n == 1 ? QString() : QStringLiteral("s"));
-    menu.addAction(QStringLiteral("Export (last dir)  —  %1").arg(exCount), this, [this, models]() {
+    const QString exLastDir = ViewportPartMenu::condensePath(
+        QSettings().value(QStringLiteral("models/lastExportDir")).toString());
+    // Destination shown, the way the card and part menus have always shown it. "last dir"
+    // named a folder the menu would not tell you, so the two families disagreed on the one
+    // thing the label existed to convey. Same helper, so they cannot drift again.
+    menu.addAction(ViewportPartMenu::withValue(QStringLiteral("Export to last dir"), exLastDir)
+                       + QStringLiteral("  —  %1").arg(exCount), this, [this, models]() {
         const QString dir = QSettings().value(QStringLiteral("models/lastExportDir")).toString();
         if (dir.isEmpty()) {
             const QString d = QFileDialog::getExistingDirectory(this, QStringLiteral("Export to…"));

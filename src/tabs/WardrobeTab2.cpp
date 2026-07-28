@@ -5350,6 +5350,18 @@ void WardrobeTab2::appendLookCards(int maxCards)
                                                        && m_slotDyeable[m_activeSlot]));
         }
         if (k == c->currentIndex()) b->setChecked(true);
+        if (sno <= 0) {   // "(none)" — the one card in the grid that used to ignore right-click
+            b->setContextMenuPolicy(Qt::CustomContextMenu);
+            connect(b, &QWidget::customContextMenuRequested, this, [this, b](const QPoint& p) {
+                QMenu menu;
+                QAction* a = menu.addAction(QStringLiteral("Clear"), this, [this] {
+                    if (QComboBox* cc = slotCombo(m_activeSlot)) cc->setCurrentIndex(0);
+                    refreshSlotCells(); refreshLookSelection(); updateLookHeader();
+                });
+                a->setEnabled(slotItem(m_activeSlot) > 0);
+                menu.exec(b->mapToGlobal(p));
+            });
+        }
         if (sno > 0) {   // right-click -> equip / equip theme
             b->setContextMenuPolicy(Qt::CustomContextMenu);
             connect(b, &QWidget::customContextMenuRequested, this,
@@ -5525,6 +5537,17 @@ void WardrobeTab2::fillPigmentGrid()
             QMenu menu;
             menu.addAction(QStringLiteral("Apply to this slot"), this, [this, cn, chx] { applyPresetDye(cn, chx, false); });
             menu.addAction(QStringLiteral("Apply to all slots"),  this, [this, cn, chx] { applyPresetDye(cn, chx, true);  });
+            // A pigment is a name and four colours — no SNO, no file, no collection — so this is
+            // the whole copy block the other grids get, rather than an arbitrary subset of it.
+            menu.addSeparator();
+            auto clip = [](const QString& t) { QGuiApplication::clipboard()->setText(t); };
+            QAction* aName = menu.addAction(
+                QStringLiteral("Copy name  (%1)").arg(cn.size() > 30 ? cn.left(29) + QChar(0x2026) : cn),
+                this, [cn, clip] { clip(cn); });
+            aName->setEnabled(!cn.isEmpty());
+            QAction* aHex = menu.addAction(QStringLiteral("Copy colours  (%1)").arg(chx.join(QLatin1Char(' '))),
+                                           this, [chx, clip] { clip(chx.join(QLatin1Char(','))); });
+            aHex->setEnabled(!chx.isEmpty());
             if (isCustom) {
                 menu.addSeparator();
                 menu.addAction(QStringLiteral("Delete custom pigment"), this, [this, cn] {
@@ -6183,6 +6206,19 @@ void WardrobeTab2::fillCreatorGrid()
             b->setToolTip(b->toolTip() + QStringLiteral("\n\nThe colour this Marking is authored to "
                                                        "use. Markings are not recolourable in-game."));
         if (k == c->currentIndex()) b->setChecked(true);
+        if (k == 0) {   // "(none)" — the one card in the grid that used to ignore right-click
+            b->setContextMenuPolicy(Qt::CustomContextMenu);
+            connect(b, &QWidget::customContextMenuRequested, this, [this, b](const QPoint& p) {
+                QMenu menu;
+                QComboBox* cc = m_creator[m_activeCreator];
+                QAction* a = menu.addAction(QStringLiteral("Clear"), this, [this] {
+                    if (m_creator[m_activeCreator]) m_creator[m_activeCreator]->setCurrentIndex(0);
+                    refreshCreatorCells();
+                });
+                a->setEnabled(cc && cc->currentIndex() > 0);
+                menu.exec(b->mapToGlobal(p));
+            });
+        }
         if (k > 0) {   // right-click -> equip / equip theme (same menu as the look grid)
             b->setContextMenuPolicy(Qt::CustomContextMenu);
             connect(b, &QWidget::customContextMenuRequested, this,
@@ -6203,8 +6239,17 @@ void WardrobeTab2::fillCreatorGrid()
                         menu.addAction(QStringLiteral("Equip Theme Weapons  (%1)").arg(themeNames(r, ThemeWeapons)),
                                        this, [this, stem] { equipTheme(0, stem, ThemeWeapons); });
                         menu.addSeparator();
-                        menu.addAction(QStringLiteral("Copy name"), this,
-                                       [stem] { QGuiApplication::clipboard()->setText(stem); });
+                        // Creator options are stems, not appearances — there is no SNO or
+                        // collection to copy. The old single "Copy name" copied the STEM, which is
+                        // the file name; both are offered now under the labels they actually mean.
+                        auto clip = [](const QString& s) { QGuiApplication::clipboard()->setText(s); };
+                        auto prev = [](const QString& s) { return s.size() > 30 ? s.left(29) + QChar(0x2026) : s; };
+                        const QString disp = m_creator[m_activeCreator]
+                                               ? m_creator[m_activeCreator]->itemText(k) : stem;
+                        menu.addAction(QStringLiteral("Copy file name  (%1)").arg(prev(stem)), this,
+                                       [stem, clip] { clip(stem); });
+                        menu.addAction(QStringLiteral("Copy name  (%1)").arg(prev(disp)), this,
+                                       [disp, clip] { clip(disp); });
                         menu.exec(b->mapToGlobal(p));
                     });
         }
@@ -8439,6 +8484,7 @@ void WardrobeTab2::showPartContextMenu(int part, const QPoint& gp, int groupPart
             in.sourceFileName = m_partSource.value(part);     // the outfit piece this part came from
             in.sourceName     = m_partSource.value(part);
             in.sno            = m_partSourceSno.value(part, -1);   // enables "Copy source SNO ID"
+            in.collection     = AppearanceMeta::instance().collectionFor(in.sno);
             in.partTris       = m_partTris.value(part);
             in.visible        = !item || item->checkState(0) == Qt::Checked;
             in.isSim          = part < m_partSim.size() && m_partSim[part];

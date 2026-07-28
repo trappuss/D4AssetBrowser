@@ -13,6 +13,7 @@
 #include "app/Config.h"
 #include "tabs/BatchSink.h"
 
+#include "util/ViewportPartMenu.h"
 #include <QPlainTextEdit>
 #include <QProgressBar>
 #include <QScrollBar>
@@ -1109,7 +1110,12 @@ void BulkExtractorTab::showListMenu(const QPoint& pos)
 
     // Export queue count.
     const QString exCount = QStringLiteral("%1 item%2").arg(n).arg(n == 1 ? QString() : QStringLiteral("s"));
-    menu.addAction(QStringLiteral("Export (last dir)  —  %1").arg(exCount), this, [this, items] { doExtract(false, items); });
+    // The destination is on screen in m_outDir, but the menu claimed "last dir" without saying
+    // which — the card and part menus name it. Same helper so they cannot drift again.
+    const QString exLastDir = ViewportPartMenu::condensePath(
+        m_outDir ? m_outDir->text().trimmed() : QString());
+    menu.addAction(ViewportPartMenu::withValue(QStringLiteral("Export to last dir"), exLastDir)
+                       + QStringLiteral("  —  %1").arg(exCount), this, [this, items] { doExtract(false, items); });
     menu.addAction(QStringLiteral("Export to…  —  %1").arg(exCount), this, [this, items] { doExtract(true, items); });
     menu.addSeparator();
 

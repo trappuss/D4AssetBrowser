@@ -42,6 +42,7 @@
 #include "util/NameTemplate.h"
 #include "util/PanelPersist.h"
 
+#include "util/ViewportPartMenu.h"
 #include <QCheckBox>
 #include <QComboBox>
 #include <QDataStream>
@@ -686,6 +687,24 @@ QWidget* TexturesTab::buildLeft()
     m_view->hideColumn(4);   // COLLECTION
     m_view->setColumnWidth(0, 70);   // SNO
     m_view->horizontalHeader()->setStretchLastSection(true);
+    // Three columns start hidden and there was no way to get them back — the Models tab's browser
+    // has exactly this menu on its header (ModelsTab::showColumnMenu).
+    m_view->horizontalHeader()->setContextMenuPolicy(Qt::CustomContextMenu);
+    connect(m_view->horizontalHeader(), &QWidget::customContextMenuRequested, this,
+            [this](const QPoint& p) {
+        static const char* const kCols[5] = {"SNO", "Icon", "FILENAME", "NAME", "COLLECTION"};
+        QMenu menu(this);
+        for (int c = 0; c < 5; ++c) {
+            const bool shown = !m_view->isColumnHidden(c);
+            QAction* a = menu.addAction(QString::fromLatin1(kCols[c]));
+            a->setCheckable(true);
+            a->setChecked(shown);
+            connect(a, &QAction::triggered, this, [this, c, shown] { m_view->setColumnHidden(c, shown); });
+        }
+        menu.exec(m_view->horizontalHeader()->mapToGlobal(p));
+        QSettings().setValue(QStringLiteral("tex/listHeader"),
+                             m_view->horizontalHeader()->saveState());
+    });
     CsvCopy::install(m_view);
     m_view->setContextMenuPolicy(Qt::CustomContextMenu);
     connect(m_view, &QWidget::customContextMenuRequested, this,
@@ -1335,7 +1354,13 @@ void TexturesTab::showBrowserMenu(QAbstractItemView* view, const QPoint& viewpor
     auto copy = [](const QStringList& l) { QApplication::clipboard()->setText(l.join(QLatin1Char('\n'))); };
     auto prev = [](const QString& s) { return s.size() > 30 ? s.left(29) + QChar(0x2026) : s; };
     const QString exCount = QStringLiteral("%1 texture%2").arg(n).arg(n == 1 ? QString() : QStringLiteral("s"));
-    menu.addAction(QStringLiteral("Export (last dir)  —  %1").arg(exCount), this, [this] { exportSelected(false, true); });
+    const QString exLastDir = ViewportPartMenu::condensePath(
+        QSettings().value(QStringLiteral("tex/lastDir")).toString());
+    // Destination shown, the way the card and part menus have always shown it. "last dir"
+    // named a folder the menu would not tell you, so the two families disagreed on the one
+    // thing the label existed to convey. Same helper, so they cannot drift again.
+    menu.addAction(ViewportPartMenu::withValue(QStringLiteral("Export to last dir"), exLastDir)
+                       + QStringLiteral("  —  %1").arg(exCount), this, [this] { exportSelected(false, true); });
     menu.addAction(QStringLiteral("Export to…  —  %1").arg(exCount), this, [this] { exportSelected(false, false); });
     {
         // Copy the (first) selected texture's decoded image to the clipboard.

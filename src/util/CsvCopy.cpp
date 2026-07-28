@@ -5,6 +5,9 @@
 #include <QApplication>
 #include <QClipboard>
 #include <QItemSelectionModel>
+#include <QMenu>
+#include <QAction>
+#include <QWidget>
 #include <QKeySequence>
 #include <QSet>
 #include <QShortcut>
@@ -73,4 +76,31 @@ void CsvCopy::install(QAbstractItemView* view)
     auto* sc = new QShortcut(QKeySequence::Copy, view);
     sc->setContext(Qt::WidgetWithChildrenShortcut);
     QObject::connect(sc, &QShortcut::activated, view, [view] { copySelection(view); });
+
+    // A right-click Copy as well as Ctrl+C. Ten of the Models tab's detail tables had this
+    // shortcut and NOTHING on right-click, while every neighbouring panel in Wardrobe and Stable
+    // offered a menu — a keyboard-only affordance next to a dozen menus reads as "no copy here".
+    // Installed here rather than per call site so the fourteen views that already ask for CsvCopy
+    // all get it, and so a fifteenth cannot be added without it.
+    if (view->contextMenuPolicy() != Qt::DefaultContextMenu) return;   // a view with its own menu keeps it
+    view->setContextMenuPolicy(Qt::CustomContextMenu);
+    QObject::connect(view, &QWidget::customContextMenuRequested, view, [view](const QPoint& p) {
+        QMenu menu;
+        QItemSelectionModel* sel = view->selectionModel();
+        const bool has = sel && sel->hasSelection();
+        // "Copy" is the selection; "Copy all" ignores it. copySelection already falls back to every
+        // row when nothing is selected, which is exactly what "Copy all" means — so the second
+        // action just clears the selection first rather than duplicating the CSV walk.
+        QAction* aSel = menu.addAction(QStringLiteral("Copy"));
+        aSel->setEnabled(has);
+        QObject::connect(aSel, &QAction::triggered, view, [view] { copySelection(view); });
+        QAction* aAll = menu.addAction(QStringLiteral("Copy all"));
+        QObject::connect(aAll, &QAction::triggered, view, [view, sel] {
+            const QItemSelection keep = sel ? sel->selection() : QItemSelection();
+            if (sel) sel->clearSelection();
+            copySelection(view);
+            if (sel) sel->select(keep, QItemSelectionModel::Select);
+        });
+        menu.exec(view->viewport()->mapToGlobal(p));
+    });
 }
