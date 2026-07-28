@@ -270,27 +270,68 @@ bool ExportCapture::turntableGif(GLModelWidget* view, const QString& path, const
     GLModelWidget::CaptureScope capture(view);
     QSettings s;
     const bool wantT  = transparentEnabled();
-    const int frames  = qBound(8, s.value(QStringLiteral("export/gifTurntableFrames"), 48).toInt(), 240);
+    int frames        = qBound(8, s.value(QStringLiteral("export/gifTurntableFrames"), 48).toInt(), 240);
     const int fps     = qBound(1, s.value(QStringLiteral("export/gifFps"), 25).toInt(), 60);
     const int delayCs = qMax(2, 100 / fps);
     const int scalePct = qBound(25, s.value(QStringLiteral("export/gifScale"), 100).toInt(), 100);
     const int maxCols  = qBound(16, s.value(QStringLiteral("export/gifMaxColors"), 256).toInt(), 256);
     const bool cropToModel = cropEnabled() && !wantT;   // transparent captures already carry alpha
     const float startYaw = view->orbitYaw();
+    const int prevFrame  = view->animFrame();
 
-    // (1) Settle steps per captured frame — see GLModelWidget::settleCloth. A turntable has no
-    // animation, so every frame is the same pose and the cloth should simply be allowed to hang.
+    // The clip plays THROUGH the orbit. The turntable used to hold one pose the whole way round,
+    // which is right for a static prop and wrong for anything with an idle: you got a spinning
+    // statue. A clip is played whenever one is loaded, and the pose is simply left alone when none
+    // is — no setting, because "there is a clip loaded" is the whole question.
+    const int clipN = view->animFrameCount();
+    //
+    // A GIF loops the entire sequence, so BOTH the orbit and the pose have to arrive back where
+    // they started. The orbit always does (a full revolution by construction); the pose only does
+    // if the clip completes a whole number of cycles across the capture. So the capture length is
+    // snapped to the nearest whole number of clip loops — a 48-frame turntable of a 56-frame idle
+    // becomes 56 frames, one revolution and one clip cycle, and the wrap is seamless at the clip's
+    // authored speed.
+    //
+    // When a whole number of loops will not fit in the 240-frame ceiling, the clip is instead
+    // mapped proportionally across the revolution: one cycle per turn. That still wraps seamlessly,
+    // it just plays the clip at the turntable's speed rather than its own.
+    bool authoredRate = false;
+    if (clipN > 0) {
+        const int loops = qMax(1, int(std::lround(double(frames) / double(clipN))));
+        if (loops * clipN <= 240) { frames = qMax(8, loops * clipN); authoredRate = true; }
+    }
+    auto clipFrameFor = [&](int i) {
+        return authoredRate ? (i % clipN) : int(qint64(i) * clipN / frames);
+    };
+
+    // (1) Settle steps per captured frame — see GLModelWidget::settleCloth. With no clip every
+    // frame is the same pose and the cloth is simply allowed to hang; with one, setFrame already
+    // advances the sim once, so only the extras are added here.
     const int physSteps = qBound(1, s.value(QStringLiteral("export/gifPhysicsSteps"), 3).toInt(), 8);
+    const int extraSteps = clipN > 0 ? physSteps - 1 : physSteps;
+
+    // Warm-up lap (not captured), for the same reason animLoopGif has one: stepping the pose from
+    // wherever the preview sat to frame 0 whips the cloth, and the blow-up would be baked into the
+    // first captured frames. It also leaves the sim at frame 0 in the state it will be in after the
+    // last frame, so the GIF's wrap is seamless in the cloth as well as the pose.
+    if (clipN > 0)
+        for (int i = 0; i < frames; ++i) { view->setFrame(clipFrameFor(i)); view->settleCloth(extraSteps); }
 
     std::vector<std::vector<uint8_t>> buf; int gw = 0, gh = 0;
+    auto restore = [&] { view->setOrbitYaw(startYaw); if (clipN > 0) view->setFrame(prevFrame); };
     for (int i = 0; i < frames; ++i) {
         view->setOrbitYaw(startYaw + float(i) / float(frames) * 2.0f * 3.14159265f);
+        if (clipN > 0) view->setFrame(clipFrameFor(i));
         view->setCaptureTime(float(i) * float(delayCs) * 0.01f);   // uniform FX time per frame
-        view->settleCloth(physSteps);
+        view->settleCloth(extraSteps);
         pushFrame(captureFrame(view, wantT, cropToModel), buf, gw, gh, scalePct);
-        if (progress && !progress(i + 1, frames)) { view->setOrbitYaw(startYaw); return false; }
+        if (progress && !progress(i + 1, frames)) { restore(); return false; }
     }
-    view->setOrbitYaw(startYaw);   // restore the original angle
+    restore();
+    if (clipN > 0)
+        qInfo("gif turntable: %d frame(s) — clip %d frame(s) %s", frames, clipN,
+              authoredRate ? "at its authored rate — whole loops per revolution"
+                           : "mapped to one cycle per revolution (whole loops exceed the 240 cap)");
 
     if (buf.empty() || gw == 0) return false;
     if (cropEnabled()) {
