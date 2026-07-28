@@ -359,9 +359,7 @@ constexpr int kNumClasses = 8;
 
 // Marks a row in the animation list as the equipped back trophy's own clip rather than a body
 // clip, so selection can refuse to play it against the body rig.
-constexpr int kTrophyClipRole = Qt::UserRole + 7;
-// On an attachment's clip row: which attachment it belongs to. Empty on body clips and on the
-// non-selectable separator/header rows.
+// On a row of the ATTACHED list: which attachment the clip belongs to. Empty on a group header.
 constexpr int kAttachApprRole = Qt::UserRole + 8;
 
 // The nine character-creator categories: UI label, SNO folder, file extension.
@@ -1423,6 +1421,10 @@ WardrobeTab2::WardrobeTab2(QWidget* parent) : BrowserTab(parent)
     // ── Animations clip list — registered as a RIGHT-side panel below (like the Models tab). The
     //    PanelBox header supplies the "ANIMATIONS" title, so no label here.
     m_animPanel = new QWidget;
+    // Greedy: PanelBox reads this to decide whether the content fills the panel or hugs the top in
+    // a scroll area. Without it the clip list sat at its ~6-row sizeHint no matter how tall the
+    // column was, with the rest of the panel showing blank — see PanelBox.h's sizing contract.
+    m_animPanel->setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Expanding);
     auto* bl = new QVBoxLayout(m_animPanel);
     bl->setContentsMargins(0, 0, 0, 0);
     bl->setSpacing(3);
@@ -1463,10 +1465,7 @@ WardrobeTab2::WardrobeTab2(QWidget* parent) : BrowserTab(parent)
     connect(m_anims, &QWidget::customContextMenuRequested, this, [this](const QPoint& p) {
         QListWidgetItem* hit = m_anims->itemAt(p);
         auto pickHit = [this, hit]() { if (hit && !hit->isSelected()) { m_anims->clearSelection(); hit->setSelected(true); } };
-        int nBody = 0;
-        for (QListWidgetItem* si : m_anims->selectedItems())
-            if (!si->data(kTrophyClipRole).toBool()) ++nBody;
-        const int nSel = (hit && hit->isSelected()) ? qMax(1, nBody) : 1;
+        const int nSel = (hit && hit->isSelected()) ? qMax(1, int(m_anims->selectedItems().size())) : 1;
         QMenu menu(this);
         menu.addAction(nSel > 1 ? QStringLiteral("Export animation library — %1 clip(s) (.glb)…").arg(nSel)
                                 : QStringLiteral("Export animation library (.glb)…"),
@@ -1486,9 +1485,38 @@ WardrobeTab2::WardrobeTab2(QWidget* parent) : BrowserTab(parent)
     buildEnsemblePanel();                     // Ensembles: under the item browser
     if (m_ensemblePanel) ll->addWidget(m_ensemblePanel);   // compact (list is height-capped) — no
                                                            // stretch, so the item grid fills instead
-    // Attachment transport. Lives at the bottom of the ANIMATIONS panel because the attachments'
-    // clips now live in that same list — a separate panel meant two lists and a dropdown to choose
-    // which one you were even looking at. Hidden until something animated is attached.
+    // ── ATTACHED — pinned under the character's clips, inside the SAME panel ──────────────────
+    // Not appended to m_anims: that list runs to several hundred clips, so anything at its end is
+    // permanently below the fold. A short pinned list is always in view, and keeps the character's
+    // selection, filters and library-export scope entirely separate from the attachments'.
+    m_attachSep = new QLabel(QStringLiteral("ATTACHED"), m_animPanel);
+    m_attachSep->setStyleSheet(QStringLiteral(
+        "color:#78c8ff;font-weight:bold;border-top:1px solid #3a4048;padding:4px 0 1px 0;"));
+    m_attachSep->setVisible(false);
+    bl->addWidget(m_attachSep);
+    m_attachList = new QListWidget(m_animPanel);
+    m_attachList->setFrameShape(QFrame::NoFrame);   // reads as part of the panel, not a widget in it
+    m_attachList->setSelectionMode(QAbstractItemView::SingleSelection);
+    m_attachList->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+    m_attachList->setVisible(false);
+    bl->addWidget(m_attachList);   // no stretch: height is set to its content, capped in fill
+    connect(m_attachList, &QListWidget::itemClicked, this, [this](QListWidgetItem* it) {
+        if (!it) return;
+        const QString appr = it->data(kAttachApprRole).toString();
+        const QString name = it->data(Qt::UserRole).toString();
+        if (appr.isEmpty() || name.isEmpty() || m_restoring) return;
+        QSettings().setValue(QStringLiteral("wardrobe2/attachClip/") + appr.toLower(), name);
+        if (m_status) m_status->setText(QStringLiteral("%1 → %2").arg(appr, name));
+        // Deferred: re-arming rebuilds this list, and deleting the item that is mid-signal is
+        // exactly the kind of thing that bites later.
+        const QString play = m_playingAnim;
+        QTimer::singleShot(0, this, [this, play] {
+            if (!play.isEmpty()) playAnimByName(play);   // re-arms the attachment clock
+            else                 fillAttachList();        // just move the bullet
+        });
+    });
+
+    // Attachment transport, directly under its list.
     m_attachRow = new QWidget(m_animPanel);
     {
         auto* row = new QHBoxLayout(m_attachRow);
@@ -2290,25 +2318,6 @@ WardrobeTab2::WardrobeTab2(QWidget* parent) : BrowserTab(parent)
             [this](QListWidgetItem* it, QListWidgetItem*) {
         if (!it) return;
         const QString name = it->data(Qt::UserRole).toString();
-        // An attachment row changes only that attachment: the character keeps playing whatever it
-        // was, so this must not become the list's current item. Handled here (rather than on click)
-        // because arrow-key navigation reaches these rows too.
-        if (it->data(kTrophyClipRole).toBool()) {
-            const QString appr = it->data(kAttachApprRole).toString();
-            if (!m_restoring) {
-                QSettings().setValue(QStringLiteral("wardrobe2/attachClip/") + appr.toLower(), name);
-                if (m_status)
-                    m_status->setText(QStringLiteral("%1 → %2").arg(appr, name));
-                // Deferred: re-arming rebuilds this list, and deleting the item that is mid-signal
-                // is exactly the kind of thing that bites later. Off the stack it is just a rebuild.
-                const QString play = m_playingAnim;
-                QTimer::singleShot(0, this, [this, play] {
-                    if (!play.isEmpty()) playAnimByName(play);   // re-arms the attachment clock
-                    else                 fillAnimList();          // just move the bullet
-                });
-            }
-            return;
-        }
         if (name != m_playingAnim) { playAnimByName(name); m_animJustSelected = true; }
     });
     // Re-clicking the ALREADY-selected clip unselects it (stops + clears). But a first click
@@ -8836,48 +8845,45 @@ void WardrobeTab2::fillAnimList()
                                     set.isEmpty() ? QStringLiteral("—") : set));
         if (a.name == sel) m_anims->setCurrentItem(it);
     }
-    appendAttachmentRows();
     m_anims->blockSignals(false);
+    fillAttachList();
 }
 
-// The attachments' clips, appended to the SAME list as the character's under a separator.
+// The attachments' clips: a short pinned list under the character's, inside the same panel.
 //
-// They were a separate panel, which meant two lists, two places to look, and a dropdown to pick
-// whose clips you were even seeing. One list shows everything that is animating: the character at
-// the top, then a group per attached model with its clips inline. Nothing is hidden behind a
-// selection.
+// This lived in a separate right-column panel behind a dropdown, so seeing what an equipped weapon
+// could play meant a second panel and a selection. Everything animating is now in one place, one
+// group per attachment, no dropdown — but in its own list widget rather than appended to the
+// character's, because that list runs to several hundred clips and its end is never on screen.
 //
-// Selection semantics differ by row, which is the one subtlety: choosing a character clip changes
-// what the CHARACTER plays, so it takes the list's current-item highlight. Choosing an attachment
-// clip changes only that attachment — the character keeps playing what it was — so it is marked
-// with a bullet in its own group instead of stealing the highlight.
-void WardrobeTab2::appendAttachmentRows()
+// Sized to its content and capped, so it takes only the room it needs and the character's list
+// keeps the rest.
+void WardrobeTab2::fillAttachList()
 {
-    if (!m_anims) return;
+    if (!m_attachList) return;
     QVector<const Attached*> animated;
     for (const Attached& at : m_attached)
         if (!BackTrophyIndex::instance().clipsFor(at.appearance).isEmpty()) animated.push_back(&at);
-    // The transport only earns its space when there is something for it to transport.
-    if (m_attachRow) m_attachRow->setVisible(!animated.isEmpty());
-    if (animated.isEmpty()) return;
 
-    auto addHeader = [this](const QString& text, bool rule) {
-        auto* it = new QListWidgetItem(text, m_anims);
-        it->setFlags(Qt::NoItemFlags);          // not selectable: it is a label, not a choice
-        QFont f = it->font();
-        f.setBold(true);
-        // pointSizeF() is -1 when the font was set in pixels; shrinking that yields an unreadable
-        // 1pt row, so only adjust a font that is actually specified in points.
-        if (rule && f.pointSizeF() > 1.0) f.setPointSizeF(f.pointSizeF() - 1.0);
-        it->setFont(f);
-        it->setForeground(QBrush(rule ? QColor(122, 130, 138) : kAttachAccent));
-        return it;
-    };
-    addHeader(QStringLiteral("──  ATTACHED  ──────────────────"), true);
+    // The whole block only earns its space when something animated is attached.
+    const bool any = !animated.isEmpty();
+    if (m_attachSep) m_attachSep->setVisible(any);
+    if (m_attachRow) m_attachRow->setVisible(any);
+    m_attachList->setVisible(any);
+    QSignalBlocker block(m_attachList);
+    m_attachList->clear();
+    if (!any) return;
 
     for (const Attached* at : animated) {
-        addHeader(QStringLiteral("%1 — %2").arg(at->slot, at->label), false)
-            ->setIcon(attachedGlyph());
+        auto* hdr = new QListWidgetItem(QStringLiteral("%1 — %2").arg(at->slot, at->label),
+                                        m_attachList);
+        hdr->setFlags(Qt::NoItemFlags);          // a label, not a choice
+        QFont f = hdr->font();
+        f.setBold(true);
+        hdr->setFont(f);
+        hdr->setForeground(QBrush(kAttachAccent));
+        hdr->setIcon(attachedGlyph());
+
         const QString active = selectedClipFor(at->appearance);
         for (const BackTrophyIndex::Clip& c : BackTrophyIndex::instance().clipsFor(at->appearance)) {
             // Named by what distinguishes it — idle / killstreak / clip — since the group header
@@ -8889,19 +8895,26 @@ void WardrobeTab2::appendAttachmentRows()
             const bool on = (c.name == active);
             const double secs = c.frames > 0 ? c.frames / 30.0 : 0.0;
             auto* it = new QListWidgetItem(
-                QStringLiteral("   %1 %2%3").arg(on ? QStringLiteral("●") : QStringLiteral("○"), kind,
-                    c.frames > 0 ? QStringLiteral("   ·   %1 frames  (%2s)")
-                                       .arg(c.frames).arg(secs, 0, 'f', 1) : QString()),
-                m_anims);
+                QStringLiteral("    %1  %2%3")
+                    .arg(on ? QStringLiteral("●") : QStringLiteral("○"), kind,
+                         c.frames > 0 ? QStringLiteral("   ·   %1 frames  (%2s)")
+                                            .arg(c.frames).arg(secs, 0, 'f', 1) : QString()),
+                m_attachList);
             it->setData(Qt::UserRole, c.name);
-            it->setData(kTrophyClipRole, true);
             it->setData(kAttachApprRole, at->appearance);
             if (on) it->setForeground(QBrush(kAttachAccent));
             it->setToolTip(QStringLiteral("%1\nPlays on its own %2-frame loop, independent of the "
                                           "character clip.").arg(c.name).arg(c.frames));
         }
     }
+    // Sized to content so it never scrolls for the common one- or two-attachment case, capped so a
+    // full loadout cannot crowd out the character's list.
+    int h = 2 * m_attachList->frameWidth();
+    for (int i = 0; i < m_attachList->count(); ++i)
+        h += m_attachList->sizeHintForRow(i);
+    m_attachList->setFixedHeight(qMin(h, 190));
 }
+
 
 // Decode one clip for the CURRENT merged rig — extracted from playAnimByName so the
 // export path can decode clips that aren't playing (scope "All of the model's animations").
@@ -9004,21 +9017,17 @@ void WardrobeTab2::collectExportAnims(QVector<AnimParser::DecodedAnim>& anims, Q
         return;
     // Explicit multi-selection wins over the scope setting: embed exactly the ctrl/shift-
     // selected clips (a precise middle ground between "playing clip" and "all listed").
-    // Attachment rows share the list but not the rig: their clips drive the attachment's own bones
-    // and would decode to nothing against the body skeleton. Never an export candidate.
+    // The ATTACHED list is a separate widget, so nothing here can pick up an attachment's clip —
+    // those drive the attachment's own bones and would decode to nothing against the body rig.
     auto bodyRows = [this]() {
         QVector<QListWidgetItem*> v;
-        for (int i = 0; m_anims && i < m_anims->count(); ++i) {
-            QListWidgetItem* it = m_anims->item(i);
-            if (!it->data(kTrophyClipRole).toBool() && !it->data(Qt::UserRole).toString().isEmpty())
-                v.push_back(it);
-        }
+        for (int i = 0; m_anims && i < m_anims->count(); ++i)
+            if (!m_anims->item(i)->data(Qt::UserRole).toString().isEmpty())
+                v.push_back(m_anims->item(i));
         return v;
     };
     if (m_anims && m_anims->selectedItems().size() > 1) {
-        QVector<QListWidgetItem*> sel;
-        for (QListWidgetItem* it : m_anims->selectedItems())
-            if (!it->data(kTrophyClipRole).toBool()) sel.push_back(it);
+        const auto sel = m_anims->selectedItems();
         QProgressDialog prog(QStringLiteral("Decoding selected animations…"), QStringLiteral("Cancel"),
                              0, sel.size(), this);
         prog.setWindowModality(Qt::WindowModal);
@@ -9164,7 +9173,7 @@ void WardrobeTab2::playAnimByName(const QString& animName)
     QSettings().setValue(QStringLiteral("wardrobe2/anim"), animName);   // remember selection
     if (!seh::runGuarded("w2SetAnim", [&]() { m_view->setAnimation(anim); })) return;
     // AFTER setAnimation, which clears every previous range.
-    fillAnimList();   // re-mark which attachment clip is active (bullets), keep the body selection
+    fillAttachList();   // re-mark which attachment clip is actually playing
     QVector<GLModelWidget::AttachRange> ranges;
     ranges.reserve(m_btAttachRanges.size());
     for (const AttachSpan& sp : m_btAttachRanges)
