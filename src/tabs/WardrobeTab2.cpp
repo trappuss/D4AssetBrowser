@@ -143,25 +143,10 @@ QIcon transportGlyph(int kind, const QColor& tint = QColor(210, 205, 190))
     return QIcon(pm);
 }
 
-// Strip/panel glyph for ATTACHED animations: the play triangle in the attachment accent, orbited
-// by a ring — it reads as "a second, separate playhead" rather than a duplicate of the ANIMATIONS
-// button, which is what a same-shaped icon in a vertical strip of glyphs looks like.
-const QColor kAttachAccent(120, 200, 255);
-
-QIcon attachedGlyph()
-{
-    QPixmap pm(16, 16);
-    pm.fill(Qt::transparent);
-    QPainter p(&pm);
-    p.setRenderHint(QPainter::Antialiasing);
-    p.setPen(QPen(kAttachAccent, 1.4));
-    p.setBrush(Qt::NoBrush);
-    p.drawEllipse(QRectF(1.4, 1.4, 13.2, 13.2));
-    p.setPen(Qt::NoPen);
-    p.setBrush(kAttachAccent);
-    p.drawPolygon(QPolygonF({{6.0, 4.6}, {6.0, 11.4}, {11.4, 8.0}}));
-    return QIcon(pm);
-}
+// Accent for the ATTACHED group headers: the theme's red, the same #b0453c the panel strip and
+// the combo hovers use. This was a distinct blue while the attachments had a panel of their own;
+// inside the ANIMATIONS panel a second accent just reads as a different widget bolted on.
+const QColor kAttachAccent(176, 69, 60);
 
 // Material-name classifiers for the FX / SIM part toggles. D4 names cosmetic effect and
 // cloth-sim submeshes with recognizable tokens, but the set is broad — beyond plain "fx"
@@ -1491,12 +1476,12 @@ WardrobeTab2::WardrobeTab2(QWidget* parent) : BrowserTab(parent)
     // selection, filters and library-export scope entirely separate from the attachments'.
     m_attachSep = new QLabel(QStringLiteral("ATTACHED"), m_animPanel);
     m_attachSep->setStyleSheet(QStringLiteral(
-        "color:#78c8ff;font-weight:bold;border-top:1px solid #3a4048;padding:4px 0 1px 0;"));
+        "color:#b0453c;font-weight:bold;border-top:1px solid #2a2a2a;padding:4px 0 1px 0;"));
     m_attachSep->setVisible(false);
     bl->addWidget(m_attachSep);
     m_attachList = new QListWidget(m_animPanel);
     m_attachList->setFrameShape(QFrame::NoFrame);   // reads as part of the panel, not a widget in it
-    m_attachList->setSelectionMode(QAbstractItemView::SingleSelection);
+    m_attachList->setSelectionMode(QAbstractItemView::NoSelection);   // the ● marks the live clip
     m_attachList->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
     m_attachList->setVisible(false);
     bl->addWidget(m_attachList);   // no stretch: height is set to its content, capped in fill
@@ -1523,7 +1508,7 @@ WardrobeTab2::WardrobeTab2(QWidget* parent) : BrowserTab(parent)
         row->setContentsMargins(0, 2, 0, 0);
         row->setSpacing(6);
         auto* lbl = new QLabel(QStringLiteral("Attached:"), m_attachRow);
-        lbl->setStyleSheet(QStringLiteral("color:#78c8ff;"));
+        lbl->setStyleSheet(QStringLiteral("color:#b0453c;"));
         row->addWidget(lbl);
         m_attachPlay = new QCheckBox(QStringLiteral("Play"), m_attachRow);
         m_attachPlay->setChecked(true);
@@ -8882,23 +8867,24 @@ void WardrobeTab2::fillAttachList()
         f.setBold(true);
         hdr->setFont(f);
         hdr->setForeground(QBrush(kAttachAccent));
-        hdr->setIcon(attachedGlyph());
 
         const QString active = selectedClipFor(at->appearance);
         for (const BackTrophyIndex::Clip& c : BackTrophyIndex::instance().clipsFor(at->appearance)) {
-            // Named by what distinguishes it — idle / killstreak / clip — since the group header
-            // already says which model it belongs to.
+            // Named by the part of the stem that is NOT the appearance — idle, killstreak — since
+            // the group header already says which model it belongs to. Most attachments ship a
+            // single unnamed clip, which leaves nothing to say: the frame count alone is the row.
             QString kind = c.name.startsWith(at->appearance, Qt::CaseInsensitive)
                                ? c.name.mid(at->appearance.size()) : c.name;
             if (kind.startsWith(QLatin1Char('_'))) kind = kind.mid(1);
-            if (kind.isEmpty()) kind = QStringLiteral("clip");
             const bool on = (c.name == active);
-            const double secs = c.frames > 0 ? c.frames / 30.0 : 0.0;
             auto* it = new QListWidgetItem(
                 QStringLiteral("    %1  %2%3")
                     .arg(on ? QStringLiteral("●") : QStringLiteral("○"), kind,
-                         c.frames > 0 ? QStringLiteral("   ·   %1 frames  (%2s)")
-                                            .arg(c.frames).arg(secs, 0, 'f', 1) : QString()),
+                         c.frames > 0 ? QStringLiteral("%1%2 frames")
+                                            .arg(kind.isEmpty() ? QString()
+                                                                : QStringLiteral("   ·   "))
+                                            .arg(c.frames)
+                                      : QString()),
                 m_attachList);
             it->setData(Qt::UserRole, c.name);
             it->setData(kAttachApprRole, at->appearance);
