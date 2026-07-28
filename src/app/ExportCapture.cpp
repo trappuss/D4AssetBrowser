@@ -41,9 +41,79 @@ QImage grabNativeAlpha(GLModelWidget* v)
 // renders on black and white, recovering coverage from the difference — which doubled capture time
 // for every frame and could not recover straight colour where alpha was low without amplifying
 // noise. The pipeline preserves per-fragment alpha, so the second render bought nothing.
-QImage captureFrame(GLModelWidget* v, bool transparent)
+bool cropEnabled()
 {
-    return transparent ? grabNativeAlpha(v) : grabOpaque(v);
+    return QSettings().value(QStringLiteral("export/gifCropToModel"), false).toBool();
+}
+
+// Normal opaque render, but with the alpha channel left as model coverage so the crop pass can
+// find the subject. One render, not two — the backdrop still draws, it just does not mark alpha.
+QImage grabCoverage(GLModelWidget* v)
+{
+    v->setCoverageAlpha(true);
+    QImage img = v->grabFramebuffer().convertToFormat(QImage::Format_RGBA8888);
+    v->setCoverageAlpha(false);
+    return img.isNull() ? grabOpaque(v) : img;
+}
+
+// wantCoverage is passed explicitly rather than read from the setting here, because a still image
+// must never take the coverage path: it would ship a PNG whose background is fully transparent
+// while looking like a normal backdrop render. Only the GIF exporters ask for it, and only because
+// they strip the alpha again once the crop box is known.
+QImage captureFrame(GLModelWidget* v, bool transparent, bool wantCoverage = false)
+{
+    if (transparent) return grabNativeAlpha(v);
+    return wantCoverage ? grabCoverage(v) : grabOpaque(v);
+}
+
+// Crop every frame to the union of the model's silhouette across the WHOLE sequence — one box for
+// all frames, because a per-frame box would make the subject swim around as the crop chased it.
+//
+// The alpha channel is the silhouette: a transparent export has it natively, and an opaque one gets
+// it from coverage mode. Opaque frames are then forced back to alpha 255, so the GIF encoder still
+// takes its opaque path (and with it inter-frame differencing, which a 1-bit-alpha export cannot
+// use). Returns false when nothing was found — an empty viewport must not crop to nothing.
+bool cropFramesToModel(std::vector<std::vector<uint8_t>>& frames, int& gw, int& gh, bool keepAlpha)
+{
+    if (frames.empty() || gw <= 0 || gh <= 0) return false;
+    // 8/255 rather than 0: anti-aliased silhouette edges and faint FX fade to near-zero coverage,
+    // and a strict >0 test would chase single stray pixels out to the frame border.
+    constexpr int kMinAlpha = 8;
+    int x0 = gw, y0 = gh, x1 = -1, y1 = -1;
+    for (const auto& f : frames)
+        for (int y = 0; y < gh; ++y) {
+            const uint8_t* row = f.data() + size_t(y) * size_t(gw) * 4u;
+            for (int x = 0; x < gw; ++x)
+                if (row[x * 4 + 3] >= kMinAlpha) {
+                    if (x < x0) x0 = x;
+                    if (x > x1) x1 = x;
+                    if (y < y0) y0 = y;
+                    if (y > y1) y1 = y;
+                }
+        }
+    if (x1 < 0) return false;   // nothing drawn
+
+    // A few pixels of air so the silhouette is not shaved flush against the edge.
+    constexpr int kPad = 4;
+    x0 = qMax(0, x0 - kPad); y0 = qMax(0, y0 - kPad);
+    x1 = qMin(gw - 1, x1 + kPad); y1 = qMin(gh - 1, y1 + kPad);
+    const int nw = x1 - x0 + 1, nh = y1 - y0 + 1;
+    if (nw <= 0 || nh <= 0) return false;
+    if (nw == gw && nh == gh && keepAlpha) return false;   // already tight — nothing to do
+
+    for (auto& f : frames) {
+        std::vector<uint8_t> nb(size_t(nw) * size_t(nh) * 4u);
+        for (int y = 0; y < nh; ++y) {
+            const uint8_t* src = f.data() + (size_t(y + y0) * size_t(gw) + size_t(x0)) * 4u;
+            uint8_t* dst = nb.data() + size_t(y) * size_t(nw) * 4u;
+            std::memcpy(dst, src, size_t(nw) * 4u);
+            if (!keepAlpha)
+                for (int x = 0; x < nw; ++x) dst[x * 4 + 3] = 255;   // coverage was a means, not output
+        }
+        f = std::move(nb);
+    }
+    gw = nw; gh = nh;
+    return true;
 }
 
 // Append a QImage as tightly-packed RGBA to `frames`; the first frame fixes the size. scalePct<100
@@ -205,6 +275,7 @@ bool ExportCapture::turntableGif(GLModelWidget* view, const QString& path, const
     const int delayCs = qMax(2, 100 / fps);
     const int scalePct = qBound(25, s.value(QStringLiteral("export/gifScale"), 100).toInt(), 100);
     const int maxCols  = qBound(16, s.value(QStringLiteral("export/gifMaxColors"), 256).toInt(), 256);
+    const bool cropToModel = cropEnabled() && !wantT;   // transparent captures already carry alpha
     const float startYaw = view->orbitYaw();
 
     // (1) Settle steps per captured frame — see GLModelWidget::settleCloth. A turntable has no
@@ -216,12 +287,18 @@ bool ExportCapture::turntableGif(GLModelWidget* view, const QString& path, const
         view->setOrbitYaw(startYaw + float(i) / float(frames) * 2.0f * 3.14159265f);
         view->setCaptureTime(float(i) * float(delayCs) * 0.01f);   // uniform FX time per frame
         view->settleCloth(physSteps);
-        pushFrame(captureFrame(view, wantT), buf, gw, gh, scalePct);
+        pushFrame(captureFrame(view, wantT, cropToModel), buf, gw, gh, scalePct);
         if (progress && !progress(i + 1, frames)) { view->setOrbitYaw(startYaw); return false; }
     }
     view->setOrbitYaw(startYaw);   // restore the original angle
 
     if (buf.empty() || gw == 0) return false;
+    if (cropEnabled()) {
+        const int fw = gw, fh = gh;
+        if (cropFramesToModel(buf, gw, gh, wantT))
+            qInfo("gif: cropped to model — %dx%d from %dx%d (%.0f%% of the pixels)",
+                  gw, gh, fw, fh, 100.0 * double(gw) * gh / (double(fw) * fh));
+    }
     return encodeWithBudget(path, buf, gw, gh, delayCs, /*loop=*/true,
                             /*transparentAlphaThreshold=*/wantT ? 128 : -1, maxCols);
 }
@@ -241,6 +318,7 @@ bool ExportCapture::animLoopGif(GLModelWidget* view, const QString& path, const 
     const int delayCs = qBound(2, int(std::lround(100.0 / double(fr))), 100);
     const int scalePct = qBound(25, QSettings().value(QStringLiteral("export/gifScale"), 100).toInt(), 100);
     const int maxCols  = qBound(16, QSettings().value(QStringLiteral("export/gifMaxColors"), 256).toInt(), 256);
+    const bool cropToModel = cropEnabled() && !wantT;   // transparent captures already carry alpha
     const int prev = view->animFrame();
 
     // Warm-up lap (not captured): step every frame once first. The capture otherwise TELEPORTS
@@ -277,12 +355,18 @@ bool ExportCapture::animLoopGif(GLModelWidget* view, const QString& path, const 
         view->setFrame(f);
         view->setCaptureTime(float(f) * float(delayCs) * 0.01f);   // uniform FX time per frame
         view->settleCloth(extraPerFrame);
-        pushFrame(captureFrame(view, wantT), buf, gw, gh, scalePct);
+        pushFrame(captureFrame(view, wantT, cropToModel), buf, gw, gh, scalePct);
         if (progress && !progress(f + 1, n)) { view->setFrame(prev); return false; }
     }
     view->setFrame(prev);   // restore the frame the preview was on
 
     if (buf.empty() || gw == 0) return false;
+    if (cropEnabled()) {
+        const int fw = gw, fh = gh;
+        if (cropFramesToModel(buf, gw, gh, wantT))
+            qInfo("gif: cropped to model — %dx%d from %dx%d (%.0f%% of the pixels)",
+                  gw, gh, fw, fh, 100.0 * double(gw) * gh / (double(fw) * fh));
+    }
     return encodeWithBudget(path, buf, gw, gh, delayCs, /*loop=*/true,
                             /*transparentAlphaThreshold=*/wantT ? 128 : -1, maxCols);
 }

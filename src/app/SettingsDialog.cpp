@@ -1050,6 +1050,14 @@ reading the right blob out of packed storage.</p>
         m_exportResetActions.push_back([gifTarget] { gifTarget->setValue(10); });
         gf->addRow(QStringLiteral("Target size:"), gifTarget);
 
+        exChk(gf, QStringLiteral("export/gifCropToModel"),
+            QStringLiteral("Crop to model"), false,
+            QStringLiteral("Trim the empty margin around the model, so the GIF is the subject rather\n"
+                           "than the viewport. One box for the whole animation (the union of every\n"
+                           "frame's silhouette), so the model doesn't swim around as the crop\n"
+                           "follows it. Costs no extra rendering, and fewer pixels means a smaller\n"
+                           "file at the same quality."));
+
         // One transparency path — native alpha, a single render. The "Transparency method" choice
         // that used to sit here offered difference matting as the alternative, which cost a second
         // render of every frame to recover information the framebuffer's own alpha already carried.
@@ -1465,6 +1473,7 @@ static QStringList liveSettingKeys()
         QStringLiteral("export/gifFps"), QStringLiteral("export/gifTurntableFrames"),
         QStringLiteral("export/gifScale"), QStringLiteral("export/gifMaxColors"),
         QStringLiteral("export/gifOptimize"), QStringLiteral("export/gifTargetMB"),
+        QStringLiteral("export/gifCropToModel"),
         QStringLiteral("export/transparentBg"),
         QStringLiteral("export/includeTex"), QStringLiteral("export/bakeDye"),
         QStringLiteral("export/bakeDetail"), QStringLiteral("export/reconstructNormalZ"),

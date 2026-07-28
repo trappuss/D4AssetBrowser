@@ -379,6 +379,9 @@ public:
     // Clear the background with alpha 0 (for native-alpha screenshot/GIF capture). The captured
     // framebuffer then carries the model's coverage as alpha; restored to opaque after the grab.
     void setTransparentClear(bool on) { m_transparentClear = on; }
+    // Render normally (backdrop and all), but leave the alpha channel as pure model coverage —
+    // background 0, model 1. Lets a capture locate the subject without a second render.
+    void setCoverageAlpha(bool on) { m_coverageAlpha = on; }
     // Bones below this index are authored/base; from it onward they're spring-simulated
     // (cloth/physics). Exposed for the outliner's "N phys" armature badge.
     int  baseBoneCount() const { return m_baseBones; }
@@ -792,6 +795,7 @@ private:
     float     m_fov = 45.0f;   // vertical field of view (degrees)
     bool      m_ortho = false;  // orthographic projection (Camera popup)
     bool      m_transparentClear = false;  // clear alpha 0 during native-alpha capture
+    bool      m_coverageAlpha    = false;  // alpha = model coverage, RGB the normal opaque render
     float     m_maxAniso = 1.0f;           // GPU max anisotropic-filtering level (1 = unsupported)
     // Smooth camera glide (frameRegion animate=true): interpolate toward these targets.
     QTimer*   m_camAnim = nullptr;

@@ -3811,7 +3811,11 @@ void GLModelWidget::paintGL()
         uploadTextures();
     // (The pending dye-gradient upload left with setDyeGradient — nothing ever queued one.)
 
-    glClearColor(m_bg[0], m_bg[1], m_bg[2], m_transparentClear ? 0.0f : 1.0f);   // a=0 → native-alpha capture
+    // a=0 → native-alpha capture. Coverage mode clears to 0 as well but keeps DRAWING the backdrop,
+    // so the colour is the normal opaque render while the alpha channel still says where the model
+    // is. That is what lets "crop to model" find the subject without a second render.
+    glClearColor(m_bg[0], m_bg[1], m_bg[2],
+                 (m_transparentClear || m_coverageAlpha) ? 0.0f : 1.0f);
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 
     // ── Studio-gradient backdrop (Graphics ▸ Backdrop ▸ Gradient): a vertical wash derived
@@ -3828,8 +3832,8 @@ void main() {
 })";
             static const char* kBgFrag = R"(#version 450 core
 in float vT; out vec4 o;
-uniform vec3 uTop; uniform vec3 uBot;
-void main() { o = vec4(mix(uBot, uTop, clamp(vT, 0.0, 1.0)), 1.0); })";
+uniform vec3 uTop; uniform vec3 uBot; uniform float uA;
+void main() { o = vec4(mix(uBot, uTop, clamp(vT, 0.0, 1.0)), uA); })";
             auto compile = [this](GLenum type, const char* src) -> GLuint {
                 GLuint sh = glCreateShader(type);
                 glShaderSource(sh, 1, &src, nullptr);
@@ -3860,6 +3864,9 @@ void main() { o = vec4(mix(uBot, uTop, clamp(vT, 0.0, 1.0)), 1.0); })";
                         qMin(1.0f, m_bg[2] * 1.55f + 0.05f));
             glUniform3f(glGetUniformLocation(m_bgProg, "uBot"),
                         m_bg[0] * 0.40f, m_bg[1] * 0.40f, m_bg[2] * 0.40f);
+            // The backdrop is background, so in coverage mode it stays at alpha 0 — only the model
+            // marks the alpha channel. Its RGB is untouched either way.
+            glUniform1f(glGetUniformLocation(m_bgProg, "uA"), m_coverageAlpha ? 0.0f : 1.0f);
             glBindVertexArray(m_bgVao);
             glDrawArrays(GL_TRIANGLES, 0, 3);
             glBindVertexArray(0);
