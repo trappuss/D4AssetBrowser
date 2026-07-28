@@ -1050,23 +1050,13 @@ reading the right blob out of packed storage.</p>
         m_exportResetActions.push_back([gifTarget] { gifTarget->setValue(10); });
         gf->addRow(QStringLiteral("Target size:"), gifTarget);
 
-        auto* transp = exChk(gf, QStringLiteral("export/transparentBg"),
+        // One transparency path — native alpha, a single render. The "Transparency method" choice
+        // that used to sit here offered difference matting as the alternative, which cost a second
+        // render of every frame to recover information the framebuffer's own alpha already carried.
+        exChk(gf, QStringLiteral("export/transparentBg"),
             QStringLiteral("Transparent background (captures)"), false,
             QStringLiteral("Preview image / GIF captures render the model on a transparent background.\n"
                            "PNG gets true alpha; GIF uses a 1-bit cutout (hard edges). JPEG ignores this."));
-
-        auto* transpMode = new QComboBox(gifBox);
-        transpMode->addItems({QStringLiteral("Difference matting (robust)"), QStringLiteral("Native alpha (single render)")});
-        transpMode->setCurrentIndex(qBound(0, QSettings().value(QStringLiteral("export/transparentMode"), 0).toInt(), 1));
-        transpMode->setToolTip(QStringLiteral(
-            "How transparency is captured. Difference matting renders on black+white and recovers\n"
-            "true edge alpha (robust, 2× renders). Native alpha does a single render with a cleared alpha."));
-        transpMode->setEnabled(transp->isChecked());
-        QObject::connect(transp, &QCheckBox::toggled, transpMode, &QWidget::setEnabled);
-        QObject::connect(transpMode, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int i) {
-            QSettings().setValue(QStringLiteral("export/transparentMode"), i); });
-        m_exportResetActions.push_back([transpMode] { transpMode->setCurrentIndex(0); });
-        gf->addRow(QStringLiteral("Transparency method:"), transpMode);
 
         exportTab->addWidget(gifBox);
 
@@ -1475,7 +1465,7 @@ static QStringList liveSettingKeys()
         QStringLiteral("export/gifFps"), QStringLiteral("export/gifTurntableFrames"),
         QStringLiteral("export/gifScale"), QStringLiteral("export/gifMaxColors"),
         QStringLiteral("export/gifOptimize"), QStringLiteral("export/gifTargetMB"),
-        QStringLiteral("export/transparentBg"), QStringLiteral("export/transparentMode"),
+        QStringLiteral("export/transparentBg"),
         QStringLiteral("export/includeTex"), QStringLiteral("export/bakeDye"),
         QStringLiteral("export/bakeDetail"), QStringLiteral("export/reconstructNormalZ"),
         QStringLiteral("export/includeAnim"), QStringLiteral("export/animScope"),

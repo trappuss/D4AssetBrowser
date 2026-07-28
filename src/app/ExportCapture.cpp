@@ -4,7 +4,8 @@
 #include "gl/GifEncoder.h"
 
 #include <QImage>
-#include <QColor>
+#include <QDebug>
+#include <QElapsedTimer>
 #include <QFileInfo>
 #include <QSettings>
 #include <QtGlobal>
@@ -36,52 +37,13 @@ QImage grabNativeAlpha(GLModelWidget* v)
     return img.isNull() ? grabOpaque(v) : img;
 }
 
-// True-alpha capture via difference matting: render the SAME frame on a black and a white
-// background, then recover per-pixel coverage (alpha) and straight colour. This needs no
-// GL alpha plumbing and is robust to the shading pipeline, because the only thing that
-// differs between the two renders is the background (IBL/ambient use a preset gradient, not
-// the clear colour). Anti-aliased edges resolve to fractional alpha correctly.
-QImage grabTransparent(GLModelWidget* v)
-{
-    const QColor orig = v->backgroundColor();
-    v->setBackgroundColor(QColor(0, 0, 0));
-    QImage b = v->grabFramebuffer().convertToFormat(QImage::Format_RGB888);
-    v->setBackgroundColor(QColor(255, 255, 255));
-    QImage w = v->grabFramebuffer().convertToFormat(QImage::Format_RGB888);
-    v->setBackgroundColor(orig);
-    if (b.isNull() || w.isNull() || b.size() != w.size()) return grabOpaque(v);
-
-    const int W = b.width(), H = b.height();
-    QImage out(W, H, QImage::Format_RGBA8888);
-    for (int y = 0; y < H; ++y) {
-        const uchar* rb = b.constScanLine(y);
-        const uchar* rw = w.constScanLine(y);
-        uchar* ro = out.scanLine(y);
-        for (int x = 0; x < W; ++x) {
-            const int bR = rb[x * 3], bG = rb[x * 3 + 1], bB = rb[x * 3 + 2];
-            const int wR = rw[x * 3], wG = rw[x * 3 + 1], wB = rw[x * 3 + 2];
-            int diff = ((wR - bR) + (wG - bG) + (wB - bB)) / 3;   // (1-A)*255, averaged
-            diff = qBound(0, diff, 255);
-            const int a = 255 - diff;                            // coverage
-            int oR = 0, oG = 0, oB = 0;
-            if (a > 0) {   // straight colour = premultiplied (black-bg) value / alpha
-                oR = qBound(0, bR * 255 / a, 255);
-                oG = qBound(0, bG * 255 / a, 255);
-                oB = qBound(0, bB * 255 / a, 255);
-            }
-            ro[x * 4] = uchar(oR); ro[x * 4 + 1] = uchar(oG);
-            ro[x * 4 + 2] = uchar(oB); ro[x * 4 + 3] = uchar(a);
-        }
-    }
-    return out;
-}
-
+// Native alpha is the only transparency path. Difference matting used to be the alternative — two
+// renders on black and white, recovering coverage from the difference — which doubled capture time
+// for every frame and could not recover straight colour where alpha was low without amplifying
+// noise. The pipeline preserves per-fragment alpha, so the second render bought nothing.
 QImage captureFrame(GLModelWidget* v, bool transparent)
 {
-    if (!transparent) return grabOpaque(v);
-    // export/transparentMode: 0 = difference matting (robust), 1 = native alpha (single render).
-    return QSettings().value(QStringLiteral("export/transparentMode"), 0).toInt() == 1
-               ? grabNativeAlpha(v) : grabTransparent(v);
+    return transparent ? grabNativeAlpha(v) : grabOpaque(v);
 }
 
 // Append a QImage as tightly-packed RGBA to `frames`; the first frame fixes the size. scalePct<100
@@ -123,10 +85,25 @@ void downscaleFrames(std::vector<std::vector<uint8_t>>& frames, int& gw, int& gh
     gw = nw; gh = nh;
 }
 
-// Encode the GIF; if "Optimize to target size" is on and the file exceeds the
-// target, iteratively cut palette colours then downscale the frames and re-encode
-// until the file fits (or we hit the floor). Frames are captured once, so retries
-// only re-encode — no extra rendering.
+// Encode the GIF, and when "Optimize to target size" is on, keep re-encoding until the result
+// fits. Frames are captured once, so retries only re-encode — no extra rendering.
+//
+// Three things were wrong with the old loop, and together they are why the target was missed:
+//
+//   · CUTTING COLOURS MADE THE FILE BIGGER. Dither amplitude is scaled to palette coarseness
+//     (256/colours × 3), so dropping 256 → 32 raised it eightfold. Ordered dithering replaces flat
+//     runs with an 8×8 alternating pattern, which is precisely what LZW cannot compress — so the
+//     optimiser's primary lever fought itself, and with dither on it could climb for several passes
+//     before it ever started shrinking. Dither is now a lever of its own, tried before resolution
+//     is sacrificed.
+//   · IT SHIPPED THE LAST ATTEMPT, NOT THE BEST. Every pass overwrote the file, so a pass that came
+//     out larger than an earlier one was what the user got.
+//   · IT GAVE UP EARLY AND SILENTLY. Twelve passes, of which eight went on palette steps, left three
+//     downscales of 15% — 0.61× linear, nowhere near enough for a file several times over budget,
+//     and it returned success regardless.
+//
+// Downscaling is now aimed rather than nibbled: file size is close to linear in pixel count, so one
+// pass at sqrt(target/actual) lands near the target instead of creeping toward it.
 bool encodeWithBudget(const QString& path, std::vector<std::vector<uint8_t>>& buf,
                       int gw, int gh, int delayCs, bool loop, int transThresh, int maxColors)
 {
@@ -137,29 +114,69 @@ bool encodeWithBudget(const QString& path, std::vector<std::vector<uint8_t>>& bu
 
     // Ordered dithering breaks up palette banding. Without it, smooth shaded surfaces band, and on
     // a MOVING garment the band edges crawl across the surface frame to frame — indistinguishable
-    // from simulation jitter even when the sim is fully deterministic.
-    const bool dither = s.value(QStringLiteral("export/gifDither"), true).toBool();
+    // from simulation jitter even when the sim is fully deterministic. Kept on unless the budget
+    // forces it off.
+    const bool wantDither = s.value(QStringLiteral("export/gifDither"), true).toBool();
 
-    int colors = maxColors;
-    for (int attempt = 0; attempt < 12; ++attempt) {
-        if (!GifEncoder::encode(path.toStdString(), buf, gw, gh, delayCs, loop, transThresh,
-                                colors, dither))
-            return false;
-        if (!optimize) return true;
+    QElapsedTimer clock; clock.start();
+    std::vector<uint8_t> bytes, best;
+    int bestW = gw, bestH = gh, bestColors = maxColors;
+    bool bestDither = wantDither;
 
-        const qint64 sz = QFileInfo(path).size();
-        if (sz <= 0 || sz <= targetBytes) return true;
+    auto attempt = [&](int colors, bool dither) -> qint64 {
+        if (!GifEncoder::encodeToBuffer(bytes, buf, gw, gh, delayCs, loop, transThresh,
+                                        colors, dither))
+            return -1;
+        if (best.empty() || bytes.size() < best.size()) {
+            best = bytes; bestW = gw; bestH = gh; bestColors = colors; bestDither = dither;
+        }
+        return qint64(bytes.size());
+    };
 
-        // Cut the palette first (big win, keeps resolution) down to a 32-colour floor.
-        if (colors > 32) { colors = qMax(32, colors * 3 / 4); continue; }
-
-        // Then shrink the frames ~15% per pass (quadratic size reduction) to a 96px floor.
-        const int nw = qMax(96, gw * 85 / 100);
-        const int nh = qMax(96, gh * 85 / 100);
-        if (nw >= gw && nh >= gh) return true;   // can't shrink further — ship what we have
-        downscaleFrames(buf, gw, gh, nw, nh);
+    qint64 sz = attempt(maxColors, wantDither);
+    if (sz < 0) return false;
+    if (!optimize || sz <= targetBytes) {
+        qInfo("gif: %dx%d px, %d frame(s), %d colours, dither %s — %.2f MB in %lld ms",
+              gw, gh, int(buf.size()), maxColors, wantDither ? "on" : "off",
+              double(sz) / (1024.0 * 1024.0), clock.elapsed());
+        return GifEncoder::writeBuffer(path.toStdString(), bytes);
     }
-    return true;
+
+    // 1. Palette, down to a 32-colour floor. Cheapest in perceived quality per byte saved.
+    int colors = maxColors;
+    while (sz > targetBytes && colors > 32) {
+        colors = qMax(32, colors * 3 / 4);
+        sz = attempt(colors, wantDither);
+        if (sz < 0) return false;
+    }
+    // 2. Dither off. At a coarse palette this is often the single largest saving available, because
+    //    it hands LZW back the flat runs the Bayer pattern was breaking up.
+    if (sz > targetBytes && wantDither) {
+        sz = attempt(colors, false);
+        if (sz < 0) return false;
+    }
+    const bool ditherNow = (sz <= targetBytes) ? bestDither : false;
+    // 3. Resolution, aimed at the target rather than stepped toward it. A few passes because the
+    //    size/pixel relationship is only approximately linear.
+    for (int pass = 0; pass < 5 && sz > targetBytes; ++pass) {
+        const double ratio = double(targetBytes) / double(sz);
+        // 0.93 of the ideal ratio so a slight underestimate still lands under budget; floored so a
+        // single pass cannot collapse the image, and capped so a pass always makes progress.
+        const double k = qBound(0.35, std::sqrt(ratio) * 0.93, 0.92);
+        const int nw = qMax(96, int(gw * k));
+        const int nh = qMax(96, int(gh * k));
+        if (nw >= gw && nh >= gh) break;             // at the 96px floor — nothing left to give
+        downscaleFrames(buf, gw, gh, nw, nh);
+        sz = attempt(colors, ditherNow);
+        if (sz < 0) return false;
+    }
+
+    const bool hit = !best.empty() && qint64(best.size()) <= targetBytes;
+    qInfo("gif: %s — %.2f MB vs %.2f MB target · %dx%d px, %d colours, dither %s · %lld ms",
+          hit ? "target met" : "TARGET NOT REACHABLE — shipping the smallest encode",
+          double(best.size()) / (1024.0 * 1024.0), double(targetBytes) / (1024.0 * 1024.0),
+          bestW, bestH, bestColors, bestDither ? "on" : "off", clock.elapsed());
+    return GifEncoder::writeBuffer(path.toStdString(), best);
 }
 
 }  // namespace

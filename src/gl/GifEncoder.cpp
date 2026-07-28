@@ -4,6 +4,7 @@
 #include <cstring>
 #include <algorithm>
 #include <array>
+#include <thread>
 
 namespace GifEncoder {
 
@@ -187,9 +188,33 @@ private:
 // LZW compression (GIF variant)
 // ---------------------------------------------------------------------------
 
+// Reusable LZW dictionary. The table is 4096*256 entries; clearing it with std::fill costs a
+// 4 MB memset, and the encoder did that once per frame PLUS once per mid-frame table reset — on a
+// 600x600x120 export that is hundreds of megabytes of pure memset and it dominated encode time.
+// An epoch stamp makes "clear" a single increment: an entry counts only when its stamp matches the
+// current epoch. Identical output, no clearing.
+struct LzwScratch {
+    static constexpr int kMaxCode = 4096;
+    std::vector<uint32_t> stamp;   // epoch an entry was written in
+    std::vector<int>      code;    // the code itself
+    uint32_t              epoch = 0;
+
+    void begin() {
+        if (stamp.empty()) { stamp.assign(size_t(kMaxCode) * 256, 0); code.resize(size_t(kMaxCode) * 256); }
+        clear();
+    }
+    void clear() {
+        if (++epoch == 0) {   // wrapped after 4 billion resets — the only time a real wipe is due
+            std::fill(stamp.begin(), stamp.end(), 0);
+            epoch = 1;
+        }
+    }
+};
+
 static void lzwEncode(std::vector<uint8_t>& out,
                       const std::vector<uint8_t>& indices,
-                      int minCodeSize) {
+                      int minCodeSize,
+                      LzwScratch& scratch) {
     const int clearCode = 1 << minCodeSize;
     const int endCode = clearCode + 1;
 
@@ -197,17 +222,14 @@ static void lzwEncode(std::vector<uint8_t>& out,
 
     BlockWriter bw(out);
 
-    // Dictionary: map from (prefix<<8 | nextByte) -> code.
-    // Using a flat array indexed by prefix*256+byte for speed; max prefix code
-    // is 4095, so table size 4096*256.
-    const int kMaxCode = 4096;
-    std::vector<int> dict(kMaxCode * 256, -1);
+    const int kMaxCode = LzwScratch::kMaxCode;
+    scratch.begin();
 
     int codeSize = minCodeSize + 1;
     int nextCode = endCode + 1;
 
     auto resetDict = [&]() {
-        std::fill(dict.begin(), dict.end(), -1);
+        scratch.clear();
         codeSize = minCodeSize + 1;
         nextCode = endCode + 1;
     };
@@ -224,13 +246,14 @@ static void lzwEncode(std::vector<uint8_t>& out,
     for (size_t i = 1; i < indices.size(); ++i) {
         int k = indices[i];
         int idx = prefix * 256 + k;
-        int found = dict[idx];
+        int found = (scratch.stamp[idx] == scratch.epoch) ? scratch.code[idx] : -1;
         if (found != -1) {
             prefix = found;
         } else {
             bw.writeBits(prefix, codeSize);
             if (nextCode < kMaxCode) {
-                dict[idx] = nextCode;
+                scratch.stamp[idx] = scratch.epoch;
+                scratch.code[idx]  = nextCode;
                 ++nextCode;
                 // Increase code size when we've filled the current range.
                 if (nextCode > (1 << codeSize) && codeSize < 12) {
@@ -261,10 +284,11 @@ static void putU16(std::vector<uint8_t>& out, uint16_t v) {
 
 } // namespace
 
-bool encode(const std::string& path,
-            const std::vector<std::vector<uint8_t>>& framesRGBA,
-            int width, int height, int delayCs, bool loop,
-            int transparentAlphaThreshold, int maxColors, bool dither) {
+bool encodeToBuffer(std::vector<uint8_t>& out,
+                    const std::vector<std::vector<uint8_t>>& framesRGBA,
+                    int width, int height, int delayCs, bool loop,
+                    int transparentAlphaThreshold, int maxColors, bool dither) {
+    out.clear();
     if (width <= 0 || height <= 0 || framesRGBA.empty()) return false;
 
     const size_t expected = static_cast<size_t>(width) * height * 4;
@@ -341,8 +365,9 @@ bool encode(const std::string& path,
     int minCodeSize = std::max(2, sizeExp + 1);
 
     // --- Assemble the GIF byte stream. ---
-    std::vector<uint8_t> out;
-    out.reserve(expected / 2 + 1024);
+    // Reserved for EVERY frame, not one: the old figure was a single frame's RGBA size halved, so a
+    // 120-frame export grew the vector by repeated doubling and copied itself the whole way up.
+    out.reserve(expected / 2 * framesRGBA.size() + 4096);
 
     // Header
     const char* hdr = "GIF89a";
@@ -378,16 +403,6 @@ bool encode(const std::string& path,
         out.push_back(0x00); // block terminator
     }
 
-    // Precompute nearest-color mapping cache keyed by RGB (24-bit). This avoids
-    // rescanning the palette for repeated colors, which is common in renders.
-    // Use a hash map-ish flat cache: since 24-bit is 16M entries we instead
-    // memoize per unique color via an unordered map would need <unordered_map>.
-    // Keep it simple and correct: direct nearest per pixel is fine for the
-    // target sizes (600x600x120 ~ 43M lookups worst case). To keep it fast,
-    // we cache the last mapping and use a small 2^15 quantized cache.
-    // Build a coarse cache over 15-bit RGB (5 bits each) to accelerate.
-    std::vector<int16_t> coarseCache(32768, -1);
-
     // Nearest-color search must only consider the opaque palette entries, never the
     // reserved transparent slot (which has a cosmetic RGB and would corrupt matching).
     // A palette view limited to the opaque entries is used for the lookup.
@@ -410,38 +425,77 @@ bool encode(const std::string& path,
         ? std::max(2, std::min(24, 256 / std::max(1, opaqueCount) * 3))
         : 0;
 
-    auto mapPixel = [&](int r, int g, int b, int x, int y) -> uint8_t {
-        if (ditherAmp > 0) {
-            // Bias BEFORE quantisation; the cache key is the biased colour, so it stays valid.
-            const int d = ((kBayer8[((y & 7) << 3) | (x & 7)] * 2) - 63) * ditherAmp / 63;
-            r = std::min(255, std::max(0, r + d));
-            g = std::min(255, std::max(0, g + d));
-            b = std::min(255, std::max(0, b + d));
-        }
-        int key = ((r >> 3) << 10) | ((g >> 3) << 5) | (b >> 3);
-        int16_t c = coarseCache[key];
-        if (c >= 0) return static_cast<uint8_t>(c);
-        int idx = nearestColor(opaquePalette, r, g, b);
-        coarseCache[key] = static_cast<int16_t>(idx);
-        return static_cast<uint8_t>(idx);
-    };
+    // Nearest-palette lookup for every 15-bit (5:5:5) colour, resolved ONCE up front rather than
+    // memoised on demand. The table is 32768 entries and filling it costs one palette scan each;
+    // in exchange every pixel becomes a single array read with no branch and no palette walk. The
+    // old lazy cache degenerated exactly where it mattered: dithering biases each pixel by its
+    // Bayer offset, so one source colour hits up to 64 different keys and most of the table ends
+    // up populated anyway — but one miss at a time, interleaved with the encode.
+    std::vector<uint8_t> lut(32768);
+    for (int key = 0; key < 32768; ++key) {
+        // Reconstruct the bucket CENTRE (+4), not its floor: quantising to the floor biased every
+        // lookup toward darker palette entries by half a bucket.
+        const int r = std::min(255, ((key >> 10) & 31) * 8 + 4);
+        const int g = std::min(255, ((key >>  5) & 31) * 8 + 4);
+        const int b = std::min(255, ( key        & 31) * 8 + 4);
+        lut[key] = static_cast<uint8_t>(nearestColor(opaquePalette, r, g, b));
+    }
 
     const size_t pixCount = static_cast<size_t>(width) * height;
-    std::vector<uint8_t> indices(pixCount);
+    const size_t nFrames  = framesRGBA.size();
 
-    for (const auto& frame : framesRGBA) {
-        const uint8_t* p = frame.data();
-        for (size_t i = 0; i < pixCount; ++i) {
-            if (useTransparency && (p[i * 4 + 3] < transparentAlphaThreshold)) {
-                indices[i] = static_cast<uint8_t>(transparentIndex);
-            } else {
-                // x,y drive the ordered dither pattern (position-only ⇒ stable across frames).
-                const int x = static_cast<int>(i % static_cast<size_t>(width));
-                const int y = static_cast<int>(i / static_cast<size_t>(width));
-                indices[i] = mapPixel(p[i * 4 + 0], p[i * 4 + 1], p[i * 4 + 2], x, y);
+    // Frames are independent — the palette is global and read-only, and each frame's LZW stream is
+    // self-contained (its own clear code, its own dictionary). Quantise and compress them in
+    // parallel, then stitch the blocks in order. Bit-identical to encoding them one at a time.
+    std::vector<std::vector<uint8_t>> lzwBlocks(nFrames);
+    unsigned hw = std::thread::hardware_concurrency();
+    if (hw == 0) hw = 1;
+    // Each worker keeps an 8 MB LZW scratch, so the thread count is capped rather than taking
+    // every core on a many-core machine for what is a memory-bound job anyway.
+    const unsigned nThreads = std::max(1u, std::min<unsigned>({hw, 8u, unsigned(nFrames)}));
+
+    auto encodeRange = [&](size_t from, size_t to) {
+        LzwScratch scratch;
+        std::vector<uint8_t> indices(pixCount);
+        for (size_t fi = from; fi < to; ++fi) {
+            const uint8_t* p = framesRGBA[fi].data();
+            for (size_t i = 0; i < pixCount; ++i) {
+                if (useTransparency && (p[i * 4 + 3] < transparentAlphaThreshold)) {
+                    indices[i] = static_cast<uint8_t>(transparentIndex);
+                    continue;
+                }
+                int r = p[i * 4 + 0], g = p[i * 4 + 1], b = p[i * 4 + 2];
+                if (ditherAmp > 0) {
+                    // x,y drive the ordered pattern (position-only ⇒ stable across frames).
+                    const int x = static_cast<int>(i % static_cast<size_t>(width));
+                    const int y = static_cast<int>(i / static_cast<size_t>(width));
+                    const int d = ((kBayer8[((y & 7) << 3) | (x & 7)] * 2) - 63) * ditherAmp / 63;
+                    r = std::min(255, std::max(0, r + d));
+                    g = std::min(255, std::max(0, g + d));
+                    b = std::min(255, std::max(0, b + d));
+                }
+                indices[i] = lut[((r >> 3) << 10) | ((g >> 3) << 5) | (b >> 3)];
             }
+            lzwBlocks[fi].reserve(pixCount / 2 + 64);
+            lzwEncode(lzwBlocks[fi], indices, minCodeSize, scratch);
         }
+    };
 
+    if (nThreads <= 1) {
+        encodeRange(0, nFrames);
+    } else {
+        std::vector<std::thread> pool;
+        pool.reserve(nThreads);
+        const size_t chunk = (nFrames + nThreads - 1) / nThreads;
+        for (unsigned t = 0; t < nThreads; ++t) {
+            const size_t from = size_t(t) * chunk;
+            if (from >= nFrames) break;
+            pool.emplace_back(encodeRange, from, std::min(nFrames, from + chunk));
+        }
+        for (std::thread& th : pool) th.join();
+    }
+
+    for (size_t fi = 0; fi < nFrames; ++fi) {
         // Graphic Control Extension
         out.push_back(0x21); // extension introducer
         out.push_back(0xF9); // graphic control label
@@ -467,19 +521,31 @@ bool encode(const std::string& path,
         putU16(out, static_cast<uint16_t>(height));
         out.push_back(0x00); // no local color table, not interlaced
 
-        // LZW image data
-        lzwEncode(out, indices, minCodeSize);
+        out.insert(out.end(), lzwBlocks[fi].begin(), lzwBlocks[fi].end());
     }
 
     // Trailer
     out.push_back(0x3B);
+    return true;
+}
 
-    // --- Write file. ---
+bool encode(const std::string& path,
+            const std::vector<std::vector<uint8_t>>& framesRGBA,
+            int width, int height, int delayCs, bool loop,
+            int transparentAlphaThreshold, int maxColors, bool dither) {
+    std::vector<uint8_t> bytes;
+    if (!encodeToBuffer(bytes, framesRGBA, width, height, delayCs, loop,
+                        transparentAlphaThreshold, maxColors, dither))
+        return false;
+    return writeBuffer(path, bytes);
+}
+
+bool writeBuffer(const std::string& path, const std::vector<uint8_t>& bytes) {
     FILE* fp = std::fopen(path.c_str(), "wb");
     if (!fp) return false;
-    size_t written = std::fwrite(out.data(), 1, out.size(), fp);
+    const size_t written = std::fwrite(bytes.data(), 1, bytes.size(), fp);
     std::fclose(fp);
-    return written == out.size();
+    return written == bytes.size();
 }
 
 } // namespace GifEncoder

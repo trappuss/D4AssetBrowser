@@ -29,4 +29,16 @@ bool encode(const std::string& path,
             // surfaces band, and on a moving garment those band edges crawl across the surface —
             // reads as jitter even when the simulation is perfectly deterministic.
             bool dither = true);
+
+// Same encode, into memory. The size-budget path re-encodes with different palettes/scales until
+// the result fits, so it needs to MEASURE a candidate without touching the disk — and then write
+// only the one it keeps.
+bool encodeToBuffer(std::vector<uint8_t>& out,
+                    const std::vector<std::vector<uint8_t>>& framesRGBA,
+                    int width, int height, int delayCs, bool loop,
+                    int transparentAlphaThreshold = -1,
+                    int maxColors = 256,
+                    bool dither = true);
+
+bool writeBuffer(const std::string& path, const std::vector<uint8_t>& bytes);
 }
