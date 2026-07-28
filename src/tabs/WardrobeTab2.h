@@ -18,6 +18,7 @@
 #include <functional>
 
 class QColor;
+class QMenu;
 class QComboBox;
 class QCheckBox;
 class QButtonGroup;
@@ -236,6 +237,10 @@ private:
     void appendLookCards(int maxCards);      // build the next chunk of look cards
     void rebuildLookCollections();           // repopulate the collection dropdown for the active slot
     QComboBox*   slotCombo(int i) const;     // backing combo for slot i (armour or weapon)
+    int          slotItem(int i, QString* fullName = nullptr) const;   // equipped sno (0 = empty)
+    // Image / export / copy actions for one equipped item — shared by the slot cells and the
+    // look-grid cards so the two menus cannot drift apart.
+    void         addItemActions(QMenu& menu, int sno, const QString& fullName);
     QString      slotLabel(int i) const;     // "Helm".."Boots", "Main", "Off"
     void updateWeaponSlotAvailability();     // grey weapon slots the class can't fill (data-driven)
     bool m_lastClassRestrict = true;         // last applied "class restricted" state (live-toggle diff)

@@ -190,6 +190,8 @@ private:
     void   dumpDyeDebug();               // decode + visualize DyeMask/DyeRamp values
     void   rebuildDyeCombo();            // repopulate: Custom + real dyes + saved pigments
     void   recomputePartVisibility();   // combine parts-tree checks with FX/SIM toggles
+    // The shared part menu (util/ViewportPartMenu.h) — raised by the viewport and the PARTS panel.
+    void   showPartContextMenu(int part, const QPoint& gp);
     void   setFlaggedPartsChecked(const QVector<bool>& partFlags, bool checked);   // FX/SIM/GIB toggle → tree checks
     void   clearAnimationSelection();   // stop + clear the playing animation/selection
     void   applyPartMaterials();        // decode + push per-part textures for m_appMatNames

@@ -2795,6 +2795,19 @@ ModelsTab::ModelsTab(QWidget* parent) : BrowserTab(parent)
         m_partsView = makeTable(right, m_partsModel);
         m_partsView->setSelectionMode(QAbstractItemView::ExtendedSelection);
         CsvCopy::install(m_partsView);
+        // The same part menu the viewport raises. This panel had nothing at all on right-click,
+        // while the equivalent panels in Wardrobe and Stable offered the full set — CsvCopy gives
+        // Ctrl+C and no menu, which is easy to miss when every neighbouring panel has one.
+        m_partsView->setContextMenuPolicy(Qt::CustomContextMenu);
+        connect(m_partsView, &QWidget::customContextMenuRequested, this, [this](const QPoint& pos) {
+            // customContextMenuRequested delivers viewport coordinates for an item view.
+            const QModelIndex ix = m_partsView->indexAt(pos);
+            if (!ix.isValid() || !m_partsModel) return;
+            QStandardItem* it = m_partsModel->item(ix.row(), 0);
+            if (!it) return;
+            showPartContextMenu(it->data(Qt::UserRole).toInt(),
+                                m_partsView->viewport()->mapToGlobal(pos));
+        });
         m_partsHdr = section(QStringLiteral("PARTS"), m_partsView,
                              ModelOutlinerModel::kindIcon(ModelOutlinerModel::Part),
                              QStringLiteral("Parts — per-piece visibility, triangle counts, materials"));
@@ -3064,73 +3077,9 @@ ModelsTab::ModelsTab(QWidget* parent) : BrowserTab(parent)
         m_list->scrollTo(ix);
     });
     // Right-click a part in the viewport → hide/show/isolate it + copy its material name.
-    connect(m_modelView, &GLModelWidget::partRightClicked, this, [this](int part, const QPoint& gp) {
-        if (!m_treeModel) return;
-        auto showAll = [this] {
-            QHash<int, bool> all; m_treeModel->partChecks(all);
-            for (auto it = all.constBegin(); it != all.constEnd(); ++it) m_treeModel->setPartCheck(it.key(), true);
-            recomputePartVisibility();
-        };
-        // Right-click SELECTS the part (blue outline) but must NOT move the camera — framing is
-        // an explicit menu action. Shared builder: util/ViewportPartMenu.h.
-        if (m_modelView) m_modelView->setPickedPart(part);
-        ViewportPartMenu::Info in;
-        ViewportPartMenu::Actions act;
-        int modelTris = 0;
-        for (int i = 0; i < m_curGeo.primitives.size(); ++i) modelTris += m_modelView->partTriangles(i);
-        in.sourceModel   = m_curName;
-        in.sourceFileName= m_curName;
-        in.sourceName    = m_curName;
-        in.sno           = m_curSno;
-        in.modelTris     = modelTris;
-        in.lastExportDir = QSettings().value(QStringLiteral("models/lastExportDir")).toString();
-        if (part >= 0 && part < m_curGeo.primitives.size()) {
-            QHash<int, bool> checks; m_treeModel->partChecks(checks);
-            in.part         = part;
-            in.partName     = m_curGeo.primitives[part].materialName;
-            in.partFileName = in.partName;
-            in.partTris     = m_modelView->partTriangles(part);
-            in.visible      = checks.value(part, true);
-            in.isFx         = part < m_partIsFx.size()  && m_partIsFx[part];
-            in.isSim        = part < m_partIsSim.size() && m_partIsSim[part];
-            act.setVisible  = [this, part](bool on) { m_treeModel->setPartCheck(part, on); recomputePartVisibility(); };
-            act.isolate     = [this, part] {
-                QHash<int, bool> all; m_treeModel->partChecks(all);
-                for (auto it = all.constBegin(); it != all.constEnd(); ++it)
-                    m_treeModel->setPartCheck(it.key(), it.key() == part);
-                recomputePartVisibility();
-            };
-            act.frame       = [this, part] {
-                if (!m_modelView) return;
-                QVector3D c; float r;
-                if (m_modelView->partsBounds(QVector<int>{part}, c, r))
-                    m_modelView->frameRegionKeepRotation(c, r, /*animate=*/true);
-            };
-            act.selectPart  = [this, part] { selectPartInOutliner(part); };
-            const QString pn = in.partName.isEmpty() ? QStringLiteral("part") : in.partName;
-            act.exportPart        = [this, part, pn] { exportCurrentModelGlb(QVector<int>{part}, pn, false); };
-            act.exportPartLastDir = [this, part, pn] { exportCurrentModelGlb(QVector<int>{part}, pn, true); };
-        }
-        // Scoped to the model under the cursor. exportSelectedGlb/exportSelectionToLast take the
-        // LIST selection as their scope and would export other selected rows too.
-        act.exportModel        = [this] { exportCurrentModelGlb(QVector<int>(), QString(), false); };
-        act.exportModelLastDir = [this] { exportCurrentModelGlb(QVector<int>(), QString(), true); };
-        act.showAll = [showAll] { showAll(); };
-        act.hideAll = [this] {
-            QHash<int, bool> all; m_treeModel->partChecks(all);
-            for (auto it = all.constBegin(); it != all.constEnd(); ++it) m_treeModel->setPartCheck(it.key(), false);
-            recomputePartVisibility();
-        };
-        act.invert = [this] {
-            QHash<int, bool> all; m_treeModel->partChecks(all);
-            for (auto it = all.constBegin(); it != all.constEnd(); ++it) m_treeModel->setPartCheck(it.key(), !it.value());
-            recomputePartVisibility();
-        };
-        // The right-click outline is transient: it marks what the menu acts on and must go
-        // when the menu does. Persistent selection is the tree/highlight, not this.
-        act.closed = [this] { if (m_modelView) m_modelView->setPickedPart(-1); };
-        ViewportPartMenu::exec(this, gp, in, act);
-    });
+    // The viewport and the PARTS panel raise the SAME menu — see showPartContextMenu.
+    connect(m_modelView, &GLModelWidget::partRightClicked, this,
+            [this](int part, const QPoint& gp) { showPartContextMenu(part, gp); });
     // Double-click = expand/collapse, everywhere, deterministically. The stock
     // expandsOnDoubleClick is style-hint-dependent (a QSS-styled app can silently disable it),
     // so it's turned OFF and handled manually: model rows force-load first when needed, and any
@@ -6479,6 +6428,80 @@ void ModelsTab::updateTabCounts()
     set(m_detailTabs, 0, "Textures", m_matTexModel ? m_matTexModel->rowCount() : 0);
     set(m_detailTabs, 1, "Values",   m_matValModel ? m_matValModel->rowCount() : 0);
     set(m_detailTabs, 2, "Shaders",  m_shaderModel ? m_shaderModel->rowCount() : 0);
+}
+
+// The shared part menu (util/ViewportPartMenu.h), raised by the viewport AND by the PARTS panel.
+// It used to live inline in the viewport's signal handler, which is why the PARTS table had
+// nothing on right-click while Wardrobe and Stable — whose part panels call their own
+// equivalent of this — offered the full set. ViewportPartMenu.h claims six entry points; this
+// is what makes that true.
+void ModelsTab::showPartContextMenu(int part, const QPoint& gp)
+{
+    if (!m_treeModel) return;
+    auto showAll = [this] {
+        QHash<int, bool> all; m_treeModel->partChecks(all);
+        for (auto it = all.constBegin(); it != all.constEnd(); ++it) m_treeModel->setPartCheck(it.key(), true);
+        recomputePartVisibility();
+    };
+    // Right-click SELECTS the part (blue outline) but must NOT move the camera — framing is
+    // an explicit menu action. Shared builder: util/ViewportPartMenu.h.
+    if (m_modelView) m_modelView->setPickedPart(part);
+    ViewportPartMenu::Info in;
+    ViewportPartMenu::Actions act;
+    int modelTris = 0;
+    for (int i = 0; i < m_curGeo.primitives.size(); ++i) modelTris += m_modelView->partTriangles(i);
+    in.sourceModel   = m_curName;
+    in.sourceFileName= m_curName;
+    in.sourceName    = m_curName;
+    in.sno           = m_curSno;
+    in.modelTris     = modelTris;
+    in.lastExportDir = QSettings().value(QStringLiteral("models/lastExportDir")).toString();
+    if (part >= 0 && part < m_curGeo.primitives.size()) {
+        QHash<int, bool> checks; m_treeModel->partChecks(checks);
+        in.part         = part;
+        in.partName     = m_curGeo.primitives[part].materialName;
+        in.partFileName = in.partName;
+        in.partTris     = m_modelView->partTriangles(part);
+        in.visible      = checks.value(part, true);
+        in.isFx         = part < m_partIsFx.size()  && m_partIsFx[part];
+        in.isSim        = part < m_partIsSim.size() && m_partIsSim[part];
+        act.setVisible  = [this, part](bool on) { m_treeModel->setPartCheck(part, on); recomputePartVisibility(); };
+        act.isolate     = [this, part] {
+            QHash<int, bool> all; m_treeModel->partChecks(all);
+            for (auto it = all.constBegin(); it != all.constEnd(); ++it)
+                m_treeModel->setPartCheck(it.key(), it.key() == part);
+            recomputePartVisibility();
+        };
+        act.frame       = [this, part] {
+            if (!m_modelView) return;
+            QVector3D c; float r;
+            if (m_modelView->partsBounds(QVector<int>{part}, c, r))
+                m_modelView->frameRegionKeepRotation(c, r, /*animate=*/true);
+        };
+        act.selectPart  = [this, part] { selectPartInOutliner(part); };
+        const QString pn = in.partName.isEmpty() ? QStringLiteral("part") : in.partName;
+        act.exportPart        = [this, part, pn] { exportCurrentModelGlb(QVector<int>{part}, pn, false); };
+        act.exportPartLastDir = [this, part, pn] { exportCurrentModelGlb(QVector<int>{part}, pn, true); };
+    }
+    // Scoped to the model under the cursor. exportSelectedGlb/exportSelectionToLast take the
+    // LIST selection as their scope and would export other selected rows too.
+    act.exportModel        = [this] { exportCurrentModelGlb(QVector<int>(), QString(), false); };
+    act.exportModelLastDir = [this] { exportCurrentModelGlb(QVector<int>(), QString(), true); };
+    act.showAll = [showAll] { showAll(); };
+    act.hideAll = [this] {
+        QHash<int, bool> all; m_treeModel->partChecks(all);
+        for (auto it = all.constBegin(); it != all.constEnd(); ++it) m_treeModel->setPartCheck(it.key(), false);
+        recomputePartVisibility();
+    };
+    act.invert = [this] {
+        QHash<int, bool> all; m_treeModel->partChecks(all);
+        for (auto it = all.constBegin(); it != all.constEnd(); ++it) m_treeModel->setPartCheck(it.key(), !it.value());
+        recomputePartVisibility();
+    };
+    // The right-click outline is transient: it marks what the menu acts on and must go
+    // when the menu does. Persistent selection is the tree/highlight, not this.
+    act.closed = [this] { if (m_modelView) m_modelView->setPickedPart(-1); };
+    ViewportPartMenu::exec(this, gp, in, act);
 }
 
 void ModelsTab::recomputePartVisibility()

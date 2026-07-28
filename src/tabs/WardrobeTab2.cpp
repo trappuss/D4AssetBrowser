@@ -1524,7 +1524,19 @@ WardrobeTab2::WardrobeTab2(QWidget* parent) : BrowserTab(parent)
             cell->setContextMenuPolicy(Qt::CustomContextMenu);
             connect(cell, &QWidget::customContextMenuRequested, this, [this, i, cell](const QPoint& p) {
                 QMenu menu;
+                QString fullName;
+                const int sno = slotItem(i, &fullName);
+                // Clear FIRST. It is the one action that is about the slot rather than the item in
+                // it, it is the one people reach for most, and putting it last (where it was) meant
+                // scanning past a dozen item actions to unequip.
+                QAction* aClear = menu.addAction(QStringLiteral("Clear"), this, [this, i] {
+                    if (QComboBox* c = slotCombo(i)) c->setCurrentIndex(0);   // (none) → rebuilds
+                    refreshSlotCells();
+                    if (i == m_activeSlot) { refreshLookSelection(); updateLookHeader(); }
+                });
+                aClear->setEnabled(sno > 0);
                 if (i < 5) {   // armour only — weapons can't be dyed
+                    menu.addSeparator();
                     menu.addAction(QStringLiteral("Copy pigment"), this,
                                    [this, i] { m_dyeClip = m_slotDye[i]; m_dyeClipSet = true; });
                     QAction* paste = menu.addAction(QStringLiteral("Paste pigment"), this,
@@ -1532,13 +1544,8 @@ WardrobeTab2::WardrobeTab2(QWidget* parent) : BrowserTab(parent)
                     paste->setEnabled(m_dyeClipSet);
                     menu.addAction(QStringLiteral("Clear pigment"), this,
                                    [this, i] { applyPresetDye(QString(), QStringList(), false, i); });
-                    menu.addSeparator();
                 }
-                menu.addAction(QStringLiteral("Clear"), this, [this, i] {   // unequip this slot
-                    if (QComboBox* c = slotCombo(i)) c->setCurrentIndex(0);   // (none) → rebuilds
-                    refreshSlotCells();
-                    if (i == m_activeSlot) { refreshLookSelection(); updateLookHeader(); }
-                });
+                addItemActions(menu, sno, fullName);   // image · export · copy — same as the icon grids
                 menu.exec(cell->mapToGlobal(p));
             });
             return cell;
@@ -4657,6 +4664,80 @@ static QImage wardrobeLookImage(int sno, CascReader* reader)
     QImage img = h ? IconIndex::instance().iconImage(h, reader) : QImage();
     if (!img.isNull()) cache.insert(sno, img);   // don't cache misses — retry on the next refill
     return img;
+}
+
+// The block of actions an EQUIPPED ITEM offers, shared by the slot cells and the look-grid cards so
+// the two cannot drift. Modelled on the Models tab's icon-grid menu — image actions, then export,
+// then the copy block in the same order and with the same wording — because a slot cell and a
+// browser icon are the same idea: a picture of one item you want to do something with.
+//
+// Appends nothing when the slot is empty, so the caller's "Clear" is all an empty cell offers.
+void WardrobeTab2::addItemActions(QMenu& menu, int sno, const QString& fullName)
+{
+    if (sno <= 0) return;
+    AppearanceMeta& am = AppearanceMeta::instance();
+    const QString title = am.titleFor(sno);
+    const QString coll  = am.collectionFor(sno);
+    const QString dispName = title.isEmpty() ? fullName : title;
+    auto clip = [](const QString& t) { QGuiApplication::clipboard()->setText(t); };
+    auto prev = [](const QString& t) { return t.size() > 30 ? t.left(29) + QChar(0x2026) : t; };
+
+    // ── image ──
+    const QImage icon = wardrobeLookImage(sno, m_reader);
+    menu.addSeparator();
+    QAction* aCopyImg = menu.addAction(QStringLiteral("Copy image"), this,
+        [icon] { QGuiApplication::clipboard()->setImage(icon); });
+    aCopyImg->setEnabled(!icon.isNull());
+    QAction* aSaveImg = menu.addAction(QStringLiteral("Save image…"), this, [this, icon, fullName] {
+        QSettings st;
+        QString dir = st.value(QStringLiteral("export/captureDir")).toString();
+        if (dir.isEmpty()) dir = QStandardPaths::writableLocation(QStandardPaths::PicturesLocation);
+        const QString f = QFileDialog::getSaveFileName(this, QStringLiteral("Save icon"),
+            QDir(dir).filePath(fullName + QStringLiteral(".png")),
+            QStringLiteral("PNG image (*.png)"));
+        if (f.isEmpty()) return;
+        st.setValue(QStringLiteral("export/captureDir"), QFileInfo(f).absolutePath());
+        icon.save(f);
+    });
+    aSaveImg->setEnabled(!icon.isNull());
+
+    // ── export ──
+    menu.addSeparator();
+    const QString exExtra = exportMenuExtras(exportMenuSuffix(sno, fullName));
+    const QString exDir = ViewportPartMenu::condensePath(
+        QSettings().value(QStringLiteral("wardrobe2/lastExportDir")).toString());
+    if (!exDir.isEmpty())
+        menu.addAction(ViewportPartMenu::withValue(QStringLiteral("Export Model Last dir"), exDir) + exExtra,
+                       this, [this, sno, fullName] { exportItemModel(sno, fullName, true); });
+    menu.addAction(QStringLiteral("Export Model") + exExtra, this,
+                   [this, sno, fullName] { exportItemModel(sno, fullName, false); });
+
+    // ── copy ──
+    menu.addSeparator();
+    menu.addAction(QStringLiteral("Copy SNO id  (%1)").arg(sno), this,
+                   [sno, clip] { clip(QString::number(sno)); });
+    menu.addAction(QStringLiteral("Copy file name  (%1)").arg(prev(fullName)), this,
+                   [fullName, clip] { clip(fullName); });
+    menu.addAction(QStringLiteral("Copy name  (%1)").arg(prev(dispName)), this,
+                   [dispName, clip] { clip(dispName); });
+    QAction* aColl = menu.addAction(
+        QStringLiteral("Copy collection name  (%1)").arg(prev(coll.isEmpty() ? QStringLiteral("—") : coll)),
+        this, [coll, clip] { clip(coll); });
+    aColl->setEnabled(!coll.isEmpty());
+}
+
+// What a slot cell currently holds. Armour combos store the appearance name as the item TEXT;
+// weapons strip the type prefix for display and keep the real name in UserRole+1, so the role is
+// preferred and the text is only the fallback.
+int WardrobeTab2::slotItem(int i, QString* fullName) const
+{
+    QComboBox* c = slotCombo(i);
+    if (!c || c->currentIndex() <= 0) return 0;
+    if (fullName) {
+        const QString appr = c->currentData(Qt::UserRole + 1).toString();
+        *fullName = appr.isEmpty() ? c->currentText() : appr;
+    }
+    return c->currentData().toInt();
 }
 
 QComboBox* WardrobeTab2::slotCombo(int i) const
