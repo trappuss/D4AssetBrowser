@@ -309,14 +309,10 @@ private:
     struct AttachSpan { int from = 0; int count = 0; int frames = 0; float fps = 30.0f; };
     QVector<AttachSpan> m_btAttachRanges;
     // ATTACHED panel: the attached model's own clip list + transport.
-    QWidget*     m_attachPanel = nullptr;
-    QLabel*      m_attachWho   = nullptr;
-    QListWidget* m_attachAnims = nullptr;
-    QComboBox*   m_attachWhich = nullptr;   // which attachment's clips are listed
+    QWidget*     m_attachRow    = nullptr;   // attachment transport, bottom of the ANIMATIONS panel
     QCheckBox*   m_attachPlay  = nullptr;
-    QLabel*      m_attachHint  = nullptr;
     QToolButton* m_attachRestart = nullptr;
-    void refreshAttachAnimList();   // repopulate from the equipped attachments
+    void appendAttachmentRows();    // attachments' clips, appended under the character's
     QTreeWidget* m_partTree = nullptr; // per-part visibility tree (piece → submeshes)
     QWidget* m_sidebar = nullptr;      // right-side panel column (strip + splitter)
     QSplitter* m_rsplit = nullptr;     // vertical splitter: the visible panels, drag to resize

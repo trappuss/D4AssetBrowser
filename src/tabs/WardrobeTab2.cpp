@@ -360,6 +360,9 @@ constexpr int kNumClasses = 8;
 // Marks a row in the animation list as the equipped back trophy's own clip rather than a body
 // clip, so selection can refuse to play it against the body rig.
 constexpr int kTrophyClipRole = Qt::UserRole + 7;
+// On an attachment's clip row: which attachment it belongs to. Empty on body clips and on the
+// non-selectable separator/header rows.
+constexpr int kAttachApprRole = Qt::UserRole + 8;
 
 // The nine character-creator categories: UI label, SNO folder, file extension.
 struct CreatorCat { const char* label; const char* folder; const char* ext; };
@@ -1432,9 +1435,9 @@ WardrobeTab2::WardrobeTab2(QWidget* parent) : BrowserTab(parent)
         {"Attack", "attk"}, {"Navigation", "nav"}, {"Turn", "turn"}, {"Sheathe", "sheath"},
         {"Reaction", "reac"}, {"Emote", "emote,emotes"}, {"UI", "_ui_"}, {"Wardrobe", "wardrobe"},
         {"Mount", "mount,horse"}, {"Two-Hand", "2h"}, {"Dual Wield", "dw_"}, {"One-Hand", "1h"},
-        // The equipped back trophy's OWN clips, appended to the list below. Every trophy clip is
-        // named trophy_*, so the plain token isolates them without any special-casing here.
-        {"Back trophy", "trophy"},
+        // Filters the CHARACTER's clips only. The attachments' clips are appended below the list
+        // under their own headers and are deliberately never filtered out — there are only a
+        // handful, and hiding the thing you just equipped behind a filter helps nobody.
     };
     for (const auto& c : kAnimCats)
         m_animFilter->addItem(QString::fromLatin1(c.label), QString::fromLatin1(c.token));
@@ -1460,7 +1463,10 @@ WardrobeTab2::WardrobeTab2(QWidget* parent) : BrowserTab(parent)
     connect(m_anims, &QWidget::customContextMenuRequested, this, [this](const QPoint& p) {
         QListWidgetItem* hit = m_anims->itemAt(p);
         auto pickHit = [this, hit]() { if (hit && !hit->isSelected()) { m_anims->clearSelection(); hit->setSelected(true); } };
-        const int nSel = (hit && hit->isSelected()) ? qMax(1, int(m_anims->selectedItems().size())) : 1;
+        int nBody = 0;
+        for (QListWidgetItem* si : m_anims->selectedItems())
+            if (!si->data(kTrophyClipRole).toBool()) ++nBody;
+        const int nSel = (hit && hit->isSelected()) ? qMax(1, nBody) : 1;
         QMenu menu(this);
         menu.addAction(nSel > 1 ? QStringLiteral("Export animation library — %1 clip(s) (.glb)…").arg(nSel)
                                 : QStringLiteral("Export animation library (.glb)…"),
@@ -1480,85 +1486,35 @@ WardrobeTab2::WardrobeTab2(QWidget* parent) : BrowserTab(parent)
     buildEnsemblePanel();                     // Ensembles: under the item browser
     if (m_ensemblePanel) ll->addWidget(m_ensemblePanel);   // compact (list is height-capped) — no
                                                            // stretch, so the item grid fills instead
-    // ── ATTACHED ANIMATIONS — clips owned by an ATTACHED model (currently the back trophy)
-    //    rather than by the character. Separate from the list above because they are a separate
-    //    thing: they drive the attachment's own bones on their own looping timeline, so they do
-    //    not belong in a list whose selection replaces what the CHARACTER is doing.
-    //    Without this the code auto-picked "_idle" and a trophy's _killstreak was unreachable.
-    m_attachPanel = new QWidget;
-    auto* al = new QVBoxLayout(m_attachPanel);
-    al->setContentsMargins(0, 0, 0, 0);
-    al->setSpacing(3);
-    // Header: which model these clips belong to. Accent-coloured and left-ruled so the panel reads
-    // as a different subject from ANIMATIONS at a glance rather than on a second look.
-    m_attachWho = new QLabel(QStringLiteral("Nothing attached"), m_attachPanel);
-    m_attachWho->setWordWrap(true);
-    m_attachWho->setStyleSheet(QStringLiteral(
-        "QLabel{color:#78c8ff;border-left:2px solid #78c8ff;padding:2px 0 2px 6px;}"));
-    al->addWidget(m_attachWho);
-    // Secondary line: what the panel DOES. New concept ("second timeline"), so it earns one line
-    // of explanation rather than hiding in a tooltip nobody hovers.
-    // Which attachment you are choosing a clip FOR. All of them play regardless — this only picks
-    // whose list is shown — so it stays hidden unless there is more than one.
-    m_attachWhich = new QComboBox(m_attachPanel);
-    m_attachWhich->setToolTip(QStringLiteral("Which attached model's clips to show. They all play."));
-    m_attachWhich->setVisible(false);
-    al->addWidget(m_attachWhich);
-    m_attachHint = new QLabel(m_attachPanel);
-    m_attachHint->setWordWrap(true);
-    m_attachHint->setStyleSheet(QStringLiteral("color:#8a8f96;font-size:11px;"));
-    m_attachHint->setText(QStringLiteral("Runs on its own loop, independent of the character clip."));
-    al->addWidget(m_attachHint);
-    m_attachAnims = new QListWidget(m_attachPanel);
-    m_attachAnims->setAlternatingRowColors(true);
-    m_attachAnims->setMinimumHeight(80);
-    m_attachAnims->setSelectionMode(QAbstractItemView::SingleSelection);
-    // The accent follows through to the selection, so it is obvious which list a highlighted row
-    // belongs to when both panels are up.
-    m_attachAnims->setStyleSheet(QStringLiteral(
-        "QListWidget::item:selected{background:#1d4b66;color:#eaf6ff;}"
-        "QListWidget::item{padding:2px 4px;}"));
-    m_attachAnims->setToolTip(QStringLiteral(
-        "Clips shipped with the attached model. Selecting one plays it on its OWN looping "
-        "timeline — independent of the character clip, so mismatched lengths do not fight."));
-    al->addWidget(m_attachAnims, 1);
+    // Attachment transport. Lives at the bottom of the ANIMATIONS panel because the attachments'
+    // clips now live in that same list — a separate panel meant two lists and a dropdown to choose
+    // which one you were even looking at. Hidden until something animated is attached.
+    m_attachRow = new QWidget(m_animPanel);
     {
-        auto* row = new QHBoxLayout(); row->setSpacing(6);
-        m_attachPlay = new QCheckBox(QStringLiteral("Play"), m_attachPanel);
+        auto* row = new QHBoxLayout(m_attachRow);
+        row->setContentsMargins(0, 2, 0, 0);
+        row->setSpacing(6);
+        auto* lbl = new QLabel(QStringLiteral("Attached:"), m_attachRow);
+        lbl->setStyleSheet(QStringLiteral("color:#78c8ff;"));
+        row->addWidget(lbl);
+        m_attachPlay = new QCheckBox(QStringLiteral("Play"), m_attachRow);
         m_attachPlay->setChecked(true);
-        m_attachPlay->setToolTip(QStringLiteral("Off freezes the attachment on its first frame"));
+        m_attachPlay->setToolTip(QStringLiteral("Off freezes every attachment on its first frame"));
         row->addWidget(m_attachPlay);
         row->addStretch(1);
-        // Restart is genuinely useful here: the attachment loops on its own clock, so there is
-        // otherwise no way to see a one-shot clip (a killstreak) from the top on demand.
-        m_attachRestart = new QToolButton(m_attachPanel);
+        m_attachRestart = new QToolButton(m_attachRow);
         m_attachRestart->setText(QStringLiteral("Restart"));
-        m_attachRestart->setToolTip(QStringLiteral("Play the selected clip from its first frame"));
+        m_attachRestart->setToolTip(QStringLiteral("Play the attachments' clips from their first frame"));
         m_attachRestart->setAutoRaise(true);
         row->addWidget(m_attachRestart);
-        al->addLayout(row);
     }
-    connect(m_attachRestart, &QToolButton::clicked, this, [this] {
-        if (!m_playingAnim.isEmpty()) playAnimByName(m_playingAnim);   // re-arms the attach clock
-    });
-    // Re-arm playback with whatever is selected now. Goes through the normal clip path so the
-    // character clip is rebuilt and the attachment range re-declared in one place.
-    connect(m_attachWhich, &QComboBox::currentIndexChanged, this, [this](int) {
-        if (!m_restoring) refreshAttachAnimList();   // show that attachment's clips; playback unchanged
-    });
-    connect(m_attachAnims, &QListWidget::currentItemChanged, this,
-            [this](QListWidgetItem*, QListWidgetItem*) {
-        if (m_restoring || !m_attachAnims->currentItem() || !m_attachWhich) return;
-        // Remembered PER APPEARANCE: one shared key would be clobbered the moment a second
-        // attachment existed, which is exactly the case this panel now handles.
-        const QString appr = m_attachWhich->currentData().toString();
-        if (appr.isEmpty()) return;
-        QSettings().setValue(QStringLiteral("wardrobe2/attachClip/") + appr.toLower(),
-                             m_attachAnims->currentItem()->data(Qt::UserRole).toString());
-        if (!m_playingAnim.isEmpty()) playAnimByName(m_playingAnim);
-    });
+    m_attachRow->setVisible(false);
+    bl->addWidget(m_attachRow);
     connect(m_attachPlay, &QCheckBox::toggled, this, [this](bool) {
         if (!m_restoring && !m_playingAnim.isEmpty()) playAnimByName(m_playingAnim);
+    });
+    connect(m_attachRestart, &QToolButton::clicked, this, [this] {
+        if (!m_playingAnim.isEmpty()) playAnimByName(m_playingAnim);   // re-arms the attach clocks
     });
 
     // (m_animPanel is NOT added here — it's registered as a RIGHT-side panel; the transport bar
@@ -2334,13 +2290,23 @@ WardrobeTab2::WardrobeTab2(QWidget* parent) : BrowserTab(parent)
             [this](QListWidgetItem* it, QListWidgetItem*) {
         if (!it) return;
         const QString name = it->data(Qt::UserRole).toString();
-        // Trophy clips drive the TROPHY's bones, which the current seating bakes away. Playing one
-        // against the body rig would decode to nothing and silently stop whatever was running, so
-        // say why instead of pretending.
+        // An attachment row changes only that attachment: the character keeps playing whatever it
+        // was, so this must not become the list's current item. Handled here (rather than on click)
+        // because arrow-key navigation reaches these rows too.
         if (it->data(kTrophyClipRole).toBool()) {
-            if (m_status)
-                m_status->setText(QStringLiteral("%1 is the back trophy's own clip — it animates the "
-                                                 "trophy's rig, which isn't preserved yet.").arg(name));
+            const QString appr = it->data(kAttachApprRole).toString();
+            if (!m_restoring) {
+                QSettings().setValue(QStringLiteral("wardrobe2/attachClip/") + appr.toLower(), name);
+                if (m_status)
+                    m_status->setText(QStringLiteral("%1 → %2").arg(appr, name));
+                // Deferred: re-arming rebuilds this list, and deleting the item that is mid-signal
+                // is exactly the kind of thing that bites later. Off the stack it is just a rebuild.
+                const QString play = m_playingAnim;
+                QTimer::singleShot(0, this, [this, play] {
+                    if (!play.isEmpty()) playAnimByName(play);   // re-arms the attachment clock
+                    else                 fillAnimList();          // just move the bullet
+                });
+            }
             return;
         }
         if (name != m_playingAnim) { playAnimByName(name); m_animJustSelected = true; }
@@ -2536,10 +2502,6 @@ WardrobeTab2::WardrobeTab2(QWidget* parent) : BrowserTab(parent)
             QStringLiteral("Animations — the model's clip list (filter, search, select to play)"));
     // Own colour AND own shape: the strip is a column of small monochrome glyphs, so a tint alone
     // is easy to miss — the ring marks it as "the other timeline" at a glance.
-    section(QStringLiteral("ATTACHED"), QStringLiteral("ATTACHED"), m_attachPanel,
-            attachedGlyph().pixmap(QSize(16, 16)),
-            QStringLiteral("Attached animations — clips owned by an attached model (back trophy), "
-                           "played on their own independent timeline"));
     m_rstripLay->addStretch(1);   // registrations are done — pin the strip buttons to the top
 
     // ── Restore the panel layout: which panels are up, their order, their heights. Same scheme
@@ -2881,7 +2843,7 @@ void WardrobeTab2::refresh()
     BackTrophyIndex::instance().ensureBuilt(Config::d4dataDir());
     connect(&BackTrophyIndex::instance(), &BackTrophyIndex::readyChanged, this,
             [this] {
-        populateSlots(); fillAnimList(); refreshAttachAnimList();
+        populateSlots(); fillAnimList();
         // The first rebuild races the index: with a cold cache clipsFor() is empty for everything,
         // so every item takes the bake and nothing animates until the user happens to re-equip.
         // A cache-version bump makes that the FIRST run for every existing user, so rebuild once
@@ -7872,7 +7834,7 @@ void WardrobeTab2::applyOutfit(const WardrobeBuildCtx& ctx, const WardrobeOutfit
 
     // The attachment (and therefore its clip list) is only settled once the rebuild has run, so
     // refresh the ATTACHED panel here — BEFORE replaying the clip, which reads its selection.
-    refreshAttachAnimList();
+    fillAnimList();
     // Re-apply the animation that was running before this rebuild (setGeometry cleared
     // it), restoring the frame + play/pause state so equipping/creator changes don't
     // interrupt playback.
@@ -8821,9 +8783,7 @@ void WardrobeTab2::fillAnimList()
 {
     if (!m_anims) return;
     const QStringList rows = m_animCache.value(classPrefix());
-    // `forced` overrides the AnimActionIndex action label: trophy clips are not in any AnimSet, so
-    // that index has nothing to say about them and they would otherwise render as bare filenames.
-    struct A { QString display, name; int frames; QString forced; };
+    struct A { QString display, name; int frames; };
     QVector<A> items;
     items.reserve(rows.size());
     for (const QString& r : rows) {
@@ -8832,27 +8792,6 @@ void WardrobeTab2::fillAnimList()
         const QString tail = r.section(QStringLiteral("  ·  "), 1, 1);   // "N frames"
         a.frames = tail.isEmpty() ? 0 : tail.section(QLatin1Char(' '), 0, 0).toInt();
         items << a;
-    }
-    // The equipped back trophy's own clips. Listed but NOT yet playable on the body rig: the
-    // trophy is seated by baking its verts onto the attach bone, which leaves no internal rig for
-    // a clip to drive. Surfacing them first makes the name mapping verifiable against real data
-    // before the seating is reworked to preserve the trophy's skeleton.
-    if (m_backTrophy && m_backTrophy->currentData().toInt() > 0) {
-        const QString appr = m_backTrophy->currentData(Qt::UserRole + 1).toString();
-        for (const BackTrophyIndex::Entry& t : BackTrophyIndex::instance().entries()) {
-            if (t.appearance.compare(appr, Qt::CaseInsensitive) != 0) continue;
-            for (const BackTrophyIndex::Clip& c : t.clips) {
-                A a;
-                a.name    = c.name;
-                a.frames  = c.frames;
-                a.display = c.frames > 0
-                    ? QStringLiteral("%1  ·  %2 frames").arg(c.name).arg(c.frames)
-                    : c.name;
-                a.forced  = QStringLiteral("Back trophy");
-                items << a;
-            }
-            break;
-        }
     }
     const int sort = m_animSort ? m_animSort->currentIndex() : 0;
     std::sort(items.begin(), items.end(), [sort](const A& x, const A& y) {
@@ -8884,28 +8823,84 @@ void WardrobeTab2::fillAnimList()
             for (const QString& t : tokens) if (low.contains(t)) { hit = true; break; }
             if (!hit) continue;
         }
-        const QString action = a.forced.isEmpty() ? aai.action(low) : a.forced;
+        const QString action = aai.action(low);
         const QString label = action.isEmpty() ? a.display
                                                : QStringLiteral("%1   —   %2").arg(action, a.display);
         if (!search.isEmpty() && !label.toLower().contains(search)) continue;   // match action too
         auto* it = new QListWidgetItem(label, m_anims);
         it->setData(Qt::UserRole, a.name);
-        it->setData(kTrophyClipRole, !a.forced.isEmpty());
-        if (!a.forced.isEmpty()) {
-            it->setToolTip(QStringLiteral("Animation shipped with the equipped back trophy.\n"
-                                          "Listed for reference — not yet playable, because the "
-                                          "trophy is baked onto its attach bone and keeps no rig "
-                                          "of its own."));
-        } else {
-            const QString set = aai.animSet(low);
-            if (!action.isEmpty() || !set.isEmpty())
-                it->setToolTip(QStringLiteral("Action: %1\nAnimSet: %2")
-                                   .arg(action.isEmpty() ? QStringLiteral("—") : action,
-                                        set.isEmpty() ? QStringLiteral("—") : set));
-        }
+        const QString set = aai.animSet(low);
+        if (!action.isEmpty() || !set.isEmpty())
+            it->setToolTip(QStringLiteral("Action: %1\nAnimSet: %2")
+                               .arg(action.isEmpty() ? QStringLiteral("—") : action,
+                                    set.isEmpty() ? QStringLiteral("—") : set));
         if (a.name == sel) m_anims->setCurrentItem(it);
     }
+    appendAttachmentRows();
     m_anims->blockSignals(false);
+}
+
+// The attachments' clips, appended to the SAME list as the character's under a separator.
+//
+// They were a separate panel, which meant two lists, two places to look, and a dropdown to pick
+// whose clips you were even seeing. One list shows everything that is animating: the character at
+// the top, then a group per attached model with its clips inline. Nothing is hidden behind a
+// selection.
+//
+// Selection semantics differ by row, which is the one subtlety: choosing a character clip changes
+// what the CHARACTER plays, so it takes the list's current-item highlight. Choosing an attachment
+// clip changes only that attachment — the character keeps playing what it was — so it is marked
+// with a bullet in its own group instead of stealing the highlight.
+void WardrobeTab2::appendAttachmentRows()
+{
+    if (!m_anims) return;
+    QVector<const Attached*> animated;
+    for (const Attached& at : m_attached)
+        if (!BackTrophyIndex::instance().clipsFor(at.appearance).isEmpty()) animated.push_back(&at);
+    // The transport only earns its space when there is something for it to transport.
+    if (m_attachRow) m_attachRow->setVisible(!animated.isEmpty());
+    if (animated.isEmpty()) return;
+
+    auto addHeader = [this](const QString& text, bool rule) {
+        auto* it = new QListWidgetItem(text, m_anims);
+        it->setFlags(Qt::NoItemFlags);          // not selectable: it is a label, not a choice
+        QFont f = it->font();
+        f.setBold(true);
+        // pointSizeF() is -1 when the font was set in pixels; shrinking that yields an unreadable
+        // 1pt row, so only adjust a font that is actually specified in points.
+        if (rule && f.pointSizeF() > 1.0) f.setPointSizeF(f.pointSizeF() - 1.0);
+        it->setFont(f);
+        it->setForeground(QBrush(rule ? QColor(122, 130, 138) : kAttachAccent));
+        return it;
+    };
+    addHeader(QStringLiteral("──  ATTACHED  ──────────────────"), true);
+
+    for (const Attached* at : animated) {
+        addHeader(QStringLiteral("%1 — %2").arg(at->slot, at->label), false)
+            ->setIcon(attachedGlyph());
+        const QString active = selectedClipFor(at->appearance);
+        for (const BackTrophyIndex::Clip& c : BackTrophyIndex::instance().clipsFor(at->appearance)) {
+            // Named by what distinguishes it — idle / killstreak / clip — since the group header
+            // already says which model it belongs to.
+            QString kind = c.name.startsWith(at->appearance, Qt::CaseInsensitive)
+                               ? c.name.mid(at->appearance.size()) : c.name;
+            if (kind.startsWith(QLatin1Char('_'))) kind = kind.mid(1);
+            if (kind.isEmpty()) kind = QStringLiteral("clip");
+            const bool on = (c.name == active);
+            const double secs = c.frames > 0 ? c.frames / 30.0 : 0.0;
+            auto* it = new QListWidgetItem(
+                QStringLiteral("   %1 %2%3").arg(on ? QStringLiteral("●") : QStringLiteral("○"), kind,
+                    c.frames > 0 ? QStringLiteral("   ·   %1 frames  (%2s)")
+                                       .arg(c.frames).arg(secs, 0, 'f', 1) : QString()),
+                m_anims);
+            it->setData(Qt::UserRole, c.name);
+            it->setData(kTrophyClipRole, true);
+            it->setData(kAttachApprRole, at->appearance);
+            if (on) it->setForeground(QBrush(kAttachAccent));
+            it->setToolTip(QStringLiteral("%1\nPlays on its own %2-frame loop, independent of the "
+                                          "character clip.").arg(c.name).arg(c.frames));
+        }
+    }
 }
 
 // Decode one clip for the CURRENT merged rig — extracted from playAnimByName so the
@@ -9009,8 +9004,21 @@ void WardrobeTab2::collectExportAnims(QVector<AnimParser::DecodedAnim>& anims, Q
         return;
     // Explicit multi-selection wins over the scope setting: embed exactly the ctrl/shift-
     // selected clips (a precise middle ground between "playing clip" and "all listed").
+    // Attachment rows share the list but not the rig: their clips drive the attachment's own bones
+    // and would decode to nothing against the body skeleton. Never an export candidate.
+    auto bodyRows = [this]() {
+        QVector<QListWidgetItem*> v;
+        for (int i = 0; m_anims && i < m_anims->count(); ++i) {
+            QListWidgetItem* it = m_anims->item(i);
+            if (!it->data(kTrophyClipRole).toBool() && !it->data(Qt::UserRole).toString().isEmpty())
+                v.push_back(it);
+        }
+        return v;
+    };
     if (m_anims && m_anims->selectedItems().size() > 1) {
-        const auto sel = m_anims->selectedItems();
+        QVector<QListWidgetItem*> sel;
+        for (QListWidgetItem* it : m_anims->selectedItems())
+            if (!it->data(kTrophyClipRole).toBool()) sel.push_back(it);
         QProgressDialog prog(QStringLiteral("Decoding selected animations…"), QStringLiteral("Cancel"),
                              0, sel.size(), this);
         prog.setWindowModality(Qt::WindowModal);
@@ -9025,34 +9033,35 @@ void WardrobeTab2::collectExportAnims(QVector<AnimParser::DecodedAnim>& anims, Q
         prog.setValue(sel.size());
         if (!anims.isEmpty()) return;
     }
+    const QVector<QListWidgetItem*> all = bodyRows();
     bool wantAll = QSettings().value(QStringLiteral("export/animScope"), 0).toInt() == 1
-                   && m_anims && m_anims->count() > 0;
-    if (wantAll && m_anims->count() > 25) {
+                   && !all.isEmpty();
+    if (wantAll && all.size() > 25) {
         const auto r = QMessageBox::question(this, QStringLiteral("Embed animations"),
             QStringLiteral("Embed all %1 clips currently listed in the ANIMATIONS panel?\n"
                            "Every clip is decoded — this takes a while and makes a large "
                            ".glb.\n\nYes = all listed clips (narrow the list with the "
                            "category/search filters first to embed fewer).\n"
                            "No = just the playing/selected clip.")
-                .arg(m_anims->count()),
+                .arg(all.size()),
             QMessageBox::Yes | QMessageBox::No | QMessageBox::Cancel);
         if (r == QMessageBox::Cancel) return;                 // no animation at all
         if (r == QMessageBox::No) wantAll = false;
     }
     if (wantAll) {
         QProgressDialog prog(QStringLiteral("Decoding animations…"), QStringLiteral("Cancel"),
-                             0, m_anims->count(), this);
+                             0, all.size(), this);
         prog.setWindowModality(Qt::WindowModal);
-        for (int i = 0; i < m_anims->count(); ++i) {
+        for (int i = 0; i < all.size(); ++i) {
             if (prog.wasCanceled()) break;
-            const QString nm = m_anims->item(i)->data(Qt::UserRole).toString();
+            const QString nm = all[i]->data(Qt::UserRole).toString();
             prog.setValue(i);
             prog.setLabelText(nm);
             QCoreApplication::processEvents();
             const AnimParser::DecodedAnim a = decodeAnimByName(nm);
             if (a.valid && !a.bones.isEmpty()) { anims << a; names << nm; }
         }
-        prog.setValue(m_anims->count());
+        prog.setValue(all.size());
         if (!anims.isEmpty())
             return;
     }
@@ -9065,108 +9074,6 @@ void WardrobeTab2::collectExportAnims(QVector<AnimParser::DecodedAnim>& anims, Q
         const AnimParser::DecodedAnim a = decodeAnimByName(nm);
         if (a.valid && !a.bones.isEmpty()) { anims << a; names << nm; }
     }
-}
-
-// Repopulate the ATTACHED panel from whatever is currently attached. Kept deliberately dumb: the
-// index already knows every clip an attachment owns, so this is a straight listing — no matching,
-// no guessing which one is "the" clip.
-void WardrobeTab2::refreshAttachAnimList()
-{
-    if (!m_attachAnims || !m_attachWho || !m_attachWhich) return;
-    auto setControls = [this](bool on) {
-        if (m_attachPlay)    m_attachPlay->setEnabled(on);
-        if (m_attachRestart) m_attachRestart->setEnabled(on);
-        if (m_attachAnims)   m_attachAnims->setEnabled(on);
-        if (m_attachWhich)   m_attachWhich->setEnabled(on);
-    };
-
-    // Only attachments that actually own clips are listed. Nothing without clips reaches m_attached
-    // today, so this is a guard rather than a filter — but it keeps the panel correct if a future
-    // socket starts attaching rigged-but-unanimated models.
-    QVector<int> animated;
-    for (int i = 0; i < m_attached.size(); ++i)
-        if (!BackTrophyIndex::instance().clipsFor(m_attached[i].appearance).isEmpty())
-            animated.push_back(i);
-
-    const QString prevAppr = m_attachWhich->currentData().toString();
-    {
-        QSignalBlocker b(m_attachWhich);
-        m_attachWhich->clear();
-        for (int i : animated)
-            m_attachWhich->addItem(QStringLiteral("%1 — %2").arg(m_attached[i].slot, m_attached[i].label),
-                                   m_attached[i].appearance);
-        int keep = m_attachWhich->findData(prevAppr);
-        if (keep < 0) keep = 0;
-        if (m_attachWhich->count() > 0) m_attachWhich->setCurrentIndex(keep);
-    }
-    // The selector only earns its space when there is a choice to make — and when it IS shown it
-    // already names the attachment, so the header would just repeat it.
-    const bool multi = animated.size() > 1;
-    m_attachWhich->setVisible(multi);
-    m_attachWho->setVisible(!multi);
-
-    QSignalBlocker block(m_attachAnims);
-    m_attachAnims->clear();
-    if (animated.isEmpty()) {
-        // Distinct states that all look like "empty list": nothing attached at all, versus things
-        // attached that simply ship no animation (the common case), versus the index still building.
-        // m_attached only ever holds things that already own clips, so it cannot distinguish
-        // "nothing equipped" from "equipped, but static". Ask the slots instead.
-        bool anySlotFilled = m_backTrophy && m_backTrophy->currentData().toInt() > 0;
-        for (QComboBox* c : {m_weapon, m_weapon2, m_weapon3, m_weapon4})
-            if (c && c->currentData().toInt() > 0) { anySlotFilled = true; break; }
-        if (!anySlotFilled) {
-            m_attachWho->setText(QStringLiteral("Nothing attached"));
-            m_attachHint->setText(QStringLiteral("Equip a Back item or a weapon to see its own clips."));
-        } else if (!BackTrophyIndex::instance().ready()) {
-            m_attachWho->setText(QStringLiteral("Scanning…"));
-            m_attachHint->setText(QStringLiteral("Looking for clips owned by the equipped items."));
-        } else {
-            m_attachWho->setText(QStringLiteral("No animated attachments"));
-            m_attachHint->setText(QStringLiteral("The equipped back item and weapons are static "
-                                                 "props — most are. Only a few ship an animation "
-                                                 "of their own."));
-        }
-        m_attachWho->setVisible(true);   // no selector in the empty states; the header carries them
-        setControls(false);
-        return;
-    }
-    setControls(true);
-
-    const QString appr = m_attachWhich->currentData().toString();
-    const Attached* cur = nullptr;
-    for (int i : animated) if (m_attached[i].appearance == appr) { cur = &m_attached[i]; break; }
-    if (!cur) cur = &m_attached[animated.first()];
-
-    const QVector<BackTrophyIndex::Clip> clips =
-        BackTrophyIndex::instance().clipsFor(cur->appearance);
-    for (const BackTrophyIndex::Clip& c : clips) {
-        // Named by the part of the clip stem that is NOT the appearance — idle / killstreak / clip —
-        // since the appearance is already the header.
-        QString kind = c.name.startsWith(cur->appearance, Qt::CaseInsensitive)
-                           ? c.name.mid(cur->appearance.size()) : c.name;
-        if (kind.startsWith(QLatin1Char('_'))) kind = kind.mid(1);
-        if (kind.isEmpty()) kind = QStringLiteral("default");
-        const double secs = c.frames > 0 ? c.frames / 30.0 : 0.0;
-        auto* it = new QListWidgetItem(
-            c.frames > 0 ? QStringLiteral("%1   ·   %2 frames  (%3s)")
-                               .arg(kind).arg(c.frames).arg(secs, 0, 'f', 1)
-                         : kind,
-            m_attachAnims);
-        it->setData(Qt::UserRole, c.name);
-        it->setToolTip(QStringLiteral("%1\nPlays on its own %2-frame loop.").arg(c.name).arg(c.frames));
-    }
-    m_attachWho->setText(QStringLiteral("%1 — %2").arg(cur->slot, cur->label));
-    m_attachHint->setText(multi
-        ? QStringLiteral("%1 attachments animating, each on its own loop").arg(animated.size())
-        : QStringLiteral("%1 clip%2 · own loop, independent of the character")
-              .arg(clips.size()).arg(clips.size() == 1 ? QString() : QStringLiteral("s")));
-
-    // Highlight the clip this attachment is actually playing.
-    const QString sel = selectedClipFor(cur->appearance);
-    for (int i = 0; i < m_attachAnims->count(); ++i)
-        if (m_attachAnims->item(i)->data(Qt::UserRole).toString() == sel)
-            { m_attachAnims->setCurrentRow(i); break; }
 }
 
 // The clip chosen for one attachment, remembered per APPEARANCE so each equipped item keeps its own
@@ -9257,6 +9164,7 @@ void WardrobeTab2::playAnimByName(const QString& animName)
     QSettings().setValue(QStringLiteral("wardrobe2/anim"), animName);   // remember selection
     if (!seh::runGuarded("w2SetAnim", [&]() { m_view->setAnimation(anim); })) return;
     // AFTER setAnimation, which clears every previous range.
+    fillAnimList();   // re-mark which attachment clip is active (bullets), keep the body selection
     QVector<GLModelWidget::AttachRange> ranges;
     ranges.reserve(m_btAttachRanges.size());
     for (const AttachSpan& sp : m_btAttachRanges)
