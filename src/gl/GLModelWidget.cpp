@@ -1358,9 +1358,13 @@ void GLModelWidget::setAttachAnimRanges(const QVector<AttachRange>& ranges)
     }
 }
 
+void GLModelWidget::setPlaybackTimer(QTimer* t) { m_playbackTimer = t; }
+
 bool GLModelWidget::animPlaying() const
 {
-    return m_playbackTimer && m_playbackTimer->isActive();
+    // Non-const target: qobject_cast is specified over pointers to non-const QObject subclasses.
+    const QTimer* t = qobject_cast<QTimer*>(m_playbackTimer.data());
+    return t && t->isActive();
 }
 
 void GLModelWidget::setAnimation(const AnimParser::DecodedAnim& anim)
