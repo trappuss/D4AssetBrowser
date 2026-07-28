@@ -7026,7 +7026,10 @@ void WardrobeTab2::rebuildOutfitImpl(bool async)
             if (ModelAttach::attachSubRigAt(wgeo, m_bodySkeleton, wBone, wMz, wSalt, &preSalt)) {
                 Attached at;
                 at.appearance = weapName;
-                at.label      = weapName;
+                // The item's real name, same source the slot header uses. The appearance stem
+                // ("axe_stor027") is a filename, not something to show as a label.
+                at.label      = AppearanceMeta::instance().titleFor(sno);
+                if (at.label.isEmpty()) at.label = weapName;
                 at.slot       = hs.hand == 1 ? QStringLiteral("Off hand")
                                              : QStringLiteral("Main hand");
                 at.salt       = wSalt;
@@ -9096,8 +9099,11 @@ void WardrobeTab2::refreshAttachAnimList()
         if (keep < 0) keep = 0;
         if (m_attachWhich->count() > 0) m_attachWhich->setCurrentIndex(keep);
     }
-    // The selector only earns its space when there is a choice to make.
-    m_attachWhich->setVisible(animated.size() > 1);
+    // The selector only earns its space when there is a choice to make — and when it IS shown it
+    // already names the attachment, so the header would just repeat it.
+    const bool multi = animated.size() > 1;
+    m_attachWhich->setVisible(multi);
+    m_attachWho->setVisible(!multi);
 
     QSignalBlocker block(m_attachAnims);
     m_attachAnims->clear();
@@ -9121,6 +9127,7 @@ void WardrobeTab2::refreshAttachAnimList()
                                                  "props — most are. Only a few ship an animation "
                                                  "of their own."));
         }
+        m_attachWho->setVisible(true);   // no selector in the empty states; the header carries them
         setControls(false);
         return;
     }
@@ -9150,7 +9157,7 @@ void WardrobeTab2::refreshAttachAnimList()
         it->setToolTip(QStringLiteral("%1\nPlays on its own %2-frame loop.").arg(c.name).arg(c.frames));
     }
     m_attachWho->setText(QStringLiteral("%1 — %2").arg(cur->slot, cur->label));
-    m_attachHint->setText(animated.size() > 1
+    m_attachHint->setText(multi
         ? QStringLiteral("%1 attachments animating, each on its own loop").arg(animated.size())
         : QStringLiteral("%1 clip%2 · own loop, independent of the character")
               .arg(clips.size()).arg(clips.size() == 1 ? QString() : QStringLiteral("s")));
