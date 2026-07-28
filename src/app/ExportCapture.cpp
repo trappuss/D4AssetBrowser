@@ -251,14 +251,59 @@ bool encodeWithBudget(const QString& path, std::vector<std::vector<uint8_t>>& bu
 
 }  // namespace
 
+QString ExportCapture::imageFormat()
+{
+    const QString f = QSettings().value(QStringLiteral("export/imageFormat"),
+                                        QStringLiteral("png")).toString().toLower();
+    return (f == QLatin1String("jpg") || f == QLatin1String("webp")) ? f : QStringLiteral("png");
+}
+
 bool ExportCapture::saveImage(GLModelWidget* view, const QString& path)
 {
     if (!view || path.isEmpty()) return false;
-    // True transparency only for PNG (JPEG has no alpha).
-    const bool wantT = transparentEnabled() && path.endsWith(QLatin1String(".png"), Qt::CaseInsensitive);
-    const QImage img = captureFrame(view, wantT);
+    // Alpha only where the container has it. JPEG has none at all, so asking for a transparent
+    // background there would silently composite onto black.
+    const QString ext = QFileInfo(path).suffix().toLower();
+    const bool alphaOk = (ext != QLatin1String("jpg") && ext != QLatin1String("jpeg"));
+    const bool wantT = transparentEnabled() && alphaOk;
+
+    // Resolution. Above 100% the scene is genuinely re-rendered larger (real detail, real
+    // anti-aliasing); at or below it the viewport grab is resampled down. Upscaling a grab would
+    // only invent pixels, so it is not offered.
+    const int pct = qBound(25, QSettings().value(QStringLiteral("export/imageScale"), 100).toInt(), 400);
+    QImage img;
+    if (pct > 100) {
+        const int factor = qBound(2, (pct + 99) / 100, 4);   // 2x covers 101..200, 3x 201..300, 4x above
+        // The capture flags have to be live across the render, not just the grab.
+        if (wantT) view->setTransparentClear(true);
+        img = view->grabSupersampled(factor);
+        if (wantT) view->setTransparentClear(false);
+        if (img.isNull()) img = captureFrame(view, wantT);   // driver refused the size — ship 1x
+        else {
+            img = img.convertToFormat(QImage::Format_RGBA8888);
+            // Land on the requested percentage rather than the whole factor it was rendered at.
+            const int tw = qMax(1, int(qint64(view->width()) * pct / 100));
+            if (img.width() != tw)
+                img = img.scaled(tw, qMax(1, img.height() * tw / img.width()),
+                                 Qt::IgnoreAspectRatio, Qt::SmoothTransformation);
+        }
+    } else {
+        img = captureFrame(view, wantT);
+        if (!img.isNull() && pct < 100)
+            img = img.scaled(qMax(1, img.width() * pct / 100), qMax(1, img.height() * pct / 100),
+                             Qt::IgnoreAspectRatio, Qt::SmoothTransformation);
+    }
     if (img.isNull()) return false;
-    return img.save(path);   // PNG/JPEG inferred from the extension
+    if (!alphaOk) img = img.convertToFormat(QImage::Format_RGB888);
+
+    // -1 lets Qt pick the format's own default; only a deliberate setting overrides it.
+    const int q = qBound(1, QSettings().value(QStringLiteral("export/imageQuality"), 92).toInt(), 100);
+    const bool lossy = (ext == QLatin1String("jpg") || ext == QLatin1String("jpeg")
+                        || ext == QLatin1String("webp"));
+    const bool ok = img.save(path, nullptr, lossy ? q : -1);
+    qInfo("image: %s %dx%d%s", qPrintable(ext.toUpper()), img.width(), img.height(),
+          pct > 100 ? " (supersampled)" : "");
+    return ok;
 }
 
 bool ExportCapture::turntableGif(GLModelWidget* view, const QString& path, const ProgressFn& progress)

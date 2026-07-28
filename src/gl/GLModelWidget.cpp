@@ -3631,7 +3631,7 @@ void GLModelWidget::initializeGL()
     glDrawBuffer(GL_NONE);
     glReadBuffer(GL_NONE);
     glBindTexture(GL_TEXTURE_2D, 0);
-    glBindFramebuffer(GL_FRAMEBUFFER, defaultFramebufferObject());
+    glBindFramebuffer(GL_FRAMEBUFFER, targetFbo());
 
     // SSAO position-prepass program + world-position G-buffer (storage sized on demand in renderPos).
     GLuint pvs = compile(GL_VERTEX_SHADER, kPosVert);
@@ -3668,7 +3668,7 @@ void GLModelWidget::renderPos(const QMatrix4x4& mvp, const QMatrix4x4& model)
         glBindFramebuffer(GL_FRAMEBUFFER, m_posFbo);
         glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, m_posTex, 0);
         glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, m_posDepth);
-        glBindFramebuffer(GL_FRAMEBUFFER, defaultFramebufferObject());
+        glBindFramebuffer(GL_FRAMEBUFFER, targetFbo());
         glBindTexture(GL_TEXTURE_2D, 0);
         glBindRenderbuffer(GL_RENDERBUFFER, 0);
     }
@@ -3696,7 +3696,7 @@ void GLModelWidget::renderPos(const QMatrix4x4& mvp, const QMatrix4x4& model)
         }
     }
     glBindVertexArray(0);
-    glBindFramebuffer(GL_FRAMEBUFFER, defaultFramebufferObject());
+    glBindFramebuffer(GL_FRAMEBUFFER, targetFbo());
     glViewport(0, 0, m_fbW, m_fbH);
 }
 
@@ -3734,7 +3734,7 @@ void GLModelWidget::renderShadow(const QMatrix4x4& lightMvp)
         }
     }
     glBindVertexArray(0);
-    glBindFramebuffer(GL_FRAMEBUFFER, defaultFramebufferObject());
+    glBindFramebuffer(GL_FRAMEBUFFER, targetFbo());
     glViewport(0, 0, m_fbW, m_fbH);
 }
 
@@ -5309,6 +5309,62 @@ void GLModelWidget::setPartVisible(int i, bool on)
 bool GLModelWidget::partVisible(int i) const
 {
     return (i >= 0 && i < m_parts.size()) ? m_parts[i].visible : true;
+}
+
+// See the header. The whole reason this can be short: every pass already sizes itself from
+// m_fbW/m_fbH and every "back to the screen" bind already goes through targetFbo(), so raising the
+// former and pointing the latter at our own FBO supersamples the entire pipeline — SSAO G-buffer,
+// shadow pass, FX, stencil silhouette — with no per-pass special-casing.
+QImage GLModelWidget::grabSupersampled(int factor)
+{
+    if (factor <= 1 || m_prog == 0) return {};
+    const qreal dpr = devicePixelRatioF();
+    const int baseW = qMax(1, int(width()  * dpr));
+    const int baseH = qMax(1, int(height() * dpr));
+    qint64 W = qint64(baseW) * factor, H = qint64(baseH) * factor;
+
+    makeCurrent();
+    // Two ceilings, both of which the driver enforces silently by handing back an invalid FBO:
+    // the texture-size limit, and what the GPU will actually allocate. Shrink the factor until it
+    // fits rather than returning nothing, so a 4x request on a big viewport degrades to 3x or 2x.
+    GLint maxTex = 0;
+    glGetIntegerv(GL_MAX_TEXTURE_SIZE, &maxTex);
+    if (maxTex <= 0) maxTex = 8192;
+    while (factor > 1 && (W > maxTex || H > maxTex)) {
+        --factor; W = qint64(baseW) * factor; H = qint64(baseH) * factor;
+    }
+    if (factor <= 1) { doneCurrent(); return {}; }
+
+    std::unique_ptr<QOpenGLFramebufferObject> fbo;
+    while (factor > 1) {
+        // CombinedDepthStencil, not Depth: the part-highlight silhouette is a stencil pass, and a
+        // capture target without a stencil buffer would drop it.
+        fbo = std::make_unique<QOpenGLFramebufferObject>(int(W), int(H),
+                  QOpenGLFramebufferObject::CombinedDepthStencil);
+        if (fbo->isValid()) break;
+        fbo.reset();
+        --factor; W = qint64(baseW) * factor; H = qint64(baseH) * factor;
+    }
+    if (!fbo) { doneCurrent(); return {}; }
+
+    const int prevW = m_fbW, prevH = m_fbH;
+    m_captureFbo = fbo->handle();
+    m_fbW = int(W); m_fbH = int(H);
+    fbo->bind();
+    glViewport(0, 0, m_fbW, m_fbH);
+    paintGL();                       // the real thing, at the real size
+    glFinish();                      // localise any driver fault to this render (see grabThumbnail)
+    glGetError();
+    fbo->release();
+    QImage img = fbo->toImage();
+
+    m_captureFbo = 0;
+    m_fbW = prevW; m_fbH = prevH;
+    // The SSAO G-buffer was reallocated to the capture size; renderPos re-checks against m_fbW/m_fbH
+    // and will size it back on the next on-screen frame, so nothing is left stale.
+    doneCurrent();
+    update();
+    return img;
 }
 
 QImage GLModelWidget::grabThumbnail(int size)

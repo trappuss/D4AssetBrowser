@@ -45,6 +45,12 @@ public:
 
     // Render the current (bind-pose) model to a square thumbnail. Null if empty.
     QImage grabThumbnail(int size = 64);
+    // The full pipeline rendered at `factor`x the viewport's own resolution. Real extra pixels, not
+    // an upscale: paintGL sizes its SSAO G-buffer and every pass from m_fbW/m_fbH, so enlarging
+    // those and pointing the passes at a bigger FBO supersamples the whole thing. Uniform scaling
+    // leaves the aspect ratio alone, so the framing is identical to what is on screen. Returns a
+    // null image if the size is refused by the driver.
+    QImage grabSupersampled(int factor);
     // Ensemble tile: the FULL render pipeline (textures/dyes/fur) in the BASE COLOUR channel —
     // unlit flat colour so the tile reads as the outfit's palette — framed from the FRONT (+X)
     // view with grid/skeleton/gradient suppressed. State is restored after the grab.
@@ -588,6 +594,10 @@ private:
     GLint uni(GLuint prog, const char* name);
     // Persistent offscreen FBO reused by grabThumbnail — creating/destroying an FBO on every
     // thumbnail (dozens per scroll) stresses the driver and crashes some GPUs. Reuse one.
+    // Where the on-screen passes render. Normally QOpenGLWidget's own FBO; during a supersampled
+    // capture, ours. One accessor so a pass can never be left pointing at the wrong one.
+    GLuint  targetFbo() const { return m_captureFbo ? m_captureFbo : GLuint(defaultFramebufferObject()); }
+    GLuint  m_captureFbo = 0;
     std::unique_ptr<QOpenGLFramebufferObject> m_thumbFbo;
     int     m_thumbFboSize = 0;
     // Reflection-probe cubemap (uploaded on the GL thread from a pending CASC payload).

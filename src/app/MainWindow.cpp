@@ -45,6 +45,7 @@
 #include <QDialog>
 #include <QDialogButtonBox>
 #include <QFileDialog>
+#include <QImageWriter>
 #include <QFormLayout>
 #include <QKeySequence>
 #include <QLabel>
@@ -648,9 +649,19 @@ void MainWindow::captureActiveImage()
     BrowserTab* t = activeTab();
     GLModelWidget* pv = t ? t->previewWidget() : nullptr;
     if (!pv) return;
-    const QString path = captureSavePath(this, QStringLiteral("preview"), QStringLiteral("png"),
-                                         QStringLiteral("Save preview image"),
-                                         QStringLiteral("PNG image (*.png);;JPEG (*.jpg)"));
+    // Default to the configured container, but keep every option in the filter so the dialog can
+    // still override it per-save.
+    const QString fmt = ExportCapture::imageFormat();
+    const QString pngF  = QStringLiteral("PNG image (*.png)");
+    const QString jpgF  = QStringLiteral("JPEG (*.jpg)");
+    const bool haveWebp = QImageWriter::supportedImageFormats().contains(QByteArrayLiteral("webp"));
+    const QString webpF = haveWebp ? QStringLiteral(";;WebP (*.webp)") : QString();
+    const QString filter = fmt == QLatin1String("jpg")  ? jpgF + QStringLiteral(";;") + pngF + webpF
+                         : fmt == QLatin1String("webp") ? QStringLiteral("WebP (*.webp);;") + pngF
+                                                          + QStringLiteral(";;") + jpgF
+                                                        : pngF + QStringLiteral(";;") + jpgF + webpF;
+    const QString path = captureSavePath(this, QStringLiteral("preview"), fmt,
+                                         QStringLiteral("Save preview image"), filter);
     if (path.isEmpty()) return;
     setStatus(ExportCapture::saveImage(pv, path) ? QStringLiteral("Saved %1").arg(path)
                                                  : QStringLiteral("Could not save %1").arg(path));

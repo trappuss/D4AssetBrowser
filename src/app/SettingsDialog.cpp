@@ -13,6 +13,7 @@
 #include <QCryptographicHash>
 #include <QDateTime>
 #include <QComboBox>
+#include <QImageWriter>
 #include <QDialogButtonBox>
 #include <QDir>
 #include <QFile>
@@ -953,6 +954,60 @@ reading the right blob out of packed storage.</p>
         auto* gifBox = new QGroupBox(QStringLiteral("Image && GIF capture"), this);
         auto* gf = new QFormLayout(gifBox);
 
+        // ── Still image ──────────────────────────────────────────────
+        auto* imgFmt = new QComboBox(gifBox);
+        imgFmt->addItem(QStringLiteral("PNG — lossless, keeps alpha"),  QStringLiteral("png"));
+        imgFmt->addItem(QStringLiteral("JPEG — smallest, no alpha"),    QStringLiteral("jpg"));
+        // Only offered when Qt can actually write it: WebP lives in a separate image-format plugin
+        // that is not always deployed, and without this check picking it would just fail at save
+        // time with nothing to explain why.
+        if (QImageWriter::supportedImageFormats().contains(QByteArrayLiteral("webp")))
+            imgFmt->addItem(QStringLiteral("WebP — small, keeps alpha"), QStringLiteral("webp"));
+        {
+            const int i = imgFmt->findData(QSettings().value(QStringLiteral("export/imageFormat"),
+                                                            QStringLiteral("png")).toString());
+            imgFmt->setCurrentIndex(i < 0 ? 0 : i);
+        }
+        imgFmt->setToolTip(QStringLiteral(
+            "Container for Save preview image. Sets the save dialog's default — you can still pick\n"
+            "another there. JPEG has no alpha channel, so \"Transparent background\" is ignored for it."));
+        QObject::connect(imgFmt, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [imgFmt](int) {
+            QSettings().setValue(QStringLiteral("export/imageFormat"), imgFmt->currentData().toString()); });
+        m_exportResetActions.push_back([imgFmt] { imgFmt->setCurrentIndex(0); });
+        gf->addRow(QStringLiteral("Image format:"), imgFmt);
+
+        auto* imgScale = new QComboBox(gifBox);
+        for (int p : {25, 50, 75, 100, 200, 300, 400})
+            imgScale->addItem(p > 100 ? QStringLiteral("%1%  (%2x supersampled)").arg(p).arg(p / 100)
+                                      : QStringLiteral("%1%").arg(p), p);
+        {
+            const int i = imgScale->findData(QSettings().value(QStringLiteral("export/imageScale"), 100).toInt());
+            imgScale->setCurrentIndex(i < 0 ? 3 : i);
+        }
+        imgScale->setToolTip(QStringLiteral(
+            "Resolution of Save preview image, relative to the viewport.\n\n"
+            "Above 100% the scene is genuinely RE-RENDERED larger — real detail and much cleaner\n"
+            "edges, not an upscale — so it costs one extra render and more VRAM. If the driver\n"
+            "refuses the size it steps down automatically.\n"
+            "At or below 100% the captured frame is resampled down."));
+        QObject::connect(imgScale, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [imgScale](int) {
+            QSettings().setValue(QStringLiteral("export/imageScale"), imgScale->currentData().toInt()); });
+        m_exportResetActions.push_back([imgScale] { imgScale->setCurrentIndex(3); });
+        gf->addRow(QStringLiteral("Image resolution:"), imgScale);
+
+        auto* imgQual = new QSpinBox(gifBox);
+        imgQual->setRange(1, 100);
+        imgQual->setValue(QSettings().value(QStringLiteral("export/imageQuality"), 92).toInt());
+        imgQual->setToolTip(QStringLiteral("Quality for the lossy formats (JPEG, WebP). PNG ignores it."));
+        imgQual->setEnabled(imgFmt->currentData().toString() != QLatin1String("png"));
+        QObject::connect(imgFmt, QOverload<int>::of(&QComboBox::currentIndexChanged), this,
+                         [imgFmt, imgQual](int) {
+            imgQual->setEnabled(imgFmt->currentData().toString() != QLatin1String("png")); });
+        QObject::connect(imgQual, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int v) {
+            QSettings().setValue(QStringLiteral("export/imageQuality"), v); });
+        m_exportResetActions.push_back([imgQual] { imgQual->setValue(92); });
+        gf->addRow(QStringLiteral("Image quality:"), imgQual);
+
         auto* gifFps = new QSpinBox(gifBox);
         gifFps->setRange(1, 60); gifFps->setSuffix(QStringLiteral(" fps"));
         gifFps->setValue(QSettings().value(QStringLiteral("export/gifFps"), 25).toInt());
@@ -1474,6 +1529,8 @@ static QStringList liveSettingKeys()
         QStringLiteral("export/gifScale"), QStringLiteral("export/gifMaxColors"),
         QStringLiteral("export/gifOptimize"), QStringLiteral("export/gifTargetMB"),
         QStringLiteral("export/gifCropToModel"),
+        QStringLiteral("export/imageFormat"), QStringLiteral("export/imageScale"),
+        QStringLiteral("export/imageQuality"),
         QStringLiteral("export/transparentBg"),
         QStringLiteral("export/includeTex"), QStringLiteral("export/bakeDye"),
         QStringLiteral("export/bakeDetail"), QStringLiteral("export/reconstructNormalZ"),

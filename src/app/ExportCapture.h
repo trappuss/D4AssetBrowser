@@ -14,7 +14,13 @@ namespace ExportCapture {
 // each rendered frame; return false to cancel (the capture then aborts and returns false).
 using ProgressFn = std::function<bool(int done, int total)>;
 
-// Save the current preview frame. Format is inferred from the path extension (.png/.jpg).
+// The configured still-image container ("png" / "jpg" / "webp"). The save dialog takes its default
+// extension and filter from here so the setting and the dialog cannot disagree.
+QString imageFormat();
+
+// Save the current preview frame. The container comes from the path extension; resolution
+// (export/imageScale) and quality (export/imageQuality) come from settings. Above 100% the scene
+// is genuinely re-rendered larger rather than upscaled.
 bool saveImage(GLModelWidget* view, const QString& path);
 
 // Render one full 360° turntable spin → animated, looping GIF.
