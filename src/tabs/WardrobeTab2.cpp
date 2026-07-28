@@ -2251,6 +2251,7 @@ WardrobeTab2::WardrobeTab2(QWidget* parent) : BrowserTab(parent)
 
     // Animation timer + wiring.
     m_animTimer = new QTimer(this);
+    if (m_view) m_view->setPlaybackTimer(m_animTimer);   // lets a capture ask if we're playing
     connect(m_animTimer, &QTimer::timeout, this, &WardrobeTab2::tickAnimation);
     connect(m_speedCombo, &QComboBox::currentIndexChanged, this, [this](int) { applyAnimSpeed(); });
     connect(m_animSlider, &QSlider::valueChanged, this, [this](int v) {

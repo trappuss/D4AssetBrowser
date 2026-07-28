@@ -6,6 +6,7 @@
 #include <QColor>
 #include <QElapsedTimer>
 #include <QMatrix4x4>
+#include <QPointer>
 #include <QHash>
 #include <QImage>
 #include <QSet>
@@ -226,6 +227,12 @@ public:
     bool snapshotPose(ModelGeometry& geo) const;
     float animFrameRate()  const { return m_hasAnim ? m_anim.frameRate : 0.0f; }  // for anim-loop GIF timing
     int   animFrame()      const { return m_frame; }                              // current frame
+    // Playback lives in the owning tab's timer, so the widget is handed that timer rather than a
+    // flag it would have to keep in step: there are a dozen start/stop sites between the two tabs
+    // and a mirrored bool only has to be missed at one of them to lie. Asking the timer cannot
+    // desync. QPointer so a destroyed tab reads as "not playing" instead of dangling.
+    void setPlaybackTimer(QTimer* t) { m_playbackTimer = t; }
+    bool animPlaying() const;
 
     // Cloth (NvCloth-style) sim parameters — live-tunable from the Physics panel.
     struct ClothParams {
@@ -554,6 +561,7 @@ private:
     QVector<float>       m_colR0, m_colR1;         // tapered radii at each endpoint (flRadiusA/B)
     QVector<float>       m_colP0, m_colP1;         // per-frame animated endpoints (3 each)
 
+    QPointer<QTimer> m_playbackTimer;      // the owning tab's animation timer (see animPlaying)
     class QTimer* m_spinTimer = nullptr;   // drives the Spin turntable
     float         m_spinSpeed = 0.025f;    // radians per tick (turntable rate)
     class QTimer* m_fxTimer = nullptr;     // drives mesh-FX UV-scroll repaints

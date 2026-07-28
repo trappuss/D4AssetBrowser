@@ -3173,6 +3173,7 @@ ModelsTab::ModelsTab(QWidget* parent) : BrowserTab(parent)
 
     // Timeline / animation.
     m_animTimer = new QTimer(this);
+    if (m_modelView) m_modelView->setPlaybackTimer(m_animTimer);   // lets a capture ask if we're playing
     connect(m_animTimer, &QTimer::timeout, this, &ModelsTab::tickAnimation);
     connect(m_animSlider, &QSlider::valueChanged, this, [this](int v) {
         if (m_modelView) m_modelView->setFrame(v);

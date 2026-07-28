@@ -1358,6 +1358,11 @@ void GLModelWidget::setAttachAnimRanges(const QVector<AttachRange>& ranges)
     }
 }
 
+bool GLModelWidget::animPlaying() const
+{
+    return m_playbackTimer && m_playbackTimer->isActive();
+}
+
 void GLModelWidget::setAnimation(const AnimParser::DecodedAnim& anim)
 {
     // A new clip invalidates every attached range; the caller re-declares them after installing.

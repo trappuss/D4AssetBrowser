@@ -279,11 +279,13 @@ bool ExportCapture::turntableGif(GLModelWidget* view, const QString& path, const
     const float startYaw = view->orbitYaw();
     const int prevFrame  = view->animFrame();
 
-    // The clip plays THROUGH the orbit. The turntable used to hold one pose the whole way round,
-    // which is right for a static prop and wrong for anything with an idle: you got a spinning
-    // statue. A clip is played whenever one is loaded, and the pose is simply left alone when none
-    // is — no setting, because "there is a clip loaded" is the whole question.
-    const int clipN = view->animFrameCount();
+    // The clip plays THROUGH the orbit — but only if it is actually PLAYING. The turntable used to
+    // hold one pose the whole way round, which is right for a static prop and a spinning statue for
+    // anything with an idle. "A clip is loaded" is the wrong test though: a clip stays loaded when
+    // you pause it on a frame you want to look at, and turning that pose into a walk cycle is not
+    // what pausing meant. The transport is the intent, so the export follows it: playing gives an
+    // animated turntable, paused or stopped orbits the pose you left on screen.
+    const int clipN = view->animPlaying() ? view->animFrameCount() : 0;
     //
     // A GIF loops the entire sequence, so BOTH the orbit and the pose have to arrive back where
     // they started. The orbit always does (a full revolution by construction); the pose only does
@@ -328,10 +330,16 @@ bool ExportCapture::turntableGif(GLModelWidget* view, const QString& path, const
         if (progress && !progress(i + 1, frames)) { restore(); return false; }
     }
     restore();
+    // Says which of the two turntables you got, because "why is my GIF 56 frames when I asked for
+    // 48" and "why is my model not moving" are both answered here.
     if (clipN > 0)
-        qInfo("gif turntable: %d frame(s) — clip %d frame(s) %s", frames, clipN,
+        qInfo("gif turntable: %d frame(s) — playing a %d-frame clip %s", frames, clipN,
               authoredRate ? "at its authored rate — whole loops per revolution"
                            : "mapped to one cycle per revolution (whole loops exceed the 240 cap)");
+    else
+        qInfo("gif turntable: %d frame(s) — static pose (%s)", frames,
+              view->animFrameCount() > 0 ? "a clip is loaded but not playing — press Play to animate it"
+                                         : "no clip loaded");
 
     if (buf.empty() || gw == 0) return false;
     if (cropEnabled()) {
