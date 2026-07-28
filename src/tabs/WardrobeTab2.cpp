@@ -1480,55 +1480,27 @@ WardrobeTab2::WardrobeTab2(QWidget* parent) : BrowserTab(parent)
     m_attachSep->setVisible(false);
     bl->addWidget(m_attachSep);
     m_attachList = new QListWidget(m_animPanel);
-    m_attachList->setFrameShape(QFrame::NoFrame);   // reads as part of the panel, not a widget in it
-    m_attachList->setSelectionMode(QAbstractItemView::NoSelection);   // the ● marks the live clip
+    m_attachList->setSelectionMode(QAbstractItemView::SingleSelection);
     m_attachList->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
     m_attachList->setVisible(false);
     bl->addWidget(m_attachList);   // no stretch: height is set to its content, capped in fill
+    // Selecting a clip plays it on that attachment; re-clicking the selected one clears it and the
+    // attachment stops. Exactly the character list's contract, which is why there is no Play
+    // checkbox or Restart button — selecting is the transport.
+    connect(m_attachList, &QListWidget::currentItemChanged, this,
+            [this](QListWidgetItem* it, QListWidgetItem*) {
+        if (!it || m_restoring) return;
+        setAttachClip(it->data(kAttachApprRole).toString(), it->data(Qt::UserRole).toString());
+        m_attachJustSelected = true;
+    });
     connect(m_attachList, &QListWidget::itemClicked, this, [this](QListWidgetItem* it) {
+        if (m_attachJustSelected) { m_attachJustSelected = false; return; }   // press already ran it
         if (!it) return;
         const QString appr = it->data(kAttachApprRole).toString();
-        const QString name = it->data(Qt::UserRole).toString();
-        if (appr.isEmpty() || name.isEmpty() || m_restoring) return;
-        QSettings().setValue(QStringLiteral("wardrobe2/attachClip/") + appr.toLower(), name);
-        if (m_status) m_status->setText(QStringLiteral("%1 → %2").arg(appr, name));
-        // Deferred: re-arming rebuilds this list, and deleting the item that is mid-signal is
-        // exactly the kind of thing that bites later.
-        const QString play = m_playingAnim;
-        QTimer::singleShot(0, this, [this, play] {
-            if (!play.isEmpty()) playAnimByName(play);   // re-arms the attachment clock
-            else                 fillAttachList();        // just move the bullet
-        });
+        if (!appr.isEmpty() && it->data(Qt::UserRole).toString() == selectedClipFor(appr))
+            setAttachClip(appr, QString());   // re-click the live clip → stop this attachment
     });
 
-    // Attachment transport, directly under its list.
-    m_attachRow = new QWidget(m_animPanel);
-    {
-        auto* row = new QHBoxLayout(m_attachRow);
-        row->setContentsMargins(0, 2, 0, 0);
-        row->setSpacing(6);
-        auto* lbl = new QLabel(QStringLiteral("Attached:"), m_attachRow);
-        lbl->setStyleSheet(QStringLiteral("color:#b0453c;"));
-        row->addWidget(lbl);
-        m_attachPlay = new QCheckBox(QStringLiteral("Play"), m_attachRow);
-        m_attachPlay->setChecked(true);
-        m_attachPlay->setToolTip(QStringLiteral("Off freezes every attachment on its first frame"));
-        row->addWidget(m_attachPlay);
-        row->addStretch(1);
-        m_attachRestart = new QToolButton(m_attachRow);
-        m_attachRestart->setText(QStringLiteral("Restart"));
-        m_attachRestart->setToolTip(QStringLiteral("Play the attachments' clips from their first frame"));
-        m_attachRestart->setAutoRaise(true);
-        row->addWidget(m_attachRestart);
-    }
-    m_attachRow->setVisible(false);
-    bl->addWidget(m_attachRow);
-    connect(m_attachPlay, &QCheckBox::toggled, this, [this](bool) {
-        if (!m_restoring && !m_playingAnim.isEmpty()) playAnimByName(m_playingAnim);
-    });
-    connect(m_attachRestart, &QToolButton::clicked, this, [this] {
-        if (!m_playingAnim.isEmpty()) playAnimByName(m_playingAnim);   // re-arms the attach clocks
-    });
 
     // (m_animPanel is NOT added here — it's registered as a RIGHT-side panel; the transport bar
     //  m_timeline is placed under the viewport in the centre column. Both happen below.)
@@ -2723,7 +2695,7 @@ WardrobeTab2::WardrobeTab2(QWidget* parent) : BrowserTab(parent)
     });
     connect(m_weapon, &QComboBox::currentIndexChanged, this, [this](int) {
         if (m_restoring) return;
-        QSettings().setValue(QStringLiteral("wardrobe2/weapon"), m_weapon->currentText());
+        QSettings().setValue(QStringLiteral("wardrobe2/weapon"), weaponKeyOf(m_weapon));
         scheduleRebuild();
     });
     connect(m_weaponType2, &QComboBox::currentIndexChanged, this, [this](int) {
@@ -2733,17 +2705,17 @@ WardrobeTab2::WardrobeTab2(QWidget* parent) : BrowserTab(parent)
     });
     connect(m_weapon2, &QComboBox::currentIndexChanged, this, [this](int) {
         if (m_restoring) return;
-        QSettings().setValue(QStringLiteral("wardrobe2/weapon2"), m_weapon2->currentText());
+        QSettings().setValue(QStringLiteral("wardrobe2/weapon2"), weaponKeyOf(m_weapon2));
         scheduleRebuild();
     });
     connect(m_weapon3, &QComboBox::currentIndexChanged, this, [this](int) {
         if (m_restoring) return;
-        QSettings().setValue(QStringLiteral("wardrobe2/weaponSheath"), m_weapon3->currentText());
+        QSettings().setValue(QStringLiteral("wardrobe2/weaponSheath"), weaponKeyOf(m_weapon3));
         scheduleRebuild();
     });
     connect(m_weapon4, &QComboBox::currentIndexChanged, this, [this](int) {
         if (m_restoring) return;
-        QSettings().setValue(QStringLiteral("wardrobe2/weaponSheath2"), m_weapon4->currentText());
+        QSettings().setValue(QStringLiteral("wardrobe2/weaponSheath2"), weaponKeyOf(m_weapon4));
         scheduleRebuild();
     });
     connect(m_backTrophy, &QComboBox::currentIndexChanged, this, [this](int) {
@@ -3997,6 +3969,15 @@ void WardrobeTab2::ensureWeaponIndex()
     populateWeapons();
 }
 
+// What a weapon slot persists: the appearance name, which is unique, rather than the combo's
+// visible text, which is the appearance with its type prefix stripped and therefore is not.
+QString WardrobeTab2::weaponKeyOf(const QComboBox* cb)
+{
+    if (!cb || cb->currentIndex() <= 0) return QString();   // index 0 is "(none)"
+    const QString appr = cb->currentData(Qt::UserRole + 1).toString();
+    return appr.isEmpty() ? cb->currentText() : appr;
+}
+
 void WardrobeTab2::populateWeapons()
 {
     if (!m_weaponType || !m_weapon || !m_weaponType2 || !m_weapon2) return;
@@ -4041,8 +4022,25 @@ void WardrobeTab2::populateWeapons()
                 modelCb->setItemData(idx, label,    Qt::UserRole + 2);         // weapon-type label
             }
         }
-        const int wi = savedModel.isEmpty() ? 0 : modelCb->findText(savedModel);
-        if (wi > 0) modelCb->setCurrentIndex(wi);
+        // Resolved by APPEARANCE (UserRole+1), never by the visible text. The list strips the
+        // type prefix for display, so "stor027" names thirteen different main-hand weapons and
+        // findText returns whichever type sorts first — twoHandSword_stor027 where the user had
+        // axe_stor027. 149 of the 1473 main-hand entries collide that way, and the off hand only
+        // looked fine because its 2H types are filtered out. Old settings hold the display text:
+        // fall back to it once, then the next change writes the unambiguous key.
+        int wi = -1;
+        if (!savedModel.isEmpty()) {
+            wi = modelCb->findData(savedModel, Qt::UserRole + 1, Qt::MatchFixedString);
+            if (wi < 0) wi = modelCb->findText(savedModel);   // legacy value, migrated on next write
+        }
+        if (wi > 0) {
+            modelCb->setCurrentIndex(wi);
+            const QString appr = modelCb->currentData(Qt::UserRole + 1).toString();
+            if (appr.compare(savedModel, Qt::CaseInsensitive) != 0)
+                qInfo("wardrobe: %s restored '%s' from the legacy display key '%s' — rewriting",
+                      qPrintable(modelKey), qPrintable(appr), qPrintable(savedModel));
+            QSettings().setValue(modelKey, appr);
+        }
     };
 
     fillHand(m_weaponType, m_weapon, /*offHand=*/false,
@@ -6476,7 +6474,7 @@ void WardrobeTab2::equipTheme(int sno, const QString& appearanceName, ThemeScope
             if (!mc) return false;
             for (const QString& wn : r.weapons) {
                 const int i = mc->findData(wn, Qt::UserRole + 1, Qt::MatchFixedString);
-                if (i > 0) { mc->setCurrentIndex(i); QSettings().setValue(key, mc->itemText(i)); return true; }
+                if (i > 0) { mc->setCurrentIndex(i); QSettings().setValue(key, weaponKeyOf(mc)); return true; }
             }
             return false;
         };
@@ -8853,16 +8851,17 @@ void WardrobeTab2::fillAttachList()
     // The whole block only earns its space when something animated is attached.
     const bool any = !animated.isEmpty();
     if (m_attachSep) m_attachSep->setVisible(any);
-    if (m_attachRow) m_attachRow->setVisible(any);
     m_attachList->setVisible(any);
     QSignalBlocker block(m_attachList);
+    m_attachJustSelected = false;   // rows are about to be deleted; no pending release to swallow
     m_attachList->clear();
     if (!any) return;
 
+    QListWidgetItem* live = nullptr;
     for (const Attached* at : animated) {
         auto* hdr = new QListWidgetItem(QStringLiteral("%1 — %2").arg(at->slot, at->label),
                                         m_attachList);
-        hdr->setFlags(Qt::NoItemFlags);          // a label, not a choice
+        hdr->setFlags(Qt::NoItemFlags);          // the model title separating one group's clips
         QFont f = hdr->font();
         f.setBold(true);
         hdr->setFont(f);
@@ -8870,29 +8869,27 @@ void WardrobeTab2::fillAttachList()
 
         const QString active = selectedClipFor(at->appearance);
         for (const BackTrophyIndex::Clip& c : BackTrophyIndex::instance().clipsFor(at->appearance)) {
-            // Named by the part of the stem that is NOT the appearance — idle, killstreak — since
-            // the group header already says which model it belongs to. Most attachments ship a
-            // single unnamed clip, which leaves nothing to say: the frame count alone is the row.
+            // Same shape as a character row — "Action   —   clip_name  ·  N frames". The action
+            // is the part of the stem that is NOT the appearance (idle, killstreak); attachments
+            // shipping one unnamed clip have none, and the row is then just clip + frames.
             QString kind = c.name.startsWith(at->appearance, Qt::CaseInsensitive)
                                ? c.name.mid(at->appearance.size()) : c.name;
             if (kind.startsWith(QLatin1Char('_'))) kind = kind.mid(1);
-            const bool on = (c.name == active);
+            if (!kind.isEmpty()) kind[0] = kind[0].toUpper();
+            const QString tail = c.frames > 0
+                ? QStringLiteral("%1  ·  %2 frames").arg(c.name).arg(c.frames) : c.name;
             auto* it = new QListWidgetItem(
-                QStringLiteral("    %1  %2%3")
-                    .arg(on ? QStringLiteral("●") : QStringLiteral("○"), kind,
-                         c.frames > 0 ? QStringLiteral("%1%2 frames")
-                                            .arg(kind.isEmpty() ? QString()
-                                                                : QStringLiteral("   ·   "))
-                                            .arg(c.frames)
-                                      : QString()),
-                m_attachList);
+                kind.isEmpty() ? tail : QStringLiteral("%1   —   %2").arg(kind, tail), m_attachList);
             it->setData(Qt::UserRole, c.name);
             it->setData(kAttachApprRole, at->appearance);
-            if (on) it->setForeground(QBrush(kAttachAccent));
             it->setToolTip(QStringLiteral("%1\nPlays on its own %2-frame loop, independent of the "
-                                          "character clip.").arg(c.name).arg(c.frames));
+                                          "character clip. Click again to stop it.")
+                               .arg(c.name).arg(c.frames));
+            if (c.name == active) live = it;
         }
     }
+    // Selection IS the playing state, as in the character list.
+    m_attachList->setCurrentItem(live);   // null when the attachment is stopped
     // Sized to content so it never scrolls for the common one- or two-attachment case, capped so a
     // full loadout cannot crowd out the character's list.
     int h = 2 * m_attachList->frameWidth();
@@ -9071,6 +9068,25 @@ void WardrobeTab2::collectExportAnims(QVector<AnimParser::DecodedAnim>& anims, Q
     }
 }
 
+// Choose (or stop) an attachment's clip. Stopping is an EXPLICIT empty value, not a missing key:
+// absent means "never chosen, fall back to idle", and conflating the two would make a stopped
+// attachment silently restart on the next rebuild.
+void WardrobeTab2::setAttachClip(const QString& appearance, const QString& clip)
+{
+    if (appearance.isEmpty()) return;
+    QSettings().setValue(QStringLiteral("wardrobe2/attachClip/") + appearance.toLower(), clip);
+    if (m_status)
+        m_status->setText(clip.isEmpty() ? QStringLiteral("%1 stopped").arg(appearance)
+                                         : QStringLiteral("%1 → %2").arg(appearance, clip));
+    // Deferred: re-arming rebuilds this list, and deleting the item that is mid-signal is exactly
+    // the kind of thing that bites later.
+    const QString play = m_playingAnim;
+    QTimer::singleShot(0, this, [this, play] {
+        if (!play.isEmpty()) playAnimByName(play);   // re-arms the attachment clocks
+        else                 fillAttachList();
+    });
+}
+
 // The clip chosen for one attachment, remembered per APPEARANCE so each equipped item keeps its own
 // choice — a selection stored per panel would be clobbered the moment a second attachment existed.
 //
@@ -9082,7 +9098,11 @@ QString WardrobeTab2::selectedClipFor(const QString& appearance) const
     const QVector<BackTrophyIndex::Clip> clips = BackTrophyIndex::instance().clipsFor(appearance);
     if (clips.isEmpty()) return QString();
     QSettings st;
-    QString want = st.value(QStringLiteral("wardrobe2/attachClip/") + appearance.toLower()).toString();
+    const QString key = QStringLiteral("wardrobe2/attachClip/") + appearance.toLower();
+    // An empty value that is PRESENT means the user stopped this attachment. Only an absent key
+    // falls through to the _idle default below.
+    if (st.contains(key) && st.value(key).toString().isEmpty()) return QString();
+    QString want = st.value(key).toString();
     // One-time migration off the old single-attachment key. Leaving it unread would silently
     // discard the choice every existing user already made, and leave a key that is written by
     // nothing and read by nothing.
@@ -9112,8 +9132,6 @@ void WardrobeTab2::mergeAttachmentClips(AnimParser::DecodedAnim& anim)
 {
     m_btAttachRanges.clear();
     if (m_attached.isEmpty() || !anim.valid || anim.frameCount <= 0) return;
-    const bool play = !m_attachPlay || m_attachPlay->isChecked();
-
     for (const Attached& at : m_attached) {
         if (at.preSalt.isEmpty()) continue;
         const QString clip = selectedClipFor(at.appearance);
@@ -9125,7 +9143,7 @@ void WardrobeTab2::mergeAttachmentClips(AnimParser::DecodedAnim& anim)
 
         AttachSpan span;
         span.from   = anim.bones.size();
-        span.frames = play ? tr.frameCount : 1;   // not playing → a one-frame span never advances
+        span.frames = tr.frameCount;
         span.fps    = tr.frameRate > 1.0f ? tr.frameRate : 30.0f;
         int added = 0;
         for (const AnimParser::DecodedBone& src : tr.bones) {

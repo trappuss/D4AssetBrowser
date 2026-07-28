@@ -115,7 +115,8 @@ private:
     void applyDye();         // push the selected pigment across the whole outfit
     void rebuildDyeCombo();  // (re)fill the dye dropdown from real DyeDefinitions
     void ensureWeaponIndex();// enumerate weapon appearances by name prefix (data-driven)
-    void populateWeapons();  // fill the weapon type/model combos (class-filtered)
+    void populateWeapons();
+    static QString weaponKeyOf(const QComboBox* cb);   // unambiguous settings value for a weapon slot  // fill the weapon type/model combos (class-filtered)
     QString baseAppJsonPath() const;   // current class/gender base body .app.json path (case-resolved)
     // Real game attach data: body hardpoint hash → (bone index, bone-local TRS, z-up).
     QHash<quint32, QPair<int, std::array<float, 16>>> loadBodyHardpoints(const QString& d4);
@@ -311,10 +312,9 @@ private:
     // ATTACHED panel: the attached model's own clip list + transport.
     QLabel*      m_attachSep    = nullptr;   // "ATTACHED" rule inside the ANIMATIONS panel
     QListWidget* m_attachList   = nullptr;   // its clips, grouped by attachment
-    QWidget*     m_attachRow    = nullptr;   // attachment transport, bottom of the ANIMATIONS panel
-    QCheckBox*   m_attachPlay  = nullptr;
-    QToolButton* m_attachRestart = nullptr;
+    bool         m_attachJustSelected = false;   // press already handled it; ignore the release
     void fillAttachList();          // attachments' clips, pinned under the character's
+    void setAttachClip(const QString& appearance, const QString& clip);   // empty clip = stop it
     QTreeWidget* m_partTree = nullptr; // per-part visibility tree (piece → submeshes)
     QWidget* m_sidebar = nullptr;      // right-side panel column (strip + splitter)
     QSplitter* m_rsplit = nullptr;     // vertical splitter: the visible panels, drag to resize
