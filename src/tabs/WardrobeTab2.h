@@ -176,6 +176,7 @@ private:
     void maybeAutoAnimate();            // after a rebuild: act only if the weapon class moved
     QString m_autoFollowClip;           // queued behind the current one-shot (see tickAnimation)
     int  m_lastAutoWeaponClass = -2;    // -2 = never computed; the first rebuild only arms it
+    QString m_lastAutoSig;              // class/gender/weapon-class of the last armed state
 
     QComboBox* m_class  = nullptr;
     QComboBox* m_gender = nullptr;

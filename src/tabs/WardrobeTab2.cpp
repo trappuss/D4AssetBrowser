@@ -3011,10 +3011,19 @@ void WardrobeTab2::autoAnimateForLoadout()
 void WardrobeTab2::maybeAutoAnimate()
 {
     if (!WardrobeAnimIndex::instance().ready()) return;
+    // Keyed on CHARACTER as well as weapon class. The class alone was not enough: switching
+    // Barbarian → Rogue holding the same two-hander keeps weapon class 3, yet the animation is a
+    // completely different clip from a different set, and nothing would have replayed it. Gender
+    // likewise — it selects snoFemaleOverrideAnim inside the set.
     const int wc = wardrobeWeaponClass();
+    const QString sig = QStringLiteral("%1/%2/%3")
+        .arg(m_class  ? m_class->currentData().toString()  : QString(),
+             m_gender ? m_gender->currentData().toString() : QString())
+        .arg(wc);
     const bool first = (m_lastAutoWeaponClass == -2);
-    const bool changed = (wc != m_lastAutoWeaponClass);
+    const bool changed = (sig != m_lastAutoSig);
     m_lastAutoWeaponClass = wc;
+    m_lastAutoSig = sig;
     if (first || !changed || m_restoring) return;
     autoAnimateForLoadout();
 }
