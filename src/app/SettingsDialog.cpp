@@ -735,6 +735,15 @@ reading the right blob out of packed storage.</p>
     auto* w2l = new QVBoxLayout(wardrobe2);
     m_w2NudeBase = new QCheckBox(QStringLiteral("Show nude base body when nothing is equipped"), wardrobe2);
     w2l->addWidget(m_w2NudeBase);
+    m_w2AutoAnimate = new QCheckBox(QStringLiteral("Auto Animate — react to weapon changes"), wardrobe2);
+    m_w2AutoAnimate->setToolTip(QStringLiteral(
+        "Play the animation the game's OWN wardrobe would play whenever the weapon loadout\n"
+        "changes: it draws the new weapon, then settles into that loadout's idle on a loop.\n\n"
+        "Resolved from the shipped data (ItemType.eWeaponClass → the matching *_ui_wardrobe\n"
+        "AnimSet), so unarmed, one weapon, dual wield and each two-hander get their own pair.\n\n"
+        "Note the game has no wardrobe \"sheathe\" — a weapon change always draws and settles,\n"
+        "it never puts anything away. Armour and cosmetic changes do not trigger it."));
+    w2l->addWidget(m_w2AutoAnimate);
     auto* dbg2Lbl = new QLabel(QStringLiteral(
         "<b>Panels</b> — side panels toggle from the icon strip in the tab itself:"), wardrobe2);
     dbg2Lbl->setStyleSheet(QStringLiteral("color:#aaa;margin-top:6px;"));
@@ -751,6 +760,7 @@ reading the right blob out of packed storage.</p>
     for (QCheckBox* cb : {m_w2SecEnsembles, m_w2RememberPanels, m_w2ShowLog})
         w2l->addWidget(cb);
     live(QStringLiteral("wardrobe2/nudeBase"),         m_w2NudeBase,    /*rebuild=*/true);
+    live(QStringLiteral("wardrobe2/autoAnimate"),      m_w2AutoAnimate, false);
     live(QStringLiteral("wardrobe2/viewport/ensembles"), m_w2SecEnsembles, false);
     live(QStringLiteral("wardrobe2/rememberPanels"),   m_w2RememberPanels, false);
     live(QStringLiteral("wardrobe2/dbg/log"),          m_w2ShowLog,     false);
@@ -1520,6 +1530,7 @@ static QStringList liveSettingKeys()
         QStringLiteral("models/rememberPanels"), QStringLiteral("models/fillSkin"),
         QStringLiteral("models/autoRender3D"), QStringLiteral("models/clothSim"),
         QStringLiteral("wardrobe2/nudeBase"),
+        QStringLiteral("wardrobe2/autoAnimate"),
         QStringLiteral("wardrobe2/rememberPanels"),
         QStringLiteral("wardrobe2/dbg/log"), QStringLiteral("wardrobe2/viewport/ensembles"),
         QStringLiteral("wardrobe2/perf/coalesce"), QStringLiteral("wardrobe2/perf/asyncLoad"),

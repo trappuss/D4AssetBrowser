@@ -63,6 +63,7 @@ private:
     QCheckBox*   m_mdlRememberLast = nullptr; // Models: remember last selected model
     // Wardrobe section toggles (its own panels + animations + ensembles player).
     QCheckBox*   m_w2NudeBase    = nullptr;
+    QCheckBox*   m_w2AutoAnimate = nullptr;
     QCheckBox*   m_w2RememberPanels = nullptr; // remember the side-panel layout (strip toggles)
     QCheckBox*   m_w2SecEnsembles= nullptr; // ENSEMBLES (saved-looks panel)
     QCheckBox*   m_w2ShowLog     = nullptr; // DEBUG LOG (status text + Copy debug)

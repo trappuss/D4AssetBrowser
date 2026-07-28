@@ -24,6 +24,7 @@
 #include "index/AnimActionIndex.h"
 #include "index/AppearanceMeta.h"
 #include "index/BackTrophyIndex.h"
+#include "index/WardrobeAnimIndex.h"
 #include "index/IconIndex.h"
 #include "index/CoreToc.h"
 #include "index/SnoIndex.h"
@@ -2815,6 +2816,7 @@ void WardrobeTab2::refresh()
     // Back trophies: Item(CosmeticBack) → Actor → Appearance, built in the background. The picker
     // is empty until this lands, so refill the slot lists when it does.
     BackTrophyIndex::instance().ensureBuilt(Config::d4dataDir());
+    WardrobeAnimIndex::instance().ensureBuilt(Config::d4dataDir());
     connect(&BackTrophyIndex::instance(), &BackTrophyIndex::readyChanged, this,
             [this] {
         populateSlots(); fillAnimList();
@@ -2862,6 +2864,99 @@ void WardrobeTab2::refresh()
         }
     });
     qInfo("startup: wardrobe refresh — %lld ms total (restore + weapon index + initial rebuild)", refT.elapsed());
+}
+
+// The weapon class the GAME would put this loadout in — the key its wardrobe AnimSets are indexed
+// by. Derived from the two held hands via ItemType.eWeaponClass, never from the appearance name.
+//
+// Dual wield is the one case the item data cannot answer: no ItemType carries class 9, because it
+// describes a STATE (a one-hander in each hand) rather than an item. Barbarian and Rogue are the
+// two classes whose wardrobe sets declare it, so it is TRIED and falls back to the main hand's own
+// class when this character has no set for it — rather than being assumed.
+int WardrobeTab2::wardrobeWeaponClass() const
+{
+    WardrobeAnimIndex& wi = WardrobeAnimIndex::instance();
+    auto classOfHand = [&](QComboBox* c) -> int {
+        if (!c || c->currentIndex() <= 0) return -1;
+        const QString appr = c->currentData(Qt::UserRole + 1).toString().toLower();
+        if (appr.isEmpty()) return -1;
+        for (const WeapTypeDef& w : kWeapTypes) {
+            const QString pfx = QString::fromLatin1(w.prefix).toLower() + QLatin1Char('_');
+            if (appr.startsWith(pfx)) return wi.weaponClassOf(QString::fromLatin1(w.itemType));
+        }
+        return -1;
+    };
+    auto twoHanded = [&](QComboBox* c) -> bool {
+        if (!c || c->currentIndex() <= 0) return false;
+        const QString appr = c->currentData(Qt::UserRole + 1).toString().toLower();
+        for (const WeapTypeDef& w : kWeapTypes) {
+            const QString pfx = QString::fromLatin1(w.prefix).toLower() + QLatin1Char('_');
+            if (appr.startsWith(pfx)) return w.twoHand;
+        }
+        return false;
+    };
+
+    const int mainC = classOfHand(m_weapon);
+    const int offC  = classOfHand(m_weapon2);
+    const QString cls = m_class ? m_class->currentData().toString().toLower() : QString();
+
+    if (mainC < 0 && offC < 0) return 0;                      // unarmed — every set calls this 0
+    if (twoHanded(m_weapon)) return mainC;                    // a two-hander is its own class
+    if (mainC >= 0 && offC >= 0) {                            // a weapon in each hand
+        if (!wi.clipsFor(cls, 9, true).idle.isEmpty()
+            || !wi.clipsFor(cls, 9, false).idle.isEmpty()) return 9;
+        return mainC;
+    }
+    return mainC >= 0 ? mainC : offC;                         // one hand filled
+}
+
+// Play what the game's wardrobe would play for the current loadout: the unsheathe once, then its
+// idle on a loop. Called after a rebuild that CHANGED the weapon configuration, never on every
+// rebuild — re-drawing the weapons because a helmet changed would be wrong and maddening.
+void WardrobeTab2::autoAnimateForLoadout()
+{
+    if (!m_view || m_restoring) return;
+    if (!QSettings().value(QStringLiteral("wardrobe2/autoAnimate"), false).toBool()) return;
+    WardrobeAnimIndex& wi = WardrobeAnimIndex::instance();
+    if (!wi.ready()) return;
+
+    const QString cls = m_class ? m_class->currentData().toString().toLower() : QString();
+    if (!wi.covers(cls)) return;                       // no wardrobe sets shipped for this class
+    const bool female = m_gender && m_gender->currentData().toString().compare(
+                            QLatin1String("F"), Qt::CaseInsensitive) == 0;
+    const int wc = wardrobeWeaponClass();
+    const WardrobeAnimIndex::Clips c = wi.clipsFor(cls, wc, female);
+    if (c.idle.isEmpty() && c.unsheathe.isEmpty()) {
+        qInfo("auto-animate: no wardrobe set for %s weapon class %d", qPrintable(cls), wc);
+        return;
+    }
+    // Unsheathe once, then the idle. There is no wardrobe "sheathe" in the data — the only Powers
+    // the *_ui_wardrobe sets bind are unSheathe, idle and the loading-screen pose — so a change of
+    // weapons always DRAWS and settles, it never puts anything away.
+    m_autoFollowClip = c.idle;
+    const QString first = c.unsheathe.isEmpty() ? c.idle : c.unsheathe;
+    if (first == c.idle) m_autoFollowClip.clear();     // nothing to follow; the idle just loops
+    qInfo("auto-animate: %s class %d -> %s%s", qPrintable(cls), wc, qPrintable(first),
+          m_autoFollowClip.isEmpty() ? "" : qPrintable(QStringLiteral(" then ") + m_autoFollowClip));
+    playAnimByName(first);
+    if (m_animTimer && !m_animTimer->isActive()) {
+        m_animTimer->start();
+        if (m_playBtn) m_playBtn->setIcon(transportGlyph(1));
+    }
+}
+
+// Runs after every rebuild; acts only when the weapon class actually moved. -2 means "never
+// computed", so the first rebuild after startup arms the comparison without playing anything —
+// restoring a saved outfit is not a change the user made.
+void WardrobeTab2::maybeAutoAnimate()
+{
+    if (!WardrobeAnimIndex::instance().ready()) return;
+    const int wc = wardrobeWeaponClass();
+    const bool first = (m_lastAutoWeaponClass == -2);
+    const bool changed = (wc != m_lastAutoWeaponClass);
+    m_lastAutoWeaponClass = wc;
+    if (first || !changed || m_restoring) return;
+    autoAnimateForLoadout();
 }
 
 QString WardrobeTab2::classPrefix() const
@@ -7687,6 +7782,9 @@ void WardrobeTab2::rebuildOutfitImpl(bool async)
         const WardrobeOutfitMaps M = decode();
         const qint64 tDec = dt.elapsed();
         applyOutfit(ctx, M);
+        // Auto-animate reacts to the WEAPON configuration, not to any rebuild — re-drawing the
+        // weapons because a helmet changed would be both wrong and maddening.
+        maybeAutoAnimate();
         qInfo("wardrobe: rebuild(sync) — geometry %lld ms · decode %lld ms · apply %lld ms (%d pieces)",
               tGeom, tDec, dt.elapsed() - tDec, ctx.pieceCount);
         return;
@@ -7703,6 +7801,9 @@ void WardrobeTab2::rebuildOutfitImpl(bool async)
             if (gen != m_buildGen) return;
             QElapsedTimer at; at.start();
             applyOutfit(ctx, M);
+            // Auto-animate reacts to the WEAPON configuration, not to any rebuild — re-drawing the
+            // weapons because a helmet changed would be both wrong and maddening.
+            maybeAutoAnimate();
             qInfo("wardrobe: rebuild(async) — geometry %lld ms · decode %lld ms (worker) · apply %lld ms (%d pieces)",
                   tGeom, tDec, at.elapsed(), ctx.pieceCount);
         }, Qt::QueuedConnection);
@@ -9387,6 +9488,16 @@ void WardrobeTab2::tickAnimation()
     if (fc <= 0) { m_animTimer->stop(); return; }
     int next = m_animSlider->value() + 1;
     if (next >= fc) {
+        // Auto-animate queues the idle behind the unsheathe. Taken BEFORE the loop checkbox so the
+        // transition plays exactly once whatever Loop is set to — looping a draw animation is not
+        // a thing the wardrobe ever does.
+        if (!m_autoFollowClip.isEmpty()) {
+            const QString follow = m_autoFollowClip;
+            m_autoFollowClip.clear();
+            playAnimByName(follow);
+            if (m_animTimer && !m_animTimer->isActive()) m_animTimer->start();
+            return;
+        }
         if (m_loopCheck && m_loopCheck->isChecked()) next = 0;
         else { m_animTimer->stop(); m_playBtn->setIcon(transportGlyph(0)); return; }
     }
