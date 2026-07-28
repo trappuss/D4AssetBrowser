@@ -4669,15 +4669,28 @@ void WardrobeTab2::seatWeapon(ModelGeometry& wgeo, int hand, const QString& item
         if (socketIdentity) {
             static const Mat4 kHeld{{ -1,0,0,0,  0,1,0,0,  0,0,-1,0,  0,0,0,1 }};   // 180 about Y
             Toff = mat4mul(Toff, kHeld);
+            // The roll reverses the mesh's X and Z, so the authored grip SLIDE — which every held
+            // offset in the data is: a pure translation along the socket's X, sliding the weapon up
+            // or down its own shaft — is now pointing the wrong way along the weapon. Re-express it
+            // in the rolled frame.
+            //
+            // This is invisible on almost everything, which is why it went unnoticed: every other
+            // held offset in the game data is a nudge of 0.03 to 0.10 (sword -0.07, dagger -0.04,
+            // Axe2H/Mace2H +0.08 to +0.10), so the error is under 0.2 units. The polearm authors
+            // -0.500 — five times larger than anything else — and lands a full 1.0 unit down the
+            // shaft, which is the hand-at-the-butt-end symptom.
+            Toff[12] = -Toff[12];
+            Toff[14] = -Toff[14];
         }
         // The roll decision is the remaining unknown for a mis-oriented weapon: the authored socket
         // transform lives in the CASC payload, so it cannot be read from the JSON snapshot and the
         // only way to see which branch a given class/weapon took is to print it.
-        dbg += QStringLiteral("\n%1: socket rot [%2 %3 %4] %5")
+        dbg += QStringLiteral("\n%1: socket rot [%2 %3 %4] %5 · grip slide (%6 %7 %8)")
                    .arg(QLatin1String(lbl))
                    .arg(s[0], 0, 'f', 3).arg(s[5], 0, 'f', 3).arg(s[10], 0, 'f', 3)
                    .arg(socketIdentity ? QStringLiteral("identity -> 180° grip roll APPLIED")
-                                       : QStringLiteral("authored -> roll skipped"));
+                                       : QStringLiteral("authored -> roll skipped"))
+                   .arg(Toff[12], 0, 'f', 3).arg(Toff[13], 0, 'f', 3).arg(Toff[14], 0, 'f', 3);
     }
     // ── User orientation overrides (Weapon Settings dropdown): per-hand flip (half turn about
     // the grip) and invert (upside down), applied on top of the data seating. In-hand only —
