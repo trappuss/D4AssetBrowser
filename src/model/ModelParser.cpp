@@ -1051,6 +1051,8 @@ ModelGeometry ModelParser::mergeGeometries(const QVector<ModelGeometry>& parts)
                     b = (b >= 0 && b < remap.size()) ? remap[b] : -1;
                 for (int& b : s.drvBone)
                     b = (b >= 0 && b < remap.size()) ? remap[b] : -1;
+                if (s.spaceBone >= 0)
+                    s.spaceBone = (s.spaceBone < remap.size()) ? remap[s.spaceBone] : -1;
             }
             out.clothSims.append(s);
         }

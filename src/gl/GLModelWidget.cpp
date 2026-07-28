@@ -1637,21 +1637,39 @@ void GLModelWidget::buildSpringBones()
     m_sbPin.fill(0, nb);
     m_sbAttach.fill(1.0f, nb);   // default fully free; overwritten per matched bone below
     m_sbSim.fill(-1, nb);
+    int cageMatched = 0, cageTotal = 0, cageReSpaced = 0;
     for (int si = 0; si < m_clothSims.size(); ++si) {
         const ClothSim& cs = m_clothSims[si];
         QVector<int> v2b(cs.vertCount, -1);
+        // An ATTACHMENT's cage is authored around the trophy's own origin while its bones sit
+        // wherever the placement bone put them. Comparing the two directly is how 93% of a back
+        // trophy's mesh ends up on bones the solver never claims: every particle misses the 3cm
+        // test by metres, so the piece renders rigid. spaceBone names the bone whose rest frame
+        // the cage is in; applying it puts particles and bones back in one frame. Identity for
+        // every body piece, which have spaceBone -1.
+        const bool reSpace = (cs.spaceBone >= 0 && cs.spaceBone < nb);
+        const Mat4 toModel = reSpace ? restG[cs.spaceBone] : Mat4{};
+        if (reSpace) ++cageReSpaced;
         // Only REAL particles map to bones — entries past nRealVerts are SIMD padding
         // parked at the bind origin, which could otherwise claim a bone near the feet.
         const int v2bReal = (cs.nRealVerts > 0 && cs.nRealVerts <= cs.vertCount)
                                 ? cs.nRealVerts : cs.vertCount;
         for (int k = 0; k < v2bReal; ++k) {
-            const float* cp = cs.bindVerts.constData() + k*3;
+            const float* raw = cs.bindVerts.constData() + k*3;
+            float cp[3] = { raw[0], raw[1], raw[2] };
+            if (reSpace) {
+                cp[0] = toModel[0]*raw[0] + toModel[4]*raw[1] + toModel[8] *raw[2] + toModel[12];
+                cp[1] = toModel[1]*raw[0] + toModel[5]*raw[1] + toModel[9] *raw[2] + toModel[13];
+                cp[2] = toModel[2]*raw[0] + toModel[6]*raw[1] + toModel[10]*raw[2] + toModel[14];
+            }
             int best = -1; float bd = 0.03f*0.03f;     // ≤3cm = same point
             for (int b = scanStart; b < nb; ++b) {
                 if (authoredSplit && !m_skeleton[b].cloth) continue;   // base bones stay unclaimable
                 const float dx=restG[b][12]-cp[0], dy=restG[b][13]-cp[1], dz=restG[b][14]-cp[2];
                 const float d2 = dx*dx+dy*dy+dz*dz; if (d2 < bd) { bd = d2; best = b; }
             }
+            ++cageTotal;
+            if (best >= 0) ++cageMatched;
             v2b[k] = best;
             if (best >= 0) {
                 m_sbSim[best] = si;   // this bone belongs to cloth piece si (its tuning)
@@ -1672,6 +1690,11 @@ void GLModelWidget::buildSpringBones()
     // NO split (standalone gear): the simulated set IS the cage-claimed bones — build the order
     // from them now. BAD ratio: trust only cage-claimed bones, everything else drops back to
     // normal skinning. Either way, on a mis-split body rig the unclaimed bones stay rigid.
+    // Cage coverage, always printed: a cage that claims nothing is silent otherwise — the piece
+    // just renders rigid, which is indistinguishable from "it has no cloth" without this line.
+    if (cageTotal > 0)
+        qInfo("cloth-cage: %d of %d particle(s) claimed a bone (%.0f%%) · %d attachment cage(s) re-spaced",
+              cageMatched, cageTotal, 100.0 * cageMatched / cageTotal, cageReSpaced);
     if (authoredSplit) {
         qInfo("cloth: AUTHORED bone split — %d cloth bone(s) flagged (first %d), index heuristics bypassed",
               authoredFlagged, firstFlagged);

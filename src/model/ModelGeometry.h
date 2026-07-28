@@ -134,6 +134,13 @@ struct ClothSim {
     QVector<quint8>  conClass;       // per constraint pair: 0=warp 1=weft 2=shear 3=bend (from the
                                      // pt*Clusters ranges), 255=unclassified. The classes take the
                                      // .clt.json per-class stiffnesses (stretch/horiz/shear/bend).
+    // Which bone's REST frame bindVerts are expressed in. -1 (the normal case) means the piece's
+    // own model space, which after merging IS the merged model space — so the solver compares cage
+    // particles against rest globals directly. An ATTACHMENT is different: its cage is authored
+    // around the trophy's own origin, but its bones end up wherever the placement bone puts them,
+    // metres away. Naming the placement bone here lets the solver put the two back in one frame
+    // instead of the cage silently matching nothing.
+    int              spaceBone = -1;
     QString          name;           // ClothData.name (e.g. "barF_dlux100_TRS_cape") — legacy
                                      // key for the matching Cloth/*.clt.json (fallback path only)
     // ── Authoritative tuning link. The game's OWN per-item physics reference: each

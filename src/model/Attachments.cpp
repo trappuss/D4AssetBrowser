@@ -303,6 +303,12 @@ bool ModelAttach::attachSubRigAt(ModelGeometry& childGeo,
 {
     if (childGeo.skeleton.isEmpty()) return false;
     if (bone < 0 || bone >= parentSkel.size()) return false;
+    // A cage with no real particles claims no bones, so the cloth flag would only enrol them
+    // unconstrained. Checked BEFORE the rig is rebuilt so the decision is on the authored data.
+    bool hasUsableCage = false;
+    for (const ClothSim& s : childGeo.clothSims)
+        if (s.vertCount > 0 && !s.bindVerts.isEmpty() && !s.constraintLen.isEmpty())
+            { hasUsableCage = true; break; }
     if (outPreSalt) *outPreSalt = childGeo.skeleton;
     const Mat4 attachWorld = RigMath::jointWorldMat(parentSkel, bone);
     const Mat4 rootPre = RigMath::mat4mul(RigMath::invert(attachWorld), Mz);
@@ -344,12 +350,12 @@ bool ModelAttach::attachSubRigAt(ModelGeometry& childGeo,
         // for this bone replaces only the child's own authored pose, never the attachment.
         j.nameHash = saltBoneHash(j.nameHash, salt);
         j.name = QStringLiteral("bt_") + j.name;
-        // The authored cloth cage is in the child's own space and its particles are matched to
-        // bones by a few-centimetre proximity test, which cannot succeed once the rig is placed on
-        // the body. Leaving these flagged would enrol them in the solver with no constraints and no
-        // pins — the documented free-fall failure. Clearing the flag keeps them animation-driven,
-        // which is strictly no worse than the bake this replaces.
-        j.cloth = false;
+        // Keep the authored cloth flag ONLY when this attachment actually ships a cage the solver
+        // can use — ClothSim::spaceBone (set below) tells it where that cage lives, so the
+        // proximity match now succeeds in the child's own frame instead of failing silently metres
+        // away. Without a cage the bones would enrol with no constraints and no pins: the
+        // documented free-fall. Those stay animation-driven, which is what the bake did.
+        if (!hasUsableCage) j.cloth = false;
         out.append(j);
     }
 
@@ -374,6 +380,10 @@ bool ModelAttach::attachSubRigAt(ModelGeometry& childGeo,
         for (ClothPlane& pl : sim.planes) if (pl.boneIndex >= 0) pl.boneIndex += 2;
         for (int& b : sim.followerBone) if (b >= 0) b += 2;
         for (int& b : sim.drvBone)      if (b >= 0) b += 2;
+        // The cage stays in the child's own coordinates; bone [1] is exactly the transform that
+        // takes those coordinates to where the rig now sits, so the solver can do the conversion
+        // itself rather than us rewriting every particle here.
+        sim.spaceBone = 1;
     }
     for (ModelHardpoint& h : childGeo.hardpoints) {
         if (h.boneIndex >= 0) h.boneIndex += 2;
