@@ -1498,6 +1498,12 @@ WardrobeTab2::WardrobeTab2(QWidget* parent) : BrowserTab(parent)
     al->addWidget(m_attachWho);
     // Secondary line: what the panel DOES. New concept ("second timeline"), so it earns one line
     // of explanation rather than hiding in a tooltip nobody hovers.
+    // Which attachment you are choosing a clip FOR. All of them play regardless — this only picks
+    // whose list is shown — so it stays hidden unless there is more than one.
+    m_attachWhich = new QComboBox(m_attachPanel);
+    m_attachWhich->setToolTip(QStringLiteral("Which attached model's clips to show. They all play."));
+    m_attachWhich->setVisible(false);
+    al->addWidget(m_attachWhich);
     m_attachHint = new QLabel(m_attachPanel);
     m_attachHint->setWordWrap(true);
     m_attachHint->setStyleSheet(QStringLiteral("color:#8a8f96;font-size:11px;"));
@@ -1537,12 +1543,18 @@ WardrobeTab2::WardrobeTab2(QWidget* parent) : BrowserTab(parent)
     });
     // Re-arm playback with whatever is selected now. Goes through the normal clip path so the
     // character clip is rebuilt and the attachment range re-declared in one place.
+    connect(m_attachWhich, &QComboBox::currentIndexChanged, this, [this](int) {
+        if (!m_restoring) refreshAttachAnimList();   // show that attachment's clips; playback unchanged
+    });
     connect(m_attachAnims, &QListWidget::currentItemChanged, this,
             [this](QListWidgetItem*, QListWidgetItem*) {
-        if (m_restoring) return;
-        if (m_attachAnims->currentItem())
-            QSettings().setValue(QStringLiteral("wardrobe2/attachClip"),
-                                 m_attachAnims->currentItem()->data(Qt::UserRole).toString());
+        if (m_restoring || !m_attachAnims->currentItem() || !m_attachWhich) return;
+        // Remembered PER APPEARANCE: one shared key would be clobbered the moment a second
+        // attachment existed, which is exactly the case this panel now handles.
+        const QString appr = m_attachWhich->currentData().toString();
+        if (appr.isEmpty()) return;
+        QSettings().setValue(QStringLiteral("wardrobe2/attachClip/") + appr.toLower(),
+                             m_attachAnims->currentItem()->data(Qt::UserRole).toString());
         if (!m_playingAnim.isEmpty()) playAnimByName(m_playingAnim);
     });
     connect(m_attachPlay, &QCheckBox::toggled, this, [this](bool) {
@@ -2783,7 +2795,7 @@ WardrobeTab2::WardrobeTab2(QWidget* parent) : BrowserTab(parent)
         QSettings().setValue(QStringLiteral("wardrobe2/backTrophy"),
                              QString::number(m_backTrophy->currentData().toInt()));
         fillAnimList();   // the list carries this trophy's own clips
-        scheduleRebuild();   // the ATTACHED panel refreshes from the rebuild, once m_btSubRigAppr is set
+        scheduleRebuild();   // the ATTACHED panel refreshes from the rebuild, once m_attached is filled
     });
     // Build both popups eagerly so m_env (Preview) and m_fovSlider (Camera) exist for
     // restore/rebuild before the user ever opens either panel.
@@ -2868,7 +2880,14 @@ void WardrobeTab2::refresh()
     // is empty until this lands, so refill the slot lists when it does.
     BackTrophyIndex::instance().ensureBuilt(Config::d4dataDir());
     connect(&BackTrophyIndex::instance(), &BackTrophyIndex::readyChanged, this,
-            [this] { populateSlots(); fillAnimList(); refreshAttachAnimList(); });
+            [this] {
+        populateSlots(); fillAnimList(); refreshAttachAnimList();
+        // The first rebuild races the index: with a cold cache clipsFor() is empty for everything,
+        // so every item takes the bake and nothing animates until the user happens to re-equip.
+        // A cache-version bump makes that the FIRST run for every existing user, so rebuild once
+        // the answers are actually available.
+        if (m_loaded) scheduleRebuild();
+    });
     // Appearance-icon atlas index (same trigger point as the Models tab). Refill the grid/cells
     // when it finishes; show the live percentage while it scans.
     IconIndex::instance().ensureBuilt(Config::d4dataDir());
@@ -4346,11 +4365,14 @@ static quint32 backTrophySocket(const QHash<quint32, QPair<int, std::array<float
     return 0;
 }
 
-// Stable per-trophy salt: the same appearance must always produce the same bone hashes, or a clip
-// decoded in one rebuild would not bind in the next.
-static quint32 backTrophySalt(const QString& appr)
+// Per-ATTACHMENT-INSTANCE salt. Stable across rebuilds (so a clip decoded in one binds in the next)
+// but distinct per socket, because mergeGeometries unifies bones BY HASH: dual-wielding the same
+// sword, or holding one and sheathing an identical copy, would otherwise give both instances the
+// same salted hashes and fuse the second rig onto the first — the off-hand copy would render at the
+// main hand's placement, and only one of the two clips could bind.
+static quint32 backTrophySalt(const QString& appr, int socket = 0)
 {
-    return quint32(qHash(appr.toLower()));
+    return quint32(qHash(appr.toLower())) ^ (quint32(socket) * 0x9E3779B9u);
 }
 
 static QString seatBackTrophy(ModelGeometry& geo, const QVector<ModelJoint>& bodySkel,
@@ -4375,7 +4397,8 @@ static QString seatBackTrophy(ModelGeometry& geo, const QVector<ModelJoint>& bod
 void WardrobeTab2::seatWeapon(ModelGeometry& wgeo, int hand, const QString& itemType,
                              const QString& gender,
                              const QHash<quint32, QPair<int, std::array<float,16>>>& hp,
-                             QString& dbg, quint32 forceHash)
+                             QString& dbg, quint32 forceHash,
+                             int* outBone, std::array<float,16>* outMz, bool bake)
 {
     constexpr quint32 kMain = 3636304447u, kOff = 4036545548u;
     auto mirror = [](quint32 h) -> quint32 {
@@ -4555,6 +4578,12 @@ void WardrobeTab2::seatWeapon(ModelGeometry& wgeo, int hand, const QString& item
     // the shared skinning palette carries the weapon with the bone during animation
     // (the bone's inverseBind in the palette cancels the rest world). This is what ties
     // weapons to the hand bone when animating.
+    // Hand back the FINAL placement (after the auto-upright correction above) so a caller that
+    // wants to keep the weapon's rig can attach it at exactly the transform the bake would have
+    // applied — the placement then cannot drift between the two paths, because it is the same Mz.
+    if (outBone) *outBone = bone;
+    if (outMz)   *outMz   = Mz;
+    if (bake) {
     for (MeshPrimitive& p : wgeo.primitives)
         for (MeshVertex& v : p.vertices) {
             const float x = v.px, y = v.py, z = v.pz;
@@ -4574,6 +4603,7 @@ void WardrobeTab2::seatWeapon(ModelGeometry& wgeo, int hand, const QString& item
     // Drop the weapon's own rig: its verts now reference the BODY bone index directly,
     // so the merge must use those indices as-is (not remap them via the weapon skeleton).
     wgeo.skeleton.clear();
+    }
     dbg += QStringLiteral("\n%1: bone %2 hash %3 boneW=(%4,%5,%6) hpLocal=(%7,%8,%9) attachW=(%10,%11,%12)")
                .arg(QLatin1String(lbl)).arg(bone).arg(hash)
                .arg(world[12], 0, 'f', 2).arg(world[13], 0, 'f', 2).arg(world[14], 0, 'f', 2)
@@ -6676,6 +6706,10 @@ void WardrobeTab2::rebuildOutfitImpl(bool async)
     // Body hardpoint map (hash → bone + bone-local transform) for this class/gender. At function
     // scope because BOTH the back trophy and the weapon pass seat against it.
     const auto hpMap = loadBodyHardpoints(d4);
+    // Cleared here, ahead of BOTH attach sites, so the guard that clears it can never be narrower
+    // than the guards that fill it — the back-trophy site sits behind two more conditions than the
+    // weapon site does.
+    m_attached.clear();
     // `onGeo`, when supplied, runs on the parsed geometry BEFORE it is merged — the hook the back
     // trophy uses to seat itself on a body hardpoint. It must not change the primitive count, which
     // pieceList/primSlot are about to be sized from.
@@ -6855,8 +6889,7 @@ void WardrobeTab2::rebuildOutfitImpl(bool async)
             // Cleared unconditionally: addPiece returns early on no-data/parse-fault, so a clear
             // inside the geometry hook would leave a previous trophy's state live after unequipping
             // or after a failed load — and its tracks would keep riding into every exported clip.
-            m_btSubRigAppr.clear();
-            m_btPreSaltSkel.clear();
+
             const int btSno = m_backTrophy->currentData().toInt();
             // The APPEARANCE name, not currentText(): the label is "<localized name>  (<stem>)"
             // and appearanceRoster/parseApp key off the appearance stem.
@@ -6878,10 +6911,21 @@ void WardrobeTab2::rebuildOutfitImpl(bool async)
                     QString bone;
                     if (trophyBones > 0 && animated) {
                         const quint32 hpHash = backTrophySocket(hpMap, d4, btAppr);
+                        QVector<ModelJoint> btPreSalt;   // local: nothing outside needs it
+                        const quint32 btSalt = backTrophySalt(btAppr, 9);   // socket 9 = back
                         if (ModelAttach::attachSubRig(g, m_bodySkeleton, hpMap, hpHash,
-                                                      backTrophySalt(btAppr), &m_btPreSaltSkel)) {
+                                                      btSalt, &btPreSalt)) {
                             bone = Hardpoints::nameForHash(hpHash) + QStringLiteral(" (sub-rig)");
-                            m_btSubRigAppr = btAppr;   // → its idle is merged into the played clip
+                            Attached at;
+                            at.appearance = btAppr;
+                            at.slot       = QStringLiteral("Back");
+                            at.salt       = btSalt;
+                            at.preSalt    = btPreSalt;
+                            at.label      = btAppr;
+                            for (const BackTrophyIndex::Entry& t : BackTrophyIndex::instance().entries())
+                                if (t.appearance.compare(btAppr, Qt::CaseInsensitive) == 0)
+                                    { if (!t.displayName.isEmpty()) at.label = t.displayName; break; }
+                            m_attached.push_back(at);
                         }
                     }
                     if (bone.isEmpty())   // static, unrigged, or the socket did not resolve
@@ -6964,7 +7008,38 @@ void WardrobeTab2::rebuildOutfitImpl(bool async)
         const WeapTypeDef* wt = weapTypeByLabel(wlabel);
         const QString itemType = wt ? QString::fromLatin1(wt->itemType) : QStringLiteral("Sword");
         const quint32 forceHash = hs.sheathed ? sheathHardpointFor(itemType, hs.hand == 1, hpMap) : 0u;
-        seatWeapon(wgeo, hs.hand, itemType, wgender, hpMap, weapDbg, forceHash);
+        // A weapon that has BOTH its own bones and its own clip keeps its rig so the clip has
+        // something to drive; every other weapon takes the bake, exactly as before. Placement is
+        // seatWeapon's own final matrix either way, so the rigged path cannot drift from the baked
+        // one — it is the same Mz, after the same auto-upright correction.
+        const QVector<BackTrophyIndex::Clip> wClips =
+            BackTrophyIndex::instance().clipsFor(weapName);
+        bool wRigged = false;
+        // Held only. A sheathed weapon is stowed on the body — animating it there would have it
+        // idling on your back, which is not what the clip is for.
+        if (!wClips.isEmpty() && !wgeo.skeleton.isEmpty() && !hs.sheathed) {
+            int wBone = -1; std::array<float,16> wMz{};
+            seatWeapon(wgeo, hs.hand, itemType, wgender, hpMap, weapDbg, forceHash,
+                       &wBone, &wMz, /*bake=*/false);
+            QVector<ModelJoint> preSalt;
+            const quint32 wSalt = backTrophySalt(weapName, hs.slot);   // slot 5..8 → unique per socket
+            if (ModelAttach::attachSubRigAt(wgeo, m_bodySkeleton, wBone, wMz, wSalt, &preSalt)) {
+                Attached at;
+                at.appearance = weapName;
+                at.label      = weapName;
+                at.slot       = hs.hand == 1 ? QStringLiteral("Off hand")
+                                             : QStringLiteral("Main hand");
+                at.salt       = wSalt;
+                at.preSalt    = preSalt;
+                m_attached.push_back(at);
+                wRigged = true;
+                qInfo("attached %s: %s kept its rig (%d bones, %d clips)",
+                      qPrintable(at.slot), qPrintable(weapName),
+                      int(preSalt.size()), int(wClips.size()));
+            }
+        }
+        if (!wRigged)
+            seatWeapon(wgeo, hs.hand, itemType, wgender, hpMap, weapDbg, forceHash);
         for (const MeshPrimitive& p : wgeo.primitives) { totalV += p.vertices.size(); totalT += p.indices.size() / 3; }
         pieceList.append({weapName, int(wgeo.primitives.size())});
         pieceSno.append(sno);
@@ -8994,139 +9069,172 @@ void WardrobeTab2::collectExportAnims(QVector<AnimParser::DecodedAnim>& anims, Q
 // no guessing which one is "the" clip.
 void WardrobeTab2::refreshAttachAnimList()
 {
-    if (!m_attachAnims || !m_attachWho) return;
-    const QString prev = m_attachAnims->currentItem()
-        ? m_attachAnims->currentItem()->data(Qt::UserRole).toString()
-        : QSettings().value(QStringLiteral("wardrobe2/attachClip")).toString();
-    QSignalBlocker block(m_attachAnims);
-    m_attachAnims->clear();
-    // Controls are only meaningful with something animated attached; leaving them live invites a
-    // click that silently does nothing.
+    if (!m_attachAnims || !m_attachWho || !m_attachWhich) return;
     auto setControls = [this](bool on) {
         if (m_attachPlay)    m_attachPlay->setEnabled(on);
         if (m_attachRestart) m_attachRestart->setEnabled(on);
         if (m_attachAnims)   m_attachAnims->setEnabled(on);
+        if (m_attachWhich)   m_attachWhich->setEnabled(on);
     };
-    if (m_btSubRigAppr.isEmpty()) {
-        // Three distinct states that all look like "empty list" unless spelled out: nothing in the
-        // slot, something in the slot that is a static prop, or an index that has not landed yet.
-        const bool equipped = m_backTrophy && m_backTrophy->currentData().toInt() > 0;
-        const QString what = equipped ? m_backTrophy->currentText().section(QStringLiteral("  ("), 0, 0)
-                                      : QString();
-        if (!equipped) {
+
+    // Only attachments that actually own clips are listed. Nothing without clips reaches m_attached
+    // today, so this is a guard rather than a filter — but it keeps the panel correct if a future
+    // socket starts attaching rigged-but-unanimated models.
+    QVector<int> animated;
+    for (int i = 0; i < m_attached.size(); ++i)
+        if (!BackTrophyIndex::instance().clipsFor(m_attached[i].appearance).isEmpty())
+            animated.push_back(i);
+
+    const QString prevAppr = m_attachWhich->currentData().toString();
+    {
+        QSignalBlocker b(m_attachWhich);
+        m_attachWhich->clear();
+        for (int i : animated)
+            m_attachWhich->addItem(QStringLiteral("%1 — %2").arg(m_attached[i].slot, m_attached[i].label),
+                                   m_attached[i].appearance);
+        int keep = m_attachWhich->findData(prevAppr);
+        if (keep < 0) keep = 0;
+        if (m_attachWhich->count() > 0) m_attachWhich->setCurrentIndex(keep);
+    }
+    // The selector only earns its space when there is a choice to make.
+    m_attachWhich->setVisible(animated.size() > 1);
+
+    QSignalBlocker block(m_attachAnims);
+    m_attachAnims->clear();
+    if (animated.isEmpty()) {
+        // Distinct states that all look like "empty list": nothing attached at all, versus things
+        // attached that simply ship no animation (the common case), versus the index still building.
+        // m_attached only ever holds things that already own clips, so it cannot distinguish
+        // "nothing equipped" from "equipped, but static". Ask the slots instead.
+        bool anySlotFilled = m_backTrophy && m_backTrophy->currentData().toInt() > 0;
+        for (QComboBox* c : {m_weapon, m_weapon2, m_weapon3, m_weapon4})
+            if (c && c->currentData().toInt() > 0) { anySlotFilled = true; break; }
+        if (!anySlotFilled) {
             m_attachWho->setText(QStringLiteral("Nothing attached"));
-            m_attachHint->setText(QStringLiteral("Equip a Back item to see its own clips here."));
+            m_attachHint->setText(QStringLiteral("Equip a Back item or a weapon to see its own clips."));
         } else if (!BackTrophyIndex::instance().ready()) {
-            m_attachWho->setText(what);
-            m_attachHint->setText(QStringLiteral("Scanning for clips…"));
+            m_attachWho->setText(QStringLiteral("Scanning…"));
+            m_attachHint->setText(QStringLiteral("Looking for clips owned by the equipped items."));
         } else {
-            m_attachWho->setText(what);
-            m_attachHint->setText(QStringLiteral("This item is a static prop — it ships no animation "
-                                                 "of its own. Most back items do not."));
+            m_attachWho->setText(QStringLiteral("No animated attachments"));
+            m_attachHint->setText(QStringLiteral("The equipped back item and weapons are static "
+                                                 "props — most are. Only a few ship an animation "
+                                                 "of their own."));
         }
         setControls(false);
         return;
     }
     setControls(true);
-    QString label = m_btSubRigAppr;
-    for (const BackTrophyIndex::Entry& t : BackTrophyIndex::instance().entries()) {
-        if (t.appearance.compare(m_btSubRigAppr, Qt::CaseInsensitive) != 0) continue;
-        if (!t.displayName.isEmpty()) label = t.displayName;
-        for (const BackTrophyIndex::Clip& c : t.clips) {
-            // Name the clip by its suffix (idle / killstreak / …) — the stem is the appearance and
-            // carries no information once the panel header already names the item.
-            QString kind = c.name.mid(m_btSubRigAppr.size());
-            if (kind.startsWith(QLatin1Char('_'))) kind = kind.mid(1);
-            if (kind.isEmpty()) kind = QStringLiteral("default");
-            // Seconds, not just frames: "4.0s" answers "how long is this loop" directly, which is
-            // the question the number is actually being read for.
-            const double secs = c.frames > 0 ? c.frames / 30.0 : 0.0;
-            auto* it = new QListWidgetItem(
-                c.frames > 0 ? QStringLiteral("%1   ·   %2 frames  (%3s)")
-                                   .arg(kind).arg(c.frames).arg(secs, 0, 'f', 1)
-                             : kind,
-                m_attachAnims);
-            it->setData(Qt::UserRole, c.name);
-            it->setToolTip(QStringLiteral("%1\nPlays on its own %2-frame loop.").arg(c.name).arg(c.frames));
-        }
-        break;
+
+    const QString appr = m_attachWhich->currentData().toString();
+    const Attached* cur = nullptr;
+    for (int i : animated) if (m_attached[i].appearance == appr) { cur = &m_attached[i]; break; }
+    if (!cur) cur = &m_attached[animated.first()];
+
+    const QVector<BackTrophyIndex::Clip> clips =
+        BackTrophyIndex::instance().clipsFor(cur->appearance);
+    for (const BackTrophyIndex::Clip& c : clips) {
+        // Named by the part of the clip stem that is NOT the appearance — idle / killstreak / clip —
+        // since the appearance is already the header.
+        QString kind = c.name.startsWith(cur->appearance, Qt::CaseInsensitive)
+                           ? c.name.mid(cur->appearance.size()) : c.name;
+        if (kind.startsWith(QLatin1Char('_'))) kind = kind.mid(1);
+        if (kind.isEmpty()) kind = QStringLiteral("default");
+        const double secs = c.frames > 0 ? c.frames / 30.0 : 0.0;
+        auto* it = new QListWidgetItem(
+            c.frames > 0 ? QStringLiteral("%1   ·   %2 frames  (%3s)")
+                               .arg(kind).arg(c.frames).arg(secs, 0, 'f', 1)
+                         : kind,
+            m_attachAnims);
+        it->setData(Qt::UserRole, c.name);
+        it->setToolTip(QStringLiteral("%1\nPlays on its own %2-frame loop.").arg(c.name).arg(c.frames));
     }
-    const int n = m_attachAnims->count();
-    m_attachWho->setText(label);
-    m_attachHint->setText(n == 1
-        ? QStringLiteral("1 clip · own loop, independent of the character")
-        : QStringLiteral("%1 clips · own loop, independent of the character").arg(n));
-    // Restore the previous pick when the same clip still exists, else take the first.
-    int row = 0;
+    m_attachWho->setText(QStringLiteral("%1 — %2").arg(cur->slot, cur->label));
+    m_attachHint->setText(animated.size() > 1
+        ? QStringLiteral("%1 attachments animating, each on its own loop").arg(animated.size())
+        : QStringLiteral("%1 clip%2 · own loop, independent of the character")
+              .arg(clips.size()).arg(clips.size() == 1 ? QString() : QStringLiteral("s")));
+
+    // Highlight the clip this attachment is actually playing.
+    const QString sel = selectedClipFor(cur->appearance);
     for (int i = 0; i < m_attachAnims->count(); ++i)
-        if (m_attachAnims->item(i)->data(Qt::UserRole).toString() == prev) { row = i; break; }
-    if (m_attachAnims->count() > 0) m_attachAnims->setCurrentRow(row);
+        if (m_attachAnims->item(i)->data(Qt::UserRole).toString() == sel)
+            { m_attachAnims->setCurrentRow(i); break; }
 }
 
-// Append the equipped back trophy's idle to a body clip, so the trophy animates while the
-// character plays whatever the user selected.
+// The clip chosen for one attachment, remembered per APPEARANCE so each equipped item keeps its own
+// choice — a selection stored per panel would be clobbered the moment a second attachment existed.
 //
-// The two are independent timelines targeting DISJOINT bones — the body clip drives the character
-// rig, the trophy clip drives the attached sub-rig — so they can share one DecodedAnim: the
-// renderer looks each bone's track up by hash, and a bone with no track simply keeps its rest pose.
-//
-// The trophy's track hashes are salted with the SAME function the attach used, because that is the
-// only thing that makes them resolve against the re-hashed sub-rig bones.
-//
-// A trophy loop is usually longer than a body idle (111 vs 56 frames is typical), and the sampler
-// bails per bone when the frame index passes the end of that bone's track — which would freeze the
-// trophy part-way. So the trophy's frames are RESAMPLED onto the body clip's length, wrapping: it
-// plays at its authored speed and repeats for as long as the body clip runs.
-void WardrobeTab2::mergeBackTrophyIdle(AnimParser::DecodedAnim& anim)
+// Always validated against what the appearance actually owns: a remembered name from a previous
+// session (or a different item) must never be handed to the decoder. Falls back to an explicit
+// _idle, then to the first clip, so something sensible plays before the panel is ever touched.
+QString WardrobeTab2::selectedClipFor(const QString& appearance) const
 {
-    m_btAttachFrom = -1; m_btAttachFrames = 0;
-    if (m_btSubRigAppr.isEmpty() || m_btPreSaltSkel.isEmpty()
-        || !anim.valid || anim.frameCount <= 0) return;
-    // Whatever the ATTACHED panel has selected. Falling back to an explicit _idle, then to the
-    // first clip, keeps behaviour sane before the panel has ever been touched.
-    QString idle = (m_attachAnims && m_attachAnims->currentItem())
-                       ? m_attachAnims->currentItem()->data(Qt::UserRole).toString() : QString();
-    for (const BackTrophyIndex::Entry& t : BackTrophyIndex::instance().entries()) {
-        if (t.appearance.compare(m_btSubRigAppr, Qt::CaseInsensitive) != 0) continue;
-        bool have = false;
-        for (const BackTrophyIndex::Clip& c : t.clips) if (c.name == idle) { have = true; break; }
-        if (!have) {
-            idle.clear();
-            for (const BackTrophyIndex::Clip& c : t.clips)
-                if (c.name.endsWith(QLatin1String("_idle"), Qt::CaseInsensitive)) { idle = c.name; break; }
-            if (idle.isEmpty() && !t.clips.isEmpty()) idle = t.clips.first().name;
-        }
-        break;
+    const QVector<BackTrophyIndex::Clip> clips = BackTrophyIndex::instance().clipsFor(appearance);
+    if (clips.isEmpty()) return QString();
+    QSettings st;
+    QString want = st.value(QStringLiteral("wardrobe2/attachClip/") + appearance.toLower()).toString();
+    // One-time migration off the old single-attachment key. Leaving it unread would silently
+    // discard the choice every existing user already made, and leave a key that is written by
+    // nothing and read by nothing.
+    if (want.isEmpty()) {
+        const QString legacy = st.value(QStringLiteral("wardrobe2/attachClip")).toString();
+        for (const BackTrophyIndex::Clip& c : clips) if (c.name == legacy) { want = legacy; break; }
     }
-    if (idle.isEmpty()) return;
-    // Against the PRE-SALT skeleton. The decoder uses the rig to supply a rest pose for channels
-    // the clip leaves empty, and D4 authors rotation-only tracks routinely — decoding against the
-    // salted rig would miss every lookup and substitute a zero translation, collapsing the chain.
-    const AnimParser::DecodedAnim tr = decodeAnimForSkeleton(idle, m_btPreSaltSkel);
-    if (!tr.valid || tr.bones.isEmpty() || tr.frameCount <= 0) return;
+    for (const BackTrophyIndex::Clip& c : clips) if (c.name == want) return c.name;
+    for (const BackTrophyIndex::Clip& c : clips)
+        if (c.name.endsWith(QLatin1String("_idle"), Qt::CaseInsensitive)) return c.name;
+    return clips.first().name;
+}
 
-    const quint32 salt = backTrophySalt(m_btSubRigAppr);
-    const int from = anim.bones.size();   // attached tracks start here, and run on their own clock
-    int added = 0;
-    for (const AnimParser::DecodedBone& src : tr.bones) {
-        // Appended at their AUTHORED length, not resampled onto the body clip. Resampling with
-        // `f % tr.frameCount` tied the trophy to the body's frame index, so every time the body
-        // clip looped back to 0 the trophy restarted too — a 130-frame idle under a 56-frame body
-        // idle never played past its 56th frame. The viewport indexes these by m_frameAttach.
-        AnimParser::DecodedBone b = src;
-        b.boneHash = ModelAttach::saltBoneHash(src.boneHash, salt);
-        if (b.rotations.isEmpty() && b.translations.isEmpty()) continue;
-        anim.bones.push_back(b);
-        ++added;
-    }
-    m_btAttachFrom   = added ? from : -1;      // handed to the viewport after setAnimation()
-    // Play unticked pins it to frame 0: a one-frame range never advances.
+// Append EVERY animated attachment's selected clip to the body clip, so each attached model plays
+// while the character plays whatever the user picked.
+//
+// They share one DecodedAnim because the renderer looks each bone's track up by hash and the bone
+// sets are disjoint: the body clip drives the character rig, each attachment's clip drives that
+// attachment's re-hashed sub-rig, and a bone with no track keeps its rest pose. What is NOT shared
+// is the playhead — each attachment gets its own span and its own clock (see AttachRange), so a
+// 120-frame axe loop and a 111-frame trophy loop under a 56-frame body idle all run at their
+// authored speeds without resetting each other.
+//
+// Track hashes are salted with the SAME per-attachment salt used when attaching, which is the only
+// thing that makes them resolve against the sub-rig's re-hashed bones.
+void WardrobeTab2::mergeAttachmentClips(AnimParser::DecodedAnim& anim)
+{
+    m_btAttachRanges.clear();
+    if (m_attached.isEmpty() || !anim.valid || anim.frameCount <= 0) return;
     const bool play = !m_attachPlay || m_attachPlay->isChecked();
-    m_btAttachFrames = added ? (play ? tr.frameCount : 1) : 0;
-    m_btAttachFps    = tr.frameRate > 1.0f ? tr.frameRate : 30.0f;
-    qInfo("back trophy %s: clip %s on its own timeline — %d frames @ %.0f fps (body clip %d frames), %d tracks",
-          qPrintable(m_btSubRigAppr), qPrintable(idle), tr.frameCount, double(m_btAttachFps),
-          anim.frameCount, added);
+
+    for (const Attached& at : m_attached) {
+        if (at.preSalt.isEmpty()) continue;
+        const QString clip = selectedClipFor(at.appearance);
+        if (clip.isEmpty()) continue;
+        // Decoded against the PRE-SALT rig: the decoder uses it for the rest pose of channels a clip
+        // leaves empty, and D4 authors rotation-only tracks routinely.
+        const AnimParser::DecodedAnim tr = decodeAnimForSkeleton(clip, at.preSalt);
+        if (!tr.valid || tr.bones.isEmpty() || tr.frameCount <= 0) continue;
+
+        AttachSpan span;
+        span.from   = anim.bones.size();
+        span.frames = play ? tr.frameCount : 1;   // not playing → a one-frame span never advances
+        span.fps    = tr.frameRate > 1.0f ? tr.frameRate : 30.0f;
+        int added = 0;
+        for (const AnimParser::DecodedBone& src : tr.bones) {
+            // Appended at their AUTHORED length — never resampled onto the body clip, which is what
+            // tied an attachment to the body's frame index and made it restart on every body loop.
+            AnimParser::DecodedBone b = src;
+            b.boneHash = ModelAttach::saltBoneHash(src.boneHash, at.salt);
+            if (b.rotations.isEmpty() && b.translations.isEmpty()) continue;
+            anim.bones.push_back(b);
+            ++added;
+        }
+        if (!added) continue;
+        span.count = added;
+        m_btAttachRanges.push_back(span);
+        qInfo("attached %s (%s): clip %s on its own timeline — %d frames @ %.0f fps, %d tracks",
+              qPrintable(at.slot), qPrintable(at.appearance), qPrintable(clip),
+              tr.frameCount, double(span.fps), added);
+    }
 }
 
 void WardrobeTab2::playAnimByName(const QString& animName)
@@ -9135,14 +9243,18 @@ void WardrobeTab2::playAnimByName(const QString& animName)
         return;
     AnimParser::DecodedAnim anim = decodeAnimByName(animName);
     if (!anim.valid) return;
-    mergeBackTrophyIdle(anim);   // the trophy's own loop rides alongside the body clip
+    mergeAttachmentClips(anim);   // every attachment's loop rides alongside the body clip
 
     m_playingAnim = animName;
     m_curAnim = anim;   // retained for "include animation" .glb export
     QSettings().setValue(QStringLiteral("wardrobe2/anim"), animName);   // remember selection
     if (!seh::runGuarded("w2SetAnim", [&]() { m_view->setAnimation(anim); })) return;
-    // AFTER setAnimation, which clears any previous range.
-    m_view->setAttachAnimRange(m_btAttachFrom, m_btAttachFrames, m_btAttachFps);
+    // AFTER setAnimation, which clears every previous range.
+    QVector<GLModelWidget::AttachRange> ranges;
+    ranges.reserve(m_btAttachRanges.size());
+    for (const AttachSpan& sp : m_btAttachRanges)
+        ranges.push_back({sp.from, sp.count, sp.frames, sp.fps});
+    m_view->setAttachAnimRanges(ranges);
     m_timeline->setVisible(true);   // (restored) timeline shows once a clip is playing
     m_animSlider->blockSignals(true);
     m_animSlider->setRange(0, anim.frameCount - 1);

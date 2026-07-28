@@ -99,6 +99,20 @@ inline quint32 saltBoneHash(quint32 h, quint32 salt)
 // pose for channels the clip leaves empty (D4 authors rotation-only tracks routinely), and decoding
 // against the salted rig silently substitutes a zero translation for every bone — collapsing the
 // child's chain to a point the moment it plays.
+// As attachSubRig, but with the placement SUPPLIED rather than derived from a hardpoint: `Mz` is
+// the child's attach transform in D4-native (z-up) space and `bone` the parent bone it follows.
+//
+// Exists so a caller that already has proven placement logic can reuse it verbatim. Weapon seating
+// resolves hand, grip offset, mirror, held-roll and an auto-upright correction before arriving at
+// its matrix; re-deriving any of that here would be a second implementation to keep in step, and
+// the placement could silently drift between the baked and rigged paths.
+bool attachSubRigAt(ModelGeometry& childGeo,
+                    const QVector<ModelJoint>& parentSkel,
+                    int bone,
+                    const std::array<float, 16>& Mz,
+                    quint32 salt,
+                    QVector<ModelJoint>* outPreSalt = nullptr);
+
 bool attachSubRig(ModelGeometry& childGeo,
                   const QVector<ModelJoint>& parentSkel,
                   const QHash<quint32, QPair<int, std::array<float, 16>>>& hpMap,

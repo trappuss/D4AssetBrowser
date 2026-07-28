@@ -1,4 +1,5 @@
 #pragma once
+#include <QHash>
 #include <QObject>
 #include <QString>
 #include <QVector>
@@ -58,15 +59,23 @@ public:
     // Sorted by display name. Empty until ready() — callers keep their previous list until then.
     const QVector<Entry>& entries() const { return m_entries; }
 
+    // Clips owned by ANY appearance, not just back trophies. Weapons, off-hands, mount trophies and
+    // the Necromancer candle rigs all ship their own clips — 27 of them use a "_clip" suffix rather
+    // than the trophies' _idle/_killstreak — but every one declares snoAppearance, so the same
+    // reference-follows-the-data rule covers them all. Empty for an appearance that owns none.
+    QVector<Clip> clipsFor(const QString& appearance) const
+    { return m_clipsByAppearance.value(appearance.toLower()); }
+
 signals:
     void readyChanged();
 
 private:
     explicit BackTrophyIndex(QObject* parent = nullptr) : QObject(parent) {}
-    void install(QVector<Entry>&& e);
+    void install(QVector<Entry>&& e, QHash<QString, QVector<Clip>>&& clips);
     int  generation() const { return m_generation; }
 
     QVector<Entry> m_entries;
+    QHash<QString, QVector<Clip>> m_clipsByAppearance;   // lower-cased appearance stem → its clips
     bool m_ready    = false;
     bool m_building = false;
     // Bumped by reset(). An in-flight build captures the value it started with and discards its

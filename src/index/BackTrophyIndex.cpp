@@ -15,7 +15,7 @@
 #include <thread>
 
 namespace {
-constexpr int kCacheVersion = 3;   // v3 resolves clips by snoAppearance, not by name
+constexpr int kCacheVersion = 4;   // v4 indexes clips for ANY appearance, not just trophies
 
 // The ItemType every back trophy points at. Matched against the sno reference's target path, not
 // against the item's own filename — that distinction is the whole point of this index.
@@ -63,7 +63,7 @@ void logResult(const QVector<BackTrophyIndex::Entry>& e, const char* how)
         if (!t.clips.isEmpty()) ++withClips;
         nClips += t.clips.size();
     }
-    qInfo("back-trophy index (%s): %d trophies, %d with animation (%d clips)",
+    qInfo("attachment index (%s): %d back trophies, %d with animation (%d clips)",
           how, int(e.size()), withClips, nClips);
 }
 
@@ -92,9 +92,10 @@ BackTrophyIndex& BackTrophyIndex::instance()
     return inst;
 }
 
-void BackTrophyIndex::install(QVector<Entry>&& e)
+void BackTrophyIndex::install(QVector<Entry>&& e, QHash<QString, QVector<Clip>>&& clips)
 {
     m_entries  = std::move(e);
+    m_clipsByAppearance = std::move(clips);
     m_ready    = true;
     m_building = false;
     emit readyChanged();
@@ -106,6 +107,7 @@ void BackTrophyIndex::reset()
     m_ready = false;
     m_building = false;
     m_entries.clear();
+    m_clipsByAppearance.clear();
     QFile::remove(AppPaths::dataDir()
                   + QStringLiteral("/back_trophy_v%1.json").arg(kCacheVersion));
     emit readyChanged();
@@ -144,6 +146,7 @@ void BackTrophyIndex::ensureBuilt(const QString& d4dataDir)
         }
 
         QVector<Entry> out;
+        QHash<QString, QVector<Clip>> clipsByAppr;
         {   // Cache hit?
             QFile f(cachePath);
             if (f.open(QIODevice::ReadOnly)) {
@@ -164,10 +167,24 @@ void BackTrophyIndex::ensureBuilt(const QString& d4dataDir)
                         }
                         if (!e.appearance.isEmpty()) out.push_back(e);
                     }
+                    // The general map covers appearances that are NOT back trophies (weapons,
+                    // off-hands…), so it cannot be rebuilt from the trophy list alone.
+                    const QJsonObject cl = root.value(QStringLiteral("clips")).toObject();
+                    for (auto it = cl.constBegin(); it != cl.constEnd(); ++it) {
+                        QVector<Clip> v;
+                        for (const QJsonValue& cv : it.value().toArray()) {
+                            const QJsonObject co = cv.toObject();
+                            Clip c;
+                            c.name   = co.value(QStringLiteral("n")).toString();
+                            c.frames = co.value(QStringLiteral("f")).toInt();
+                            if (!c.name.isEmpty()) v.push_back(c);
+                        }
+                        if (!v.isEmpty()) clipsByAppr.insert(it.key(), v);
+                    }
                     logResult(out, "cached");
-                    QMetaObject::invokeMethod(this, [this, gen, out]() mutable {
+                    QMetaObject::invokeMethod(this, [this, gen, out, clipsByAppr]() mutable {
                         if (gen != generation()) return;      // d4data switched mid-build
-                        install(std::move(out));
+                        install(std::move(out), std::move(clipsByAppr));
                     }, Qt::QueuedConnection);
                     return;
                 }
@@ -228,7 +245,14 @@ void BackTrophyIndex::ensureBuilt(const QString& d4dataDir)
             while (ai.hasNext()) {
                 const QString fp = ai.next();
                 const QString stem = QFileInfo(fp).fileName().section(QStringLiteral(".ani.json"), 0, 0);
-                if (!stem.startsWith(QLatin1String("trophy"), Qt::CaseInsensitive)) continue;
+                // Cheap gate only — ~45k anim files, and parsing every one to read a single field
+                // would dominate the build. Two shipped conventions: trophies name their clips after
+                // the appearance (_idle/_killstreak), everything else that owns a clip — weapons,
+                // off-hands, mount trophies, candle rigs — uses a "_clip" suffix. Ownership still
+                // comes from snoAppearance, never from the name.
+                const bool maybe = stem.startsWith(QLatin1String("trophy"), Qt::CaseInsensitive)
+                                || stem.endsWith(QLatin1String("_clip"), Qt::CaseInsensitive);
+                if (!maybe) continue;
                 QFile f(fp);
                 if (!f.open(QIODevice::ReadOnly)) continue;
                 const QJsonObject o = QJsonDocument::fromJson(f.readAll()).object();
@@ -240,19 +264,17 @@ void BackTrophyIndex::ensureBuilt(const QString& d4dataDir)
                         if (n == normStem(it.key()) || n.startsWith(normStem(it.key()) + QLatin1Char('_')))
                             { owner = it.value()->appearance; break; }
                 }
-                Entry* e = owner.isEmpty() ? nullptr : byAppr.value(owner.toLower(), nullptr);
-                if (!e) {
-                    qInfo("back-trophy index: clip %s owns appearance '%s', which is not a back trophy",
-                          qPrintable(stem), qPrintable(owner.isEmpty() ? QStringLiteral("(none)") : owner));
-                    continue;
-                }
+                if (owner.isEmpty()) continue;   // declares no owner and no name rule matched
                 Clip c;
                 c.name   = stem;
                 // Keyframes from the permutation already parsed here, rather than re-reading.
                 const QJsonArray perms = o.value(QStringLiteral("ptPermutations")).toArray();
                 c.frames = perms.isEmpty() ? 0
                     : perms.first().toObject().value(QStringLiteral("nKeyframeCount")).toInt();
-                e->clips.push_back(c);
+                // Recorded for EVERY appearance, so a weapon's clips are found the same way a
+                // trophy's are; the trophy list keeps its own copy for the picker.
+                clipsByAppr[owner.toLower()].push_back(c);
+                if (Entry* e = byAppr.value(owner.toLower(), nullptr)) e->clips.push_back(c);
             }
         }
 
@@ -263,7 +285,7 @@ void BackTrophyIndex::ensureBuilt(const QString& d4dataDir)
             return c != 0 ? c < 0 : a.appearance.compare(b.appearance, Qt::CaseInsensitive) < 0;
         });
 
-        QMetaObject::invokeMethod(this, [this, gen, out, sig, cachePath]() mutable {
+        QMetaObject::invokeMethod(this, [this, gen, out, clipsByAppr, sig, cachePath]() mutable {
             if (gen != generation()) return;                  // d4data switched mid-build
             QJsonArray arr;
             for (const Entry& e : out) {
@@ -277,14 +299,22 @@ void BackTrophyIndex::ensureBuilt(const QString& d4dataDir)
                 }
                 arr.append(o);
             }
+            QJsonObject clipObj;
+            for (auto it = clipsByAppr.constBegin(); it != clipsByAppr.constEnd(); ++it) {
+                QJsonArray ca;
+                for (const Clip& c : it.value())
+                    ca.append(QJsonObject{{QStringLiteral("n"), c.name}, {QStringLiteral("f"), c.frames}});
+                clipObj.insert(it.key(), ca);
+            }
             QDir().mkpath(QFileInfo(cachePath).absolutePath());
             QFile f(cachePath);
             if (f.open(QIODevice::WriteOnly))
                 f.write(QJsonDocument(QJsonObject{{QStringLiteral("sig"), sig},
-                                                  {QStringLiteral("trophies"), arr}})
+                                                  {QStringLiteral("trophies"), arr},
+                                                  {QStringLiteral("clips"), clipObj}})
                             .toJson(QJsonDocument::Compact));
             logResult(out, "built");
-            install(std::move(out));
+            install(std::move(out), std::move(clipsByAppr));
         }, Qt::QueuedConnection);
     }).detach();
 }

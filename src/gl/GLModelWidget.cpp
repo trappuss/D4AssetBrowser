@@ -1341,18 +1341,27 @@ void GLModelWidget::clearGeometry()
     update();
 }
 
-void GLModelWidget::setAttachAnimRange(int from, int frames, float fps)
+void GLModelWidget::setAttachAnimRanges(const QVector<AttachRange>& ranges)
 {
-    m_animAttachFrom   = (from >= 0 && frames > 0) ? from : -1;
-    m_animAttachFrames = qMax(0, frames);
-    m_animAttachFps    = (fps > 1.0f) ? fps : 30.0f;
-    m_frameAttach      = 0;
+    m_attachRanges.clear();
+    m_attachFrame.clear();
+    // Flattened to a per-track lookup once, here, instead of scanning the ranges for every bone of
+    // every frame in the skinning loop.
+    m_trackClock.assign(m_anim.bones.size(), -1);
+    for (const AttachRange& r : ranges) {
+        if (r.count <= 0 || r.frames <= 0 || r.from < 0) continue;
+        const int clock = m_attachRanges.size();
+        m_attachRanges.push_back(r);
+        m_attachFrame.push_back(0);
+        for (int i = r.from; i < r.from + r.count && i < m_trackClock.size(); ++i)
+            m_trackClock[i] = clock;
+    }
 }
 
 void GLModelWidget::setAnimation(const AnimParser::DecodedAnim& anim)
 {
-    // A new clip invalidates the attached range; the caller re-declares it after installing.
-    m_animAttachFrom = -1; m_animAttachFrames = 0; m_frameAttach = 0;
+    // A new clip invalidates every attached range; the caller re-declares them after installing.
+    m_attachRanges.clear(); m_attachFrame.clear(); m_trackClock.clear();
     m_anim = anim;
     m_animByHash.clear();
     for (int i = 0; i < anim.bones.size(); ++i)
@@ -1366,6 +1375,9 @@ void GLModelWidget::setAnimation(const AnimParser::DecodedAnim& anim)
 
 void GLModelWidget::clearAnimation()
 {
+    // Same invariant setAnimation keeps: these are sized against m_anim.bones, so they must not
+    // outlive the clip they describe.
+    m_attachRanges.clear(); m_attachFrame.clear(); m_trackClock.clear();
     m_hasAnim = false;
     m_frame = 0;
     m_anim = {};
@@ -1459,12 +1471,16 @@ void GLModelWidget::setFrame(int f)
     if (!m_hasAnim) return;
     m_frame = qBound(0, f, m_anim.frameCount - 1);
     if (!m_clothClock.isValid()) m_clothClock.start();
-    // Wall-clock, wrapped on the attached clip's OWN length: it neither restarts when the body
-    // clip loops nor stretches to match it, so it runs at its authored speed.
-    if (m_animAttachFrames > 0) {
+    // Wall-clock, each wrapped on ITS OWN clip length: an attachment neither restarts when the body
+    // clip loops nor stretches to match it, and two attachments of different lengths stay
+    // independent of each other as well.
+    if (!m_attachRanges.isEmpty()) {
         const qint64 ms = m_clothClock.elapsed();
-        const qint64 fr = qint64(double(ms) * double(m_animAttachFps) / 1000.0);
-        m_frameAttach = int(fr % qint64(m_animAttachFrames));
+        for (int i = 0; i < m_attachRanges.size() && i < m_attachFrame.size(); ++i) {
+            const AttachRange& r = m_attachRanges[i];
+            const qint64 fr = qint64(double(ms) * double(r.fps > 1.0f ? r.fps : 30.0f) / 1000.0);
+            m_attachFrame[i] = int(fr % qint64(qMax(1, r.frames)));
+        }
     }
     m_lastFrameStep = m_clothClock.elapsed();   // mark playback so the idle timer stands down
     applySkinning();
@@ -3017,8 +3033,8 @@ void GLModelWidget::applySkinning()
         // static channels legitimately carry fewer keyframes than the rotation track.
         if (ai >= 0 && ai < m_anim.bones.size()) {
             const auto& ba = m_anim.bones[ai];
-            // Attached tracks run on their own clock (see m_animAttachFrom).
-            const int fa = (m_animAttachFrom >= 0 && ai >= m_animAttachFrom) ? m_frameAttach : f;
+            // Attached tracks run on their own clock (see m_trackClock).
+            const int fa = animFrameFor(ai);
             if (!ba.rotations.isEmpty() && !ba.translations.isEmpty() && !ba.scales.isEmpty()) {
                 const int rf = qBound(0, fa, int(ba.rotations.size())    - 1);
                 const int tf = qBound(0, fa, int(ba.translations.size()) - 1);

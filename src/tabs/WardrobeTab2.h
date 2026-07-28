@@ -125,7 +125,9 @@ private:
     // sheathed slots), bypassing the in-hand grip-offset/mirror pick and the held-roll fix.
     void seatWeapon(ModelGeometry& wgeo, int hand, const QString& itemType, const QString& gender,
                     const QHash<quint32, QPair<int, std::array<float, 16>>>& hp, QString& dbg,
-                    quint32 forceHash = 0);
+                    quint32 forceHash = 0,
+                    int* outBone = nullptr, std::array<float,16>* outMz = nullptr,
+                    bool bake = true);
     void populateCreator();  // fill the 9 character-creator pickers for this class/gender
     void resetDefaults();    // reset every wardrobe selection to defaults
     void populateSets();     // group slot appearances into m_sets (feeds right-click Equip Theme)
@@ -290,24 +292,31 @@ private:
     QVector<int> m_partEye;            // per merged-part: 1 = eyeball (Hero_Eye shader / eyeball mat)
     QStringList m_partSource;          // per merged-part source piece name (for grouping)
     QVector<int> m_partSourceSno;      // per merged-part source appearance SNO (context-menu export)
-    // Set when the equipped back trophy was attached as a SUB-RIG (kept its bones) rather than
-    // baked. Empty otherwise. Its idle clip is merged into whatever clip is playing.
-    QString      m_btSubRigAppr;
-    // The trophy's skeleton BEFORE its bones were re-hashed. Its clips must be decoded against
-    // these original hashes or the decoder substitutes a zero rest pose for every bone.
-    QVector<ModelJoint> m_btPreSaltSkel;
-    // Where the attached trophy's tracks start in the played clip, and their own length/rate.
+    // One attached model that kept its own rig and can therefore be animated. Several are live at
+    // once — back item, main hand, off hand — and each plays its own clip on its own clock.
+    struct Attached {
+        QString appearance;   // appearance stem; the key everything else joins on
+        QString label;        // localized item name for the panel, else the stem
+        QString slot;         // "Back" / "Main hand" / "Off hand" — which socket it came from
+        quint32 salt = 0;     // the bone-hash salt used when attaching; clips need the same one
+        // The rig BEFORE its bones were re-hashed. Clips must be decoded against these original
+        // hashes or the decoder substitutes a zero rest pose for every bone.
+        QVector<ModelJoint> preSalt;
+    };
+    QVector<Attached> m_attached;
+    // Mirrors GLModelWidget::AttachRange. Kept local so this header does not have to include the
+    // viewport just to name a 4-field struct; converted at the one call site.
+    struct AttachSpan { int from = 0; int count = 0; int frames = 0; float fps = 30.0f; };
+    QVector<AttachSpan> m_btAttachRanges;
     // ATTACHED panel: the attached model's own clip list + transport.
     QWidget*     m_attachPanel = nullptr;
     QLabel*      m_attachWho   = nullptr;
     QListWidget* m_attachAnims = nullptr;
+    QComboBox*   m_attachWhich = nullptr;   // which attachment's clips are listed
     QCheckBox*   m_attachPlay  = nullptr;
     QLabel*      m_attachHint  = nullptr;
     QToolButton* m_attachRestart = nullptr;
-    void refreshAttachAnimList();   // repopulate from the equipped attachment
-    int   m_btAttachFrom = -1;
-    int   m_btAttachFrames = 0;
-    float m_btAttachFps = 30.0f;
+    void refreshAttachAnimList();   // repopulate from the equipped attachments
     QTreeWidget* m_partTree = nullptr; // per-part visibility tree (piece → submeshes)
     QWidget* m_sidebar = nullptr;      // right-side panel column (strip + splitter)
     QSplitter* m_rsplit = nullptr;     // vertical splitter: the visible panels, drag to resize
@@ -515,8 +524,10 @@ private:
     void fillAnimList();                   // (re)build the list applying filter + sort + search
     void playAnimByName(const QString& animName);
     AnimParser::DecodedAnim decodeAnimByName(const QString& animName);
-    // Appends the equipped back trophy's idle tracks (salted to match its attached sub-rig).
-    void mergeBackTrophyIdle(AnimParser::DecodedAnim& anim);
+    // Appends every attachment's selected clip (each salted to match its own sub-rig).
+    void mergeAttachmentClips(AnimParser::DecodedAnim& anim);
+    // The clip the user picked for this attachment, validated against what it actually owns.
+    QString selectedClipFor(const QString& appearance) const;
     // D4_DUMP_TROPHYANIM=1: report a trophy's own rig and whose bones its clips drive.
     void dumpTrophyAnim(const QString& appr, const QVector<ModelJoint>& trophySkel);
     // Same, against an explicit rig — lets a clip be inspected before the merged rig exists.

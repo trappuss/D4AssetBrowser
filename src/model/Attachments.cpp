@@ -282,17 +282,29 @@ bool ModelAttach::attachSubRig(ModelGeometry& childGeo,
     const int bone = bh.first;
     if (bone < 0 || bone >= parentSkel.size()) return false;
     const Mat4 hpMat = bh.second;
-    if (outPreSalt) *outPreSalt = childGeo.skeleton;   // for decoding the child's own clips
 
     // ALL NATIVE (z-up). jointWorldMat and the hardpoint transform are both native, and the
     // renderer applies the z-up→y-up swap itself when it rebuilds a bone from its rest TRS.
     // Conjugation is a homomorphism, so a native premultiply survives that swap intact.
     // Same authored-vs-identity rule seat() uses, so both paths agree on where the socket is.
-    const Mat4 attachWorld = RigMath::jointWorldMat(parentSkel, bone);
+    const Mat4 attachWorld0 = RigMath::jointWorldMat(parentSkel, bone);
     const Mat4 base = hpIsAuthored(hpMat)
                           ? Mat4{{1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1}}
-                          : attachWorld;
-    const Mat4 Mz      = RigMath::mat4mul(base, hpMat);
+                          : attachWorld0;
+    return attachSubRigAt(childGeo, parentSkel, bone, RigMath::mat4mul(base, hpMat), salt, outPreSalt);
+}
+
+bool ModelAttach::attachSubRigAt(ModelGeometry& childGeo,
+                                 const QVector<ModelJoint>& parentSkel,
+                                 int bone,
+                                 const std::array<float, 16>& Mz,
+                                 quint32 salt,
+                                 QVector<ModelJoint>* outPreSalt)
+{
+    if (childGeo.skeleton.isEmpty()) return false;
+    if (bone < 0 || bone >= parentSkel.size()) return false;
+    if (outPreSalt) *outPreSalt = childGeo.skeleton;
+    const Mat4 attachWorld = RigMath::jointWorldMat(parentSkel, bone);
     const Mat4 rootPre = RigMath::mat4mul(RigMath::invert(attachWorld), Mz);
 
     QVector<ModelJoint> out;

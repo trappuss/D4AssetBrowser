@@ -200,12 +200,25 @@ public:
     void setFrame(int f);
     // Marks tracks [from, end) of the current animation as an attached model's, played on their own
     // looping timeline rather than the body clip's. Reset by every setAnimation().
-    void setAttachAnimRange(int from, int frames, float fps);
-    // Which frame index track `ai` should be sampled at. Attached tracks run on their own clock, so
+    // One attached model's contiguous block of tracks in the current animation, and the clip's own
+    // length/rate. Several can be live at once — main hand, off hand and back can all animate — so
+    // this is a list, not a single range.
+    struct AttachRange {
+        int   from = 0;      // first track index in DecodedAnim::bones
+        int   count = 0;     // number of tracks
+        int   frames = 0;    // the clip's OWN length
+        float fps = 30.0f;   // the clip's OWN rate
+    };
+    void setAttachAnimRanges(const QVector<AttachRange>& ranges);
+    // Which frame index track `ai` should be sampled at. Attached tracks run on their own clocks, so
     // every consumer of m_anim has to ask rather than reach for m_frame — the skeleton overlays
-    // reached, and drew the attachment a phase behind the mesh once the two timelines diverged.
+    // reached, and drew the attachment a phase behind the mesh once the timelines diverged.
     int  animFrameFor(int ai) const
-    { return (m_animAttachFrom >= 0 && ai >= m_animAttachFrom) ? m_frameAttach : m_frame; }
+    {
+        if (ai < 0 || ai >= m_trackClock.size()) return m_frame;
+        const int c = m_trackClock[ai];
+        return (c >= 0 && c < m_attachFrame.size()) ? m_attachFrame[c] : m_frame;
+    }
     int   animFrameCount() const { return m_hasAnim ? m_anim.frameCount : 0; }
     // Copy the CURRENT on-screen pose (the CPU-skinned verts) back into `geo` — positions +
     // normals, primitives walked in setGeometry's flatten order — and zero the skinning data so
@@ -423,12 +436,14 @@ private:
     // An ATTACHED model's clip rides in the same DecodedAnim (its tracks appended after the body's)
     // but on its OWN timeline. Projecting it onto the body clip's frame count made it restart every
     // time the body clip looped — a 130-frame trophy idle on a 56-frame body idle only ever played
-    // its first 56 frames. Tracks at or past m_animAttachFrom are indexed by m_frameAttach instead,
-    // derived from wall-clock at the clip's authored rate and wrapped on ITS own length.
-    int                            m_animAttachFrom = -1;   // first attached track (-1 = none)
-    int                            m_animAttachFrames = 0;
-    float                          m_animAttachFps = 30.0f;
-    int                            m_frameAttach = 0;
+    // its first 56 frames. Attached tracks are indexed by their own clock instead, derived from
+    // wall-clock at the clip's authored rate and wrapped on ITS own length — and there can be
+    // several at once (main hand, off hand, back), each independent of the others.
+    QVector<AttachRange>           m_attachRanges;   // one per attached model
+    // Per TRACK: which clock drives it (-1 = the body clip's). A flat lookup rather than a scan of
+    // the ranges, because it is hit once per bone per frame in the skinning loop.
+    QVector<int>                   m_trackClock;
+    QVector<int>                   m_attachFrame;    // current frame per clock, parallel to ranges
     bool                           m_hasAnim = false;
     int                            m_frame = 0;
 
