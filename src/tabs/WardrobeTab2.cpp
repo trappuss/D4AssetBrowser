@@ -2996,8 +2996,16 @@ void WardrobeTab2::autoAnimateForLoadout()
     m_autoFollowClip = c.idle;
     const QString first = c.unsheathe.isEmpty() ? c.idle : c.unsheathe;
     if (first == c.idle) m_autoFollowClip.clear();     // nothing to follow; the idle just loops
-    qInfo("auto-animate: %s class %d -> %s%s", qPrintable(cls), wc, qPrintable(first),
-          m_autoFollowClip.isEmpty() ? "" : qPrintable(QStringLiteral(" then ") + m_autoFollowClip));
+    // Say when the clip is the other gender's. Paladin and Warlock ship male-only wardrobe clips
+    // and Spiritborn ships female-only ones, so this is normal for those three and NOT a fault —
+    // but it is the first thing worth knowing if the pose ever looks wrong.
+    const QString wantTag = female ? QStringLiteral("f") : QStringLiteral("m");
+    const bool crossGender = first.size() > 3
+        && first.at(3).toLower() != wantTag.at(0) && (first.at(3) == QLatin1Char('F')
+                                                      || first.at(3) == QLatin1Char('M'));
+    qInfo("auto-animate: %s class %d -> %s%s%s", qPrintable(cls), wc, qPrintable(first),
+          m_autoFollowClip.isEmpty() ? "" : qPrintable(QStringLiteral(" then ") + m_autoFollowClip),
+          crossGender ? "  [other gender's clip — this class ships only one set]" : "");
     playAnimByName(first);
     if (m_animTimer && !m_animTimer->isActive()) {
         m_animTimer->start();
@@ -9056,11 +9064,31 @@ void WardrobeTab2::populateAnims()
     QStringList rows = m_animCache.value(pref);
     if (!m_animCache.contains(pref)) {
         rows = scanFor(pref);
-        // Fallback: a gender's rig may ship no dedicated clips (e.g. Warlock female). Borrow the
-        // same class's other-gender clips — the skeleton bones match by hash, so they play fine.
-        if (rows.isEmpty() && pref.size() == 4 && (pref.endsWith(QLatin1Char('f')) || pref.endsWith(QLatin1Char('m')))) {
+        // A gender may ship no animation set of its own; borrow the class's other-gender clips,
+        // which play fine because the skeletons match by bone-name hash.
+        //
+        // The test used to be "this gender has NO clips at all", which was too strict. Counts after
+        // this same snoAppearance filter, measured across the snapshot:
+        //
+        //     palF     2  vs  palM 328     <- never qualified; list showed 2 clips
+        //     spiM    20  vs  spiF 178     <- never qualified; Spiritborn ships FEMALE clips
+        //     warF     0  vs  warM 429     <- did qualify, which is why only this one was noticed
+        //
+        // So Paladin female and Spiritborn male sat on an almost-empty ANIMATIONS list. "More than
+        // double" separates those from the thirteen healthy pairs by a wide margin — the healthy
+        // ones sit within ~12% of each other (barF 325 / barM 364, rogM / rogF closer still), so
+        // nothing is near the line. Merged rather than replaced, so a gender's own few clips stay.
+        if (pref.size() == 4 && (pref.endsWith(QLatin1Char('f')) || pref.endsWith(QLatin1Char('m')))) {
             const QChar other = pref.endsWith(QLatin1Char('f')) ? QLatin1Char('m') : QLatin1Char('f');
-            rows = scanFor(pref.left(3) + other);
+            const QStringList alt = scanFor(pref.left(3) + other);
+            if (alt.size() > rows.size() * 2) {
+                qInfo("wardrobe anims: %s ships %d clip(s); merging %s's %d — this rig has no set "
+                      "of its own", qPrintable(pref), int(rows.size()),
+                      qPrintable(pref.left(3) + other), int(alt.size()));
+                QSet<QString> seen(rows.cbegin(), rows.cend());
+                for (const QString& a2 : alt) if (!seen.contains(a2)) { rows << a2; seen.insert(a2); }
+                rows.sort();
+            }
         }
         m_animCache.insert(pref, rows);
     }
