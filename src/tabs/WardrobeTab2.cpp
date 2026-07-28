@@ -4585,23 +4585,55 @@ void WardrobeTab2::seatWeapon(ModelGeometry& wgeo, int hand, const QString& item
     std::array<float,16> Toff{{1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1}};
     if (forceHash) hash = forceHash;   // sheathed: seat rigidly at the given socket, identity offset
     else {
-        // In-hand: prefer the standard mount; off hand uses a dual-state row or mirror.
-        QVector<Off> usable;
-        for (const Off& o : offs) if (hp.contains(o.hash)) usable.push_back(o);
-        if (!usable.isEmpty()) {
+        // tHardpointOffsets is indexed BY CHARACTER CLASS — the same 8-slot order as
+        // fUsableByClass — and ignoring that is what put several weapons in the wrong place.
+        // Verified over every ItemType that carries offsets: not one authors a row for a class that
+        // cannot use the item, and Flail's rows [1,2,4,6,7] are exactly its usable classes.
+        //
+        //   Flail        rows 1,2,4,6,7   Druid / Barbarian / Necro / Paladin / Warlock
+        //   Polearm      row  5           Spiritborn
+        //   Glaive       row  5           Spiritborn
+        //   Quarterstaff row  5           Spiritborn
+        //
+        // A Barbarian holding a Flail was taking row 1 — the DRUID grip — because the old code
+        // took whichever row came first. An absent row means "no offset needed", never "borrow
+        // another class's".
+        const int fubc = kClasses[qBound(0, m_class ? m_class->currentIndex() : 0, kNumClasses - 1)].fubc;
+        QVector<Off> mine;
+        for (const Off& o : offs) if (o.entry == fubc && hp.contains(o.hash)) mine.push_back(o);
+
+        // Within the class's row, a socket that is NOT the generic weapon mount is the one the
+        // class deliberately authored, and it wins. Polearm's Spiritborn row names both the generic
+        // mount (identity) and a Spiritborn socket carrying a 180° flip — preferring the generic
+        // one is exactly why the polearm came out upside down. Glaive and Quarterstaff name only
+        // their own socket, so they were landing on the generic mount with no offset at all.
+        QVector<Off> specific;
+        for (const Off& o : mine) if (o.hash != kMain && o.hash != kOff) specific.push_back(o);
+        const QVector<Off>& pool = specific.isEmpty() ? mine : specific;
+
+        if (!pool.isEmpty()) {
+            // Main-side of a mirrored pair is the hash mirror() knows how to flip; Flail's row
+            // lists both hands, and without this the off-hand grip could be chosen for the main.
             const Off* main = nullptr;
-            for (const Off& o : usable) if (o.hash == kMain) { main = &o; break; }
-            if (!main) main = &usable.first();
+            for (const Off& o : pool) if (mirror(o.hash) != o.hash) { main = &o; break; }
+            if (!main) main = &pool.first();
             hash = main->hash; Toff = main->m;
             if (hand == 1) {
+                const quint32 want = mirror(main->hash);
                 const Off* dual = nullptr;
-                for (const Off& o : usable) if (o.entry == main->entry && o.hash != main->hash) { dual = &o; break; }
+                for (const Off& o : pool) if (o.hash == want && o.hash != main->hash) { dual = &o; break; }
+                if (!dual)
+                    for (const Off& o : pool) if (o.hash != main->hash) { dual = &o; break; }
                 if (dual) { hash = dual->hash; Toff = dual->m; }
-                else      { hash = mirror(main->hash); }
+                else      { hash = want; Toff = {{1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1}}; }
             }
         } else if (hand == 1) {
             hash = mirror(kMain);
         }
+        dbg += QStringLiteral("\n%1: %2 class row %3 — socket %4%5")
+                   .arg(QLatin1String(lbl), itemType).arg(fubc).arg(hash)
+                   .arg(pool.isEmpty() ? QStringLiteral(" (no row for this class — generic mount)")
+                                       : QString());
     }
 
     if (!hp.contains(hash)) {
@@ -4631,6 +4663,14 @@ void WardrobeTab2::seatWeapon(ModelGeometry& wgeo, int hand, const QString& item
             static const Mat4 kHeld{{ -1,0,0,0,  0,1,0,0,  0,0,-1,0,  0,0,0,1 }};   // 180 about Y
             Toff = mat4mul(Toff, kHeld);
         }
+        // The roll decision is the remaining unknown for a mis-oriented weapon: the authored socket
+        // transform lives in the CASC payload, so it cannot be read from the JSON snapshot and the
+        // only way to see which branch a given class/weapon took is to print it.
+        dbg += QStringLiteral("\n%1: socket rot [%2 %3 %4] %5")
+                   .arg(QLatin1String(lbl))
+                   .arg(s[0], 0, 'f', 3).arg(s[5], 0, 'f', 3).arg(s[10], 0, 'f', 3)
+                   .arg(socketIdentity ? QStringLiteral("identity -> 180° grip roll APPLIED")
+                                       : QStringLiteral("authored -> roll skipped"));
     }
     // ── User orientation overrides (Weapon Settings dropdown): per-hand flip (half turn about
     // the grip) and invert (upside down), applied on top of the data seating. In-hand only —
