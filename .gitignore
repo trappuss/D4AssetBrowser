@@ -8,9 +8,9 @@ vcpkg_installed/
 *.pdb
 *.ilk
 
-# Local backups (already snapshotted by backup-src.bat)
+# Local backups. One tree only — backup-src.bat and the rebuild script both write .Backups,
+# and a second _backups/ had accumulated 63 MB of near-duplicates alongside it.
 .Backups/
-_backups/
 
 # Large captured data + archives
 *.tgz
@@ -29,3 +29,6 @@ cloth_audit.csv
 cloth_audit_summary.txt
 icon_audit.txt
 detail_mask_probe.txt
+d4cloth_build_log.txt
+d4cloth_extract_log.txt
+rebuild_out.txt
