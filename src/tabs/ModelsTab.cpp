@@ -5974,6 +5974,29 @@ void ModelsTab::showAppearance(int sno, const QString& name)
                     }
                 }
                 ptr = cands.isEmpty() ? QStringLiteral("NO POINTER FOUND") : cands.join(QLatin1Char(' '));
+
+                // 'base-20, next=72' turns up in every sample, so the sno sits 20 bytes into a
+                // 72-byte record and 72 is the ELEMENT size — it stays 72 for 1, 2 and 3 material
+                // appearances, so it cannot be the count. The count has to be a neighbouring field.
+                // Dump the u32s around that descriptor and let the material count identify itself:
+                // whichever slot equals the number of records is the one to read.
+                const int recs = firstHit.size();
+                for (int off = 0; off + 8 <= meta.size(); off += 4) {
+                    if (u32at(off) != quint32(base - 20) || u32at(off + 4) != 72u) continue;
+                    QStringList win;
+                    for (int k = -6; k <= 6; ++k) {
+                        const int o = off + k * 4;
+                        if (o < 0 || o + 4 > meta.size()) continue;
+                        const quint32 v = u32at(o);
+                        // Mark any neighbour that equals the record count — that is the candidate.
+                        win << QStringLiteral("%1%2%3").arg(k == 0 ? QStringLiteral("[") : QString())
+                                   .arg(v).arg(k == 0 ? QStringLiteral("]") : QString())
+                            + (int(v) == recs && k != 0 ? QStringLiteral("<=N") : QString());
+                    }
+                    ptr += QStringLiteral("\n    desc@0x%1 recs=%2 window(-6..+6): %3")
+                               .arg(off, 0, 16).arg(recs).arg(win.join(QLatin1Char(' ')));
+                    break;   // first descriptor is enough; they are identical in shape
+                }
             }
 
             qInfo().noquote() << QStringLiteral(
