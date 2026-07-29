@@ -20,6 +20,7 @@
 #include <QPair>
 #include <QRegularExpression>
 #include <QStandardPaths>
+#include <QTextStream>
 #include <QVector>
 
 #include <atomic>
@@ -581,6 +582,68 @@ BuildResult crawl(const QString& d4, const SnoIndex* index, CascReader* reader,
         }
         qInfo("AppearanceMeta: delta phase — %d items absent from d4data, %d icons filled (d4dad db: %s)",
               deltaSeen, deltaFilled, dad.items().isEmpty() ? "absent" : "loaded");
+    }
+
+    // ── D4_DUMP_ENCRYPTED=1: what is actually INSIDE the nameless records ─────
+    // Encrypted content (Doom collab, seasonal store sets) reaches CoreTOC with its name blanked, so
+    // the index carries it as "~unnamed_<sno>". Every roster path in the tool is name-SHAPED — the
+    // wardrobe slot filter is literally startsWith("barf") + endsWith("_trs") — so a nameless
+    // appearance cannot appear in the wardrobe no matter how cleanly its payload decodes.
+    //
+    // Recovering the name is therefore the whole problem, and it is NOT decidable from d4data: the
+    // Appearance JSON carries no self-name field (checked), and EncryptedNameDict ships 4 entries.
+    // The only remaining question is whether the DECRYPTED BINARY carries its authored name as a
+    // string — ClothData does, in a fixed 32-byte field, which is why cloth tuning has an
+    // embedded-name fallback at all. This dump answers that for Appearance/Actor/Item, per group,
+    // by printing every printable ASCII run in the blob. Do not build the recovery on top of an
+    // assumption about this; read the file first.
+    if (reader && reader->isReady() && index && qEnvironmentVariableIsSet("D4_DUMP_ENCRYPTED")) {
+        const QString outPath = AppPaths::dataDir() + QStringLiteral("/encrypted_dump.txt");
+        QFile df(outPath);
+        if (df.open(QIODevice::WriteOnly | QIODevice::Truncate | QIODevice::Text)) {
+            QTextStream ts(&df);
+            // 9 Appearance, 1 Actor, 73 Item, 11 Cloth, 57 Material — the chain a wardrobe piece
+            // needs end to end.
+            const QVector<QPair<int, const char*>> groups = {
+                {9, "Appearance"}, {1, "Actor"}, {73, "Item"}, {11, "Cloth"}, {57, "Material"}};
+            for (const auto& g : groups) {
+                int nameless = 0, readable = 0, withAscii = 0, dumped = 0;
+                ts << "\n===== group " << g.first << ' ' << g.second << " =====\n";
+                for (const SnoEntry& e : index->entries(g.first)) {
+                    if (!e.name.startsWith(QLatin1String("~unnamed_"))) continue;
+                    ++nameless;
+                    QByteArray blob = reader->readPayloadBySno(quint64(e.snoId));
+                    const char* which = "payload";
+                    if (blob.isEmpty()) { blob = reader->readMetaBySno(quint64(e.snoId)); which = "meta"; }
+                    if (blob.isEmpty()) continue;   // no key, or nothing stored
+                    ++readable;
+                    // Printable runs of 6+ — long enough to skip field padding, short enough to
+                    // catch "barF_stor245_TRS" and any slot/rig token.
+                    QStringList runs;
+                    QByteArray cur;
+                    for (int i = 0; i <= blob.size(); ++i) {
+                        const uchar c = (i < blob.size()) ? uchar(blob[i]) : 0;
+                        if (c >= 0x20 && c < 0x7f) { cur.append(char(c)); continue; }
+                        if (cur.size() >= 6 && runs.size() < 24) runs << QString::fromLatin1(cur);
+                        cur.clear();
+                    }
+                    if (!runs.isEmpty()) ++withAscii;
+                    if (dumped < 40) {   // a sample is enough to decide; the counts carry the rest
+                        ++dumped;
+                        ts << "sno " << e.snoId << "  " << which << ' ' << blob.size() << "B  "
+                           << (runs.isEmpty() ? QStringLiteral("<no ascii runs>") : runs.join(QStringLiteral(" | ")))
+                           << '\n';
+                    }
+                }
+                ts << QStringLiteral("-- %1: %2 nameless, %3 readable (key held), %4 carry ascii runs\n")
+                          .arg(g.second).arg(nameless).arg(readable).arg(withAscii);
+                qInfo("encrypted-dump: group %d %s — %d nameless, %d readable, %d with ascii",
+                      g.first, g.second, nameless, readable, withAscii);
+            }
+            qInfo().noquote() << "encrypted-dump: wrote" << outPath;
+        } else {
+            qWarning().noquote() << "encrypted-dump: cannot write" << outPath;
+        }
     }
 
     // ── Phase D2: name-link mop-up (unique/cosmetic items) ────────────────────
