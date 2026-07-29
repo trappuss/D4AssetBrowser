@@ -895,9 +895,29 @@ ModelGeometry ModelParser::parseApp(const QByteArray& metaBytes, const QByteArra
 
     QVector<Segment> segs = scanSegments(meta);
     QVector<SubObj> subs = findSubObjects(meta, metaBytes, segs);
+    // Sub-objects are kept only when they live on the ONE vertex/index buffer chosen above. Any
+    // that reference a different buffer are silently dropped, and that is a real source of missing
+    // geometry: measured over 1500 wardrobe appearances, 156 (10%) have at least one LOD0
+    // sub-object on another buffer. barF_base00 alone puts 14 of its 31 there.
+    //
+    // Dropping is at least SAFE — nVertOffset is relative to its own buffer, so reading those
+    // sub-objects out of the wrong one would draw scrambled geometry rather than none. Fixing it
+    // properly means decoding each buffer with its own layout and merging the results, which is
+    // the core geometry path for every model and wants its own change. Until then, say what was
+    // lost instead of losing it quietly.
     QVector<SubObj> lod0;
-    for (const SubObj& s : subs)
-        if (s.vbi == vb0->arrayIndex && s.ibi == ib0->arrayIndex) lod0.push_back(s);
+    int droppedSubs = 0; quint32 droppedVerts = 0;
+    for (const SubObj& s : subs) {
+        if (s.vbi == vb0->arrayIndex && s.ibi == ib0->arrayIndex) { lod0.push_back(s); continue; }
+        // Only count sub-objects that plausibly belong to this LOD — findSubObjects sweeps the
+        // whole meta blob, so a mismatched index buffer alone is not evidence of a real drop.
+        if (s.vbi >= 0 && s.vbi != vb0->arrayIndex && s.seg.vc > 0) {
+            ++droppedSubs; droppedVerts += s.seg.vc;
+        }
+    }
+    if (droppedSubs > 0)
+        qWarning("model: %d sub-object(s) (~%u verts) sit on vertex buffer(s) other than %d and were "
+                 "NOT loaded — this mesh is incomplete", droppedSubs, droppedVerts, vb0->arrayIndex);
     if (lod0.isEmpty()) return geo;
 
     std::sort(lod0.begin(), lod0.end(), [](const SubObj& a, const SubObj& b){
