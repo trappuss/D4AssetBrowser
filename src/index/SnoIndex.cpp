@@ -328,8 +328,14 @@ bool SnoIndex::loadFromD4data(const QString& d4dataDir)
         for (auto eit = entries.constBegin(); eit != entries.constEnd(); ++eit) {
             bool ok2 = false;
             const int sno = eit.key().toInt(&ok2);
-            if (ok2)
-                vec.append(SnoEntry{sno, eit.value().toString()});
+            if (!ok2) continue;
+            // Same treatment as the binary CoreTOC path: an encrypted record arrives with no name,
+            // and keeping it under an empty one is no better than dropping it — it sorts to the top
+            // of every list and matches nothing. Synthesise the same "~unnamed_<sno>" so the two
+            // load routes cannot disagree about what the index contains.
+            QString nm = eit.value().toString().trimmed();
+            if (nm.isEmpty()) nm = QStringLiteral("~unnamed_%1").arg(sno);
+            vec.append(SnoEntry{sno, nm});
         }
     }
     return ingest(parsed);

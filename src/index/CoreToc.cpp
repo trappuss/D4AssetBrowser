@@ -1,5 +1,7 @@
 #include "index/CoreToc.h"
 
+#include <QtGlobal>
+
 namespace {
 constexpr quint32 kNewMagic = 0xBCDE6611u;
 constexpr int     kMaxName  = 256;
@@ -16,6 +18,7 @@ inline qint32 i32(const uchar* d, qint64 off) { return static_cast<qint32>(u32(d
 
 QHash<int, QVector<SnoEntry>> parseCoreToc(const QByteArray& data)
 {
+    int unnamed = 0;   // encrypted records whose name CoreTOC withholds (see below)
     QHash<int, QVector<SnoEntry>> out;
     const qint64 dlen = data.size();
     if (dlen < 8)
@@ -71,13 +74,35 @@ QHash<int, QVector<SnoEntry>> parseCoreToc(const QByteArray& data)
             if (end >= limit)
                 continue;
 
-            const QString name = QString::fromUtf8(
+            QString name = QString::fromUtf8(
                 reinterpret_cast<const char*>(d + p), int(end - p)).trimmed();
-            if (name.isEmpty())
-                continue;
+            if (name.isEmpty()) {
+                // A NAMELESS record is not a broken one — it is ENCRYPTED content whose name D4
+                // withholds from CoreTOC. Dropping it here made the asset invisible everywhere,
+                // which is why recent collab cosmetics could not be found even though the game
+                // ships them and the TACT key to decrypt them is loaded: the seven Praetor's Suits
+                // (snos 2333773, 2334390, 2335372, 2335794, 2338096, 2339539, 2437800) are all
+                // group 73 Item records with an empty name.
+                //
+                // Scale, cross-checked two ways that agree to one record: 14100 CoreTOC entries
+                // have no name, and the snapshot's own EncryptedSNOs manifest lists 14101 encrypted
+                // SNOs with the same per-group split — 4053 Texture, 1184 Material, 1162 Item, 614
+                // Appearance, 415 Cloth.
+                //
+                // They are kept under a synthesised name so they are at least reachable and their
+                // payloads (which decode normally when the key is present) can be loaded. The '~'
+                // prefix is deliberate: it sorts after every letter, so these cluster at the end of
+                // an alphabetical list instead of interleaving with named assets, and it is an
+                // obvious marker that the real name is unknown rather than "~unnamed" being it.
+                name = QStringLiteral("~unnamed_%1").arg(snoId);
+                ++unnamed;
+            }
 
             out[snoGroup].append(SnoEntry{snoId, name});
         }
     }
+    if (unnamed > 0)
+        qInfo("CoreTOC: %d record(s) have no name (encrypted content) — indexed as ~unnamed_<sno> so "
+              "they remain reachable; they load normally where the TACT key is available", unnamed);
     return out;
 }
