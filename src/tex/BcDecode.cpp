@@ -237,7 +237,18 @@ QImage BcDecode::decode(const QByteArray& data, int width, int height, int eTexF
             const quint8* blk = base + (qint64(by) * blocksPerRow + bx) * blockBytes;
             RGBA texel[16];
             if (kind == K_BC1) {
-                decodeColorBlock(blk, texel, /*allowPunch=*/true);
+                // Punch-through ONLY for the format that means "BC1 with 1-bit alpha". Both 46 and
+                // 47 decode as BC1, and honouring c0<=c1 for BOTH is what put holes in opaque
+                // armour: in that mode the 4th palette entry is transparent black, so any block the
+                // compressor happened to encode that way vanished under the shader's alpha discard.
+                //
+                // Which is which comes from the data, not a guess. eTexFormat pairs perfectly with
+                // the material's shader across every piece checked: 46 appears only on hero_opaque
+                // (barF_stor167_GLV/HLM/BTS, barF_stor181_BTS/HLM), 47 only on the alphatest
+                // variants (barF_stor164_GLV, PalM_stor180_HLM, WarM_base01_LEG — the latter
+                // hero_opaque_alphatest_cloth). An opaque material has no cutout to express, so 46
+                // is plain BC1 and its alpha must stay 255.
+                decodeColorBlock(blk, texel, /*allowPunch=*/eTexFormat != 46);
             } else if (kind == K_BC3) {
                 quint8 alpha[16];
                 decodeAlphaBlock(blk, alpha);                 // 8 alpha bytes
