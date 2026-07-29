@@ -4653,20 +4653,37 @@ void WardrobeTab2::seatWeapon(ModelGeometry& wgeo, int hand, const QString& item
         dbg += QStringLiteral("\n%1: bone %2 out of range (rig has %3)").arg(QLatin1String(lbl)).arg(bone).arg(m_bodySkeleton.size());
         return;
     }
-    // Main-hand grip roll — DATA-CONDITIONAL (the non-Barbarian weapon-position fix).
-    // Verified against d4data: Barbarian authors HP_rightWeapon IDENTITY-local (barM_base00:
-    // q≈(0,0,0,-1)) and relies on a runtime 180° grip roll; other classes BAKE the roll into the
-    // authored socket rotation (rogM_base00: q≈(-1,0,0,0) = 180° about X, different bone too).
-    // The old code applied the Barbarian roll to every class ON TOP of the authored rotation —
-    // double-correcting and mis-orienting every non-Barbarian main-hand weapon. Now the roll is
-    // applied ONLY when the class's own socket rotation is (near-)identity, so each body's
-    // authored transform is trusted exactly as the game data specifies it.
+    // Main-hand grip roll — UNCONDITIONAL, and the reasoning matters because it used to be
+    // conditional on the class's socket being identity.
+    //
+    // The roll is applied INNERMOST (see the chain below: world · hp · Toff, with kHeld folded
+    // into the right of Toff), which makes it a correction in the WEAPON MESH's own space, not the
+    // socket's. And weapon appearances are not per class — axe_stor027 is one mesh that every
+    // class holds. A mesh-space correction for a shared mesh therefore cannot legitimately depend
+    // on which character is holding it; applying it to some classes and not others is incoherent.
+    //
+    // Measured from the shipped rigs, HP_rightWeapon's authored rotation splits exactly two ways:
+    //
+    //     identity        bar dru nec pal spi   (10 rigs)  -> was getting the roll
+    //     180° about X    rog sor war           ( 6 rigs)  -> was NOT
+    //
+    // Every orientation confirmed CORRECT in testing is in the first group, and the class reported
+    // upside down (Warlock, whose 1H sword and axe seat identically to its mace, dagger, flail and
+    // 2H sword — all with no authored grip at all) is in the second. The earlier note claiming the
+    // unconditional roll "mis-oriented every non-Barbarian weapon" predates three separate seating
+    // bugs since fixed — held weapons landing on SHEATH sockets, grips borrowed from another
+    // class's row, and the grip slide applied in the un-rolled frame — any of which would have
+    // produced exactly that impression.
+    //
+    // The socket's own 180°-about-X is the game's authored hand orientation for those rigs and is
+    // still applied, as hpMat, in its own place in the chain. It is not a substitute for the mesh
+    // correction.
     if (!forceHash && hand == 0) {   // in-hand main-weapon mesh orientation fix
         const std::array<float,16>& s = bh.second;   // authored socket, column-major
         const bool socketIdentity = std::fabs(s[0]  - 1.0f) < 0.01f
                                  && std::fabs(s[5]  - 1.0f) < 0.01f
                                  && std::fabs(s[10] - 1.0f) < 0.01f;
-        if (socketIdentity) {
+        {
             static const Mat4 kHeld{{ -1,0,0,0,  0,1,0,0,  0,0,-1,0,  0,0,0,1 }};   // 180 about Y
             Toff = mat4mul(Toff, kHeld);
             // The roll reverses the mesh's X and Z, so the authored grip SLIDE — which every held
@@ -4682,14 +4699,16 @@ void WardrobeTab2::seatWeapon(ModelGeometry& wgeo, int hand, const QString& item
             Toff[12] = -Toff[12];
             Toff[14] = -Toff[14];
         }
-        // The roll decision is the remaining unknown for a mis-oriented weapon: the authored socket
-        // transform lives in the CASC payload, so it cannot be read from the JSON snapshot and the
-        // only way to see which branch a given class/weapon took is to print it.
+        // Kept as a diagnostic, not a decision: the socket rotation IS readable from the JSON
+        // snapshot after all (Appearance/<rig>_base00.app.json, ptBoneData[0].ptHardpoints[].
+        // transform.q — an earlier note here wrongly said it was payload-only), and it is what the
+        // classification above was measured from. Printing it makes a future mis-orientation report
+        // answerable from the log alone.
         dbg += QStringLiteral("\n%1: socket rot [%2 %3 %4] %5 · grip slide (%6 %7 %8)")
                    .arg(QLatin1String(lbl))
                    .arg(s[0], 0, 'f', 3).arg(s[5], 0, 'f', 3).arg(s[10], 0, 'f', 3)
-                   .arg(socketIdentity ? QStringLiteral("identity -> 180° grip roll APPLIED")
-                                       : QStringLiteral("authored -> roll skipped"))
+                   .arg(socketIdentity ? QStringLiteral("identity socket · roll applied")
+                                       : QStringLiteral("180°X socket · roll applied"))
                    .arg(Toff[12], 0, 'f', 3).arg(Toff[13], 0, 'f', 3).arg(Toff[14], 0, 'f', 3);
     }
     // ── User orientation overrides (Weapon Settings dropdown): per-hand flip (half turn about
