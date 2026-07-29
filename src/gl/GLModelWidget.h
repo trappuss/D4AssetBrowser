@@ -516,6 +516,7 @@ private:
     QVector<int>         m_sbSim;              // per skeleton bone: index into m_clothSims (its
                                                // cloth piece) for per-piece tuning, or -1
     QVector<quint8>      m_sbHair;             // per skeleton bone: 1 = driven by hair-part verts
+    QVector<quint8>      m_sbChain;            // 1 = rigid-link chain bone (flail) — see the solve
                                                // (data-driven from skinning) → hair-class physics
     // Per cloth bone: 1 = the CURRENT clip genuinely animates it (real per-frame motion) so it must
     // follow the animation, not be sprung. 0 = its track is static/rest (the game leaves cloth bones

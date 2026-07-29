@@ -1544,6 +1544,11 @@ void GLModelWidget::buildSpringBones()
     m_sbIsCloth.fill(0, nb); m_sbChild.fill(-1, nb); m_sbLenParent.fill(0.0f, nb);
     m_sbSimHead.fill(0.0f, nb*3); m_sbPrevHead.fill(0.0f, nb*3);
     m_sbHair.fill(0, nb);   // per-bone hair flag (always sized/cleared; populated below)
+    // Rigid-link chain bones come straight off the rig (ModelJoint::chain, set when a physics-chain
+    // weapon is attached). Nothing else sets it, so this cannot touch a garment.
+    m_sbChain.fill(0, nb);
+    for (int j = 0; j < nb && j < m_skeleton.size(); ++j)
+        if (m_skeleton[j].chain) m_sbChain[j] = 1;
     m_cages.clear();        // cage-level sim state (rebuilt below when cages exist)
     m_sbAnchorPiece.fill(-1, nb); m_sbAnchorVert.fill(-1, nb); m_sbDriven.fill(0, nb);
     m_sbAnchorW.fill(0.0f, nb);
@@ -2743,8 +2748,16 @@ void GLModelWidget::springBoneStep(QVector<Mat4>& global)
         // was a workaround for the synthetic 1.0 tether; those bones now carry a geometry-derived
         // tether (see buildSpringBones), so the workaround is off by default. D4_CLOTH_LEGACY_ORPHANS=1
         // restores it. GENUINE hair (m_sbHair) is unaffected either way.
-        const bool hairBone = (j < m_sbHair.size() && m_sbHair[j] && !tuned) || (si < 0 && m_orphanLegacy);
-        const float stiffJ = hairBone ? qMax(stiff, 0.55f) : stiff;   // hold close to the skinned pose
+        // A CHAIN link is a pendulum, not fabric: it holds a rigid distance to its parent and is
+        // otherwise free. The cage-less path's job is to hug the skinned pose, which for a flail
+        // meant the links neither held their spacing (the first one floated off the handle) nor
+        // swung (they were sprung back to one fixed orientation). Both are what was reported.
+        // Return-to-pose is dropped entirely and the link length is enforced below, so the only
+        // forces left are gravity, inertia and damping — which is what a chain has.
+        const bool chainBone = (j < m_sbChain.size() && m_sbChain[j]);
+        const bool hairBone = !chainBone
+                              && ((j < m_sbHair.size() && m_sbHair[j] && !tuned) || (si < 0 && m_orphanLegacy));
+        const float stiffJ = chainBone ? 0.0f : (hairBone ? qMax(stiff, 0.55f) : stiff);
         const float keepJ  = hairBone ? qMin(keep, 0.45f)  : keep;    // heavier damping → settles fast
         const float gjJ    = hairBone ? gj * 0.35f          : gj;      // hair droops far less than cloth
         // NOTE: return-to-pose stays at the global stiffness for CLOTH — do NOT boost it for high-
@@ -2757,6 +2770,28 @@ void GLModelWidget::springBoneStep(QVector<Mat4>& global)
         n0+=(ah0-n0)*stiffJ; n1+=(ah1-n1)*stiffJ; n2+=(ah2-n2)*stiffJ;
         clampStep(S, n0, n1, n2);   // per-step travel clamp (anti-tunnelling)
         R[0]=S[0];R[1]=S[1];R[2]=S[2]; S[0]=n0;S[1]=n1;S[2]=n2;
+        // Rigid link length. m_sbLenParent has always been computed from the rest pose and never
+        // used; for a chain it is the constraint that matters. m_sbOrder is hierarchical, so the
+        // parent has already moved this step — one Gauss-Seidel pass from the root outward is
+        // enough to hold the whole chain together, and it anchors the first link to the grip
+        // because that parent is the attachment root, which is animation-driven rather than
+        // simulated.
+        if (chainBone && j < m_skeleton.size()) {
+            const int p = m_skeleton[j].parent;
+            const float len = (j < m_sbLenParent.size()) ? m_sbLenParent[j] : 0.0f;
+            if (p >= 0 && p < nb && len > 1e-5f) {
+                const bool pSim = (p < m_sbChain.size() && m_sbChain[p]);
+                const float px = pSim ? m_sbSimHead[p*3+0] : animG[p][12];
+                const float py = pSim ? m_sbSimHead[p*3+1] : animG[p][13];
+                const float pz = pSim ? m_sbSimHead[p*3+2] : animG[p][14];
+                float dx = S[0]-px, dy = S[1]-py, dz = S[2]-pz;
+                const float d = std::sqrt(dx*dx + dy*dy + dz*dz);
+                if (d > 1e-6f) {
+                    const float k = len / d;
+                    S[0] = px + dx*k; S[1] = py + dy*k; S[2] = pz + dz*k;
+                }
+            }
+        }
         sweep(S, R);                // stop at the entry point on fast motion
     }
     // Solve the AUTHORED constraint network (the 2-D mesh that holds the cloth as a sheet) +

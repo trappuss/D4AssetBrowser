@@ -362,7 +362,7 @@ bool ModelAttach::attachSubRigAt(ModelGeometry& childGeo,
         // solver's cage-less path is exactly the treatment they want (pose tracking on a short
         // leash), so the flag goes ON for everything below the root rather than off.
         if (!hasUsableCage) j.cloth = (physicsChain && !isRoot);
-        if (j.cloth && physicsChain && !hasUsableCage) ++chainBones;
+        if (j.cloth && physicsChain && !hasUsableCage) { j.chain = true; ++chainBones; }
         out.append(j);
     }
 

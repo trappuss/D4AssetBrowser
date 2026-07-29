@@ -57,6 +57,10 @@ struct ModelJoint {
     // classify per-bone instead of guessing from a single merged-index boundary — the
     // guess broke every class whose BODY carries cloth (spiritborn/druid).
     bool                  cloth = false;
+    // A RIGID-LINK chain bone (a flail's links). Cloth too, so the solver picks it up, but it wants
+    // pendulum physics — hold the rest distance to the parent, swing freely — rather than the
+    // pose-hugging treatment a cage-less fur bone gets. Set only by attachSubRigAt.
+    bool                  chain = false;
     std::array<float, 16> inverseBind {};  // inverse bind matrix, column-major
     std::array<float, 16> localMatrix {};  // node local transform, column-major
     // Raw rest-pose TRS (D4-native, pre axis-swap) — the animation rest fallback
