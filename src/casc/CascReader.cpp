@@ -392,7 +392,27 @@ QByteArray CascReader::decryptFrame(const QByteArray& data, int blockIndex) cons
     if (encType != 'S') return {};
     QByteArray key;
     { QMutexLocker kl(&m_keysMutex); key = m_tactKeys.value(keyName); }
-    if (key.isEmpty()) return {};
+    if (key.isEmpty()) {
+        // A missing TACT key returned empty here and nothing else, so the asset simply failed to
+        // load and looked identical to a parse bug. It is not one — the content is encrypted and
+        // this build has no key for it. Named once per key so a run reports exactly which keys
+        // would unlock more content rather than leaving it to guesswork.
+        //
+        // Scale, from the snapshot's own EncryptedSNOs manifest: 14101 SNOs are encrypted under 197
+        // distinct keys — 4053 textures, 1184 materials, 614 appearances, 415 cloth. The shipped
+        // key list carries 8 of those keys, so most encrypted content stays locked and every one of
+        // those assets was failing silently.
+        static QMutex warnMx;
+        static QSet<QByteArray> warned;
+        QMutexLocker wl(&warnMx);
+        if (!warned.contains(keyName)) {
+            warned.insert(keyName);
+            qWarning("CASC: encrypted content needs TACT key %s, which is not loaded — those assets "
+                     "cannot be decoded (add the key to the TACT key file to unlock them)",
+                     keyName.toHex().constData());
+        }
+        return {};
+    }
     QByteArray nonce = iv;
     char bi[4]; qToLittleEndian(quint32(blockIndex), reinterpret_cast<uchar*>(bi));
     nonce.append(bi, 4);
