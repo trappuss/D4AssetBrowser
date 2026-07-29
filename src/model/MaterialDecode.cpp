@@ -191,6 +191,11 @@ QStringList MaterialDecode::appearanceRoster(const QString& d4, const QString& a
             name = s.value(QStringLiteral("snoOverrideMaterial")).toObject().value(QStringLiteral("name")).toString();
             if (name.isEmpty()) name = s.value(QStringLiteral("snoMaterial")).toObject().value(QStringLiteral("name")).toString();
             if (name.isEmpty()) name = s.value(QStringLiteral("snoCloth")).toObject().value(QStringLiteral("name")).toString();
+            // Last resort before giving up: a sub-object can reference ONLY the HQ cloth override
+            // (spiF_stor198_TRS's chains, PalF_stor157's belt items — 14 in a 1200-piece sample).
+            // Those resolved to an empty name, which is what left the part with no material.
+            if (name.isEmpty()) name = s.value(QStringLiteral("snoHighQualityClothOverride"))
+                                        .toObject().value(QStringLiteral("name")).toString();
         }
         out.append(name);
     }

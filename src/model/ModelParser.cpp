@@ -676,13 +676,21 @@ static QHash<int, QString> snoClothMapFor(const QString& d4, const QString& appN
     if (f.open(QIODevice::ReadOnly)) {
         const QJsonObject root = QJsonDocument::fromJson(f.readAll()).object();
         const QJsonArray mats = root.value(QStringLiteral("ptAppearanceMaterials")).toArray();
+        // snoHighQualityClothOverride WINS over snoCloth. The tool renders at full quality, so the
+        // HQ tuning is the one the game would be using, and nothing here read it at all — every
+        // piece that ships one was being simulated with its low-detail parameters instead.
+        //
+        // Not a rare case: in a 1200-appearance sample, 392 SOAs carry both and 391 of those name a
+        // DIFFERENT file, so the two are genuinely distinct tunings rather than duplicates. A
+        // further 14 carry ONLY the override, and those were resolving to no tuning whatsoever.
         auto clothNameForMat = [&](int mi) -> QString {
             if (mi < 0 || mi >= mats.size()) return QString();
-            for (const QJsonValue& soaV : mats.at(mi).toObject().value(QStringLiteral("ptSOAs")).toArray()) {
-                const QJsonObject sc = soaV.toObject().value(QStringLiteral("snoCloth")).toObject();
-                const QString n = sc.value(QStringLiteral("name")).toString();
-                if (!n.isEmpty()) return n;
-            }
+            for (const char* key : {"snoHighQualityClothOverride", "snoCloth"})
+                for (const QJsonValue& soaV : mats.at(mi).toObject().value(QStringLiteral("ptSOAs")).toArray()) {
+                    const QString n = soaV.toObject().value(QLatin1String(key)).toObject()
+                                          .value(QStringLiteral("name")).toString();
+                    if (!n.isEmpty()) return n;
+                }
             return QString();
         };
         for (const QJsonValue& chV : root.value(QStringLiteral("tStructure")).toObject()
