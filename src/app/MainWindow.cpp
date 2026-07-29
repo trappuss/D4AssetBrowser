@@ -908,8 +908,12 @@ void MainWindow::reload()
             r.idx = true; r.idxSrc = QStringLiteral("CoreTOC cache (build %1…)").arg(casc->buildId().left(10));
         } else if (r.cascOk && index->loadFromCasc(*casc)) {
             r.idx = true; r.idxSrc = QStringLiteral("CASC base/CoreTOC.dat");
+            // BEFORE saveToCache: recovered names ride the existing per-build index cache, so the
+            // payload scan happens once per game build rather than on every launch.
+            index->recoverEncryptedNames(*casc);
             index->saveToCache(casc->buildId());
         } else if (index->loadFromD4data(d4)) {
+            if (r.cascOk) index->recoverEncryptedNames(*casc);
             r.idx = true; r.idxSrc = QStringLiteral("d4data CoreTOC.dat.json");
         }
         if (r.idx) index->updateLatest(casc->buildId());   // snapshot/diff for the "Latest" filter

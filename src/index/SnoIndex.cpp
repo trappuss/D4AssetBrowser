@@ -9,8 +9,10 @@
 #include <QtEndian>
 #include <QJsonDocument>
 #include <QJsonObject>
+#include <QRegularExpression>
 #include <QSet>
 #include <algorithm>
+#include <cctype>
 
 namespace {
 
@@ -353,4 +355,98 @@ const QVector<SnoEntry>& SnoIndex::entries(int group) const
     static const QVector<SnoEntry> kEmpty;
     auto it = m_byGroup.constFind(group);
     return it != m_byGroup.constEnd() ? it.value() : kEmpty;
+}
+
+// ── Encrypted-name recovery (see SnoIndex.h) ────────────────────────────────────────────────────
+namespace {
+
+// The shape the wardrobe roster requires: 3 class letters + gender, a style token ending in digits,
+// and one of the five armour slot codes. Anchored and case-insensitive — "DruM_stor235_GLV" and
+// "necF_stor245_TRS" both pass, "mnt_stor212_trophy" and "twoHandSorcStaff_stor063Shape" both fail.
+// Anything that fails is left nameless: a wrong name is worse than none, because it would seat a
+// piece on the wrong class.
+const QRegularExpression& wardrobeShapeRe()
+{
+    static const QRegularExpression re(
+        QStringLiteral("^[A-Za-z]{3}[FfMm]_[A-Za-z]+[0-9]+_(HLM|TRS|GLV|LEG|BTS)$"),
+        QRegularExpression::CaseInsensitiveOption);
+    return re;
+}
+
+// Pull the authored name out of a decrypted Appearance payload. Scans for identifier-shaped ASCII
+// runs (packed floats are incidentally printable — "B3?lu6?", "#<fff?" — hence the letter-run test),
+// then trims trailing part tokens until what is left is a wardrobe-shaped name.
+QString nameFromPayload(const QByteArray& blob)
+{
+    QByteArray cur;
+    QString best;
+    auto consider = [&best](const QByteArray& raw) {
+        if (raw.size() < 6) return;
+        if (!(std::isalpha(uchar(raw[0])) || raw[0] == '_')) return;
+        int run = 0, longest = 0;
+        for (char ch : raw) {
+            const uchar u = uchar(ch);
+            if (!(std::isalnum(u) || ch == '_')) return;
+            if (std::isalpha(u)) longest = qMax(longest, ++run); else run = 0;
+        }
+        if (longest < 3) return;
+        // "necM_stor245_LEG_chain" -> drop "chain" -> "necM_stor245_LEG". Trailing tokens vary
+        // ("_cape", "_loin", "_fur_HQO"), so peel from the right until the shape matches.
+        QStringList tok = QString::fromLatin1(raw).split(QLatin1Char('_'), Qt::SkipEmptyParts);
+        while (tok.size() >= 3) {
+            const QString cand = tok.join(QLatin1Char('_'));
+            if (wardrobeShapeRe().match(cand).hasMatch()) {
+                // Every cloth block in one appearance names the same piece, so a second opinion is
+                // corroboration; a DISAGREEMENT means the scan caught something else and the whole
+                // record is abandoned rather than resolved arbitrarily.
+                if (best.isEmpty()) best = cand;
+                else if (best.compare(cand, Qt::CaseInsensitive) != 0) best = QStringLiteral("!");
+                return;
+            }
+            tok.removeLast();
+        }
+    };
+    for (int i = 0; i <= blob.size(); ++i) {
+        const uchar c = (i < blob.size()) ? uchar(blob[i]) : 0;
+        if (c >= 0x20 && c < 0x7f) { cur.append(char(c)); continue; }
+        consider(cur);
+        cur.clear();
+    }
+    return best == QLatin1String("!") ? QString() : best;
+}
+
+}  // namespace
+
+int SnoIndex::recoverEncryptedNames(CascReader& casc)
+{
+    if (!casc.isReady()) return 0;
+    constexpr int kGroupAppearance = 9;
+    auto it = m_byGroup.find(kGroupAppearance);
+    if (it == m_byGroup.end()) return 0;
+
+    int nameless = 0, readable = 0, recovered = 0, collided = 0;
+    // Names must stay unique: the roster resolves a piece by name, so two snos answering to
+    // "necM_stor245_TRS" would make which one you get depend on iteration order.
+    QSet<QString> taken;
+    for (const SnoEntry& e : qAsConst(it.value()))
+        if (!e.name.startsWith(QLatin1String("~unnamed_"))) taken.insert(e.name.toLower());
+
+    for (SnoEntry& e : it.value()) {
+        if (!e.name.startsWith(QLatin1String("~unnamed_"))) continue;
+        ++nameless;
+        const QByteArray blob = casc.readPayloadBySno(quint64(e.snoId));
+        if (blob.isEmpty()) continue;   // no key held, or nothing stored
+        ++readable;
+        const QString nm = nameFromPayload(blob);
+        if (nm.isEmpty()) continue;     // no cloth block, or nothing wardrobe-shaped in it
+        if (taken.contains(nm.toLower())) { ++collided; continue; }
+        taken.insert(nm.toLower());
+        e.name = nm;
+        ++recovered;
+    }
+    if (recovered > 0 || nameless > 0)
+        qInfo("SnoIndex: encrypted-name recovery — %d nameless appearance(s), %d readable, "
+              "%d name(s) recovered from cloth data, %d skipped as duplicates",
+              nameless, readable, recovered, collided);
+    return recovered;
 }

@@ -42,6 +42,20 @@ public:
     // Snapshots the full SNO set per build; when `sig` (the CASC build id) changes it diffs against
     // the previous snapshot and keeps the additions until the NEXT update. First run establishes a
     // baseline (nothing is "new" yet). Call once after the index loads. Needs a non-empty sig.
+    // ── Encrypted-name recovery ──────────────────────────────────────────────────────────────────
+    // Encrypted assets reach CoreTOC with their name BLANKED (CoreToc.cpp indexes them as
+    // "~unnamed_<sno>"), and every roster in the tool is name-shaped — the wardrobe slot filter is
+    // literally startsWith("barf") + endsWith("_trs") — so decrypting them is not enough to make
+    // them appear. Measured with D4_DUMP_ENCRYPTED: the authored name IS in the Appearance payload,
+    // in ClothData's 32-byte name field, e.g. "necM_stor245_TRS_cape", "palF_stor171_LEG_hipPlate",
+    // "DruM_stor235_GLV_fur_HQO". Dropping the part token yields exactly the wardrobe's shape.
+    //
+    // Only cloth-bearing pieces carry one, so this recovers capes/skirts/chests and not plain boots.
+    // Partial by nature, and honest about it: the candidate must match <cls><g>_<style>_<SLOT> or it
+    // is left as ~unnamed rather than guessed at. Returns how many names were recovered. Runs before
+    // saveToCache so the result rides the existing per-build index cache — no new cache.
+    int recoverEncryptedNames(CascReader& casc);
+
     void updateLatest(const QString& sig);
     bool isNew(int sno) const { return m_newSnos.contains(sno); }
     const QSet<int>& newSnos() const { return m_newSnos; }
