@@ -111,7 +111,13 @@ bool attachSubRigAt(ModelGeometry& childGeo,
                     int bone,
                     const std::array<float, 16>& Mz,
                     quint32 salt,
-                    QVector<ModelJoint>* outPreSalt = nullptr);
+                    QVector<ModelJoint>* outPreSalt = nullptr,
+                    // A chain weapon (a flail) is rigged but ships no cloth cage and no clip of its
+                    // own, so nothing would drive its links. Set this and every bone BELOW the
+                    // attachment's own root is flagged cloth: the root is what the hand holds, and
+                    // everything hanging off it is chain. The solver's cage-less path then springs
+                    // them from the grip, which is what a flail does.
+                    bool physicsChain = false);
 
 bool attachSubRig(ModelGeometry& childGeo,
                   const QVector<ModelJoint>& parentSkel,

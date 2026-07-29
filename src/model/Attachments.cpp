@@ -299,7 +299,8 @@ bool ModelAttach::attachSubRigAt(ModelGeometry& childGeo,
                                  int bone,
                                  const std::array<float, 16>& Mz,
                                  quint32 salt,
-                                 QVector<ModelJoint>* outPreSalt)
+                                 QVector<ModelJoint>* outPreSalt,
+                                 bool physicsChain)
 {
     if (childGeo.skeleton.isEmpty()) return false;
     if (bone < 0 || bone >= parentSkel.size()) return false;
@@ -309,6 +310,7 @@ bool ModelAttach::attachSubRigAt(ModelGeometry& childGeo,
     for (const ClothSim& s : childGeo.clothSims)
         if (s.vertCount > 0 && !s.bindVerts.isEmpty() && !s.constraintLen.isEmpty())
             { hasUsableCage = true; break; }
+    int chainBones = 0;
     if (outPreSalt) *outPreSalt = childGeo.skeleton;
     const Mat4 attachWorld = RigMath::jointWorldMat(parentSkel, bone);
     const Mat4 rootPre = RigMath::mat4mul(RigMath::invert(attachWorld), Mz);
@@ -355,7 +357,12 @@ bool ModelAttach::attachSubRigAt(ModelGeometry& childGeo,
         // proximity match now succeeds in the child's own frame instead of failing silently metres
         // away. Without a cage the bones would enrol with no constraints and no pins: the
         // documented free-fall. Those stay animation-driven, which is what the bake did.
-        if (!hasUsableCage) j.cloth = false;
+        //
+        // A physics chain is the deliberate exception: no cage exists to claim these bones, but the
+        // solver's cage-less path is exactly the treatment they want (pose tracking on a short
+        // leash), so the flag goes ON for everything below the root rather than off.
+        if (!hasUsableCage) j.cloth = (physicsChain && !isRoot);
+        if (j.cloth && physicsChain && !hasUsableCage) ++chainBones;
         out.append(j);
     }
 
@@ -385,6 +392,9 @@ bool ModelAttach::attachSubRigAt(ModelGeometry& childGeo,
         // itself rather than us rewriting every particle here.
         sim.spaceBone = 1;
     }
+    if (physicsChain)
+        qInfo("attach: physics chain — %d of %d bone(s) spring from the grip",
+              chainBones, int(out.size()) - 2);
     for (ModelHardpoint& h : childGeo.hardpoints) {
         if (h.boneIndex >= 0) h.boneIndex += 2;
         if (h.boneHash) h.boneHash = saltBoneHash(h.boneHash, salt);

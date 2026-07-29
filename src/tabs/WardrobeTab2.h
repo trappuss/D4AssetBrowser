@@ -245,6 +245,7 @@ private:
     QString      m_lookBuildGroup;           // current weapon-type divider group while building
     void appendLookCards(int maxCards);      // build the next chunk of look cards
     void rebuildLookCollections();           // repopulate the collection dropdown for the active slot
+    static bool  weaponIsPhysicsChain(const QString& appearance);   // rigged chain (flail)
     QComboBox*   slotCombo(int i) const;     // backing combo for slot i (armour or weapon)
     int          slotItem(int i, QString* fullName = nullptr) const;   // equipped sno (0 = empty)
     // Image / export / copy actions for one equipped item — shared by the slot cells and the

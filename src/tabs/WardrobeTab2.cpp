@@ -4991,6 +4991,35 @@ int WardrobeTab2::slotItem(int i, QString* fullName) const
     return c->currentData().toInt();
 }
 
+// Does this weapon's rig want physics rather than a clip? Read from the appearance's own bone
+// data: uRagdollDegrade is the game's marker for a rig it simulates rather than animates.
+//
+// Measured across every weapon appearance in the snapshot: 38 of 38 flails set it, and of the
+// ~1400 other weapons exactly two do (one bow, one scythe). So it identifies chain weapons without
+// matching on a file name, and if a future patch adds another chain weapon it is picked up for
+// free. Cheap enough to read per rebuild — one small JSON per equipped weapon — and cached anyway
+// by the OS page cache.
+bool WardrobeTab2::weaponIsPhysicsChain(const QString& appearance)
+{
+    if (appearance.isEmpty()) return false;
+    static QHash<QString, bool> cache;   // per session; appearance -> is a chain rig
+    const auto it = cache.constFind(appearance.toLower());
+    if (it != cache.constEnd()) return *it;
+    bool chain = false;
+    QFile f(Config::d4dataDir() + QStringLiteral("/json/base/meta/Appearance/")
+            + appearance + QStringLiteral(".app.json"));
+    if (f.open(QIODevice::ReadOnly)) {
+        const QJsonObject bd = QJsonDocument::fromJson(f.readAll()).object()
+                                   .value(QStringLiteral("tStructure")).toObject()
+                                   .value(QStringLiteral("ptBoneData")).toArray()
+                                   .at(0).toObject();
+        chain = bd.value(QStringLiteral("uRagdollDegrade")).toInt(0) != 0
+                && bd.value(QStringLiteral("nBaseBoneCount")).toInt(0) > 1;
+    }
+    cache.insert(appearance.toLower(), chain);
+    return chain;
+}
+
 QComboBox* WardrobeTab2::slotCombo(int i) const
 {
     if (i < 5)  return m_slot[i];
@@ -7350,16 +7379,22 @@ void WardrobeTab2::rebuildOutfitImpl(bool async)
         // one — it is the same Mz, after the same auto-upright correction.
         const QVector<BackTrophyIndex::Clip> wClips =
             BackTrophyIndex::instance().clipsFor(weapName);
+        // A CHAIN weapon is rigged but ships neither a clip nor a cloth cage, so the old gate
+        // baked it and threw the rig away — a flail's links then rendered frozen in bind pose.
+        // uRagdollDegrade is the game's own marker for one: across ~1400 weapon appearances it is
+        // set on 38 of 38 flails and on two others, so it is a flail flag in practice and is read
+        // rather than matched on the name.
+        const bool wChain = !wgeo.skeleton.isEmpty() && weaponIsPhysicsChain(weapName);
         bool wRigged = false;
         // Held only. A sheathed weapon is stowed on the body — animating it there would have it
         // idling on your back, which is not what the clip is for.
-        if (!wClips.isEmpty() && !wgeo.skeleton.isEmpty() && !hs.sheathed) {
+        if ((!wClips.isEmpty() || wChain) && !wgeo.skeleton.isEmpty() && !hs.sheathed) {
             int wBone = -1; std::array<float,16> wMz{};
             seatWeapon(wgeo, hs.hand, itemType, wgender, hpMap, weapDbg, forceHash,
                        &wBone, &wMz, /*bake=*/false);
             QVector<ModelJoint> preSalt;
             const quint32 wSalt = backTrophySalt(weapName, hs.slot);   // slot 5..8 → unique per socket
-            if (ModelAttach::attachSubRigAt(wgeo, m_bodySkeleton, wBone, wMz, wSalt, &preSalt)) {
+            if (ModelAttach::attachSubRigAt(wgeo, m_bodySkeleton, wBone, wMz, wSalt, &preSalt, wChain)) {
                 Attached at;
                 at.appearance = weapName;
                 // The item's real name, same source the slot header uses. The appearance stem
@@ -7372,9 +7407,10 @@ void WardrobeTab2::rebuildOutfitImpl(bool async)
                 at.preSalt    = preSalt;
                 m_attached.push_back(at);
                 wRigged = true;
-                qInfo("attached %s: %s kept its rig (%d bones, %d clips)",
+                qInfo("attached %s: %s kept its rig (%d bones, %d clips)%s",
                       qPrintable(at.slot), qPrintable(weapName),
-                      int(preSalt.size()), int(wClips.size()));
+                      int(preSalt.size()), int(wClips.size()),
+                      wChain ? " — physics chain" : "");
             }
         }
         if (!wRigged)
