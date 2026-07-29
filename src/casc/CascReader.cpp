@@ -493,14 +493,53 @@ QByteArray CascReader::blteDecode(const QByteArray& data) const
     }
     QByteArray out;
     int dataPos = pos;
+    // Every chunk header carries its UNCOMPRESSED length and we were ignoring it, so a frame that
+    // failed to decode appended nothing and the loop carried on. The caller received a short buffer
+    // with no indication it was short — which is exactly how necF_stor245_TRS presented: a meta
+    // asking for 1666548 payload bytes against a 954470-byte read, and a parser blamed for it.
+    // A partial asset is a FAILURE, not a smaller asset. Now measured per frame and reported.
+    int badFrames = 0, firstBad = -1;
+    char firstBadType = 0;
+    QByteArray firstBadKey;
+    qint64 wantTotal = 0;
     for (int bi = 0; bi < chunks.size(); ++bi) {
-        const int comp = chunks[bi].first;
-        if (dataPos + comp > data.size()) break;
+        const int comp = chunks[bi].first, uncomp = chunks[bi].second;
+        wantTotal += uncomp;
+        if (dataPos + comp > data.size()) {
+            qWarning("BLTE: archive truncated at frame %d of %d — need %d byte(s) have %d",
+                     bi, int(chunks.size()), comp, int(data.size()) - dataPos);
+            ++badFrames;
+            break;
+        }
         const QByteArray frame = data.mid(dataPos, comp);
         dataPos += comp;
         if (frame.isEmpty()) continue;
-        out.append(decompressFrame(quint8(frame[0]), frame.mid(1), bi));
+        const QByteArray dec = decompressFrame(quint8(frame[0]), frame.mid(1), bi);
+        if (dec.size() != uncomp) {
+            if (++badFrames == 1) {
+                firstBad = bi;
+                firstBadType = frame[0];
+                // For an 'E' frame the key name is the first field, little-endian. Naming it turns
+                // "some asset failed" into "this specific key would fix it" — and frames within one
+                // file can use DIFFERENT keys, which a first-frame-only probe cannot see.
+                if (frame[0] == 'E' && frame.size() > 2) {
+                    const int keyLen = quint8(frame[1]);
+                    if (2 + keyLen <= frame.size()) {
+                        firstBadKey = frame.mid(2, keyLen);
+                        std::reverse(firstBadKey.begin(), firstBadKey.end());
+                    }
+                }
+            }
+        }
+        out.append(dec);
     }
+    if (badFrames > 0)
+        qWarning("BLTE: INCOMPLETE decode — %d of %d frame(s) failed, %lld of %lld byte(s) "
+                 "recovered; first failure frame %d type '%c'%s%s",
+                 badFrames, int(chunks.size()), qint64(out.size()), wantTotal, firstBad,
+                 firstBadType ? firstBadType : '?',
+                 firstBadKey.isEmpty() ? "" : " key ",
+                 firstBadKey.isEmpty() ? "" : firstBadKey.toHex().constData());
     return out;
 }
 
