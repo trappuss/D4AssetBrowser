@@ -22,6 +22,7 @@
 #include <QStandardPaths>
 #include <QTextStream>
 #include <QVector>
+#include <cctype>
 
 #include <atomic>
 #include <functional>
@@ -617,18 +618,32 @@ BuildResult crawl(const QString& d4, const SnoIndex* index, CascReader* reader,
                     if (blob.isEmpty()) { blob = reader->readMetaBySno(quint64(e.snoId)); which = "meta"; }
                     if (blob.isEmpty()) continue;   // no key, or nothing stored
                     ++readable;
-                    // Printable runs of 6+ — long enough to skip field padding, short enough to
-                    // catch "barF_stor245_TRS" and any slot/rig token.
+                    // Printable runs of 6+, then filtered to NAME-SHAPED ones. The first pass
+                    // proved the names are in there (spiM_stor190_TRS_cape, trophy_glo005_stor,
+                    // twoHandSorcStaff_stor063Shape) but buried under packed floats that are
+                    // incidentally printable ("B3?lu6?", "#<fff?") — 24 lines of noise per record.
+                    // Identifier shape only: [A-Za-z_][A-Za-z0-9_]* with a 3+ letter run in it.
                     QStringList runs;
                     QByteArray cur;
+                    auto nameShaped = [](const QByteArray& r) {
+                        if (r.size() < 6) return false;
+                        if (!(std::isalpha(uchar(r[0])) || r[0] == '_')) return false;
+                        int letterRun = 0, best = 0;
+                        for (char ch : r) {
+                            const uchar u = uchar(ch);
+                            if (!(std::isalnum(u) || ch == '_')) return false;
+                            if (std::isalpha(u)) best = qMax(best, ++letterRun); else letterRun = 0;
+                        }
+                        return best >= 3;
+                    };
                     for (int i = 0; i <= blob.size(); ++i) {
                         const uchar c = (i < blob.size()) ? uchar(blob[i]) : 0;
                         if (c >= 0x20 && c < 0x7f) { cur.append(char(c)); continue; }
-                        if (cur.size() >= 6 && runs.size() < 24) runs << QString::fromLatin1(cur);
+                        if (nameShaped(cur) && runs.size() < 12) runs << QString::fromLatin1(cur);
                         cur.clear();
                     }
                     if (!runs.isEmpty()) ++withAscii;
-                    if (dumped < 40) {   // a sample is enough to decide; the counts carry the rest
+                    if (dumped < 400) {   // wide enough that a whole sno range cannot hide in the gap
                         ++dumped;
                         ts << "sno " << e.snoId << "  " << which << ' ' << blob.size() << "B  "
                            << (runs.isEmpty() ? QStringLiteral("<no ascii runs>") : runs.join(QStringLiteral(" | ")))
@@ -640,6 +655,58 @@ BuildResult crawl(const QString& d4, const SnoIndex* index, CascReader* reader,
                 qInfo("encrypted-dump: group %d %s — %d nameless, %d readable, %d with ascii",
                       g.first, g.second, nameless, readable, withAscii);
             }
+            // ── the numeric chain: Item -> snoActor -> Actor -> snoAppearance ────────
+            // Names are a dead end for most of these, but the REFERENCES are not: Item meta is a
+            // flat 617-byte struct with snoActor at +24 and tInvImages at +368 (8 x {male,female}
+            // handles indexed by eHeroClass), and ActorDefinition carries snoAppearance at +36.
+            // That yields class and appearance without reading a single name. This section prints
+            // the chain for every readable nameless Item so the hop that breaks is visible rather
+            // than assumed — in particular whether the target appearance is itself readable.
+            ts << "\n===== chain: Item -> Actor -> Appearance =====\n";
+            {
+                QSet<int> appNameless;
+                for (const SnoEntry& e : index->entries(9))
+                    if (e.name.startsWith(QLatin1String("~unnamed_"))) appNameless.insert(e.snoId);
+                int chains = 0, gotActor = 0, gotApp = 0, appReadable = 0;
+                for (const SnoEntry& e : index->entries(73)) {
+                    if (!e.name.startsWith(QLatin1String("~unnamed_"))) continue;
+                    const QByteArray im = reader->readMetaBySno(quint64(e.snoId));
+                    if (im.isEmpty()) continue;
+                    ++chains;
+                    const ItemDef::ItemInfo info = ItemDef::parseItem(im);
+                    QStringList cls;
+                    for (int c = 0; c < info.images.size(); ++c)
+                        if (info.images[c].first || info.images[c].second)
+                            cls << QStringLiteral("%1%2%3").arg(c)
+                                       .arg(info.images[c].first ? QStringLiteral("M") : QString())
+                                       .arg(info.images[c].second ? QStringLiteral("F") : QString());
+                    quint32 app = 0;
+                    QByteArray ab;
+                    if (info.snoActor) {
+                        ++gotActor;
+                        ab = reader->readMetaBySno(quint64(info.snoActor));
+                        if (ab.size() >= 40)
+                            app = quint32(uchar(ab[36])) | quint32(uchar(ab[37])) << 8
+                                | quint32(uchar(ab[38])) << 16 | quint32(uchar(ab[39])) << 24;
+                    }
+                    if (app) ++gotApp;
+                    const bool appRd = app && reader->readPayloadBySno(quint64(app)).size() > 0;
+                    if (appRd) ++appReadable;
+                    if (chains <= 200)
+                        ts << "item " << e.snoId << "  actor " << info.snoActor
+                           << " (meta " << ab.size() << "B)  app " << app
+                           << (app ? (appNameless.contains(int(app)) ? " [nameless]" : " [NAMED]") : "")
+                           << (appRd ? " [payload readable]" : " [payload EMPTY]")
+                           << "  classes=" << (cls.isEmpty() ? QStringLiteral("none") : cls.join(QLatin1Char(',')))
+                           << '\n';
+                }
+                ts << QStringLiteral("-- chain: %1 readable nameless items, %2 gave an actor, "
+                                     "%3 gave an appearance, %4 of those have a readable payload\n")
+                          .arg(chains).arg(gotActor).arg(gotApp).arg(appReadable);
+                qInfo("encrypted-dump: chain — %d items, %d actors, %d appearances, %d readable",
+                      chains, gotActor, gotApp, appReadable);
+            }
+
             qInfo().noquote() << "encrypted-dump: wrote" << outPath;
         } else {
             qWarning().noquote() << "encrypted-dump: cannot write" << outPath;
