@@ -924,6 +924,30 @@ ModelsTab::ModelsTab(QWidget* parent) : BrowserTab(parent)
     m_onlyDecrypted->setToolTip(QStringLiteral("Hide models encrypted with a TACT key you don't have (they can't be opened)"));
     connect(m_onlyDecrypted, &QCheckBox::toggled, this, [this](bool) { loadList(); });   // re-filter the list
 
+    // The inverse of "Only decrypted": show ONLY content that ships encrypted. That is where new
+    // collab and seasonal cosmetics live — the Doom Praetor's Suits are group-73 Items with no name
+    // at all — so being able to isolate them is the difference between browsing 14000 records and
+    // hunting for them among 820000.
+    m_onlyEncrypted = new QCheckBox(QStringLiteral("Only encrypted (TACT)"), left);
+    m_onlyEncrypted->setToolTip(QStringLiteral(
+        "Show only assets whose payload is TACT-encrypted — where new collab and seasonal content\n"
+        "arrives. Ones you hold the key for open normally; the rest are listed but cannot be read.\n\n"
+        "Encrypted assets usually have no name either (D4 withholds it), so they appear as\n"
+        "~unnamed_<sno>."));
+    // Mutually exclusive with "Only decrypted" — both at once is an empty list by definition, which
+    // reads as a broken filter rather than a contradiction.
+    // Signals are deliberately NOT blocked when clearing the other box: the linked mirror copies in
+    // the toolbar (linkChk) stay in step only if the real toggle emits, and the extra loadList that
+    // costs is the same one the clear needs anyway. No recursion — the other box is already false by
+    // the time its handler looks.
+    connect(m_onlyEncrypted, &QCheckBox::toggled, this, [this](bool on) {
+        if (on && m_onlyDecrypted && m_onlyDecrypted->isChecked()) m_onlyDecrypted->setChecked(false);
+        loadList();
+    });
+    connect(m_onlyDecrypted, &QCheckBox::toggled, this, [this](bool on) {
+        if (on && m_onlyEncrypted && m_onlyEncrypted->isChecked()) m_onlyEncrypted->setChecked(false);
+    });
+
     m_snoSearch = new QLineEdit(left);
     m_snoSearch->setPlaceholderText(QStringLiteral("SNO"));
     m_snoSearch->setClearButtonEnabled(true);
@@ -1071,6 +1095,7 @@ ModelsTab::ModelsTab(QWidget* parent) : BrowserTab(parent)
     fsl->addWidget(m_genderCombo, 1);
     fsl->addWidget(m_typeCombo, 1);
     fsl->addWidget(m_onlyDecrypted);
+    fsl->addWidget(m_onlyEncrypted);
     fsl->addWidget(m_hideBrokenChk);
     fsl->addWidget(m_clearBtn);
     filterSection->setVisible(false);
@@ -1430,6 +1455,7 @@ ModelsTab::ModelsTab(QWidget* parent) : BrowserTab(parent)
         {
             auto* r = new QHBoxLayout();
             r->addWidget(linkChk(QStringLiteral("Only decrypted"), m_onlyDecrypted));
+            r->addWidget(linkChk(QStringLiteral("Only encrypted (TACT)"), m_onlyEncrypted));
             r->addWidget(linkChk(QStringLiteral("Hide un-renderable"), m_hideBrokenChk));
             r->addWidget(remChk);
             r->addStretch(1);
@@ -3320,6 +3346,7 @@ void ModelsTab::updateCount()
         if (comboSet(m_genderCombo)) ++nf;
         if (comboSet(m_typeCombo))   ++nf;
         if (m_onlyDecrypted && m_onlyDecrypted->isChecked()) ++nf;
+        if (m_onlyEncrypted && m_onlyEncrypted->isChecked()) ++nf;
         if (m_hideUnrenderable) ++nf;
         nf += m_tagFilter.size();   // funnel tags count as active filters too
         const QString arrow = m_filtersToggle->isChecked() ? QStringLiteral(" ▴") : QStringLiteral(" ▾");
@@ -3365,6 +3392,8 @@ void ModelsTab::rebuildFilterChips()
         addChip(m_typeCombo->currentText(), [this] { m_typeCombo->setCurrentIndex(0); });
     if (m_onlyDecrypted && m_onlyDecrypted->isChecked())
         addChip(QStringLiteral("Only decrypted"), [this] { m_onlyDecrypted->setChecked(false); });
+    if (m_onlyEncrypted && m_onlyEncrypted->isChecked())
+        addChip(QStringLiteral("Only encrypted (TACT)"), [this] { m_onlyEncrypted->setChecked(false); });
     if (m_hideBrokenChk && m_hideBrokenChk->isChecked())
         addChip(QStringLiteral("Hide un-renderable"), [this] { m_hideBrokenChk->setChecked(false); });
     // Funnel tags — removing a chip unchecks its menu action, whose toggled handler does the
@@ -3847,6 +3876,23 @@ void ModelsTab::loadList()
         QVector<SnoEntry> kept; kept.reserve(entries.size());
         for (const SnoEntry& e : entries)
             if (m_reader->payloadSize(quint64(e.snoId)) > 0) kept.append(e);
+        entries = kept;
+    }
+    // "Only encrypted (TACT)": keep the ones that ARE gated. Decided from the BLTE frame header
+    // rather than from the ~unnamed_ placeholder, because the two are not the same set — a handful
+    // of encrypted assets do recover a real name via EncryptedNameDict, and a name-based test would
+    // miss exactly those.
+    if (m_onlyEncrypted && m_onlyEncrypted->isChecked() && m_reader && m_reader->isReady()) {
+        QVector<SnoEntry> kept; kept.reserve(entries.size() / 8 + 8);
+        int locked = 0;
+        for (const SnoEntry& e : entries) {
+            const QByteArray kn = m_reader->tactKeyFor(quint64(e.snoId));
+            if (kn.isEmpty()) continue;
+            if (!m_reader->haveTactKey(kn)) ++locked;
+            kept.append(e);
+        }
+        qInfo("models: %d encrypted asset(s) in this group, %d of them without a key",
+              int(kept.size()), locked);
         entries = kept;
     }
     m_listModel->setEntries(entries);
@@ -5907,6 +5953,7 @@ void ModelsTab::saveFilterState()
     s.setValue(QStringLiteral("models/lastGender"), cd(m_genderCombo));
     s.setValue(QStringLiteral("models/lastType"), cd(m_typeCombo));
     s.setValue(QStringLiteral("models/lastOnlyDec"), m_onlyDecrypted && m_onlyDecrypted->isChecked());
+    s.setValue(QStringLiteral("models/lastOnlyEnc"), m_onlyEncrypted && m_onlyEncrypted->isChecked());
     s.setValue(QStringLiteral("models/lastHideBroken"), m_hideBrokenChk && m_hideBrokenChk->isChecked());
 }
 
@@ -5930,6 +5977,8 @@ void ModelsTab::restoreFilterState()
     pick(m_typeCombo, s.value(QStringLiteral("models/lastType")).toString());
     if (m_onlyDecrypted && s.value(QStringLiteral("models/lastOnlyDec"), false).toBool())
         m_onlyDecrypted->setChecked(true);
+    else if (m_onlyEncrypted && s.value(QStringLiteral("models/lastOnlyEnc"), false).toBool())
+        m_onlyEncrypted->setChecked(true);   // else-if: the two are exclusive
     if (m_hideBrokenChk && s.value(QStringLiteral("models/lastHideBroken"), false).toBool())
         m_hideBrokenChk->setChecked(true);
     // Search text last: its textChanged does the parse + filter, so everything lands together.

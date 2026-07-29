@@ -174,6 +174,7 @@ void CascReader::close()
     QMutexLocker lock(&m_mutex);
     m_ready = false;
     m_index.clear();
+    m_keyProbe.clear();
     m_root.clear();
     m_gameDir.clear();
 }
@@ -902,6 +903,7 @@ bool CascReader::open(const QString& gameDir, const QString& /*product*/)
     QMutexLocker lock(&m_mutex);
     m_ready = false;
     m_index.clear();
+    m_keyProbe.clear();
     m_root.clear();
     m_buildId.clear();
     m_gameDir = gameDir;
@@ -989,6 +991,34 @@ QByteArray CascReader::readPayloadBySno(quint64 sno)
 QByteArray CascReader::readMetaBySno(quint64 sno)
 {
     return readFile(QStringLiteral("base/meta/%1").arg(sno));
+}
+
+QByteArray CascReader::tactKeyFor(quint64 sno)
+{
+    QMutexLocker lock(&m_mutex);
+    if (!m_ready) return {};
+    const auto cached = m_keyProbe.constFind(sno);
+    if (cached != m_keyProbe.constEnd()) return cached.value();
+    auto remember = [this, sno](const QByteArray& kn) { m_keyProbe.insert(sno, kn); return kn; };
+    for (const QString& path : {QStringLiteral("base/payload/%1").arg(sno),
+                                QStringLiteral("base/paylow/%1").arg(sno),
+                                QStringLiteral("base/meta/%1").arg(sno)}) {
+        const QVector<QByteArray> eks = m_root.value(path.toLower());
+        for (const QByteArray& ek : eks) {
+            auto it = m_index.constFind(ek);
+            if (it == m_index.constEnd()) continue;
+            const QByteArray kn = frameKeyName(it.value());
+            if (!kn.isEmpty()) return remember(kn);
+        }
+    }
+    return remember(QByteArray());
+}
+
+bool CascReader::haveTactKey(const QByteArray& keyName) const
+{
+    if (keyName.isEmpty()) return true;   // unencrypted needs no key
+    QMutexLocker kl(&m_keysMutex);
+    return !m_tactKeys.value(keyName).isEmpty();
 }
 
 quint64 CascReader::payloadSize(quint64 sno)

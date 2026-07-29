@@ -61,6 +61,11 @@ public:
 
     // Stored (compressed) payload size for an SNO via index lookup only (no read).
     quint64 payloadSize(quint64 sno);
+    // The TACT key an sno's payload is encrypted with, or empty when it is not encrypted. Read from
+    // the BLTE frame header only — no decode, no decompression — so it is cheap enough to call once
+    // per row while filtering a list. Second form says whether that key is actually loaded.
+    QByteArray tactKeyFor(quint64 sno);
+    bool       haveTactKey(const QByteArray& keyName) const;
     // Stored size of a file by virtual path, or 0 if absent.
 
     // Iterate TVFS paths matching a simple prefix/substring mask ("*"/empty = all).
@@ -113,6 +118,10 @@ private:
     QHash<QByteArray, IndexEntry>          m_index;     // 9-byte EKey → location
     QHash<QString, QVector<QByteArray>>    m_root;      // path.toLower() → EKeys
     QHash<QByteArray, QByteArray>          m_tactKeys;  // keyName(8) → key(16)
+    // Memory-only, guarded by m_mutex. tactKeyFor opens an archive and seeks per sno; filtering a
+    // 40k-entry group would otherwise redo all of it on every list rebuild. Dropped with the reader,
+    // never written to disk. Empty QByteArray = probed and found unencrypted.
+    QHash<quint64, QByteArray>             m_keyProbe;
 
     // Coverage diagnostics (populated during expandNestedManifests, dumped by open()):
     // which container manifests expanded, which were skipped oversized, and which were

@@ -303,6 +303,7 @@ private:
     QComboBox*             m_genderCombo = nullptr;
     QComboBox*             m_typeCombo  = nullptr;
     QCheckBox*             m_onlyDecrypted = nullptr;
+    QCheckBox*             m_onlyEncrypted = nullptr;   // the inverse: ONLY TACT-gated content
     QLabel*                m_countLabel = nullptr;
     QHash<QString, QString> m_scan;                   // active scan key → message (merged into the toast)
     int                    m_metaPct = -1;            // AppearanceMeta crawl progress
