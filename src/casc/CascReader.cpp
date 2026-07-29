@@ -20,6 +20,8 @@
 #include <lz4frame.h>
 #include <zlib.h>
 
+#include <atomic>
+
 #include <algorithm>
 #include <cstring>
 #include <functional>
@@ -451,13 +453,27 @@ QByteArray CascReader::decompressFrame(quint8 type, const QByteArray& data, int 
         // yields plausible-looking bytes whose first byte is then read as a frame type, so testing
         // the DECOMPRESSED LENGTH is the only check that actually discriminates — an inner type
         // byte of 'N' passes by luck roughly once in 256.
+        // The winning construction is a property of the game build, not of a frame, so the first
+        // VERIFIED win is remembered and tried first from then on. Without this every encrypted
+        // frame pays two Salsa20 passes plus two inflates — a needless doubling on the hot path for
+        // a question that was settled once. Memory-only, and never written from an unverified guess.
+        static std::atomic<int> preferred{0};
+        const int first = preferred.load(std::memory_order_relaxed);
         QByteArray fallback;
-        for (int v = 0; v < kNonceVariants; ++v) {
+        for (int n = 0; n < kNonceVariants; ++n) {
+            const int v = (first + n) % kNonceVariants;
             const QByteArray dec = decryptFrame(data, blockIndex, v);
             if (dec.isEmpty()) continue;          // no key — no variant will help
             const QByteArray out = decompressFrame(quint8(dec[0]), dec.mid(1), blockIndex,
                                                    expectUncomp);
-            if (expectUncomp >= 0 && out.size() == expectUncomp) return out;
+            if (expectUncomp >= 0 && out.size() == expectUncomp) {
+                if (v != first) {
+                    preferred.store(v, std::memory_order_relaxed);
+                    qInfo("BLTE: Salsa20 nonce variant %d confirmed by frame length — preferring it "
+                          "from here (variant 0 appends the block index to the IV, 1 XORs it in)", v);
+                }
+                return out;
+            }
             if (fallback.isEmpty()) fallback = out;
             if (expectUncomp < 0) return out;     // nothing to verify against — first result stands
         }
