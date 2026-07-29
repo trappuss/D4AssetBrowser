@@ -1461,8 +1461,15 @@ WardrobeTab2::WardrobeTab2(QWidget* parent) : BrowserTab(parent)
                        this, [this, pickHit]() { pickHit(); exportAnimLibrary(true); });
         if (hit) {
             menu.addSeparator();
-            menu.addAction(QStringLiteral("Copy name"), this,
-                           [hit] { QGuiApplication::clipboard()->setText(hit->text()); });
+            // The row reads "Neutral   —   barF_DW_nav_idle  ·  56 frames"; what anyone copying a
+            // clip wants is the file name, which is what UserRole holds. Falls back to the label
+            // for a row that carries no clip.
+            const QString clipName = hit->data(Qt::UserRole).toString();
+            menu.addAction(QStringLiteral("Copy file name"), this,
+                           [hit, clipName] {
+                               QGuiApplication::clipboard()->setText(
+                                   clipName.isEmpty() ? hit->text() : clipName);
+                           });
         }
         menu.exec(m_anims->viewport()->mapToGlobal(p));
     });

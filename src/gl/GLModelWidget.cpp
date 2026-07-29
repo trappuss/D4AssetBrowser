@@ -5494,7 +5494,14 @@ QImage GLModelWidget::grabEnsembleThumb(int size)
     m_viewChannel = 1;                            // Base Color — flat, colourful
     m_showGrid = false; m_showSkeleton = false; m_bgGradient = false;
 
-    QImage img = grabFramebuffer();               // full pipeline at widget resolution
+    // Transparent backdrop: the tile is a cut-out of the character, so it sits on the card's own
+    // colour instead of carrying a rectangle of viewport grey around it. setTransparentClear also
+    // suppresses the gradient, which is why the guides above are switched off in the same breath.
+    m_transparentClear = true;
+    // Converted explicitly: grabFramebuffer can hand back a format with no alpha channel, and the
+    // crop/scale below plus the PNG write would then silently drop the cut-out.
+    QImage img = grabFramebuffer().convertToFormat(QImage::Format_RGBA8888);
+    m_transparentClear = false;
 
     m_yaw = yaw; m_pitch = pitch; m_dist = dist; m_center = ctr;
     m_tgtCenter = tgtC; m_tgtYaw = tgtY; m_tgtPitch = tgtP; m_tgtDist = tgtD;
