@@ -5905,6 +5905,55 @@ void ModelsTab::showAppearance(int sno, const QString& name)
             new QStandardItem(QString::number(it.key())),
             new QStandardItem(it.value())});
     updateTabCounts();
+
+    // ── D4_DUMP_MATSNO=1: locate the material-sno table inside the appearance META binary ────
+    // Encrypted appearances have no .app.json, so the entire material chain above is unavailable
+    // to them and they render untextured. The binary already hands us the per-sub-object material
+    // ORDER (ModelParser.cpp:356, meta.i32(so + 0x60)); what is missing is the sno LIST to index.
+    //
+    // This does not guess where that list lives. For a NAMED appearance the JSON tells us exactly
+    // which snos must be present, so their u32 values are searched for in the meta blob and every
+    // hit is reported with its offset. Run it across many appearances and a constant offset — or a
+    // constant stride between consecutive materials — is the table. Anything less than a consistent
+    // pattern across many samples is not an answer and must not be treated as one.
+    if (qEnvironmentVariableIsSet("D4_DUMP_MATSNO") && m_reader && m_reader->isReady()
+        && !matBySno.isEmpty()) {
+        const QByteArray meta = m_reader->readMetaBySno(quint64(sno));
+        if (meta.size() >= 4) {
+            auto u32at = [&meta](int off) -> quint32 {
+                return quint32(uchar(meta[off])) | quint32(uchar(meta[off + 1])) << 8
+                     | quint32(uchar(meta[off + 2])) << 16 | quint32(uchar(meta[off + 3])) << 24;
+            };
+            QString line;
+            int found = 0;
+            QVector<int> firstHit;
+            for (auto it = matBySno.constBegin(); it != matBySno.constEnd(); ++it) {
+                const quint32 want = quint32(it.key());
+                QStringList offs;
+                for (int off = 0; off + 4 <= meta.size(); ++off)
+                    if (u32at(off) == want && offs.size() < 6)
+                        offs << QStringLiteral("0x%1").arg(off, 0, 16);
+                if (!offs.isEmpty()) { ++found; firstHit << offs.first().mid(2).toInt(nullptr, 16); }
+                line += QStringLiteral("\n    sno %1 %2 -> %3")
+                            .arg(it.key(), 8).arg(it.value(), -34)
+                            .arg(offs.isEmpty() ? QStringLiteral("ABSENT") : offs.join(QLatin1Char(' ')));
+            }
+            // A stride is only meaningful when the hits are in the same order as the material list.
+            QString stride = QStringLiteral("n/a");
+            if (firstHit.size() >= 2) {
+                bool uniform = true;
+                const int d0 = firstHit[1] - firstHit[0];
+                for (int i = 2; i < firstHit.size(); ++i)
+                    if (firstHit[i] - firstHit[i - 1] != d0) { uniform = false; break; }
+                stride = uniform ? QStringLiteral("UNIFORM %1 bytes").arg(d0)
+                                 : QStringLiteral("not uniform");
+            }
+            qInfo().noquote() << QStringLiteral(
+                "matsno: %1 (sno %2) — meta %3 B, %4 of %5 material sno(s) found, stride %6%7")
+                .arg(name).arg(sno).arg(meta.size()).arg(found).arg(matBySno.size())
+                .arg(stride).arg(line);
+        }
+    }
 }
 
 // (Re)fill, place and show the search-history dropdown — or hide it when there's nothing
