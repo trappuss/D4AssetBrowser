@@ -6531,9 +6531,11 @@ void WardrobeTab2::refreshCreatorCells()
 // Reset every wardrobe selection (and its saved state) to defaults.
 void WardrobeTab2::resetDefaults()
 {
+    // Resets the OUTFIT, not the character. Clearing class and gender too sent you back to
+    // Barbarian Female every time, which meant re-picking the character before you could carry on
+    // — and "reset" reads as "clear what I put on this model", not "give me a different model".
     QSettings s;
-    for (const QString& k : {QStringLiteral("wardrobe2/class"), QStringLiteral("wardrobe2/gender"),
-                             QStringLiteral("wardrobe2/weaponType"), QStringLiteral("wardrobe2/weapon"),
+    for (const QString& k : {QStringLiteral("wardrobe2/weaponType"), QStringLiteral("wardrobe2/weapon"),
                              QStringLiteral("wardrobe2/weaponType2"), QStringLiteral("wardrobe2/weapon2"),
                              QStringLiteral("wardrobe2/weaponSheath"), QStringLiteral("wardrobe2/weaponSheath2"),
                              QStringLiteral("wardrobe2/backTrophy"), QStringLiteral("wardrobe2/dyeSel"),
@@ -6548,8 +6550,7 @@ void WardrobeTab2::resetDefaults()
     }
 
     m_restoring = true;
-    m_class->setCurrentIndex(0);
-    m_gender->setCurrentIndex(0);
+    // m_class / m_gender deliberately untouched — see above.
     for (int i = 0; i < 5; ++i) m_slot[i]->setCurrentIndex(0);
     for (int i = 0; i < 9; ++i) m_creator[i]->setCurrentIndex(0);
     if (m_weaponType->count() > 0) m_weaponType->setCurrentIndex(0);
@@ -6566,6 +6567,9 @@ void WardrobeTab2::resetDefaults()
     m_restoring = false;
 
     m_activeTheme = ThemeResolved{};   // nothing is "themed" after a reset
+    if (m_status && m_class && m_gender)
+        m_status->setText(QStringLiteral("Reset %1 %2 to defaults.")
+                              .arg(m_class->currentText(), m_gender->currentText()));
     populateCreator();
     populateSlots();   // ends with rebuildOutfit()
     refreshLookHighlights();
