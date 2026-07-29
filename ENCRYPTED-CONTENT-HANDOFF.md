@@ -62,7 +62,38 @@ this; now measured. Do not build on it.
 this recovers capes/skirts/chests, not plain boots or gloves. Closing that gap by
 SNO adjacency would be guessing.
 
-## Open problem: recovered pieces do not render
+## SOLVED: multi-frame BLTE decode (was tool-wide silent data loss)
+
+`necF_stor245_TRS` renders. The cause was **not** the parser and **not** the
+Doom set — it was `CascReader::blteDecode`.
+
+```
+BLTE: INCOMPLETE decode — 26 of 27 frame(s) failed, 954470 of 1760400 byte(s)
+recovered; first failure frame 1 type 'E' key f159f1f70eabaab1
+```
+
+Frame 0 succeeded, frames 1-26 all failed, key held, no missing-key warning. The
+only input differing between frame 0 and the rest is the BLOCK INDEX, which feeds
+the Salsa20 nonce. Two constructions are in circulation — append the block index
+to the IV, or XOR it into the IV's first 4 bytes — and **they are identical when
+the block index is 0**. Almost every encrypted asset is a single frame, so the bug
+had no symptom until a 1.7 MB payload split across 27 frames appeared.
+
+Both are now tried and the chunk header's declared uncompressed length decides
+(length match, not inner-type match: a wrong nonce yields plausible bytes whose
+first byte reads as a frame type and passes by luck ~1 in 256). The verified
+winner is memoised in an atomic and tried first thereafter.
+
+`blteDecode` also now reports shortfalls instead of returning a short buffer. It
+previously appended `decompressFrame`'s empty result and continued, so callers got
+truncated data with no indication — and each blamed itself. **Any encrypted asset
+in more than one BLTE frame was affected**, which likely explains earlier
+missing-texture / incomplete-mesh reports in this project.
+
+Verified after fix: zero `BLTE: INCOMPLETE`, zero `model-parse: GATE`, and both
+`necF_stor245_TRS` and `necF_stor245_LEG` render on the wardrobe character.
+
+## Open problem: recovered pieces render UNTEXTURED
 
 `necF_stor245_TRS` (sno 2519633) is now in the index and searchable, but shows
 "This asset has no displayable geometry" with every INFO field blank except
@@ -100,9 +131,17 @@ All 12 early exits in `ModelParser::parseApp` are silent (lines 790, 791, 797,
 817, 820, 823, 824, 834, 892, 921, 932, 945). The only warning, line 919, fires
 only when `droppedSubs > 0`, so a mesh with zero usable sub-objects is silent too.
 
+### Confirmed symptom (Wardrobe, Necromancer Female)
+
+PARTS lists base pieces with real material names (`necF_base01_GLV_mat`,
+`armor_skin_mat`, `necF_base01_BTS_mat`) but every stor245 sub-object as
+`part 7`, `part 8`, ... and MATERIALS shows 10 entries, none from stor245.
+That is `roster.value(p.materialIndex)` returning empty at
+`WardrobeTab2.cpp:7146`. Geometry is correct; only material binding is missing.
+
 ## Do this next, in order
 
-1. **Run `Check Encrypted Render.bat`.** No rebuild needed. Close the Wardrobe
+1. **Numeric material path.** `MaterialDecode::appearanceRoster` (MaterialDecode.cpp:179) opens `Appearance/<name>.app.json` and returns empty for encrypted assets. Needs a CASC fallback: appearance meta -> material SNOs -> `Material/<sno>` meta -> texture SNOs. Note the MATERIALS panel already shows a SNO column, so material SNOs are reachable somewhere — start by finding where that column is populated and whether it has a binary route. Serves all 125 readable encrypted appearances.
    tab first (its cloth sim writes ~1 line/second and buries everything), select
    `necF_stor245_TRS` in Models, then run it. It greps for
    `loadGeometry: parse produced no geometry`, which is emitted **only** when
