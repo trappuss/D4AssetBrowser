@@ -1116,12 +1116,16 @@ reading the right blob out of packed storage.</p>
         gf->addRow(QStringLiteral("Target size:"), gifTarget);
 
         exChk(gf, QStringLiteral("export/gifCropToModel"),
-            QStringLiteral("Crop to model"), false,
-            QStringLiteral("Trim the empty margin around the model, so the GIF is the subject rather\n"
-                           "than the viewport. One box for the whole animation (the union of every\n"
-                           "frame's silhouette), so the model doesn't swim around as the crop\n"
-                           "follows it. Costs no extra rendering, and fewer pixels means a smaller\n"
-                           "file at the same quality."));
+            QStringLiteral("Crop to model  (images and GIFs)"), false,
+            QStringLiteral("Trim the empty margin around the model, so the capture is the subject\n"
+                           "rather than the viewport. Applies to Save preview image and to both\n"
+                           "GIF exports.\n\n"
+                           "A GIF uses ONE box for the whole animation — the union of every frame's\n"
+                           "silhouette — so the model doesn't swim around as the crop follows it.\n\n"
+                           "Costs no extra rendering: an opaque capture renders with the backdrop\n"
+                           "drawn but alpha left as model coverage, which is what locates the\n"
+                           "subject, and the alpha is stripped again once the box is known. Fewer\n"
+                           "pixels also means a smaller file at the same quality."));
 
         // One transparency path — native alpha, a single render. The "Transparency method" choice
         // that used to sit here offered difference matting as the alternative, which cost a second

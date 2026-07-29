@@ -271,14 +271,21 @@ bool ExportCapture::saveImage(GLModelWidget* view, const QString& path)
     // anti-aliasing); at or below it the viewport grab is resampled down. Upscaling a grab would
     // only invent pixels, so it is not offered.
     const int pct = qBound(25, QSettings().value(QStringLiteral("export/imageScale"), 100).toInt(), 400);
+    // "Crop to model" is one setting for every capture, not a GIF-only one. An opaque still needs
+    // the coverage render for the same reason a GIF frame does — it is the only way to know where
+    // the model is — and the alpha is stripped again once the box is known.
+    const bool wantCrop  = cropEnabled();
+    const bool coverage  = wantCrop && !wantT;
     QImage img;
     if (pct > 100) {
         const int factor = qBound(2, (pct + 99) / 100, 4);   // 2x covers 101..200, 3x 201..300, 4x above
         // The capture flags have to be live across the render, not just the grab.
-        if (wantT) view->setTransparentClear(true);
+        if (wantT)    view->setTransparentClear(true);
+        if (coverage) view->setCoverageAlpha(true);
         img = view->grabSupersampled(factor);
-        if (wantT) view->setTransparentClear(false);
-        if (img.isNull()) img = captureFrame(view, wantT);   // driver refused the size — ship 1x
+        if (wantT)    view->setTransparentClear(false);
+        if (coverage) view->setCoverageAlpha(false);
+        if (img.isNull()) img = captureFrame(view, wantT, coverage);   // driver refused — ship 1x
         else {
             img = img.convertToFormat(QImage::Format_RGBA8888);
             // Land on the requested percentage rather than the whole factor it was rendered at.
@@ -288,12 +295,31 @@ bool ExportCapture::saveImage(GLModelWidget* view, const QString& path)
                                  Qt::IgnoreAspectRatio, Qt::SmoothTransformation);
         }
     } else {
-        img = captureFrame(view, wantT);
+        img = captureFrame(view, wantT, coverage);
         if (!img.isNull() && pct < 100)
             img = img.scaled(qMax(1, img.width() * pct / 100), qMax(1, img.height() * pct / 100),
                              Qt::IgnoreAspectRatio, Qt::SmoothTransformation);
     }
     if (img.isNull()) return false;
+
+    // Cropped AFTER the resolution step, so the percentage still means "relative to the viewport"
+    // and the crop simply trims what is left. Runs through the same cropFramesToModel the GIF path
+    // uses — one implementation, so the two cannot frame a subject differently.
+    if (wantCrop) {
+        img = img.convertToFormat(QImage::Format_RGBA8888);
+        int cw = img.width(), ch = img.height();
+        std::vector<std::vector<uint8_t>> one(1);
+        one[0].resize(size_t(cw) * size_t(ch) * 4u);
+        for (int y = 0; y < ch; ++y)
+            std::memcpy(one[0].data() + size_t(y) * size_t(cw) * 4u,
+                        img.constScanLine(y), size_t(cw) * 4u);
+        const int fw = cw, fh = ch;
+        if (cropFramesToModel(one, cw, ch, /*keepAlpha=*/wantT)) {
+            img = QImage(reinterpret_cast<const uchar*>(one[0].data()), cw, ch,
+                         QImage::Format_RGBA8888).copy();   // copy: the vector dies with this scope
+            qInfo("image: cropped to model — %dx%d from %dx%d", cw, ch, fw, fh);
+        }
+    }
     if (!alphaOk) img = img.convertToFormat(QImage::Format_RGB888);
 
     // -1 lets Qt pick the format's own default; only a deliberate setting overrides it.
@@ -301,8 +327,8 @@ bool ExportCapture::saveImage(GLModelWidget* view, const QString& path)
     const bool lossy = (ext == QLatin1String("jpg") || ext == QLatin1String("jpeg")
                         || ext == QLatin1String("webp"));
     const bool ok = img.save(path, nullptr, lossy ? q : -1);
-    qInfo("image: %s %dx%d%s", qPrintable(ext.toUpper()), img.width(), img.height(),
-          pct > 100 ? " (supersampled)" : "");
+    qInfo("image: %s %dx%d%s%s", qPrintable(ext.toUpper()), img.width(), img.height(),
+          pct > 100 ? " (supersampled)" : "", wantCrop ? " (cropped)" : "");
     return ok;
 }
 
