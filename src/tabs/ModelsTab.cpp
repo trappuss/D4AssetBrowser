@@ -5938,20 +5938,51 @@ void ModelsTab::showAppearance(int sno, const QString& name)
                             .arg(it.key(), 8).arg(it.value(), -34)
                             .arg(offs.isEmpty() ? QStringLiteral("ABSENT") : offs.join(QLatin1Char(' ')));
             }
-            // A stride is only meaningful when the hits are in the same order as the material list.
+            // Stride must be measured in OFFSET order, not sno order. matBySno is a QMap keyed by
+            // sno, so the first pass compared hits sorted by sno value and reported perfectly good
+            // tables as "not uniform" (and one as "-72 bytes"). The array does not care what the
+            // sno values are.
+            std::sort(firstHit.begin(), firstHit.end());
             QString stride = QStringLiteral("n/a");
+            int recSize = 0;
             if (firstHit.size() >= 2) {
                 bool uniform = true;
                 const int d0 = firstHit[1] - firstHit[0];
                 for (int i = 2; i < firstHit.size(); ++i)
                     if (firstHit[i] - firstHit[i - 1] != d0) { uniform = false; break; }
+                if (uniform) recSize = d0;
                 stride = uniform ? QStringLiteral("UNIFORM %1 bytes").arg(d0)
                                  : QStringLiteral("not uniform");
             }
+
+            // Where does the array START? The base moves per appearance, so something in the meta
+            // must point at it. D4 meta uses (offset,size) array descriptors — ModelParser's arr()
+            // helper already relies on that convention — so the base, or a value a few bytes below
+            // it (the sno need not be the record's first field), should appear as a u32 somewhere.
+            // Reported with the count sitting right after each candidate, since a descriptor is a
+            // PAIR and a matching count is what separates a real one from a coincidence.
+            QString ptr = QStringLiteral("(need 1+ hit)");
+            if (!firstHit.isEmpty()) {
+                const int base = firstHit.first();
+                QStringList cands;
+                for (int back = 0; back <= 64 && cands.size() < 8; back += 4) {
+                    const quint32 want = quint32(base - back);
+                    for (int off = 0; off + 8 <= meta.size() && cands.size() < 8; off += 4) {
+                        if (u32at(off) != want) continue;
+                        cands << QStringLiteral("@0x%1=base-%2,next=%3")
+                                     .arg(off, 0, 16).arg(back).arg(u32at(off + 4));
+                    }
+                }
+                ptr = cands.isEmpty() ? QStringLiteral("NO POINTER FOUND") : cands.join(QLatin1Char(' '));
+            }
+
             qInfo().noquote() << QStringLiteral(
-                "matsno: %1 (sno %2) — meta %3 B, %4 of %5 material sno(s) found, stride %6%7")
+                "matsno: %1 (sno %2) — meta %3 B, %4 of %5 sno(s), stride %6, rec %7, base 0x%8"
+                "\n    ptr candidates: %9%10")
                 .arg(name).arg(sno).arg(meta.size()).arg(found).arg(matBySno.size())
-                .arg(stride).arg(line);
+                .arg(stride).arg(recSize)
+                .arg(firstHit.isEmpty() ? 0 : firstHit.first(), 0, 16)
+                .arg(ptr).arg(line);
         }
     }
 }
