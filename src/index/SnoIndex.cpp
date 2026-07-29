@@ -134,12 +134,23 @@ bool SnoIndex::loadFromCasc(CascReader& casc)
 // Stored AFTER exclude+sort, so a warm launch is a bulk read straight into m_byGroup.
 static constexpr quint32 kTocCacheMagic = 0x544F4331;   // 'TOC1'
 
-static QString tocCachePath() { return AppPaths::dataDir() + QStringLiteral("/coretoc_v1.bin"); }
+// v2: entry NAMES changed meaning — encrypted appearances now carry the name recovered from their
+// cloth data instead of "~unnamed_<sno>". A v1 cache is still perfectly valid data, which is exactly
+// the problem: it loads clean, the recovery pass is skipped because it only runs on a cache MISS,
+// and the recovered pieces silently never appear. Bump the filename so one rebuild re-runs it.
+static QString tocCachePath() { return AppPaths::dataDir() + QStringLiteral("/coretoc_v2.bin"); }
 
 bool SnoIndex::loadFromCache(const QString& sig)
 {
     clear();
     if (sig.isEmpty()) return false;
+    // Superseded cache versions are dead weight, not history — v1 alone is 33 MB. Removed on the
+    // first load after a bump so the data folder doesn't accumulate one full index per version.
+    for (const char* old : {"/coretoc_v1.bin"}) {
+        const QString stale = AppPaths::dataDir() + QLatin1String(old);
+        if (QFile::exists(stale) && QFile::remove(stale))
+            qInfo().noquote() << "SnoIndex: removed superseded index cache" << stale;
+    }
     QFile f(tocCachePath());
     if (!f.open(QIODevice::ReadOnly)) return false;
     const QByteArray all = f.readAll();
