@@ -64,6 +64,14 @@ public:
     // The TACT key an sno's payload is encrypted with, or empty when it is not encrypted. Read from
     // the BLTE frame header only — no decode, no decompression — so it is cheap enough to call once
     // per row while filtering a list. Second form says whether that key is actually loaded.
+    // Which payload file an sno's geometry actually came from. readPayloadBySno tries
+    // base/payload/<sno> and FALLS BACK to base/paylow/<sno>, so a piece whose full-detail payload
+    // is encrypted under a key we lack can silently be served the low-detail one instead — a valid
+    // blob that does not match the meta describing it. Stored (compressed) sizes; 0 when absent.
+    // No decode, so it is safe to call from a failure path.
+    struct PayloadVariants { quint64 payload = 0; quint64 paylow = 0; };
+    PayloadVariants payloadVariants(quint64 sno);
+
     QByteArray tactKeyFor(quint64 sno);
     bool       haveTactKey(const QByteArray& keyName) const;
     // Stored size of a file by virtual path, or 0 if absent.

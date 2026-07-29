@@ -7129,6 +7129,18 @@ void ModelsTab::applyLoadedGeometry(std::shared_ptr<ModelGeometry> geo, int toke
         // Parse succeeded (produced no geometry) — not a crash, so clear the guard.
         { QSettings s; s.setValue(QStringLiteral("models/loadGuard"), -1); s.sync(); }
         qWarning("loadGeometry: parse produced no geometry");
+        // Which payload file fed that parse. readPayloadBySno silently falls back from
+        // base/payload to base/paylow, so a meta paired with the WRONG blob looks exactly like a
+        // parser bug from here. Printing both stored sizes makes the substitution visible: a
+        // present-but-unreadable payload alongside a readable paylow is the tell.
+        if (m_reader && m_reader->isReady()) {
+            const auto pv = m_reader->payloadVariants(quint64(m_curSno));
+            const QByteArray kn = m_reader->tactKeyFor(quint64(m_curSno));
+            qWarning("loadGeometry:   sno %d — payload %llu B stored, paylow %llu B stored, "
+                     "tact key %s (%s)", m_curSno, pv.payload, pv.paylow,
+                     kn.isEmpty() ? "none" : kn.toHex().constData(),
+                     kn.isEmpty() ? "unencrypted" : (m_reader->haveTactKey(kn) ? "held" : "MISSING"));
+        }
         if (m_exportBtn) m_exportBtn->setEnabled(false);
         if (m_modelView)
             m_modelView->setOverlayText(QStringLiteral(

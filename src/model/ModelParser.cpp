@@ -163,6 +163,47 @@ const VElem* findElem(const VLayout& L, int sem)
 struct VB { int fileOffset, arrayIndex, stride, dataOffset, dataSize; bool fOptional; };
 struct IB { int fileOffset, arrayIndex, dataOffset, dataSize; bool fOptional; };
 
+// Why did scanVertexBuffers come back empty? The scan is a filter chain, and "0 results" conflates
+// two completely different faults: a meta that contains NO buffer records at all, versus a meta full
+// of perfectly good records that were all rejected because the PAYLOAD we were handed is not the one
+// they describe. Those point in opposite directions, so the counts are attributed per filter and the
+// largest extent any record asked for is reported next to the payload we actually have.
+struct VbScanDiag {
+    int magicHits = 0;      // offsets whose u32 is a buffer-record marker (4 / 6 / 27)
+    int strideOk  = 0;      // ... and whose stride is 36 or 44
+    int offsetsOk = 0;      // ... and whose dataOffset/dataSize are both positive
+    int rangeOk   = 0;      // ... and which fit inside the payload
+    int strideDiv = 0;      // ... and whose dataSize is a whole number of vertices
+    int accepted  = 0;      // ... and whose fOptional flag is sane
+    qint64 maxExtent = 0;   // largest dataOffset+dataSize seen at the offsetsOk stage
+};
+
+VbScanDiag diagVertexBuffers(const Reader& meta, int payloadSize)
+{
+    VbScanDiag d;
+    for (int off = 0; off + 80 <= meta.n; off += 4) {
+        const quint32 vbf = meta.u32(off);
+        if (vbf != 4 && vbf != 6 && vbf != 27) continue;
+        ++d.magicHits;
+        const int stride = int(meta.u32(off + 4));
+        if (stride != STRIDE_SIMPLE && stride != STRIDE_SKINNED) continue;
+        ++d.strideOk;
+        const int dataOffset = int(meta.u32(off + 0x38));
+        const int dataSize   = int(meta.u32(off + 0x3C));
+        if (dataOffset <= 0 || dataSize <= 0) continue;
+        ++d.offsetsOk;
+        d.maxExtent = qMax(d.maxExtent, qint64(dataOffset) + qint64(dataSize));
+        if (qint64(dataOffset) + qint64(dataSize) > qint64(payloadSize)) continue;
+        ++d.rangeOk;
+        if (dataSize % stride != 0) continue;
+        ++d.strideDiv;
+        const quint32 fOpt = meta.u32(off + 0x4C);
+        if (fOpt != 0 && fOpt != 1) continue;
+        ++d.accepted;
+    }
+    return d;
+}
+
 QVector<VB> scanVertexBuffers(const Reader& meta, int payloadSize)
 {
     QVector<VB> out;
@@ -802,8 +843,23 @@ ModelGeometry ModelParser::parseApp(const QByteArray& metaBytes, const QByteArra
     const QVector<VB> vbs = scanVertexBuffers(meta, payload.n);
     const QVector<IB> ibs = scanIndexBuffers(meta, payload.n, vbs);
     if (vbs.isEmpty() || ibs.isEmpty()) {
+        const VbScanDiag d = diagVertexBuffers(meta, payload.n);
         qWarning("model-parse: GATE no-buffers — %d vertex buffer(s), %d index buffer(s) found",
                  int(vbs.size()), int(ibs.size()));
+        qWarning("model-parse:   vb filter chain — %d magic, %d stride-ok, %d offsets-ok, "
+                 "%d in-range, %d stride-divisible, %d accepted",
+                 d.magicHits, d.strideOk, d.offsetsOk, d.rangeOk, d.strideDiv, d.accepted);
+        qWarning("model-parse:   meta wants up to %lld payload byte(s); we have %d "
+                 "(meta %d B) — %s",
+                 d.maxExtent, payload.n, meta.n,
+                 d.magicHits == 0
+                     ? "meta carries NO buffer records — this appearance stores geometry some other way"
+                 : d.offsetsOk > 0 && d.rangeOk == 0
+                     ? "records exist but ALL fall outside the payload — WRONG PAYLOAD "
+                       "(paylow/LOD substitution or a truncated read) rather than a parser fault"
+                 : d.strideOk == 0
+                     ? "records exist but no stride is 36/44 — unhandled vertex format"
+                     : "records exist and fit — rejected later in the chain");
         return geo;
     }
 

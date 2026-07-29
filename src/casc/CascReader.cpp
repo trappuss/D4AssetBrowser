@@ -993,6 +993,23 @@ QByteArray CascReader::readMetaBySno(quint64 sno)
     return readFile(QStringLiteral("base/meta/%1").arg(sno));
 }
 
+CascReader::PayloadVariants CascReader::payloadVariants(quint64 sno)
+{
+    QMutexLocker lock(&m_mutex);
+    PayloadVariants v;
+    if (!m_ready) return v;
+    quint64* slot[2] = { &v.payload, &v.paylow };
+    const QString paths[2] = { QStringLiteral("base/payload/%1").arg(sno),
+                               QStringLiteral("base/paylow/%1").arg(sno) };
+    for (int i = 0; i < 2; ++i) {
+        for (const QByteArray& ek : m_root.value(paths[i].toLower())) {
+            auto it = m_index.constFind(ek);
+            if (it != m_index.constEnd()) *slot[i] += it.value().size;
+        }
+    }
+    return v;
+}
+
 QByteArray CascReader::tactKeyFor(quint64 sno)
 {
     QMutexLocker lock(&m_mutex);
