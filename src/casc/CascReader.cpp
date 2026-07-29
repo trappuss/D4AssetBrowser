@@ -376,7 +376,16 @@ QByteArray CascReader::readArchive(const IndexEntry& e) const
     return blteDecode(comp.mid(ARCHIVE_FRAME_HEADER));
 }
 
-QByteArray CascReader::decryptFrame(const QByteArray& data, int blockIndex) const
+// How the Salsa20 nonce is built from the frame's IV and its block index. Both constructions are in
+// circulation in CASC implementations and they AGREE for block index 0, so a single-frame file
+// cannot distinguish them — which is precisely why this went unnoticed until a 27-frame payload
+// turned up. Rather than pick one by argument, both are tried and the chunk header's declared
+// uncompressed length decides, so the choice is verified against the data every time.
+//   0 = append the block index to the IV, then take 8 bytes (the original behaviour)
+//   1 = XOR the block index into the IV's first 4 bytes, then pad to 8
+static constexpr int kNonceVariants = 2;
+
+QByteArray CascReader::decryptFrame(const QByteArray& data, int blockIndex, int variant) const
 {
     if (data.isEmpty()) return {};
     const int keyLen = quint8(data[0]);
@@ -415,25 +424,44 @@ QByteArray CascReader::decryptFrame(const QByteArray& data, int blockIndex) cons
         return {};
     }
     QByteArray nonce = iv;
-    char bi[4]; qToLittleEndian(quint32(blockIndex), reinterpret_cast<uchar*>(bi));
-    nonce.append(bi, 4);
-    nonce = nonce.left(8);
+    if (variant == 0) {
+        char bi[4]; qToLittleEndian(quint32(blockIndex), reinterpret_cast<uchar*>(bi));
+        nonce.append(bi, 4);
+        nonce = nonce.left(8);
+    } else {
+        for (int i = 0; i < 4 && i < nonce.size(); ++i)
+            nonce[i] = char(uchar(nonce[i]) ^ uchar((quint32(blockIndex) >> (8 * i)) & 0xFF));
+    }
     while (nonce.size() < 8) nonce.append('\0');
+    nonce = nonce.left(8);
     const QByteArray ks = salsa20Keystream(key, nonce, enc.size());
     QByteArray dec(enc.size(), '\0');
     for (int i = 0; i < enc.size(); ++i) dec[i] = enc[i] ^ ks[i];
     return dec;
 }
 
-QByteArray CascReader::decompressFrame(quint8 type, const QByteArray& data, int blockIndex) const
+QByteArray CascReader::decompressFrame(quint8 type, const QByteArray& data, int blockIndex,
+                                       int expectUncomp) const
 {
     switch (type) {
     case 0x4E: return data;                       // 'N' raw
     case 0x5A: return zlibInflate(data);          // 'Z' zlib
     case 0x45: {                                  // 'E' encrypted (Salsa20)
-        const QByteArray dec = decryptFrame(data, blockIndex);
-        if (dec.isEmpty()) return {};
-        return decompressFrame(quint8(dec[0]), dec.mid(1), blockIndex);
+        // Try each nonce construction and keep the one the chunk header vouches for. A wrong nonce
+        // yields plausible-looking bytes whose first byte is then read as a frame type, so testing
+        // the DECOMPRESSED LENGTH is the only check that actually discriminates — an inner type
+        // byte of 'N' passes by luck roughly once in 256.
+        QByteArray fallback;
+        for (int v = 0; v < kNonceVariants; ++v) {
+            const QByteArray dec = decryptFrame(data, blockIndex, v);
+            if (dec.isEmpty()) continue;          // no key — no variant will help
+            const QByteArray out = decompressFrame(quint8(dec[0]), dec.mid(1), blockIndex,
+                                                   expectUncomp);
+            if (expectUncomp >= 0 && out.size() == expectUncomp) return out;
+            if (fallback.isEmpty()) fallback = out;
+            if (expectUncomp < 0) return out;     // nothing to verify against — first result stands
+        }
+        return fallback;
     }
     case 0x46: {                                  // 'F' LZ4 frame
         LZ4F_decompressionContext_t ctx = nullptr;
@@ -514,7 +542,7 @@ QByteArray CascReader::blteDecode(const QByteArray& data) const
         const QByteArray frame = data.mid(dataPos, comp);
         dataPos += comp;
         if (frame.isEmpty()) continue;
-        const QByteArray dec = decompressFrame(quint8(frame[0]), frame.mid(1), bi);
+        const QByteArray dec = decompressFrame(quint8(frame[0]), frame.mid(1), bi, uncomp);
         if (dec.size() != uncomp) {
             if (++badFrames == 1) {
                 firstBad = bi;

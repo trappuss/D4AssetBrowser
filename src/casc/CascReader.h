@@ -110,8 +110,14 @@ private:
 
     // BLTE + frame decode
     QByteArray blteDecode(const QByteArray& data) const;
-    QByteArray decompressFrame(quint8 type, const QByteArray& data, int blockIndex) const;
-    QByteArray decryptFrame(const QByteArray& data, int blockIndex) const;
+    // expectUncomp: the chunk header's declared uncompressed length, or -1 when unknown. Used to
+    // VERIFY an 'E' frame decrypted correctly rather than assuming it did — see kNonceVariants.
+    QByteArray decompressFrame(quint8 type, const QByteArray& data, int blockIndex,
+                               int expectUncomp = -1) const;
+    // variant selects how the Salsa20 nonce combines the IV with the block index. Frame 0 cannot
+    // tell the constructions apart (block index 0 is a no-op in both), which is why a bug here only
+    // shows on multi-frame files.
+    QByteArray decryptFrame(const QByteArray& data, int blockIndex, int variant = 0) const;
 
     bool        m_ready = false;
     QString     m_gameDir;
