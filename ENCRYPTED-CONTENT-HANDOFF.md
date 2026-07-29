@@ -95,83 +95,74 @@ Verified after fix: zero `BLTE: INCOMPLETE`, zero `model-parse: GATE`, and both
 
 ## Open problem: recovered pieces render UNTEXTURED
 
-`necF_stor245_TRS` (sno 2519633) is now in the index and searchable, but shows
-"This asset has no displayable geometry" with every INFO field blank except
-Filesize. **Two independent silent failures:**
+Geometry is correct and complete. Only material binding is missing.
 
-### 1. INFO panel — confirmed, name/JSON-driven
-
-`ModelsTab.cpp:5736`:
-
-```cpp
-QFile f(QStringLiteral("%1/json/base/meta/Appearance/%2.app.json").arg(d4, name));
-if (!f.open(QIODevice::ReadOnly))
-    return;                 // NO LOG
-```
-
-Filesize comes from CASC just above; Format, Bounds, LODs, Bones, Materials and
-Textures all come from that JSON, by name. Encrypted assets have none.
-Same by-name pattern at `5807`, `6781`, `7149`, `7164`, `6300`.
-
-### 2. Geometry — needs one measurement to pin down
-
-`ModelsTab.cpp:7101` loads **two separate CASC files**:
-
-```cpp
-const QByteArray meta    = reader->readMetaBySno(quint64(sno));   // base/meta/<sno>
-const QByteArray payload = reader->readPayloadBySno(quint64(sno)); // base/payload/<sno>
-if (!meta.isEmpty() && !payload.isEmpty())
-    *geo = ModelParser::parseApp(meta, payload);                   // guard is SILENT
-```
-
-The dump only ever read the **payload** for group 9, so whether the **meta** is
-readable was never established.
-
-All 12 early exits in `ModelParser::parseApp` are silent (lines 790, 791, 797,
-817, 820, 823, 824, 834, 892, 921, 932, 945). The only warning, line 919, fires
-only when `droppedSubs > 0`, so a mesh with zero usable sub-objects is silent too.
-
-### Confirmed symptom (Wardrobe, Necromancer Female)
-
+**Confirmed symptom** (Wardrobe -> Necromancer -> Female -> Torso -> stor245):
 PARTS lists base pieces with real material names (`necF_base01_GLV_mat`,
 `armor_skin_mat`, `necF_base01_BTS_mat`) but every stor245 sub-object as
-`part 7`, `part 8`, ... and MATERIALS shows 10 entries, none from stor245.
-That is `roster.value(p.materialIndex)` returning empty at
-`WardrobeTab2.cpp:7146`. Geometry is correct; only material binding is missing.
+`part 7`, `part 8`, ... and MATERIALS shows 10 entries, **none** from stor245.
+
+**Cause.** `WardrobeTab2.cpp:7145-7146`:
+
+```cpp
+const QStringList roster = MaterialDecode::appearanceRoster(d4, name);
+for (MeshPrimitive& p : geo.primitives) p.materialName = roster.value(p.materialIndex);
+```
+
+`appearanceRoster` (`MaterialDecode.cpp:179`) opens
+`json/base/meta/Appearance/<name>.app.json` and returns an empty list when the
+file is absent — which it always is for encrypted content, because the d4data
+dump cannot contain what it could not decrypt. Empty roster -> empty
+`materialName` -> no material, no texture, white render, `part N` labels.
+
+The Models tab INFO panel fails the same way at `ModelsTab.cpp:5736` (silent
+`return` on the same missing JSON), which is why Format/Bounds/LODs/Bones/
+Materials/Textures are all `—` while Filesize (from CASC) is correct. Same
+by-name pattern at `5807`, `6781`, `7149`, `7164`, `6300`.
 
 ## Do this next, in order
 
-1. **Numeric material path.** `MaterialDecode::appearanceRoster` (MaterialDecode.cpp:179) opens `Appearance/<name>.app.json` and returns empty for encrypted assets. Needs a CASC fallback: appearance meta -> material SNOs -> `Material/<sno>` meta -> texture SNOs. Note the MATERIALS panel already shows a SNO column, so material SNOs are reachable somewhere — start by finding where that column is populated and whether it has a binary route. Serves all 125 readable encrypted appearances.
-   tab first (its cloth sim writes ~1 line/second and buries everything), select
-   `necF_stor245_TRS` in Models, then run it. It greps for
-   `loadGeometry: parse produced no geometry`, which is emitted **only** when
-   `parseApp` actually ran.
+1. **Numeric material path** — the main job. `appearanceRoster` needs a CASC
+   fallback used when the JSON is absent: appearance meta -> material SNOs ->
+   `Material/<sno>` meta -> texture SNOs, never touching a name.
+   Starting point: the MATERIALS panel already shows a **SNO column**, so
+   material SNOs are reachable somewhere. Find where that column is populated
+   and whether it has a binary route or is also JSON-derived. Serves all **125**
+   readable encrypted appearances, not just the 30 that got names.
 
-2. **If that line is ABSENT** — `parseApp` was never called, so `readMetaBySno`
-   returned empty. The meta file, not the payload, is the blocker. Extend the
-   dump to print meta size alongside payload size for group 9, and check
-   `EncryptedSNOs.dat.json` for whether `base/meta/<sno>` sits under a different
-   key.
+2. **Multi-vertex-buffer gap** — separate, pre-existing, still open. `ModelParser`
+   decodes only vertex buffer 0; **156 of 1500** wardrobe appearances have LOD0
+   sub-objects on another buffer and lose them (`barF_base00` 14/31). The log
+   still shows ~37 drops per session. `nVertOffset` is per-buffer relative, so
+   dropping is the safe failure. Proper fix = decode each buffer with its own
+   layout and merge. Core geometry path — use `Cloth Audit.bat` as the regression
+   net.
 
-3. **If that line is PRESENT** — the failure is inside `parseApp`. Add a
-   one-line `qWarning` to each of the 12 early exits naming the gate. Worth doing
-   regardless: right now every parse failure anywhere in the tool is
-   indistinguishable from every other.
+3. **Optional: widen name recovery.** Only cloth-bearing pieces carry a ClothData
+   name, so helms/gloves/boots of a recovered set stay `~unnamed_<sno>`. Do NOT
+   infer them from SNO adjacency. A defensible route is class+slot from the item
+   (`tInvImages` for class, `snoItemType` for slot) synthesising e.g.
+   `necF_enc2519634_BTS` — honest about identity while still landing in the right
+   wardrobe cell.
 
-4. **Then** the INFO panel and material paths need a numeric fallback:
-   Appearance payload -> material SNOs -> texture SNOs, never touching a name.
-   That single change would serve all **125** readable encrypted appearances, not
-   just the 30 that got names.
+## Method notes worth keeping
 
-## Related, still open
-
-`ModelParser` only decodes vertex buffer 0. **156 of 1500** wardrobe appearances
-have LOD0 sub-objects on another buffer and lose them (`barF_base00` 14/31);
-`nVertOffset` is per-buffer relative, so dropping is the safe failure. Proper fix
-= decode each buffer with its own layout and merge. Core geometry path, wants its
-own pass with `Cloth Audit.bat` as the regression net.
+- **Stale artefacts caused two false diagnoses in one session.** An exe older than
+  the source, then a `coretoc_v1.bin` written before the recovery pass existed.
+  Both loaded clean and presented as "the feature does nothing". Check mtimes and
+  cache versions before theorising.
+- **Close the Wardrobe tab before reading the log.** Its cloth sim writes
+  ~1 line/second and buries the window you need.
+- **Silent early exits cost more than they save.** Twelve unlogged `return`s in
+  `parseApp` and a silent guard in `loadGeometry` made a CASC bug look like a
+  parser bug for several rounds. They are all instrumented now — keep it that way.
+- `verify-src.py` miscounts commas inside string literals as printf argument
+  separators. Use em dashes in log messages.
 
 ## Commits
 
-`66944da` index nameless records · `cf8bd79` TACT filter · `b034467` +
-`a7e2cc7` dump v1/v2 · `43667b7` name recovery · `a332e83` cache v2
+`66944da` index nameless records - `cf8bd79` TACT filter - `b034467` + `a7e2cc7`
+dump v1/v2 - `43667b7` name recovery - `a332e83` cache v2 - `d68141b` name the
+silent parser gates - `d9dbe40` no-buffers self-diagnosis - `d47a923` BLTE
+incomplete-decode reporting - `dd14fd7` BLTE nonce verification (**the fix**) -
+`e6882bf` nonce memo
