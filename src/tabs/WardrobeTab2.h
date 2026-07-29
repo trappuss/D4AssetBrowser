@@ -328,6 +328,7 @@ private:
     QLabel*      m_attachSep    = nullptr;   // "ATTACHED" rule inside the ANIMATIONS panel
     QListWidget* m_attachList   = nullptr;   // its clips, grouped by attachment
     bool         m_attachJustSelected = false;   // press already handled it; ignore the release
+    bool         m_ensembleJustSelected = false;  // same guard for the ensemble tiles
     void fillAttachList();          // attachments' clips, pinned under the character's
     void setAttachClip(const QString& appearance, const QString& clip);   // empty clip = stop it
     QTreeWidget* m_partTree = nullptr; // per-part visibility tree (piece → submeshes)

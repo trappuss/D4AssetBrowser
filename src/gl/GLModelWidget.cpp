@@ -5509,8 +5509,34 @@ QImage GLModelWidget::grabEnsembleThumb(int size)
     update();
 
     if (img.isNull()) return img;
-    const int sq = qMin(img.width(), img.height());   // centre-crop square, then scale down
-    return img.copy((img.width() - sq) / 2, (img.height() - sq) / 2, sq, sq)
+    // Crop to the MODEL, not to the middle of the viewport. The transparent clear above leaves
+    // alpha as pure character coverage, so the silhouette's bounding box is known exactly — a
+    // centre crop framed whatever the camera happened to be pointing at and left the character
+    // small and off-centre in the tile.
+    const int W = img.width(), H = img.height();
+    int x0 = W, y0 = H, x1 = -1, y1 = -1;
+    for (int y = 0; y < H; ++y) {
+        const uchar* row = img.constScanLine(y);
+        for (int x = 0; x < W; ++x)
+            if (row[x * 4 + 3] >= 8) {   // 8/255: anti-aliased edges fade to near-zero coverage
+                if (x < x0) x0 = x;
+                if (x > x1) x1 = x;
+                if (y < y0) y0 = y;
+                if (y > y1) y1 = y;
+            }
+    }
+    int sq, ox, oy;
+    if (x1 < 0) {                                  // nothing drawn — keep the old framing
+        sq = qMin(W, H); ox = (W - sq) / 2; oy = (H - sq) / 2;
+    } else {
+        // Square around the silhouette so the tile does not stretch it, with a little air, then
+        // clamped inside the frame.
+        const int bw = x1 - x0 + 1, bh = y1 - y0 + 1;
+        sq = qMin(qMin(W, H), int(qMax(bw, bh) * 1.08f) + 2);
+        ox = qBound(0, x0 + bw / 2 - sq / 2, W - sq);
+        oy = qBound(0, y0 + bh / 2 - sq / 2, H - sq);
+    }
+    return img.copy(ox, oy, sq, sq)
               .scaled(size, size, Qt::IgnoreAspectRatio, Qt::SmoothTransformation);
 }
 

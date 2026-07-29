@@ -5325,6 +5325,7 @@ void WardrobeTab2::refreshEnsembles()
 {
     if (!m_ensembleList) return;
     m_ensembleList->blockSignals(true);
+    m_ensembleJustSelected = false;   // the items below are about to be deleted
     m_ensembleList->clear();
     for (const QString& name : QSettings().value(QStringLiteral("wardrobe2/lookNames")).toStringList()) {
         const QString pfx = QStringLiteral("wardrobe2/looks/%1/").arg(name);
@@ -5415,6 +5416,19 @@ void WardrobeTab2::buildEnsemblePanel()
 
     connect(m_ensembleList, &QListWidget::itemDoubleClicked, this, [this](QListWidgetItem* it) {
         if (it) loadLook(it->data(Qt::UserRole).toString());
+    });
+    // Re-clicking the selected tile clears the selection — the same contract the clip lists use,
+    // and the only way to get Overwrite / Delete / Rename to stop pointing at an ensemble. The
+    // guard is needed because a FIRST click fires currentItemChanged on press and itemClicked on
+    // release, so without it the release would immediately undo the selection just made.
+    connect(m_ensembleList, &QListWidget::currentItemChanged, this,
+            [this](QListWidgetItem* it, QListWidgetItem*) { if (it) m_ensembleJustSelected = true; });
+    connect(m_ensembleList, &QListWidget::itemClicked, this, [this](QListWidgetItem* it) {
+        if (m_ensembleJustSelected) { m_ensembleJustSelected = false; return; }
+        if (it && it->isSelected()) {
+            m_ensembleList->setCurrentItem(nullptr);
+            m_ensembleList->clearSelection();   // current and selected are separate in Qt
+        }
     });
     connect(saveB, &QPushButton::clicked, this, [this] {
         bool ok = false;
