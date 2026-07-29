@@ -787,14 +787,25 @@ ModelGeometry ModelParser::parseApp(const QByteArray& metaBytes, const QByteArra
 {
     ModelGeometry geo;
     Reader meta(metaBytes), payload(payloadBytes);
-    if (meta.n < 0xC0 || meta.u32(0) != APP_META_MAGIC) return geo;
-    if (payload.n < 0x10) return geo;
+    if (meta.n < 0xC0 || meta.u32(0) != APP_META_MAGIC) {
+        qWarning("model-parse: GATE meta-header — meta %d bytes, magic %08x (want >=192 and %08x)",
+                 meta.n, meta.n >= 4 ? meta.u32(0) : 0u, APP_META_MAGIC);
+        return geo;
+    }
+    if (payload.n < 0x10) {
+        qWarning("model-parse: GATE payload-too-small — %d bytes", payload.n);
+        return geo;
+    }
     parseClothCapsules(meta, payload, geo.clothCapsules, geo.clothSims,
                        qEnvironmentVariableIsSet("D4_DUMP_CLOTH"), appName);
 
     const QVector<VB> vbs = scanVertexBuffers(meta, payload.n);
     const QVector<IB> ibs = scanIndexBuffers(meta, payload.n, vbs);
-    if (vbs.isEmpty() || ibs.isEmpty()) return geo;
+    if (vbs.isEmpty() || ibs.isEmpty()) {
+        qWarning("model-parse: GATE no-buffers — %d vertex buffer(s), %d index buffer(s) found",
+                 int(vbs.size()), int(ibs.size()));
+        return geo;
+    }
 
     // Record VB layouts for the informational VertexBuffers panel.
     for (const VB& vb : vbs) {
@@ -814,14 +825,29 @@ ModelGeometry ModelParser::parseApp(const QByteArray& metaBytes, const QByteArra
     if (!vb0 && !vbs.isEmpty()) vb0 = &vbs.first();
     const IB* ib0 = nullptr; for (const IB& i : ibs) if (i.fOptional) { ib0 = &i; break; }
     if (!ib0 && !ibs.isEmpty()) ib0 = &ibs.first();
-    if (!vb0 || !ib0) return geo;
+    if (!vb0 || !ib0) {
+        qWarning("model-parse: GATE no-chosen-buffer — vb0 %s, ib0 %s",
+                 vb0 ? "ok" : "null", ib0 ? "ok" : "null");
+        return geo;
+    }
 
     const int stride = vb0->stride;
-    if (stride <= 0) return geo;
+    if (stride <= 0) {
+        qWarning("model-parse: GATE bad-stride — %d", stride);
+        return geo;
+    }
     const int vcount = vb0->dataSize / stride;
     const VLayout layout = resolveLayout(stride, meta, vb0->fileOffset);
-    if (layout.elems.isEmpty()) return geo;
-    if (!payload.in(vb0->dataOffset, vb0->dataSize)) return geo;
+    if (layout.elems.isEmpty()) {
+        qWarning("model-parse: GATE no-vertex-layout — stride %d unresolved (not 36/44 and nothing "
+                 "parsed from meta)", stride);
+        return geo;
+    }
+    if (!payload.in(vb0->dataOffset, vb0->dataSize)) {
+        qWarning("model-parse: GATE vb-out-of-range — offset %u size %u, payload %d",
+                 vb0->dataOffset, vb0->dataSize, payload.n);
+        return geo;
+    }
 
     const VElem* ePos = findElem(layout, SEM_POSITION);
     const VElem* eNrm = findElem(layout, SEM_NORMAL);
@@ -831,7 +857,11 @@ ModelGeometry ModelParser::parseApp(const QByteArray& metaBytes, const QByteArra
     const VElem* eUv1 = findElem(layout, SEM_TEXCOORD_1);     // f16x2 second UV
     const VElem* eJnt = findElem(layout, SEM_BLENDINDICES);   // u8x4 (skinned)
     const VElem* eWgt = findElem(layout, SEM_BLENDWEIGHTS);   // unorm4 (skinned)
-    if (!ePos) return geo;
+    if (!ePos) {
+        qWarning("model-parse: GATE no-POSITION — layout has %d element(s), stride %d",
+                 int(layout.elems.size()), stride);
+        return geo;
+    }
 
     // Decode the full shared vertex stream (D4-native), applying z_up_to_y_up.
     QVector<MeshVertex> verts(vcount);
@@ -889,7 +919,11 @@ ModelGeometry ModelParser::parseApp(const QByteArray& metaBytes, const QByteArra
 
     // Raw u16 indices.
     const int icount = ib0->dataSize / 2;
-    if (!payload.in(ib0->dataOffset, ib0->dataSize)) return geo;
+    if (!payload.in(ib0->dataOffset, ib0->dataSize)) {
+        qWarning("model-parse: GATE ib-out-of-range — offset %u size %u, payload %d",
+                 ib0->dataOffset, ib0->dataSize, payload.n);
+        return geo;
+    }
     QVector<quint16> rawIdx(icount);
     for (int i = 0; i < icount; ++i) rawIdx[i] = payload.u16(ib0->dataOffset + i * 2);
 
@@ -918,7 +952,13 @@ ModelGeometry ModelParser::parseApp(const QByteArray& metaBytes, const QByteArra
     if (droppedSubs > 0)
         qWarning("model: %d sub-object(s) (~%u verts) sit on vertex buffer(s) other than %d and were "
                  "NOT loaded — this mesh is incomplete", droppedSubs, droppedVerts, vb0->arrayIndex);
-    if (lod0.isEmpty()) return geo;
+    if (lod0.isEmpty()) {
+        // droppedSubs==0 here means findSubObjects returned NOTHING, which is a different fault
+        // from "they all sat on another vertex buffer" — the warning above only fires for the latter.
+        qWarning("model-parse: GATE no-LOD0-sub-objects — %d dropped to other vertex buffers, "
+                 "chosen vb %d", droppedSubs, vb0->arrayIndex);
+        return geo;
+    }
 
     std::sort(lod0.begin(), lod0.end(), [](const SubObj& a, const SubObj& b){
         if (a.seg.io != b.seg.io) return a.seg.io < b.seg.io;
@@ -929,7 +969,11 @@ ModelGeometry ModelParser::parseApp(const QByteArray& metaBytes, const QByteArra
     for (const SubObj& s : lod0) {
         const int baseV = int(s.seg.vo) / stride;
         const int endIdx = int(s.seg.io + s.seg.ic);
-        if (endIdx > rawIdx.size()) return ModelGeometry();
+        if (endIdx > rawIdx.size()) {
+            qWarning("model-parse: GATE index-overrun — sub-object wants %d indices, buffer has %d",
+                     endIdx, int(rawIdx.size()));
+            return ModelGeometry();
+        }
         const QVector<int>& palette = s.seg.bonePalette;   // segment-local → global bone
         MeshPrimitive prim;
         prim.materialName = QStringLiteral("Material_%1").arg(s.mat);
@@ -942,7 +986,10 @@ ModelGeometry ModelParser::parseApp(const QByteArray& metaBytes, const QByteArra
             if (a == b || b == c || a == c) continue;       // drop degenerate
             const int g[3] = {a + baseV, b + baseV, c + baseV};
             for (int k = 0; k < 3; ++k) {
-                if (g[k] < 0 || g[k] >= vcount) return ModelGeometry();
+                if (g[k] < 0 || g[k] >= vcount) {
+                    qWarning("model-parse: GATE vertex-index-out-of-range — %d of %d", g[k], vcount);
+                    return ModelGeometry();
+                }
                 auto it = remap.constFind(g[k]);
                 quint32 local;
                 if (it == remap.constEnd()) {
