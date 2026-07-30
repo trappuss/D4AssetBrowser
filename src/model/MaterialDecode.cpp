@@ -122,7 +122,8 @@ QImage MaterialDecode::byRole(CascReader* reader, const QString& d4,
     // fall through to Map 2/3 (and likewise for any multi-slot role) so a single missing
     // texture no longer wipes the whole channel.
     for (const MatTexture& t : texList) {
-        if (t.role != want || t.texName.isEmpty()) continue;
+        // Not gated on texName: encrypted textures have none, and texture() no longer needs one.
+        if (t.role != want || t.texSno <= 0) continue;
         const QImage img = texture(reader, d4, t.texName, t.texSno);
         if (!img.isNull()) return img;
     }
