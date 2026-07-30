@@ -190,6 +190,11 @@ QString runMatSnoSweep(const QString& d4, SnoIndex* idx, CascReader* rd, QWidget
                     qInfo().noquote() << QStringLiteral("    path: ") + p;
         }
         qInfo("metadump: wrote %d sno blob(s)", wrote);
+        // One-shot namespace map. Textures resolve only to base/payload and base/paylow, so their
+        // dwWidth/dwHeight/eTexFormat live somewhere else entirely — possibly a by-NAME path, or a
+        // bulk container. Printing the whole census answers that without a rebuild per guess.
+        qInfo("metadump: TVFS namespace census —");
+        for (const QString& p : rd->rootPrefixCensus()) qInfo().noquote() << "    " << p;
     }
     const QString outDir = QCoreApplication::applicationDirPath();
     QFile csv(outDir + QStringLiteral("/matsno_sweep.csv"));

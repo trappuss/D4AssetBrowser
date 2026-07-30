@@ -73,6 +73,10 @@ public:
     // base/payload, base/paylow and base/meta; textures return nothing from all three, so their
     // definition lives somewhere else and guessing the path is what this exists to avoid.
     QStringList rootPathsFor(quint64 sno);
+    // Namespace census: every distinct path PREFIX (segments before the trailing id) with a count
+    // and one example. Textures have no base/meta/<sno>, so their definition is somewhere readFile
+    // never looks — this shows what namespaces exist instead of guessing one at a time.
+    QStringList rootPrefixCensus();
 
     struct PayloadVariants { quint64 payload = 0; quint64 paylow = 0; };
     PayloadVariants payloadVariants(quint64 sno);

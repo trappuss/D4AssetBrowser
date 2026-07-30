@@ -1076,6 +1076,35 @@ QByteArray CascReader::readMetaBySno(quint64 sno)
     return readFile(QStringLiteral("base/meta/%1").arg(sno));
 }
 
+QStringList CascReader::rootPrefixCensus()
+{
+    QMutexLocker lock(&m_mutex);
+    QHash<QString, int> counts;
+    QHash<QString, QString> example;
+    for (auto it = m_root.constBegin(); it != m_root.constEnd(); ++it) {
+        const QString& k = it.key();
+        const int slash = k.lastIndexOf(QLatin1Char('/'));
+        // Group by prefix, but only collapse the trailing segment when it is a bare number (a sno).
+        // Collapsing named leaves too would hide exactly the by-NAME namespace we are looking for.
+        QString pfx = k;
+        if (slash > 0) {
+            bool numeric = slash + 1 < k.size();
+            for (int i = slash + 1; i < k.size() && numeric; ++i)
+                numeric = k[i].isDigit();
+            if (numeric) pfx = k.left(slash) + QLatin1String("/<sno>");
+            else pfx = k.left(slash) + QLatin1String("/<name>");
+        }
+        ++counts[pfx];
+        if (!example.contains(pfx)) example.insert(pfx, k);
+    }
+    QStringList out;
+    for (auto it = counts.constBegin(); it != counts.constEnd(); ++it)
+        out << QStringLiteral("%1  x%2   e.g. %3").arg(it.key(), -44).arg(it.value(), 7)
+                   .arg(example.value(it.key()));
+    out.sort();
+    return out;
+}
+
 QStringList CascReader::rootPathsFor(quint64 sno)
 {
     QMutexLocker lock(&m_mutex);
