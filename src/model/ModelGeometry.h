@@ -188,6 +188,11 @@ struct ModelHardpoint {
 
 struct ModelGeometry {
     bool                   valid = false;
+    // LOD0 sub-objects that sit on a vertex buffer other than the one decoded, so they were NOT
+    // loaded. Non-zero means the mesh RENDERS BUT IS INCOMPLETE — it passes every "did it load?"
+    // check while visibly missing parts. Surfaced so an audit can count that as the defect it is.
+    int                    droppedSubObjects = 0;
+    unsigned               droppedVerts = 0;
     QVector<MeshPrimitive> primitives;
     QVector<ModelJoint>    skeleton;       // empty ⇒ static (rigid) model
     QVector<VertexBufferInfo> vertexBuffers;   // raw VB layouts (informational)

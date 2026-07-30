@@ -1005,6 +1005,8 @@ ModelGeometry ModelParser::parseApp(const QByteArray& metaBytes, const QByteArra
             ++droppedSubs; droppedVerts += s.seg.vc;
         }
     }
+    geo.droppedSubObjects = droppedSubs;
+    geo.droppedVerts = droppedVerts;
     if (droppedSubs > 0)
         qWarning("model: %d sub-object(s) (~%u verts) sit on vertex buffer(s) other than %d and were "
                  "NOT loaded — this mesh is incomplete", droppedSubs, droppedVerts, vb0->arrayIndex);

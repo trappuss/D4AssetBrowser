@@ -467,6 +467,7 @@ namespace {
 // cannot also be judged on materials, so the first failing stage is the one reported.
 enum class Health {
     Ok,            // geometry + materials + every material's textures resolve
+    Incomplete,    // renders, but LOD0 sub-objects were dropped — visibly missing parts
     NoTexDefs,     // materials resolve but no texture definition was found for them
     NoMaterials,   // geometry loads but the material list is empty
     NoGeometry,    // meta+payload present, parse produced nothing
@@ -478,6 +479,7 @@ const char* healthName(Health h)
 {
     switch (h) {
     case Health::Ok:          return "OK";
+    case Health::Incomplete:  return "INCOMPLETE-MESH";
     case Health::NoTexDefs:   return "NO-TEXTURE-DEFS";
     case Health::NoMaterials: return "NO-MATERIALS";
     case Health::NoGeometry:  return "NO-GEOMETRY";
@@ -497,7 +499,8 @@ QString runHealthAudit(const QString& d4, SnoIndex* idx, CascReader* rd, QWidget
     if (!csv.open(QIODevice::WriteOnly | QIODevice::Text))
         return QStringLiteral("health: cannot write asset_health.csv");
     QTextStream cs(&csv);
-    cs << "name,sno,status,encrypted,keyHeld,metaBytes,payloadBytes,prims,materials,texturesResolved\n";
+    cs << "name,sno,status,encrypted,keyHeld,metaBytes,payloadBytes,prims,materials,"
+          "texturesResolved,droppedSubObjects\n";
 
     TextureDefTable::instance().ensureBuilt(rd);
 
@@ -525,7 +528,7 @@ QString runHealthAudit(const QString& d4, SnoIndex* idx, CascReader* rd, QWidget
         const bool held = enc ? rd->haveTactKey(kn) : true;
 
         Health h = Health::Ok;
-        int prims = 0, mats = 0, texOk = 0;
+        int prims = 0, mats = 0, texOk = 0, geoDropped = 0;
 
         if (meta.isEmpty() || pay.isEmpty()) {
             // Distinguish "gated behind a key we lack" from "genuinely absent". Only the second is
@@ -534,6 +537,7 @@ QString runHealthAudit(const QString& d4, SnoIndex* idx, CascReader* rd, QWidget
         } else {
             const ModelGeometry geo = ModelParser::parseApp(meta, pay, e.name);
             prims = int(geo.primitives.size());
+            geoDropped = geo.droppedSubObjects;
             if (!geo.valid || prims == 0) {
                 h = Health::NoGeometry;
             } else {
@@ -554,6 +558,10 @@ QString runHealthAudit(const QString& d4, SnoIndex* idx, CascReader* rd, QWidget
                             if (TextureDefTable::instance().lookup(ts).valid()) { ++texOk; break; }
                     }
                     if (texOk == 0) h = Health::NoTexDefs;
+                    // Checked LAST so it cannot mask a harder failure, but it IS a defect: the
+                    // piece loads, passes every other check, and is missing parts on screen. This
+                    // is the class the audit would otherwise be completely blind to.
+                    else if (geo.droppedSubObjects > 0) h = Health::Incomplete;
                 }
             }
         }
@@ -564,7 +572,7 @@ QString runHealthAudit(const QString& d4, SnoIndex* idx, CascReader* rd, QWidget
 
         cs << e.name << ',' << e.snoId << ',' << healthName(h) << ',' << (enc ? "yes" : "no") << ','
            << (held ? "yes" : "no") << ',' << meta.size() << ',' << pay.size() << ',' << prims
-           << ',' << mats << ',' << texOk << '\n';
+           << ',' << mats << ',' << texOk << ',' << geoDropped << '\n';
     }
     prog.setValue(int(apps.size()));
     csv.close();
@@ -599,13 +607,14 @@ QString runHealthAudit(const QString& d4, SnoIndex* idx, CascReader* rd, QWidget
         QTextStream ts(&rep);
         ts << "ASSET HEALTH AUDIT\n==================\n\n"
            << "appearances scanned  " << scanned << "\n\n";
-        for (Health h : {Health::Ok, Health::NoTexDefs, Health::NoMaterials, Health::NoGeometry,
-                         Health::Locked, Health::NoData})
+        for (Health h : {Health::Ok, Health::Incomplete, Health::NoTexDefs, Health::NoMaterials,
+                         Health::NoGeometry, Health::Locked, Health::NoData})
             ts << QStringLiteral("  %1 %2\n").arg(QLatin1String(healthName(h)), -18)
                       .arg(tally.value(h), 8);
         ts << "\nLOCKED is not a defect — those need a TACT key we do not hold. Everything else\n"
               "above OK is something the tool should be able to show and cannot.\n";
-        for (Health h : {Health::NoTexDefs, Health::NoMaterials, Health::NoGeometry, Health::NoData}) {
+        for (Health h : {Health::Incomplete, Health::NoTexDefs, Health::NoMaterials,
+                         Health::NoGeometry, Health::NoData}) {
             if (examples.value(h).isEmpty()) continue;
             ts << "\n" << healthName(h) << " (first " << examples.value(h).size() << "):\n";
             for (const QString& n : examples.value(h)) ts << "  " << n << '\n';
