@@ -2823,6 +2823,15 @@ void WardrobeTab2::refresh()
     // like a 12-of-25 result. Same 1500 ms defer as the cloth audit so the window paints first.
     // D4_CHAINTEST=1 — verify the encrypted-content chain end to end, then quit. Seconds, not the
     // minutes the 63k-appearance derivation sweep costs, and it checks the thing that matters now.
+    // D4_HEALTH_AUDIT=1 — corpus-wide: what can and cannot be shown, and what CHANGED since the
+    // last run. This is the durable answer to "what else is missing?"; the chain test only proves
+    // the readers work on six known pieces.
+    if (qEnvironmentVariableIsSet("D4_HEALTH_AUDIT"))
+        QTimer::singleShot(1500, this, [this] {
+            const QString msg = runHealthAudit(Config::d4dataDir(), m_index, m_reader, this);
+            qInfo().noquote() << msg;
+            QCoreApplication::exit(0);
+        });
     if (qEnvironmentVariableIsSet("D4_CHAINTEST"))
         QTimer::singleShot(1500, this, [this] {
             const QString msg = runChainTest(Config::d4dataDir(), m_index, m_reader);

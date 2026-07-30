@@ -39,3 +39,13 @@ QString runMatSnoSweep(const QString& d4, SnoIndex* idx, CascReader* rd, QWidget
 // set of encrypted pieces plus named controls. Fast (seconds), and answers the one question the
 // derivation sweep never could: does the chain actually produce pixels?
 QString runChainTest(const QString& d4, SnoIndex* idx, CascReader* rd);
+
+// ── Corpus-wide asset health audit ──────────────────────────────────────────────────────────────
+// Walks EVERY appearance and classifies what it can and cannot produce: payload, geometry,
+// materials, texture definitions. Writes asset_health.csv (one row per appearance) plus a ranked
+// summary, and DIFFS against the previous run so a game patch or a new TACT key shows up as
+// "+312 now renderable, 4 newly broken" rather than as a bug report months later.
+//
+// This is the durable answer to "what else is missing?" — the six-sample chain test proves the
+// readers work, but only a full pass finds the pieces nobody has looked at yet.
+QString runHealthAudit(const QString& d4, SnoIndex* idx, CascReader* rd, QWidget* parent);

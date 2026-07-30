@@ -3,6 +3,10 @@
 #include "casc/CascReader.h"
 #include "index/SnoIndex.h"
 #include "model/MaterialDecode.h"
+#include "model/ModelParser.h"
+#include "tex/TextureDefTable.h"
+
+#include <QMap>
 
 #include <QImage>
 
@@ -454,4 +458,179 @@ QString runMatSnoSweep(const QString& d4, SnoIndex* idx, CascReader* rd, QWidget
                   .arg(withJson ? 100.0 * exact / withJson : 0.0, 0, 'f', 1);
     qInfo().noquote() << summary;
     return summary;
+}
+
+// ── Corpus-wide asset health audit (see MatSnoSweep.h) ──────────────────────────────────────────
+namespace {
+
+// One classification per appearance, most severe first. Ordering matters: a piece with no payload
+// cannot also be judged on materials, so the first failing stage is the one reported.
+enum class Health {
+    Ok,            // geometry + materials + every material's textures resolve
+    NoTexDefs,     // materials resolve but no texture definition was found for them
+    NoMaterials,   // geometry loads but the material list is empty
+    NoGeometry,    // meta+payload present, parse produced nothing
+    Locked,        // encrypted and we hold no key — not a defect, just gated
+    NoData,        // no meta or no payload in CASC at all
+};
+
+const char* healthName(Health h)
+{
+    switch (h) {
+    case Health::Ok:          return "OK";
+    case Health::NoTexDefs:   return "NO-TEXTURE-DEFS";
+    case Health::NoMaterials: return "NO-MATERIALS";
+    case Health::NoGeometry:  return "NO-GEOMETRY";
+    case Health::Locked:      return "LOCKED";
+    case Health::NoData:      return "NO-DATA";
+    }
+    return "?";
+}
+
+}  // namespace
+
+QString runHealthAudit(const QString& d4, SnoIndex* idx, CascReader* rd, QWidget* parent)
+{
+    if (!idx || !rd || !rd->isReady()) return QStringLiteral("health: reader not ready");
+    const QString outDir = QCoreApplication::applicationDirPath();
+    QFile csv(outDir + QStringLiteral("/asset_health.csv"));
+    if (!csv.open(QIODevice::WriteOnly | QIODevice::Text))
+        return QStringLiteral("health: cannot write asset_health.csv");
+    QTextStream cs(&csv);
+    cs << "name,sno,status,encrypted,keyHeld,metaBytes,payloadBytes,prims,materials,texturesResolved\n";
+
+    TextureDefTable::instance().ensureBuilt(rd);
+
+    const QVector<SnoEntry>& apps = idx->entries(kGroupAppearance);
+    QProgressDialog prog(QStringLiteral("Asset health: %1 appearances…").arg(apps.size()),
+                         QStringLiteral("Cancel"), 0, int(apps.size()), parent);
+    prog.setWindowModality(Qt::ApplicationModal);
+    prog.setMinimumDuration(0);
+
+    QMap<Health, int> tally;
+    QMap<Health, QStringList> examples;
+    QHash<QString, QString> current;   // name -> status, for the diff against last run
+    int scanned = 0;
+
+    for (const SnoEntry& e : apps) {
+        if ((++scanned % 128) == 0) {
+            prog.setValue(scanned);
+            QCoreApplication::processEvents();
+            if (prog.wasCanceled()) break;
+        }
+        const QByteArray meta = rd->readMetaBySno(quint64(e.snoId));
+        const QByteArray pay  = rd->readPayloadBySno(quint64(e.snoId));
+        const QByteArray kn   = rd->tactKeyFor(quint64(e.snoId));
+        const bool enc = !kn.isEmpty();
+        const bool held = enc ? rd->haveTactKey(kn) : true;
+
+        Health h = Health::Ok;
+        int prims = 0, mats = 0, texOk = 0;
+
+        if (meta.isEmpty() || pay.isEmpty()) {
+            // Distinguish "gated behind a key we lack" from "genuinely absent". Only the second is
+            // a defect; conflating them would bury real breakage under thousands of locked rows.
+            h = (enc && !held) ? Health::Locked : Health::NoData;
+        } else {
+            const ModelGeometry geo = ModelParser::parseApp(meta, pay, e.name);
+            prims = int(geo.primitives.size());
+            if (!geo.valid || prims == 0) {
+                h = Health::NoGeometry;
+            } else {
+                QStringList roster = MaterialDecode::appearanceRoster(d4, e.name);
+                if (roster.isEmpty()) roster = MaterialDecode::appearanceRosterFromMeta(meta, idx);
+                mats = 0;
+                for (const QString& m : roster) if (!m.isEmpty()) ++mats;
+                if (mats == 0) {
+                    h = Health::NoMaterials;
+                } else {
+                    // Texture DEFINITIONS only — no pixel decode. Resolving 140k textures through
+                    // BcDecode would turn a two-minute audit into an hour for no extra signal:
+                    // if the definition resolves, the decode path is the same one the chain test
+                    // already covers.
+                    for (const QString& m : roster) {
+                        if (m.isEmpty()) continue;
+                        for (const int ts : MaterialDecode::textureSnosFor(rd, d4, m))
+                            if (TextureDefTable::instance().lookup(ts).valid()) { ++texOk; break; }
+                    }
+                    if (texOk == 0) h = Health::NoTexDefs;
+                }
+            }
+        }
+
+        ++tally[h];
+        if (h != Health::Ok && examples[h].size() < 25) examples[h] << e.name;
+        current.insert(e.name, QLatin1String(healthName(h)));
+
+        cs << e.name << ',' << e.snoId << ',' << healthName(h) << ',' << (enc ? "yes" : "no") << ','
+           << (held ? "yes" : "no") << ',' << meta.size() << ',' << pay.size() << ',' << prims
+           << ',' << mats << ',' << texOk << '\n';
+    }
+    prog.setValue(int(apps.size()));
+    csv.close();
+
+    // ── Diff against the previous run ────────────────────────────────────────────────────────
+    // The whole point of auditing rather than spot-checking: after a patch or a new key, what
+    // CHANGED. A raw count is easy to skim past; "4 newly broken" is not.
+    const QString basePath = outDir + QStringLiteral("/asset_health_baseline.csv");
+    QHash<QString, QString> prev;
+    {
+        QFile bf(basePath);
+        if (bf.open(QIODevice::ReadOnly | QIODevice::Text)) {
+            QTextStream bs(&bf);
+            bs.readLine();   // header
+            while (!bs.atEnd()) {
+                const QStringList f = bs.readLine().split(QLatin1Char(','));
+                if (f.size() >= 3) prev.insert(f[0], f[2]);
+            }
+        }
+    }
+    QStringList fixed, broken;
+    if (!prev.isEmpty())
+        for (auto it = current.constBegin(); it != current.constEnd(); ++it) {
+            const QString was = prev.value(it.key());
+            if (was.isEmpty() || was == it.value()) continue;
+            if (it.value() == QLatin1String("OK")) fixed << it.key();
+            else if (was == QLatin1String("OK")) broken << it.key();
+        }
+
+    QFile rep(outDir + QStringLiteral("/asset_health.txt"));
+    if (rep.open(QIODevice::WriteOnly | QIODevice::Text)) {
+        QTextStream ts(&rep);
+        ts << "ASSET HEALTH AUDIT\n==================\n\n"
+           << "appearances scanned  " << scanned << "\n\n";
+        for (Health h : {Health::Ok, Health::NoTexDefs, Health::NoMaterials, Health::NoGeometry,
+                         Health::Locked, Health::NoData})
+            ts << QStringLiteral("  %1 %2\n").arg(QLatin1String(healthName(h)), -18)
+                      .arg(tally.value(h), 8);
+        ts << "\nLOCKED is not a defect — those need a TACT key we do not hold. Everything else\n"
+              "above OK is something the tool should be able to show and cannot.\n";
+        for (Health h : {Health::NoTexDefs, Health::NoMaterials, Health::NoGeometry, Health::NoData}) {
+            if (examples.value(h).isEmpty()) continue;
+            ts << "\n" << healthName(h) << " (first " << examples.value(h).size() << "):\n";
+            for (const QString& n : examples.value(h)) ts << "  " << n << '\n';
+        }
+        ts << "\n── CHANGE SINCE LAST RUN ──\n";
+        if (prev.isEmpty())
+            ts << "  no baseline yet — this run establishes one (asset_health_baseline.csv)\n";
+        else {
+            ts << QStringLiteral("  newly working  %1\n  newly BROKEN   %2\n")
+                      .arg(fixed.size()).arg(broken.size());
+            for (int i = 0; i < broken.size() && i < 40; ++i) ts << "    BROKE: " << broken[i] << '\n';
+            for (int i = 0; i < fixed.size() && i < 15; ++i)  ts << "    fixed: " << fixed[i] << '\n';
+        }
+        ts << "\nPer-appearance detail: asset_health.csv\n";
+        rep.close();
+    }
+    QFile::remove(basePath);
+    QFile::copy(outDir + QStringLiteral("/asset_health.csv"), basePath);
+
+    const QString head =
+        QStringLiteral("health: %1 OK, %2 locked, %3 broken (%4 newly broken, %5 newly working)")
+            .arg(tally.value(Health::Ok)).arg(tally.value(Health::Locked))
+            .arg(tally.value(Health::NoTexDefs) + tally.value(Health::NoMaterials)
+                 + tally.value(Health::NoGeometry) + tally.value(Health::NoData))
+            .arg(broken.size()).arg(fixed.size());
+    qInfo().noquote() << head;
+    return head;
 }

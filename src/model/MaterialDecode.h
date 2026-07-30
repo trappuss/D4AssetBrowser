@@ -58,4 +58,9 @@ QStringList appearanceRoster(const QString& d4, const QString& appName);
 // Empty when the blob carries no material array. See AppearanceMatBin for the derived layout.
 QStringList appearanceRosterFromMeta(const QByteArray& meta, const SnoIndex* idx);
 
+// The texture SNOs a material references, via whichever route works — .mat.json when it exists,
+// the meta binary when it does not. Used by the health audit to check a material can resolve its
+// textures without paying for a pixel decode.
+QVector<qint64> textureSnosFor(CascReader* reader, const QString& d4, const QString& matName);
+
 }  // namespace MaterialDecode

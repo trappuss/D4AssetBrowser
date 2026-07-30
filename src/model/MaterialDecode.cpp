@@ -105,6 +105,20 @@ QImage MaterialDecode::texture(CascReader* reader, const QString& d4,
     return BcDecode::decode(payload, meta.width, meta.height, meta.eTexFormat);
 }
 
+QVector<qint64> MaterialDecode::textureSnosFor(CascReader* reader, const QString& d4,
+                                               const QString& matName)
+{
+    const QByteArray j = readMat(d4, matName);
+    const QVector<MatTexture> texList = j.isEmpty()
+        ? matTexFromMeta(reader, snoFromPlaceholder(matName))
+        : parseMaterialJson(j);
+    QVector<qint64> out;
+    out.reserve(texList.size());
+    for (const MatTexture& t : texList)
+        if (t.texSno > 0) out.push_back(t.texSno);
+    return out;
+}
+
 QImage MaterialDecode::byRole(CascReader* reader, const QString& d4,
                              const QString& matName, const char* role)
 {
