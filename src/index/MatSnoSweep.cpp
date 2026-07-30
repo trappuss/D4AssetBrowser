@@ -30,6 +30,33 @@ quint32 u32at(const QByteArray& b, int off)
 
 // The material snos the JSON says this appearance uses — ground truth for scoring the walk.
 // Mirrors what ModelsTab reads: snoMaterial, snoOverrideMaterial and snoCloth across every SOA.
+// The ORDERED list the tool actually needs: one sno per ptAppearanceMaterials entry, in array
+// order, because that is what MeshPrimitive::materialIndex indexes into. Preference order matches
+// MaterialDecode::appearanceRoster so the comparison is against the behaviour we must reproduce,
+// not against an idealised reading of the JSON.
+QVector<int> jsonMaterialList(const QString& d4, const QString& name)
+{
+    QVector<int> out;
+    QFile f(QStringLiteral("%1/json/base/meta/Appearance/%2.app.json").arg(d4, name));
+    if (!f.open(QIODevice::ReadOnly)) return out;
+    const QJsonObject ro = QJsonDocument::fromJson(f.readAll()).object();
+    for (const QJsonValue& mv : ro.value(QStringLiteral("ptAppearanceMaterials")).toArray()) {
+        const QJsonArray soas = mv.toObject().value(QStringLiteral("ptSOAs")).toArray();
+        int pick = 0;
+        if (!soas.isEmpty()) {
+            const QJsonObject so = soas[0].toObject();
+            for (const char* k : {"snoOverrideMaterial", "snoMaterial", "snoCloth",
+                                  "snoHighQualityClothOverride"}) {
+                const int r = so.value(QLatin1String(k)).toObject()
+                                .value(QStringLiteral("__raw__")).toInt();
+                if (r > 0) { pick = r; break; }
+            }
+        }
+        out.push_back(pick);
+    }
+    return out;
+}
+
 QSet<int> jsonMaterialSnos(const QString& d4, const QString& name)
 {
     QSet<int> out;
@@ -106,7 +133,8 @@ QString runMatSnoSweep(const QString& d4, SnoIndex* idx, CascReader* rd, QWidget
         // appearance has nothing to check the walk with and would only add noise.
         if (e.name.startsWith(QLatin1String("~unnamed_"))) continue;
         ++named;
-        const QSet<int> want = jsonMaterialSnos(d4, e.name);
+        const QSet<int>   want  = jsonMaterialSnos(d4, e.name);      // anchor set (all sno kinds)
+        const QVector<int> order = jsonMaterialList(d4, e.name);     // what materialIndex indexes
         if (want.isEmpty()) continue;
         ++withJson;
 
@@ -140,7 +168,18 @@ QString runMatSnoSweep(const QString& d4, SnoIndex* idx, CascReader* rd, QWidget
         }
         // "contiguous" = every hit precedes every miss, i.e. the array is a clean prefix.
         const bool contiguous = !shape.contains(QStringLiteral(".o"));
-        const bool covers = (seen.size() == want.size());
+        // THE TEST THAT MATTERS: does record i equal ptAppearanceMaterials[i]? That is the mapping
+        // MeshPrimitive::materialIndex needs. The previous 'covers' compared against a SET built
+        // from four sno fields, so any appearance carrying cloth as well as materials scored as a
+        // failure while being perfectly correct — 42.8% was measuring my superset, not the data.
+        bool ordered = (declaredCount == order.size());
+        if (ordered)
+            for (int r = 0; r < order.size(); ++r) {
+                const int rec = dataOff + r * kRecSize;
+                if (rec + kSnoAtRec + 4 > meta.size()
+                    || int(u32at(meta, rec + kSnoAtRec)) != order[r]) { ordered = false; break; }
+            }
+        const bool covers = ordered;
         if (contiguous) ++contiguousOk;
         if (covers) ++coversAll;
         if (contiguous && covers) ++exact;
@@ -171,7 +210,7 @@ QString runMatSnoSweep(const QString& d4, SnoIndex* idx, CascReader* rd, QWidget
            << "with JSON materials       " << withJson << '\n'
            << "descriptor located        " << descFound << '\n'
            << "walk contiguous (o*.*)    " << contiguousOk << '\n'
-           << "walk covered all JSON     " << coversAll << '\n'
+           << "record[i]==jsonMats[i]    " << coversAll << "   <- the mapping materialIndex needs\n"
            << "BOTH (clean derivation)   " << exact << '\n';
         const double pct = descFound ? 100.0 * exact / descFound : 0.0;
         ts << QStringLiteral("\nNOTE: the rate below is conditional on the descriptor being FOUND.\n"
