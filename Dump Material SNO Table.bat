@@ -119,7 +119,13 @@ set D4_METADUMP_NAMES=necF_stor245_TRS,necF_stor245_LEG,BarM_stor258_TRS,barF_st
 REM Material + Texture blobs for the encrypted stor245 set, to derive the texture chain.
 REM 2335360/2335358 = TRS mat + fur mat, 2335347 = LEG mat, 2520946/2520944/2520945 = cloth,
 REM 399607 = armor_skin_mat (NAMED - a control whose JSON we can check the derivation against).
-set D4_METADUMP_SNOS=2335360,2335358,2335347,2520946,2520944,2520945,399607
+REM Round 2 adds TEXTURE snos, the last link. Ground truth on both sides:
+REM   4678 = "black" is NAMED (dwWidth 4, dwHeight 4, eTexFormat 46 in its .tex.json)
+REM          plus 2 more named controls at different sizes so a constant cannot fit by luck.
+REM   2335276/2335281/2335285/2335278 are stor245_TRS textures - the d4analyzer PNGs give
+REM          their real sizes: Color 1024, Normal 2048, AO 256, Emissive 1024.
+REM A 4x4 control against a 2048x2048 sample is what makes the field unambiguous.
+set D4_METADUMP_SNOS=2335360,2335358,2335347,2520946,2520944,2520945,399607,4678,2335276,2335281,2335285,2335278,1662692,607202
 
 "%EXE%"
 
