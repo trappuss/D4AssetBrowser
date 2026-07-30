@@ -5995,6 +5995,24 @@ void ModelsTab::showAppearance(int sno, const QString& name)
                     }
                     ptr += QStringLiteral("\n    desc@0x%1 recs=%2 window(-6..+6): %3")
                                .arg(off, 0, 16).arg(recs).arg(win.join(QLatin1Char(' ')));
+
+                    // The count is not in that window, so stop hunting for a field and WALK the
+                    // array instead: from dataOffset, stride 72, sno at +20. Each entry is marked
+                    // against the JSON ground truth — 'ok' means the JSON lists that material,
+                    // 'XX' means it does not. Where the ok's stop IS the array end, and reading it
+                    // off many samples is more reliable than inferring a count field from one.
+                    const int dataOff = int(u32at(off));
+                    QStringList walk;
+                    for (int r = 0; r < 24; ++r) {
+                        const int rec = dataOff + r * 72;
+                        if (rec + 24 > meta.size()) break;
+                        const quint32 v = u32at(rec + 20);
+                        walk << QStringLiteral("%1%2").arg(v)
+                                    .arg(matBySno.contains(int(v)) ? QStringLiteral(":ok")
+                                                                   : QStringLiteral(":XX"));
+                    }
+                    ptr += QStringLiteral("\n    walk from 0x%1 stride 72 sno@+20: %2")
+                               .arg(dataOff, 0, 16).arg(walk.join(QLatin1Char(' ')));
                     break;   // first descriptor is enough; they are identical in shape
                 }
             }
