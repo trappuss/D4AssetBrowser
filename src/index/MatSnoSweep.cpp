@@ -2,6 +2,9 @@
 
 #include "casc/CascReader.h"
 #include "index/SnoIndex.h"
+#include "model/MaterialDecode.h"
+
+#include <QImage>
 
 #include <QCoreApplication>
 #include <QDir>
@@ -128,6 +131,61 @@ int findDescriptor(const QByteArray& meta, const QSet<int>& matSnos, const QSet<
 }
 
 }  // namespace
+
+// ── D4_CHAINTEST — end-to-end verification of the encrypted-content chain ───────────────────────
+// Replaces the derivation sweep, which had done its job: the layouts are settled, so re-deriving
+// them on 63k appearances every run answers nothing. The question that actually remains is whether
+// the three readers WORK TOGETHER in the production path, and that was being checked by asking a
+// human to look at a model.
+//
+// Walks the real code path — appearanceRosterFromMeta -> MaterialDecode::baseColor/normalMap/orm —
+// so a regression anywhere in it fails here rather than in the viewport. Encrypted pieces are the
+// point, but named ones are included as controls: if those break too the fault is general, not
+// encryption-specific, and that distinction is worth one line of output.
+QString runChainTest(const QString& d4, SnoIndex* idx, CascReader* rd)
+{
+    if (!idx || !rd || !rd->isReady()) return QStringLiteral("chaintest: reader not ready");
+    static const char* kPieces[] = {
+        "necF_stor245_TRS", "necF_stor245_LEG",      // encrypted — the target
+        "spiM_stor190_TRS", "palF_stor171_TRS",      // encrypted — other keys/sets
+        "necF_base01_TRS",  "barF_base02_GLV",       // NAMED controls
+    };
+    QString out;
+    int pass = 0, fail = 0;
+    for (const char* nm : kPieces) {
+        const QString name = QLatin1String(nm);
+        int sno = 0;
+        for (const SnoEntry& e : idx->entries(kGroupAppearance))
+            if (e.name.compare(name, Qt::CaseInsensitive) == 0) { sno = e.snoId; break; }
+        if (!sno) { out += QStringLiteral("\n  %1: NOT IN INDEX").arg(name, -20); ++fail; continue; }
+
+        const QByteArray meta = rd->readMetaBySno(quint64(sno));
+        QStringList roster = MaterialDecode::appearanceRoster(d4, name);
+        const char* via = "json";
+        if (roster.isEmpty()) { roster = MaterialDecode::appearanceRosterFromMeta(meta, idx); via = "meta"; }
+
+        int withTex = 0, decoded = 0;
+        QString dims;
+        for (const QString& m : roster) {
+            if (m.isEmpty()) continue;
+            ++withTex;
+            const QImage bc = MaterialDecode::baseColor(rd, d4, m);
+            if (bc.isNull()) continue;
+            ++decoded;
+            if (dims.size() < 40)
+                dims += QStringLiteral(" %1x%2").arg(bc.width()).arg(bc.height());
+        }
+        const bool ok = decoded > 0;
+        ok ? ++pass : ++fail;
+        out += QStringLiteral("\n  %1 sno %2 via %3 — %4 material(s), %5 with a decoded baseColor%6  %7")
+                   .arg(name, -20).arg(sno, 8).arg(QLatin1String(via))
+                   .arg(roster.size()).arg(decoded).arg(dims)
+                   .arg(ok ? QStringLiteral("PASS") : QStringLiteral("FAIL"));
+    }
+    const QString head = QStringLiteral("chaintest: %1 passed, %2 failed").arg(pass).arg(fail);
+    qInfo().noquote() << head + out;
+    return head;
+}
 
 QString runMatSnoSweep(const QString& d4, SnoIndex* idx, CascReader* rd, QWidget* parent)
 {

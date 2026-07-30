@@ -34,3 +34,8 @@ class CascReader;
 //   matsno_sweep.txt      the verdict: does a single length rule explain the corpus, and which
 // Returns a one-line summary.
 QString runMatSnoSweep(const QString& d4, SnoIndex* idx, CascReader* rd, QWidget* parent);
+
+// End-to-end check of appearance -> materials -> textures through the PRODUCTION path, on a fixed
+// set of encrypted pieces plus named controls. Fast (seconds), and answers the one question the
+// derivation sweep never could: does the chain actually produce pixels?
+QString runChainTest(const QString& d4, SnoIndex* idx, CascReader* rd);
