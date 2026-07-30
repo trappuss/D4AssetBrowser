@@ -72,7 +72,7 @@ public:
     // Every TVFS path this sno appears under, with its stored size. readFile only ever tries
     // base/payload, base/paylow and base/meta; textures return nothing from all three, so their
     // definition lives somewhere else and guessing the path is what this exists to avoid.
-    QStringList rootPathsFor(quint64 sno) const;
+    QStringList rootPathsFor(quint64 sno);
 
     struct PayloadVariants { quint64 payload = 0; quint64 paylow = 0; };
     PayloadVariants payloadVariants(quint64 sno);

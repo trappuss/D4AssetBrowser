@@ -1076,7 +1076,7 @@ QByteArray CascReader::readMetaBySno(quint64 sno)
     return readFile(QStringLiteral("base/meta/%1").arg(sno));
 }
 
-QStringList CascReader::rootPathsFor(quint64 sno) const
+QStringList CascReader::rootPathsFor(quint64 sno)
 {
     QMutexLocker lock(&m_mutex);
     QStringList out;

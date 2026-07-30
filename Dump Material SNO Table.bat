@@ -87,10 +87,10 @@ REM so cmake.exe stays the last native process and its exit code survives.
 powershell -NoProfile -ExecutionPolicy Bypass -Command "cmake --build --preset release 2>&1 | Tee-Object -FilePath '%~dp0build_log.txt'; exit $LASTEXITCODE"
 if errorlevel 1 (
     echo.
-    findstr /i /c:"error C" /c:": error" /c:"error LNK" /c:"fatal error" "%~dp0build_log.txt" > "%~dp0build_errors.txt"
-    echo  [X] BUILD FAILED - errors:
-    echo.
-    type "%~dp0build_errors.txt"
+    REM Tee-Object writes UTF-16, which findstr cannot read - it warns and produces an EMPTY
+    REM file, so the failure printed no errors at all. Select-String handles the encoding.
+    powershell -NoProfile -ExecutionPolicy Bypass -Command "Select-String -Path '%~dp0build_log.txt' -Pattern 'error C|error LNK|fatal error|: error' | ForEach-Object { $_.Line } | Select-Object -First 40 | Tee-Object -FilePath '%~dp0build_errors.txt' -Encoding utf8"
+    echo  [X] BUILD FAILED - errors above.
     pause & exit /b 1
 )
 if not exist "%EXE%" (
