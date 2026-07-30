@@ -1,8 +1,11 @@
 #pragma once
+#include <QByteArray>
 #include <QImage>
 #include <QString>
 #include <QStringList>
 #include <QVector>
+
+class SnoIndex;
 
 class CascReader;
 
@@ -47,5 +50,12 @@ void   factors(CascReader* reader, const QString& d4, const QString& matName,
 // Default-look material roster of an appearance, indexed by primitive materialIndex
 // (override > base > cloth, per ptAppearanceMaterials[].ptSOAs[0]).
 QStringList appearanceRoster(const QString& d4, const QString& appName);
+
+// The same roster read from the CASC meta BINARY, for appearances that have no .app.json — i.e.
+// every encrypted one. Names are resolved sno -> index name, so an encrypted material (itself
+// nameless) comes back as "~unnamed_<sno>": positionally correct, which is what materialIndex
+// needs, even though the texture lookup that follows still wants a real name.
+// Empty when the blob carries no material array. See AppearanceMatBin for the derived layout.
+QStringList appearanceRosterFromMeta(const QByteArray& meta, const SnoIndex* idx);
 
 }  // namespace MaterialDecode

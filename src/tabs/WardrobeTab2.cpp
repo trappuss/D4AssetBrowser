@@ -7153,7 +7153,17 @@ void WardrobeTab2::rebuildOutfitImpl(bool async)
                      qPrintable(name), sno, slot, qint64(payload.size()));
             return false;
         }
-        const QStringList roster = MaterialDecode::appearanceRoster(d4, name);
+        QStringList roster = MaterialDecode::appearanceRoster(d4, name);
+        // Encrypted appearances have no .app.json, so the JSON roster is empty and every primitive
+        // lost its material — white mesh, "part 7"/"part 8" labels. Same list read from the meta
+        // binary instead; verified to reproduce the JSON exactly on 8 named appearances and the
+        // d4analyzer GLB export on 2 encrypted ones.
+        if (roster.isEmpty()) {
+            roster = MaterialDecode::appearanceRosterFromMeta(meta, m_index);
+            if (!roster.isEmpty())
+                qInfo("wardrobe %s: material roster from meta binary — %d entry(ies)",
+                      qPrintable(name), int(roster.size()));
+        }
         for (MeshPrimitive& p : geo.primitives) p.materialName = roster.value(p.materialIndex);
         // Remember the face's real body-skin material (…_BOD) — test999 body pieces use a
         // black placeholder (armor_skin_mat), so we re-skin them with this.

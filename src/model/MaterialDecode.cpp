@@ -1,5 +1,8 @@
 #include "model/MaterialDecode.h"
 
+#include "index/SnoIndex.h"
+#include "model/AppearanceMatBin.h"
+
 #include "casc/CascReader.h"
 #include "model/Material.h"
 #include "tex/BcDecode.h"
@@ -174,6 +177,23 @@ void MaterialDecode::factors(CascReader*, const QString& d4, const QString& matN
     const MaterialValues v = parseMaterialValues(j);
     if (v.hasMetal) metal = float(v.metal);
     if (v.hasRough) rough = float(v.rough);
+}
+
+QStringList MaterialDecode::appearanceRosterFromMeta(const QByteArray& meta, const SnoIndex* idx)
+{
+    QStringList out;
+    const QVector<int> snos = AppearanceMatBin::snos(meta);
+    if (snos.isEmpty()) return out;
+    // sno -> name over both material groups (57 "Material (2)", 37 "Material") plus Cloth (11),
+    // since an entry can be cloth-only. Built once per call; the caller does this at most once per
+    // piece load, and caching it would outlive a d4data change.
+    QHash<int, QString> byId;
+    if (idx)
+        for (int g : {57, 37, 11})
+            for (const SnoEntry& e : idx->entries(g)) byId.insert(e.snoId, e.name);
+    out.reserve(snos.size());
+    for (int s : snos) out << (s ? byId.value(s) : QString());
+    return out;
 }
 
 QStringList MaterialDecode::appearanceRoster(const QString& d4, const QString& appName)

@@ -51,6 +51,7 @@ qt_add_executable(D4AssetBrowser WIN32
     src/index/SnoListModel.h    src/index/SnoListModel.cpp
     src/index/AppearanceMeta.h  src/index/AppearanceMeta.cpp
     src/index/MatSnoSweep.h     src/index/MatSnoSweep.cpp
+    src/model/AppearanceMatBin.h src/model/AppearanceMatBin.cpp
     src/index/IconIndex.h       src/index/IconIndex.cpp
     src/index/AssetLinks.h      src/index/AssetLinks.cpp
     src/index/ItemDef.h         src/index/ItemDef.cpp
