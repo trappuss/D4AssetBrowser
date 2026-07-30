@@ -1076,6 +1076,25 @@ QByteArray CascReader::readMetaBySno(quint64 sno)
     return readFile(QStringLiteral("base/meta/%1").arg(sno));
 }
 
+QStringList CascReader::rootPathsFor(quint64 sno) const
+{
+    QMutexLocker lock(&m_mutex);
+    QStringList out;
+    if (!m_ready) return out;
+    const QString suffix = QLatin1Char('/') + QString::number(sno);
+    for (auto it = m_root.constBegin(); it != m_root.constEnd(); ++it) {
+        if (!it.key().endsWith(suffix)) continue;
+        quint64 bytes = 0;
+        for (const QByteArray& ek : it.value()) {
+            auto e = m_index.constFind(ek);
+            if (e != m_index.constEnd()) bytes += e.value().size;
+        }
+        out << QStringLiteral("%1 (%2 B stored)").arg(it.key()).arg(bytes);
+    }
+    out.sort();
+    return out;
+}
+
 CascReader::PayloadVariants CascReader::payloadVariants(quint64 sno)
 {
     QMutexLocker lock(&m_mutex);

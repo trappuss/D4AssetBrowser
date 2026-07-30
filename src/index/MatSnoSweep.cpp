@@ -183,6 +183,11 @@ QString runMatSnoSweep(const QString& d4, SnoIndex* idx, CascReader* rd, QWidget
             }
             qInfo("metadump sno %llu: meta %lld B, payload %lld B",
                   sno, qint64(meta.size()), qint64(pay.size()));
+            // When meta is empty the definition is on a path readFile never tries — textures are
+            // exactly this case. List what CASC actually holds rather than guessing the path.
+            if (meta.isEmpty())
+                for (const QString& p : rd->rootPathsFor(sno))
+                    qInfo().noquote() << QStringLiteral("    path: ") + p;
         }
         qInfo("metadump: wrote %d sno blob(s)", wrote);
     }

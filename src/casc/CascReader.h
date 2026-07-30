@@ -69,6 +69,11 @@ public:
     // is encrypted under a key we lack can silently be served the low-detail one instead — a valid
     // blob that does not match the meta describing it. Stored (compressed) sizes; 0 when absent.
     // No decode, so it is safe to call from a failure path.
+    // Every TVFS path this sno appears under, with its stored size. readFile only ever tries
+    // base/payload, base/paylow and base/meta; textures return nothing from all three, so their
+    // definition lives somewhere else and guessing the path is what this exists to avoid.
+    QStringList rootPathsFor(quint64 sno) const;
+
     struct PayloadVariants { quint64 payload = 0; quint64 paylow = 0; };
     PayloadVariants payloadVariants(quint64 sno);
 
