@@ -112,6 +112,10 @@ echo  progress dialog, and closes on its own - leave it alone until it exits.
 echo.
 
 set D4_MATSNO_SWEEP=1
+REM Raw meta blobs for offline layout derivation. Two encrypted (ground truth from the
+REM d4analyzer GLB extraction in .Testing) + named ones covering every case the sweep
+REM flagged: the 144-byte-stride sample, 5-material, cloth+material, fx-heavy, 1-material.
+set D4_METADUMP_NAMES=necF_stor245_TRS,necF_stor245_LEG,BarM_stor258_TRS,barF_stor274_TRS,barM_stor256_TRS,druM_stor177_HLM,rogF_stor231_GLV,warM_stor175_LEG,palF_stor171_TRS,palM_stor171_TRS,barF_base02_GLV,necF_base01_TRS
 "%EXE%"
 
 echo.

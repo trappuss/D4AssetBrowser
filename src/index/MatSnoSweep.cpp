@@ -132,6 +132,30 @@ int findDescriptor(const QByteArray& meta, const QSet<int>& matSnos, const QSet<
 QString runMatSnoSweep(const QString& d4, SnoIndex* idx, CascReader* rd, QWidget* parent)
 {
     if (!idx || !rd || !rd->isReady()) return QStringLiteral("matsno sweep: index/reader not ready");
+
+    // ── D4_METADUMP_NAMES: write raw meta blobs for OFFLINE format derivation ────────────────
+    // The build-run-read loop is the slow part of deriving the material table; the d4analyzer
+    // reference extraction gives ground truth for ENCRYPTED appearances (GLB embeds the ordered
+    // material list with snos), and d4data JSON gives it for named ones. With the raw blobs on
+    // disk, the layout can be solved offline in one sitting instead of one hypothesis per rebuild.
+    if (!qEnvironmentVariable("D4_METADUMP_NAMES").isEmpty()) {
+        const QString dumpDir = QCoreApplication::applicationDirPath() + QStringLiteral("/metadump");
+        QDir().mkpath(dumpDir);
+        int wrote = 0;
+        const QStringList names = qEnvironmentVariable("D4_METADUMP_NAMES")
+                                      .split(QLatin1Char(','), Qt::SkipEmptyParts);
+        for (const QString& nm : names) {
+            int sno = 0;
+            for (const SnoEntry& e : idx->entries(kGroupAppearance))
+                if (e.name.compare(nm.trimmed(), Qt::CaseInsensitive) == 0) { sno = e.snoId; break; }
+            if (!sno) { qWarning("metadump: '%s' not in index", qPrintable(nm.trimmed())); continue; }
+            const QByteArray meta = rd->readMetaBySno(quint64(sno));
+            if (meta.isEmpty()) { qWarning("metadump: '%s' meta empty", qPrintable(nm.trimmed())); continue; }
+            QFile bf(dumpDir + QStringLiteral("/%1_%2.bin").arg(nm.trimmed()).arg(sno));
+            if (bf.open(QIODevice::WriteOnly)) { bf.write(meta); ++wrote; }
+        }
+        qInfo("metadump: wrote %d blob(s) to %s", wrote, qPrintable(dumpDir));
+    }
     const QString outDir = QCoreApplication::applicationDirPath();
     QFile csv(outDir + QStringLiteral("/matsno_sweep.csv"));
     if (!csv.open(QIODevice::WriteOnly | QIODevice::Text))
