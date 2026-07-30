@@ -558,10 +558,14 @@ QString runHealthAudit(const QString& d4, SnoIndex* idx, CascReader* rd, QWidget
                             if (TextureDefTable::instance().lookup(ts).valid()) { ++texOk; break; }
                     }
                     if (texOk == 0) h = Health::NoTexDefs;
-                    // Checked LAST so it cannot mask a harder failure, but it IS a defect: the
-                    // piece loads, passes every other check, and is missing parts on screen. This
-                    // is the class the audit would otherwise be completely blind to.
-                    else if (geo.droppedSubObjects > 0) h = Health::Incomplete;
+                    // NOT a health category — see below. droppedSubObjects is recorded in the CSV
+                    // for triage, but it cannot decide OK vs broken, because ModelParser's
+                    // findSubObjects sweeps the WHOLE meta blob (ModelParser.cpp:1002) and the
+                    // counter therefore includes LOD1/2/3 sub-objects the tool deliberately does
+                    // not load. Scoring on it flagged 45,862 of 67,720 appearances (68%) as
+                    // incomplete when the measured defect is nearer 10% — a metric that cannot
+                    // separate "missing parts" from "has more LODs" is worse than no metric.
+                    // Restore this only once sub-objects carry a LOD index.
                 }
             }
         }
@@ -593,13 +597,21 @@ QString runHealthAudit(const QString& d4, SnoIndex* idx, CascReader* rd, QWidget
             }
         }
     }
+    // Statuses the PREVIOUS run knew about, so a newly-introduced category is not read as breakage.
+    QSet<QString> seenStatuses;
+    for (auto it = prev.constBegin(); it != prev.constEnd(); ++it) seenStatuses.insert(it.value());
     QStringList fixed, broken;
     if (!prev.isEmpty())
         for (auto it = current.constBegin(); it != current.constEnd(); ++it) {
             const QString was = prev.value(it.key());
             if (was.isEmpty() || was == it.value()) continue;
             if (it.value() == QLatin1String("OK")) fixed << it.key();
-            else if (was == QLatin1String("OK")) broken << it.key();
+            // A status that exists in this build but not the last one is a CATEGORY change, not a
+            // regression. Adding INCOMPLETE-MESH reported 45,862 assets as "newly BROKEN" when
+            // nothing had changed about them at all — a diff that cries wolf on its own schema
+            // change will be ignored exactly when it matters.
+            else if (was == QLatin1String("OK") && seenStatuses.contains(it.value()))
+                broken << it.key();
         }
 
     QFile rep(outDir + QStringLiteral("/asset_health.txt"));
@@ -607,13 +619,13 @@ QString runHealthAudit(const QString& d4, SnoIndex* idx, CascReader* rd, QWidget
         QTextStream ts(&rep);
         ts << "ASSET HEALTH AUDIT\n==================\n\n"
            << "appearances scanned  " << scanned << "\n\n";
-        for (Health h : {Health::Ok, Health::Incomplete, Health::NoTexDefs, Health::NoMaterials,
+        for (Health h : {Health::Ok, Health::NoTexDefs, Health::NoMaterials,
                          Health::NoGeometry, Health::Locked, Health::NoData})
             ts << QStringLiteral("  %1 %2\n").arg(QLatin1String(healthName(h)), -18)
                       .arg(tally.value(h), 8);
         ts << "\nLOCKED is not a defect — those need a TACT key we do not hold. Everything else\n"
               "above OK is something the tool should be able to show and cannot.\n";
-        for (Health h : {Health::Incomplete, Health::NoTexDefs, Health::NoMaterials,
+        for (Health h : {Health::NoTexDefs, Health::NoMaterials,
                          Health::NoGeometry, Health::NoData}) {
             if (examples.value(h).isEmpty()) continue;
             ts << "\n" << healthName(h) << " (first " << examples.value(h).size() << "):\n";
