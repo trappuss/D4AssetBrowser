@@ -18,6 +18,54 @@
 #include <cmath>
 
 namespace {
+
+// An encrypted material has no name — SnoIndex gives it "~unnamed_<sno>". That string still carries
+// the only handle we need, so the sno is recovered from it rather than threading a second parameter
+// through every MaterialDecode entry point.
+int snoFromPlaceholder(const QString& matName)
+{
+    static const QLatin1String kPfx("~unnamed_");
+    if (!matName.startsWith(kPfx)) return 0;
+    bool ok = false;
+    const int v = matName.mid(kPfx.size()).toInt(&ok);
+    return ok ? v : 0;
+}
+
+// ptMatTexList straight out of the material meta binary, for materials with no .mat.json.
+// Layout derived from raw blobs and verified against armor_skin_mat's JSON exactly:
+//   meta +0x38 : u32 dataOffset, u32 byteSize    (records are 48 bytes, count = byteSize / 48)
+//   record +16 : eShaderTex   (the role slot - 1, 3, 62, 81 in the control, matching the JSON)
+//   record +24 : snoTex       (0xFFFFFFFF for an unused slot)
+QVector<MatTexture> matTexFromMeta(CascReader* reader, int matSno)
+{
+    QVector<MatTexture> out;
+    if (!reader || matSno <= 0) return out;
+    const QByteArray b = reader->readMetaBySno(quint64(matSno));
+    if (b.size() < 0x40) return out;
+    auto u32 = [&b](int o) -> quint32 {
+        if (o < 0 || o + 4 > b.size()) return 0;
+        return quint32(uchar(b[o])) | quint32(uchar(b[o + 1])) << 8
+             | quint32(uchar(b[o + 2])) << 16 | quint32(uchar(b[o + 3])) << 24;
+    };
+    const int off = int(u32(0x38)), bytes = int(u32(0x3C));
+    if (off <= 0 || bytes <= 0 || bytes % 48 != 0) return out;
+    const int n = bytes / 48;
+    if (off + n * 48 > b.size()) return out;
+    for (int i = 0; i < n; ++i) {
+        const int rec = off + i * 48;
+        const quint32 sno = u32(rec + 24);
+        if (sno == 0 || sno == 0xFFFFFFFFu) continue;   // unused slot
+        MatTexture t;
+        t.slot   = int(u32(rec + 16));
+        t.role   = shaderSlotRole(t.slot);
+        t.texSno = qint64(sno);
+        // texName stays empty on purpose: an encrypted texture has none, and
+        // MaterialDecode::texture no longer requires one.
+        out.push_back(t);
+    }
+    return out;
+}
+
 QByteArray readMat(const QString& d4, const QString& matName)
 {
     if (matName.isEmpty() || d4.isEmpty()) return {};
@@ -60,15 +108,20 @@ QImage MaterialDecode::texture(CascReader* reader, const QString& d4,
 QImage MaterialDecode::byRole(CascReader* reader, const QString& d4,
                              const QString& matName, const char* role)
 {
+    // JSON first; binary when there is none (encrypted materials, and anything newer than the
+    // d4data snapshot). Both produce the same MatTexture list, so everything downstream is shared.
     const QByteArray j = readMat(d4, matName);
-    if (j.isEmpty()) return {};
+    const QVector<MatTexture> texList = j.isEmpty()
+        ? matTexFromMeta(reader, snoFromPlaceholder(matName))
+        : parseMaterialJson(j);
+    if (texList.isEmpty()) return {};
     const QLatin1String want(role);
     // Try every entry with this role, not just the first: D4 lists three detail-normal
     // and three detail-roughness slots (Detail Map 1/2/3). If Detail Map 1's texture is
     // absent/undecodable, the old code returned null and dropped detail entirely — now we
     // fall through to Map 2/3 (and likewise for any multi-slot role) so a single missing
     // texture no longer wipes the whole channel.
-    for (const MatTexture& t : parseMaterialJson(j)) {
+    for (const MatTexture& t : texList) {
         if (t.role != want || t.texName.isEmpty()) continue;
         const QImage img = texture(reader, d4, t.texName, t.texSno);
         if (!img.isNull()) return img;
@@ -90,11 +143,16 @@ QImage MaterialDecode::normalMap(CascReader* reader, const QString& d4, const QS
 
 QImage MaterialDecode::orm(CascReader* reader, const QString& d4, const QString& matName)
 {
+    // JSON first; binary when there is none (encrypted materials, and anything newer than the
+    // d4data snapshot). Both produce the same MatTexture list, so everything downstream is shared.
     const QByteArray j = readMat(d4, matName);
-    if (j.isEmpty()) return {};
+    const QVector<MatTexture> texList = j.isEmpty()
+        ? matTexFromMeta(reader, snoFromPlaceholder(matName))
+        : parseMaterialJson(j);
+    if (texList.isEmpty()) return {};
     QString rN, mN, aN; qint64 rS = 0, mS = 0, aS = 0;
-    for (const MatTexture& t : parseMaterialJson(j)) {
-        if (t.texName.isEmpty()) continue;
+    for (const MatTexture& t : texList) {
+        if (t.texSno <= 0) continue;   // name is absent for encrypted textures; the sno is not
         if (rN.isEmpty() && t.role == QLatin1String("ROUGHNESS")) { rN = t.texName; rS = t.texSno; }
         if (mN.isEmpty() && t.role == QLatin1String("METALLIC"))  { mN = t.texName; mS = t.texSno; }
         if (aN.isEmpty() && t.role == QLatin1String("AO"))        { aN = t.texName; aS = t.texSno; }
@@ -139,12 +197,15 @@ void MaterialDecode::detailMapsSeparate(CascReader* reader, const QString& d4, c
     outMetalLayer = -1;                                  // which detail map is a metal library map (by name)
     outScales[0] = outScales[1] = outScales[2] = 8.0f;   // sensible default if a map lacks anim
     const QByteArray j = readMat(d4, matName);
-    if (j.isEmpty()) return;
+    const QVector<MatTexture> texList = j.isEmpty()
+        ? matTexFromMeta(reader, snoFromPlaceholder(matName))
+        : parseMaterialJson(j);
+    if (texList.isEmpty()) return;
 
     QString nName[3], rName[3];
     qint64  nSno[3] = {0, 0, 0}, rSno[3] = {0, 0, 0};
-    for (const MatTexture& t : parseMaterialJson(j)) {
-        if (t.texName.isEmpty()) continue;
+    for (const MatTexture& t : texList) {
+        if (t.texSno <= 0) continue;   // name is absent for encrypted textures; the sno is not
         switch (t.slot) {
             // Detail-NORMAL slots also carry the per-map tiling scale (the rough map matches).
             case 212: nName[0] = t.texName; nSno[0] = t.texSno; outScales[0] = t.uScale; break;
