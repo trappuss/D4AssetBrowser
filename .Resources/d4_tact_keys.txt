@@ -1,0 +1,38 @@
+# Diablo IV TACT decryption keys — merged set.
+#
+# Format: KEYNAME (16 hex) <space> KEYVALUE (32 hex), one per line — the wowdev
+# TACTKeys format. KEYNAME is the BLTE lookup id.
+#
+# Sources, merged 2026-07-29:
+#   new  HoldMyBeer-gg/rustydemon  keys/d4.keys                    (8 keys)
+#   old  HoldMyBeer-gg/rustydemon  d4_tact_keys_clean.txt @c1dd2a6  (7 keys)
+# Overlap is 5; the union below is 10.
+#
+# WHY THE FILE MOVED: upstream reorganised into keys/d4.keys. The old path still
+# resolves at that commit hash, which is how the two were diffed.
+#
+# ── VERIFIED (from keys/d4.keys, upstream states each is decrypt-verified) ─────
+# The three marked NEW were not in the old list and unlock content the tool has
+# never been able to read.
+
+0E5332FB2D834BBD 3ED1F79569C1E7B89941F8D358C31140
+1C3AC80099C0F009 9D77FE7CDE388BB382E7FABDAF0EEFE9
+1F061FD5D3B039C7 4C2255A20FF18F69079B9F867131F8E3   # NEW
+53FA92ED4238228A 55C6C0A89CD8B608E8FCA6F68E3D261B
+665198D2E8358929 DF8968D3D37D7DBA3763E4184D8F1933
+D7A67FF1B91DAFB1 8D6A1B35A614C54879BF9CDA2F31E78C   # NEW
+D9C2CF7D4F160071 9492F7D7C628736BA238CB03AB34058B   # NEW
+F159F1F70EABAAB1 E00294A2AF86C537E088A086BABE3D82   # Doom collab (Praetor's Suits)
+
+# ── SUSPECT — present only in the OLD list, dropped upstream ───────────────────
+# These two share an IDENTICAL key value, which two distinct key names cannot
+# legitimately do. That is the signature of a bad harvest, and it is very likely
+# why the verified list dropped both. Kept because loading a wrong key is now
+# cheap to detect rather than silent: blteDecode checks each frame's output
+# against its declared uncompressed length, so a bad key produces a
+# "BLTE: INCOMPLETE decode ... key <name>" warning naming the culprit instead of
+# quietly truncating the asset. If neither ever appears in a log, they are inert;
+# if one does, delete that line.
+#
+# 5960ADCB89D029CC F382EB7DB08F21000600000081938EC1
+# A1DFDA1AB6F6A163 F382EB7DB08F21000600000081938EC1

@@ -1277,8 +1277,12 @@ int CascReader::applyTactKeys(const QString& keysPath)
     if (fi.isDir()) {
         // Folder mode: load every key file in the directory, so keys can be
         // dropped in / updated / removed without re-pointing at a single file.
+        // *.keys included: upstream (rustydemon) reorganised its key list to keys/d4.keys, and a
+        // folder-mode setup pointed at a directory containing it would silently load nothing —
+        // no error, just fewer decryptable assets, which is the hardest kind of failure to notice.
         const QStringList files = QDir(keysPath).entryList(
-            {QStringLiteral("*.txt"), QStringLiteral("*.csv")}, QDir::Files, QDir::Name);
+            {QStringLiteral("*.txt"), QStringLiteral("*.csv"), QStringLiteral("*.keys")},
+            QDir::Files, QDir::Name);
         for (const QString& fn : files)
             added += loadKeysFromFile(QDir(keysPath).filePath(fn));
     } else {
