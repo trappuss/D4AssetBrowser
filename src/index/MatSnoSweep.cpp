@@ -84,19 +84,33 @@ QSet<int> jsonMaterialSnos(const QString& d4, const QString& name)
 // therefore matched only single-material arrays, which is the whole of its 32180 NO-DESCRIPTOR
 // result. The tell was already in the hand-clicked run: BarM_stor258_TRS reported a 144-byte stride.
 // Returns the descriptor offset and writes the record count out.
-int findDescriptor(const QByteArray& meta, const QSet<int>& want, int* countOut)
+// Selection must not depend on the JSON: encrypted appearances have none, and a rule tuned against
+// ground truth we will not have at runtime is worthless. So candidates are validated against the SNO
+// INDEX — every record's +20 field must be a real Material sno — which is available for encrypted
+// assets too.
+//
+// Taking the FIRST forward match was the bug behind 31670 count mismatches, overwhelmingly
+// 'declared < json' (decl=1/json=2 alone accounts for 8105): a smaller sub-array sits earlier in the
+// blob and anchored fine. Now every candidate is scored and the LONGEST fully-valid one wins, since
+// ptAppearanceMaterials is the outermost array and any sub-array is necessarily shorter.
+int findDescriptor(const QByteArray& meta, const QSet<int>& matSnos, int* countOut)
 {
+    int bestOff = -1, bestCount = 0;
     for (int off = 0; off + 8 <= meta.size(); off += 4) {
         const quint32 bytes = u32at(meta, off + 4);
         if (bytes == 0 || bytes % quint32(kRecSize) != 0 || bytes > 64u * quint32(kRecSize)) continue;
         const int dataOff = int(u32at(meta, off));
-        if (dataOff <= 0 || dataOff + kSnoAtRec + 4 > meta.size()) continue;
-        // Anchor on a KNOWN sno so this cannot latch onto an unrelated 72-multiple array.
-        if (!want.contains(int(u32at(meta, dataOff + kSnoAtRec)))) continue;
-        if (countOut) *countOut = int(bytes) / kRecSize;
-        return off;
+        const int n = int(bytes) / kRecSize;
+        if (dataOff <= 0 || dataOff + n * kRecSize > meta.size()) continue;
+        if (n <= bestCount) continue;                    // cannot beat what we already have
+        bool allValid = true;
+        for (int r = 0; r < n && allValid; ++r)
+            allValid = matSnos.contains(int(u32at(meta, dataOff + r * kRecSize + kSnoAtRec)));
+        if (!allValid) continue;
+        bestOff = off; bestCount = n;
     }
-    return -1;
+    if (bestOff >= 0 && countOut) *countOut = bestCount;
+    return bestOff;
 }
 
 }  // namespace
@@ -111,6 +125,13 @@ QString runMatSnoSweep(const QString& d4, SnoIndex* idx, CascReader* rd, QWidget
     QTextStream cs(&csv);
     cs << "appearance,sno,metaBytes,jsonMats,descOff,dataOff,declaredCount,walkHits,"
           "walkFirstMiss,contiguous,coversJson,countMatches,pattern\n";
+
+    // Every Material sno in the index — the JSON-free validator the descriptor search runs on.
+    // Both material groups: 57 is "Material (2)" and 37 the older "Material" (SnoIndex.cpp:31).
+    QSet<int> matSnos;
+    for (int g : {57, 37})
+        for (const SnoEntry& m : idx->entries(g)) matSnos.insert(m.snoId);
+    qInfo("matsno sweep: %d material sno(s) known to the index (validator)", int(matSnos.size()));
 
     const QVector<SnoEntry>& apps = idx->entries(kGroupAppearance);
     QProgressDialog prog(QStringLiteral("Material-sno sweep: %1 appearances…").arg(apps.size()),
@@ -141,7 +162,7 @@ QString runMatSnoSweep(const QString& d4, SnoIndex* idx, CascReader* rd, QWidget
         const QByteArray meta = rd->readMetaBySno(quint64(e.snoId));
         if (meta.size() < 64) continue;
         int declaredCount = 0;
-        const int desc = findDescriptor(meta, want, &declaredCount);
+        const int desc = findDescriptor(meta, matSnos, &declaredCount);
         if (desc < 0) {
             cs << e.name << ',' << e.snoId << ',' << meta.size() << ',' << want.size()
                << ",,,,,,,NO-DESCRIPTOR\n";
