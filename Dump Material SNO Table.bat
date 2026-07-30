@@ -127,6 +127,11 @@ REM          their real sizes: Color 1024, Normal 2048, AO 256, Emissive 1024.
 REM A 4x4 control against a 2048x2048 sample is what makes the field unambiguous.
 set D4_METADUMP_SNOS=2335360,2335358,2335347,2520946,2520944,2520945,399607,4678,2335276,2335281,2335285,2335278,1662692,607202
 
+REM THE ANSWER to where texture dimensions live: not a per-sno meta entry (textures have
+REM none) but a bulk table. 3.7 MB global + per-hash overlays that are probably patch deltas -
+REM one small overlay is dumped alongside so the two layouts can be compared.
+set D4_DUMP_PATHS=base/texture-base-global.dat,base/texture-base-global-0x3bc501404c5ea17a.dat,base/texture-text-global.dat
+
 "%EXE%"
 
 echo.

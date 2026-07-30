@@ -199,6 +199,29 @@ QString runMatSnoSweep(const QString& d4, SnoIndex* idx, CascReader* rd, QWidget
         // bytes of zeros) and there is no base/meta entry for any texture, so the definition lives
         // somewhere this tool has never looked. Rather than test one candidate path per rebuild,
         // dump every path once and answer it offline.
+        // D4_DUMP_PATHS=<path,path,...> — pull any CASC file out by its TVFS path. The texture
+        // definitions turned out to live in base/texture-base-global.dat (3.7 MB) rather than in a
+        // per-sno meta entry, and a generic dumper means the next container costs a command instead
+        // of a build.
+        if (!qEnvironmentVariable("D4_DUMP_PATHS").isEmpty()) {
+            const QString dumpDir = QCoreApplication::applicationDirPath()
+                                  + QStringLiteral("/metadump");
+            QDir().mkpath(dumpDir);
+            const QStringList paths = qEnvironmentVariable("D4_DUMP_PATHS")
+                                          .split(QLatin1Char(','), Qt::SkipEmptyParts);
+            for (const QString& raw : paths) {
+                const QString path = raw.trimmed();
+                const QByteArray data = rd->readFile(path);
+                QString safe = path;
+                safe.replace(QLatin1Char('/'), QLatin1Char('_')).replace(QLatin1Char('\\'),
+                                                                        QLatin1Char('_'));
+                if (data.isEmpty()) { qWarning("dumppath: '%s' EMPTY", qPrintable(path)); continue; }
+                QFile f(dumpDir + QLatin1Char('/') + safe);
+                if (f.open(QIODevice::WriteOnly)) f.write(data);
+                qInfo("dumppath: %s -> %lld B", qPrintable(path), qint64(data.size()));
+            }
+        }
+
         {
             const QString tv = QCoreApplication::applicationDirPath()
                              + QStringLiteral("/tvfs_paths.txt");
