@@ -182,6 +182,58 @@ The sweep caught all three before a reader was written on top of them, which is
 the point of scoring against ground truth. Treat a low score as "my rule is
 wrong" before "the format is odd".
 
+## THE REAL REMAINING GAP: 93 nameless-but-perfect appearances
+
+Measured by the health audit, and this is the population that matters:
+
+| | count |
+|---|---|
+| nameless appearances total | 546 |
+| LOCKED (no TACT key — genuinely unreachable) | 446 |
+| **OK — decode fully, no name, therefore INVISIBLE** | **93** |
+| other (NO-GEOMETRY / NO-DATA) | 7 |
+
+Those 93 have working geometry, materials and textures. The ONLY thing stopping
+them appearing is that every roster is name-shaped, and name recovery reaches only
+cloth-bearing pieces.
+
+### Worked example — the Doom set is 6 of the 93
+
+`stor245` exists NAMED and working for bar/dru/rog/sor, all 5 slots, both genders
+(40 pieces — those were never encrypted). Only the NECROMANCER set is encrypted,
+and only its cloth-bearing pieces recovered names:
+
+    have:    necF_stor245_TRS  necF_stor245_LEG  necM_stor245_TRS  necM_stor245_LEG
+    MISSING: necF/necM stor245 HLM, GLV, BTS      (6 pieces)
+
+**A prior audit claim was wrong and is corrected here:** "100% of 9,160
+wardrobe-shaped appearances OK" counted only appearances that HAVE names. The
+nameless ones were excluded by the regex, so the figure was blind to exactly this
+gap. Any future completeness metric must count the nameless population explicitly.
+
+### Naming route to evaluate next — NOT yet verified
+
+The strong lead is that a set is almost always PARTIALLY named: 8 of 10 stor245
+class/gender combos are in the clear. So the convention `<cls><g>_stor<N>_<SLOT>`
+is known, and what is missing is only which nameless sno is which class+slot.
+
+Candidate signals, in order of how principled they are:
+
+1. **Material sno ranges.** The d4analyzer GLB export gives necF's per-slot
+   materials: BTS 2335312, GLV 2335323, HLM 2335336, LEG 2335347, TRS 2335360.
+   The two RECOVERED pieces confirm the mapping (LEG->2335347, TRS->2335360), so
+   the remaining three material snos identify the remaining three appearances by
+   elimination — using data, not adjacency.
+2. **The granting Item.** `tInvImages` gives the class outright (Necromancer = 4,
+   verified) and `snoItemType` gives the slot. What it does NOT give is the
+   transmog appearance — `snoActor -> snoAppearance` lands on the PROXY body mesh
+   (all seven classes point at 217477). Use it for class/slot, never for identity.
+3. **Rig/skeleton reference in the appearance meta** — unexplored; would give
+   class+gender directly if present.
+
+Do NOT infer from sno adjacency. Verify any rule against the four pieces whose
+names are already known before applying it to the rest.
+
 ## Do this next, in order
 
 1. **Numeric material path** — the main job. `appearanceRoster` needs a CASC
