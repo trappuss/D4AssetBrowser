@@ -209,7 +209,18 @@ QString runMatSnoSweep(const QString& d4, SnoIndex* idx, CascReader* rd, QWidget
             QDir().mkpath(dumpDir);
             const QStringList paths = qEnvironmentVariable("D4_DUMP_PATHS")
                                           .split(QLatin1Char(','), Qt::SkipEmptyParts);
+            // "prefix:<p>" expands to every path starting with p — the encrypted texture
+            // definitions live across 137 texture-base-global-0x<hash>.dat overlays and naming
+            // each one would be a 7 KB environment variable.
+            QStringList expanded;
             for (const QString& raw : paths) {
+                const QString t = raw.trimmed();
+                if (t.startsWith(QLatin1String("prefix:")))
+                    expanded += rd->rootPathsWithPrefix(t.mid(7));
+                else
+                    expanded << t;
+            }
+            for (const QString& raw : expanded) {
                 const QString path = raw.trimmed();
                 const QByteArray data = rd->readFile(path);
                 QString safe = path;

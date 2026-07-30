@@ -130,7 +130,10 @@ set D4_METADUMP_SNOS=2335360,2335358,2335347,2520946,2520944,2520945,399607,4678
 REM THE ANSWER to where texture dimensions live: not a per-sno meta entry (textures have
 REM none) but a bulk table. 3.7 MB global + per-hash overlays that are probably patch deltas -
 REM one small overlay is dumped alongside so the two layouts can be compared.
-set D4_DUMP_PATHS=base/texture-base-global.dat,base/texture-base-global-0x3bc501404c5ea17a.dat,base/texture-text-global.dat
+REM The global table holds 141829 texture definitions but NOT the encrypted ones
+REM (2335276/2335281 are absent from it). Those live in the 137 per-hash overlays, so
+REM prefix: pulls the whole family in one go rather than naming each file.
+set D4_DUMP_PATHS=prefix:base/texture-
 
 "%EXE%"
 

@@ -81,6 +81,9 @@ public:
     // per guessed path: with the whole table on disk, any question about where a definition lives
     // is answered offline. Returns the count written.
     int dumpAllRootPaths(const QString& outPath);
+    // Every root path starting with a prefix. Lets a probe pull a whole family of files (the 137
+    // texture-base-global-0x<hash>.dat overlays) without naming each one.
+    QStringList rootPathsWithPrefix(const QString& prefix);
 
     struct PayloadVariants { quint64 payload = 0; quint64 paylow = 0; };
     PayloadVariants payloadVariants(quint64 sno);
