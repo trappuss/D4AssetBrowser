@@ -120,6 +120,68 @@ The Models tab INFO panel fails the same way at `ModelsTab.cpp:5736` (silent
 Materials/Textures are all `—` while Filesize (from CASC) is correct. Same
 by-name pattern at `5807`, `6781`, `7149`, `7164`, `6300`.
 
+## Material-sno table — derivation status (IN PROGRESS, do not build on it yet)
+
+Goal: read an appearance's material snos from the CASC meta binary, so encrypted
+appearances (which have no `.app.json`) can be textured. The binary already gives
+the per-sub-object material ORDER at `ModelParser.cpp:356`; only the sno LIST is
+missing.
+
+Driven by `Dump Material SNO Table.bat` (builds + sweeps + reports, unattended).
+Scores a candidate rule against the JSON on ~63,700 named appearances.
+
+### Established
+
+- Records contain the material sno at **+20**, and the descriptor is
+  `(dataOffset, totalBytes)` — the `arr()` convention `ModelParser` already uses.
+- Descriptor search finds a candidate for **62,974 of 63,694** (98.9%).
+- **Contiguity is 100%** of located: every record the walk reads is a real sno.
+  The format is not in doubt.
+
+### Not established — the open question
+
+`record[i] == ptAppearanceMaterials[i]` holds for only **14,288 (22.7%)**.
+Split by cause (`matsno_sweep.csv`):
+
+| | count |
+|---|---|
+| declared count != JSON count | 31,221 |
+| count agrees but order differs | 17,652 |
+
+Count mismatches are dominated by `decl=1` against `json=2/3/4`
+(8,108 + 4,237 + 1,790).
+
+### Hypotheses tested and REJECTED — do not retry
+
+1. **First-forward-match picked a sub-array.** Changed to longest-fully-valid.
+   No change.
+2. **Validator too strict (cloth/blank slots rejected the real array).** Widened
+   to "0, or any sno the index knows, with at least one real Material". Numbers
+   moved by 3 (31,218 -> 31,221). Falsified.
+
+### The remaining candidate
+
+**The 72-byte record size is probably not universal.** It was measured from ~32
+hand-picked appearances and has been an assumption ever since; every search since
+filters on `size % 72 == 0`, so any appearance with a different record size can
+only ever match a coincidental 1-record array — which is exactly the `decl=1`
+population.
+
+Next step: stop assuming 72. For each candidate `(dataOffset, totalBytes)`, try
+record sizes that divide `totalBytes`, and score by how many records land on a
+valid sno at `+20`. Let the stride be *derived* per appearance rather than fixed.
+If a single stride then explains the corpus, it is the answer; if several do, the
+record size is versioned and the descriptor must say which.
+
+### Method note
+
+Three rounds, three "REJECTED" verdicts, and each was the metric or the filter
+rather than the data: a stride test comparing in sno order, a coverage test
+against a superset of sno kinds, a validator demanding Material for every slot.
+The sweep caught all three before a reader was written on top of them, which is
+the point of scoring against ground truth. Treat a low score as "my rule is
+wrong" before "the format is odd".
+
 ## Do this next, in order
 
 1. **Numeric material path** — the main job. `appearanceRoster` needs a CASC
