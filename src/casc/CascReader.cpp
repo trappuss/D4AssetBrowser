@@ -578,7 +578,16 @@ QByteArray CascReader::blteDecode(const QByteArray& data) const
         }
         out.append(dec);
     }
-    if (badFrames > 0)
+    // A frame we hold no key for is LOCKED CONTENT, not a fault: expected, unfixable here, and
+    // already reported once per key by decryptFrame. Warning again per asset produced 258 lines in
+    // one run — enough to bury the case this check exists to catch, which is a frame that failed
+    // WITH the key held (a wrong key, a bad nonce, a corrupt archive).
+    bool keyHeld = true;
+    if (!firstBadKey.isEmpty()) {
+        QMutexLocker kl(&m_keysMutex);
+        keyHeld = !m_tactKeys.value(firstBadKey).isEmpty();
+    }
+    if (badFrames > 0 && keyHeld)
         qWarning("BLTE: INCOMPLETE decode — %d of %d frame(s) failed, %lld of %lld byte(s) "
                  "recovered; first failure frame %d type '%c'%s%s",
                  badFrames, int(chunks.size()), qint64(out.size()), wantTotal, firstBad,
