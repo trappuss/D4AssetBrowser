@@ -93,7 +93,8 @@ QSet<int> jsonMaterialSnos(const QString& d4, const QString& name)
 // 'declared < json' (decl=1/json=2 alone accounts for 8105): a smaller sub-array sits earlier in the
 // blob and anchored fine. Now every candidate is scored and the LONGEST fully-valid one wins, since
 // ptAppearanceMaterials is the outermost array and any sub-array is necessarily shorter.
-int findDescriptor(const QByteArray& meta, const QSet<int>& matSnos, int* countOut)
+int findDescriptor(const QByteArray& meta, const QSet<int>& matSnos, const QSet<int>& anySno,
+                   int* countOut)
 {
     int bestOff = -1, bestCount = 0;
     for (int off = 0; off + 8 <= meta.size(); off += 4) {
@@ -103,10 +104,23 @@ int findDescriptor(const QByteArray& meta, const QSet<int>& matSnos, int* countO
         const int n = int(bytes) / kRecSize;
         if (dataOff <= 0 || dataOff + n * kRecSize > meta.size()) continue;
         if (n <= bestCount) continue;                    // cannot beat what we already have
-        bool allValid = true;
-        for (int r = 0; r < n && allValid; ++r)
-            allValid = matSnos.contains(int(u32at(meta, dataOff + r * kRecSize + kSnoAtRec)));
-        if (!allValid) continue;
+        // A record's sno need NOT be a Material: ptAppearanceMaterials entries also reference
+        // snoCloth (group 11), and an entry can be empty (0). Demanding group 57/37 for EVERY
+        // record rejected the real array whenever one slot was cloth or blank, and the search then
+        // settled for a 1-record sub-array — which is the whole 'decl=1, json=2/3/4' population
+        // (8108 + 4237 + 1790 + ... of 31218 count mismatches).
+        //
+        // So: every record must be 0 or a sno the index knows, and at least one must be a real
+        // Material. The anchor keeps this from matching an arbitrary array of valid snos; the
+        // tolerance stops one cloth slot disqualifying a correct table.
+        bool allValid = true, anyMaterial = false;
+        for (int r = 0; r < n && allValid; ++r) {
+            const int v = int(u32at(meta, dataOff + r * kRecSize + kSnoAtRec));
+            if (v == 0) continue;                        // empty slot is legal
+            if (matSnos.contains(v)) { anyMaterial = true; continue; }
+            allValid = anySno.contains(v);
+        }
+        if (!allValid || !anyMaterial) continue;
         bestOff = off; bestCount = n;
     }
     if (bestOff >= 0 && countOut) *countOut = bestCount;
@@ -131,7 +145,12 @@ QString runMatSnoSweep(const QString& d4, SnoIndex* idx, CascReader* rd, QWidget
     QSet<int> matSnos;
     for (int g : {57, 37})
         for (const SnoEntry& m : idx->entries(g)) matSnos.insert(m.snoId);
-    qInfo("matsno sweep: %d material sno(s) known to the index (validator)", int(matSnos.size()));
+    // Cloth and every other group a material slot may legally point at.
+    QSet<int> anySno;
+    for (int g : idx->groups())
+        for (const SnoEntry& m : idx->entries(g)) anySno.insert(m.snoId);
+    qInfo("matsno sweep: validator knows %d material sno(s), %d sno(s) overall",
+          int(matSnos.size()), int(anySno.size()));
 
     const QVector<SnoEntry>& apps = idx->entries(kGroupAppearance);
     QProgressDialog prog(QStringLiteral("Material-sno sweep: %1 appearances…").arg(apps.size()),
@@ -162,7 +181,7 @@ QString runMatSnoSweep(const QString& d4, SnoIndex* idx, CascReader* rd, QWidget
         const QByteArray meta = rd->readMetaBySno(quint64(e.snoId));
         if (meta.size() < 64) continue;
         int declaredCount = 0;
-        const int desc = findDescriptor(meta, matSnos, &declaredCount);
+        const int desc = findDescriptor(meta, matSnos, anySno, &declaredCount);
         if (desc < 0) {
             cs << e.name << ',' << e.snoId << ',' << meta.size() << ',' << want.size()
                << ",,,,,,,NO-DESCRIPTOR\n";
