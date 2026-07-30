@@ -43,27 +43,64 @@ set "SRC=%~dp0src\index\MatSnoSweep.cpp"
 set "TXT=%~dp0build\release\matsno_sweep.txt"
 set "CSV=%~dp0build\release\matsno_sweep.csv"
 
-if not exist "%EXE%" (
-    echo.
-    echo  [X] Not found: %EXE%   ^(build first^)
-    echo.
-    pause
-    exit /b 1
+REM ── BUILD ────────────────────────────────────────────────────────────────────
+REM Built inline rather than by calling rebuild.bat, for two reasons: rebuild.bat
+REM finishes with run.bat, which launches DETACHED via `start ""` (so this script
+REM could not wait for the report), and run.bat also forces D4_DUMP_CLOTH=1, which
+REM floods the log. Same vcvars detection and same cmake preset as rebuild.bat.
+REM
+REM This also removes the stale-binary class of failure entirely: the exe cannot be
+REM older than the source if it is built here every run. That mistake produced two
+REM false diagnoses earlier in this project.
+
+taskkill /im D4AssetBrowser.exe /f >nul 2>&1
+
+where cl >nul 2>&1
+if errorlevel 1 (
+    set "VSWHERE=%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe"
+    set "VSPATH="
+    for /f "usebackq tokens=*" %%i in (`"!VSWHERE!" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set "VSPATH=%%i"
+    if not defined VSPATH (
+        echo  [X] Visual Studio 2022 C++ tools not found.
+        pause & exit /b 1
+    )
+    call "!VSPATH!\VC\Auxiliary\Build\vcvars64.bat" >nul
 )
 
-REM Stale-binary guard. An exe older than the sweep does not contain it, and the
-REM empty result is indistinguishable from "the sweep found nothing". This has
-REM already cost two false diagnoses in this project.
-for /f %%T in ('powershell -NoProfile -Command ^
-    "if ((Get-Item '%EXE%').LastWriteTime -lt (Get-Item '%SRC%').LastWriteTime) {'STALE'} else {'OK'}"') do set "FRESH=%%T"
-if "%FRESH%"=="STALE" (
-    echo.
-    echo  [X] STALE BINARY - the exe is older than src\index\MatSnoSweep.cpp, so
-    echo      it does not contain the sweep. Rebuild, then run this again.
-    echo.
-    pause
-    exit /b 1
+if not exist "build\release\CMakeCache.txt" (
+    echo  [X] No build directory yet - run build.bat once first.
+    pause & exit /b 1
 )
+
+REM Pre-build source checks, same as rebuild.bat (non-blocking).
+set "PYEXE="
+py -3 -c "import sys" >nul 2>&1 && set "PYEXE=py -3"
+if not defined PYEXE python -c "import sys" >nul 2>&1 && set "PYEXE=python"
+if defined PYEXE %PYEXE% "%~dp0verify-src.py" --quiet
+
+echo  Building...
+echo.
+REM NOTE: do NOT pipe cmake through findstr - in cmd, %errorlevel% after a pipe is the
+REM LAST command's, so a failed build would report success and this script would go on
+REM to read a stale report. rebuild.bat documents the same trap; Tee-Object is a cmdlet,
+REM so cmake.exe stays the last native process and its exit code survives.
+powershell -NoProfile -ExecutionPolicy Bypass -Command "cmake --build --preset release 2>&1 | Tee-Object -FilePath '%~dp0build_log.txt'; exit $LASTEXITCODE"
+if errorlevel 1 (
+    echo.
+    findstr /i /c:"error C" /c:": error" /c:"error LNK" /c:"fatal error" "%~dp0build_log.txt" > "%~dp0build_errors.txt"
+    echo  [X] BUILD FAILED - errors:
+    echo.
+    type "%~dp0build_errors.txt"
+    pause & exit /b 1
+)
+if not exist "%EXE%" (
+    echo.
+    echo  [X] Build reported success but %EXE% is missing.
+    pause & exit /b 1
+)
+echo.
+echo  Build OK.
+echo.
 
 REM Clear previous output so a failure to write cannot be read as fresh results.
 if exist "%TXT%" del /q "%TXT%"
