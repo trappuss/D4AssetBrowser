@@ -52,13 +52,22 @@ QSet<int> jsonMaterialSnos(const QString& d4, const QString& name)
 // Locate the array descriptor: the '... [dataOffset] [72] ...' pair, where dataOffset points at a
 // record whose +20 field is one of the snos we expect. Anchoring on a KNOWN sno is what keeps this
 // from matching an unrelated 72-sized array elsewhere in the blob.
-int findDescriptor(const QByteArray& meta, const QSet<int>& want)
+// The second field is the array's TOTAL BYTE SIZE, not the element size — so it is 72 for one
+// material, 144 for two, and so on, and the COUNT is size/72. The first sweep hardcoded '== 72' and
+// therefore matched only single-material arrays, which is the whole of its 32180 NO-DESCRIPTOR
+// result. The tell was already in the hand-clicked run: BarM_stor258_TRS reported a 144-byte stride.
+// Returns the descriptor offset and writes the record count out.
+int findDescriptor(const QByteArray& meta, const QSet<int>& want, int* countOut)
 {
     for (int off = 0; off + 8 <= meta.size(); off += 4) {
-        if (u32at(meta, off + 4) != quint32(kRecSize)) continue;
+        const quint32 bytes = u32at(meta, off + 4);
+        if (bytes == 0 || bytes % quint32(kRecSize) != 0 || bytes > 64u * quint32(kRecSize)) continue;
         const int dataOff = int(u32at(meta, off));
         if (dataOff <= 0 || dataOff + kSnoAtRec + 4 > meta.size()) continue;
-        if (want.contains(int(u32at(meta, dataOff + kSnoAtRec)))) return off;
+        // Anchor on a KNOWN sno so this cannot latch onto an unrelated 72-multiple array.
+        if (!want.contains(int(u32at(meta, dataOff + kSnoAtRec)))) continue;
+        if (countOut) *countOut = int(bytes) / kRecSize;
+        return off;
     }
     return -1;
 }
@@ -73,8 +82,8 @@ QString runMatSnoSweep(const QString& d4, SnoIndex* idx, CascReader* rd, QWidget
     if (!csv.open(QIODevice::WriteOnly | QIODevice::Text))
         return QStringLiteral("matsno sweep: cannot write matsno_sweep.csv");
     QTextStream cs(&csv);
-    cs << "appearance,sno,metaBytes,jsonMats,descOff,dataOff,walkHits,walkFirstMiss,"
-          "contiguous,coversJson,pattern\n";
+    cs << "appearance,sno,metaBytes,jsonMats,descOff,dataOff,declaredCount,walkHits,"
+          "walkFirstMiss,contiguous,coversJson,countMatches,pattern\n";
 
     const QVector<SnoEntry>& apps = idx->entries(kGroupAppearance);
     QProgressDialog prog(QStringLiteral("Material-sno sweep: %1 appearances…").arg(apps.size()),
@@ -103,7 +112,8 @@ QString runMatSnoSweep(const QString& d4, SnoIndex* idx, CascReader* rd, QWidget
 
         const QByteArray meta = rd->readMetaBySno(quint64(e.snoId));
         if (meta.size() < 64) continue;
-        const int desc = findDescriptor(meta, want);
+        int declaredCount = 0;
+        const int desc = findDescriptor(meta, want, &declaredCount);
         if (desc < 0) {
             cs << e.name << ',' << e.snoId << ',' << meta.size() << ',' << want.size()
                << ",,,,,,,NO-DESCRIPTOR\n";
@@ -119,7 +129,7 @@ QString runMatSnoSweep(const QString& d4, SnoIndex* idx, CascReader* rd, QWidget
         QString shape;
         int hits = 0, firstMiss = -1;
         QSet<int> seen;
-        for (int r = 0; r < 64; ++r) {
+        for (int r = 0; r < qMax(declaredCount, 1) && r < 64; ++r) {
             const int rec = dataOff + r * kRecSize;
             if (rec + kSnoAtRec + 4 > meta.size()) break;
             const int v = int(u32at(meta, rec + kSnoAtRec));
@@ -140,8 +150,9 @@ QString runMatSnoSweep(const QString& d4, SnoIndex* idx, CascReader* rd, QWidget
 
         cs << e.name << ',' << e.snoId << ',' << meta.size() << ',' << want.size() << ','
            << QStringLiteral("0x%1").arg(desc, 0, 16) << ','
-           << QStringLiteral("0x%1").arg(dataOff, 0, 16) << ',' << hits << ',' << firstMiss << ','
-           << (contiguous ? "yes" : "no") << ',' << (covers ? "yes" : "no") << ','
+           << QStringLiteral("0x%1").arg(dataOff, 0, 16) << ',' << declaredCount << ',' << hits
+           << ',' << firstMiss << ',' << (contiguous ? "yes" : "no") << ','
+           << (covers ? "yes" : "no") << ',' << (declaredCount == want.size() ? "yes" : "no") << ','
            << shape.left(24) << '\n';
     }
     prog.setValue(int(apps.size()));
@@ -162,7 +173,11 @@ QString runMatSnoSweep(const QString& d4, SnoIndex* idx, CascReader* rd, QWidget
            << "walk contiguous (o*.*)    " << contiguousOk << '\n'
            << "walk covered all JSON     " << coversAll << '\n'
            << "BOTH (clean derivation)   " << exact << '\n';
-        const double pct = withJson ? 100.0 * exact / withJson : 0.0;
+        const double pct = descFound ? 100.0 * exact / descFound : 0.0;
+        ts << QStringLiteral("\nNOTE: the rate below is conditional on the descriptor being FOUND.\n"
+                            "The first sweep divided by all appearances and read 41%% as 'the model\n"
+                            "is wrong', when the model held in 99%% of located cases and the search\n"
+                            "was what failed. Search coverage is reported separately above.\n");
         ts << QStringLiteral("\nclean derivation rate     %1%\n").arg(pct, 0, 'f', 1);
         ts << "\nVERDICT\n";
         if (pct >= 95.0)
