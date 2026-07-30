@@ -24,6 +24,7 @@
 #include "index/AnimActionIndex.h"
 #include "index/AppearanceMeta.h"
 #include "index/BackTrophyIndex.h"
+#include "index/MatSnoSweep.h"
 #include "index/WardrobeAnimIndex.h"
 #include "index/IconIndex.h"
 #include "index/CoreToc.h"
@@ -2815,6 +2816,16 @@ void WardrobeTab2::refresh()
         QTimer::singleShot(1500, this, [this] {
             const QString msg = runClothAudit(Config::d4dataDir(), m_index, m_reader, this);
             QMessageBox::information(this, QStringLiteral("Cloth audit"), msg);
+        });
+    // D4_MATSNO_SWEEP=1 → derive the appearance material-sno table across the whole corpus and
+    // QUIT ("Dump Material SNO Table.bat"). Unattended by design: the hand-clicked version sampled
+    // whatever names came to mind, which is exactly the bias that made a broken stride test look
+    // like a 12-of-25 result. Same 1500 ms defer as the cloth audit so the window paints first.
+    if (qEnvironmentVariableIsSet("D4_MATSNO_SWEEP"))
+        QTimer::singleShot(1500, this, [this] {
+            const QString msg = runMatSnoSweep(Config::d4dataDir(), m_index, m_reader, this);
+            qInfo().noquote() << msg;
+            QCoreApplication::exit(0);   // unattended — the bat reads the report
         });
     // Item-level hover metadata (rarity / season / description / introduced-in) — background build;
     // re-stamp the card tooltips when it lands.
