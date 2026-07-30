@@ -130,6 +130,12 @@ set D4_METADUMP_SNOS=2335360,2335358,2335347,2520946,2520944,2520945,399607,4678
 "%EXE%"
 
 echo.
+if exist "%~dp0build\release\tvfs_paths.txt" (
+    echo  TVFS path table written:
+    for %%A in ("%~dp0build\release\tvfs_paths.txt") do echo    %%~zA bytes - %%~fA
+    echo.
+)
+
 if not exist "%TXT%" (
     echo  [X] No report was written.
     echo      The sweep needs a configured GAME INSTALL ^(it reads meta blobs from

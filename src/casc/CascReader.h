@@ -77,6 +77,10 @@ public:
     // and one example. Textures have no base/meta/<sno>, so their definition is somewhere readFile
     // never looks — this shows what namespaces exist instead of guessing one at a time.
     QStringList rootPrefixCensus();
+    // EVERY TVFS path with its stored size, written to a file. One complete dump beats a rebuild
+    // per guessed path: with the whole table on disk, any question about where a definition lives
+    // is answered offline. Returns the count written.
+    int dumpAllRootPaths(const QString& outPath);
 
     struct PayloadVariants { quint64 payload = 0; quint64 paylow = 0; };
     PayloadVariants payloadVariants(quint64 sno);

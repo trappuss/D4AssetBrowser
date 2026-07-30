@@ -13,6 +13,7 @@
 #include <QRegularExpression>
 #include <QSet>
 #include <QSettings>
+#include <QTextStream>
 #include <QtEndian>
 #include <QtGlobal>
 
@@ -1074,6 +1075,26 @@ QByteArray CascReader::readPayloadBySno(quint64 sno)
 QByteArray CascReader::readMetaBySno(quint64 sno)
 {
     return readFile(QStringLiteral("base/meta/%1").arg(sno));
+}
+
+int CascReader::dumpAllRootPaths(const QString& outPath)
+{
+    QMutexLocker lock(&m_mutex);
+    QFile f(outPath);
+    if (!f.open(QIODevice::WriteOnly | QIODevice::Text)) return -1;
+    QTextStream ts(&f);
+    QStringList keys = m_root.keys();
+    keys.sort();
+    for (const QString& k : keys) {
+        quint64 bytes = 0;
+        int chunks = 0;
+        for (const QByteArray& ek : m_root.value(k)) {
+            auto e = m_index.constFind(ek);
+            if (e != m_index.constEnd()) { bytes += e.value().size; ++chunks; }
+        }
+        ts << k << '\t' << bytes << '\t' << chunks << '\n';
+    }
+    return int(keys.size());
 }
 
 QStringList CascReader::rootPrefixCensus()

@@ -195,6 +195,16 @@ QString runMatSnoSweep(const QString& d4, SnoIndex* idx, CascReader* rd, QWidget
         // bulk container. Printing the whole census answers that without a rebuild per guess.
         qInfo("metadump: TVFS namespace census —");
         for (const QString& p : rd->rootPrefixCensus()) qInfo().noquote() << "    " << p;
+        // And the complete table to disk. Texture dimensions are not in the payload (sno4678 is 256
+        // bytes of zeros) and there is no base/meta entry for any texture, so the definition lives
+        // somewhere this tool has never looked. Rather than test one candidate path per rebuild,
+        // dump every path once and answer it offline.
+        {
+            const QString tv = QCoreApplication::applicationDirPath()
+                             + QStringLiteral("/tvfs_paths.txt");
+            const int n = rd->dumpAllRootPaths(tv);
+            qInfo().noquote() << QStringLiteral("metadump: wrote %1 TVFS path(s) to %2").arg(n).arg(tv);
+        }
     }
     const QString outDir = QCoreApplication::applicationDirPath();
     QFile csv(outDir + QStringLiteral("/matsno_sweep.csv"));
