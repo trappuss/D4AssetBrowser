@@ -156,6 +156,36 @@ QString runMatSnoSweep(const QString& d4, SnoIndex* idx, CascReader* rd, QWidget
         }
         qInfo("metadump: wrote %d blob(s) to %s", wrote, qPrintable(dumpDir));
     }
+
+    // D4_METADUMP_SNOS=<sno,sno,...> — dump by raw sno, any group. Needed for Material and Texture
+    // blobs, which have no appearance name to look up: an encrypted material resolves to
+    // "~unnamed_<sno>", so the sno IS the handle. Writes meta and, for textures, the payload too,
+    // since dimensions live in meta but pixels live in payload.
+    if (!qEnvironmentVariable("D4_METADUMP_SNOS").isEmpty()) {
+        const QString dumpDir = QCoreApplication::applicationDirPath() + QStringLiteral("/metadump");
+        QDir().mkpath(dumpDir);
+        int wrote = 0;
+        const QStringList ids = qEnvironmentVariable("D4_METADUMP_SNOS")
+                                    .split(QLatin1Char(','), Qt::SkipEmptyParts);
+        for (const QString& idStr : ids) {
+            bool ok = false;
+            const quint64 sno = idStr.trimmed().toULongLong(&ok);
+            if (!ok || !sno) continue;
+            const QByteArray meta = rd->readMetaBySno(sno);
+            if (!meta.isEmpty()) {
+                QFile f(dumpDir + QStringLiteral("/sno%1.meta.bin").arg(sno));
+                if (f.open(QIODevice::WriteOnly)) { f.write(meta); ++wrote; }
+            }
+            const QByteArray pay = rd->readPayloadBySno(sno);
+            if (!pay.isEmpty()) {
+                QFile f(dumpDir + QStringLiteral("/sno%1.payload.bin").arg(sno));
+                if (f.open(QIODevice::WriteOnly)) { f.write(pay); ++wrote; }
+            }
+            qInfo("metadump sno %llu: meta %lld B, payload %lld B",
+                  sno, qint64(meta.size()), qint64(pay.size()));
+        }
+        qInfo("metadump: wrote %d sno blob(s)", wrote);
+    }
     const QString outDir = QCoreApplication::applicationDirPath();
     QFile csv(outDir + QStringLiteral("/matsno_sweep.csv"));
     if (!csv.open(QIODevice::WriteOnly | QIODevice::Text))

@@ -116,6 +116,11 @@ REM Raw meta blobs for offline layout derivation. Two encrypted (ground truth fr
 REM d4analyzer GLB extraction in .Testing) + named ones covering every case the sweep
 REM flagged: the 144-byte-stride sample, 5-material, cloth+material, fx-heavy, 1-material.
 set D4_METADUMP_NAMES=necF_stor245_TRS,necF_stor245_LEG,BarM_stor258_TRS,barF_stor274_TRS,barM_stor256_TRS,druM_stor177_HLM,rogF_stor231_GLV,warM_stor175_LEG,palF_stor171_TRS,palM_stor171_TRS,barF_base02_GLV,necF_base01_TRS
+REM Material + Texture blobs for the encrypted stor245 set, to derive the texture chain.
+REM 2335360/2335358 = TRS mat + fur mat, 2335347 = LEG mat, 2520946/2520944/2520945 = cloth,
+REM 399607 = armor_skin_mat (NAMED - a control whose JSON we can check the derivation against).
+set D4_METADUMP_SNOS=2335360,2335358,2335347,2520946,2520944,2520945,399607
+
 "%EXE%"
 
 echo.
