@@ -2,6 +2,7 @@
 
 #include "index/SnoIndex.h"
 #include "model/AppearanceMatBin.h"
+#include "tex/TextureDefTable.h"
 
 #include "casc/CascReader.h"
 #include "model/Material.h"
@@ -28,10 +29,28 @@ QByteArray readMat(const QString& d4, const QString& matName)
 QImage MaterialDecode::texture(CascReader* reader, const QString& d4,
                                const QString& texName, qint64 texSno)
 {
-    if (!reader || texName.isEmpty() || texSno <= 0 || d4.isEmpty()) return {};
+    // texName may legitimately be empty now: an encrypted texture has no name, only a sno. The
+    // JSON route needs one, the binary route does not, so the name is no longer a precondition.
+    if (!reader || texSno <= 0) return {};
     TexMeta meta;
-    QFile f(QStringLiteral("%1/json/base/meta/Texture/%2.tex.json").arg(d4, texName));
-    if (f.open(QIODevice::ReadOnly)) meta = parseTexMetaJson(f.readAll());
+    if (!texName.isEmpty() && !d4.isEmpty()) {
+        QFile f(QStringLiteral("%1/json/base/meta/Texture/%2.tex.json").arg(d4, texName));
+        if (f.open(QIODevice::ReadOnly)) meta = parseTexMetaJson(f.readAll());
+    }
+    if (!meta.valid) {
+        // No .tex.json — every encrypted texture, and any asset newer than the d4data snapshot.
+        // Dimensions come from CASC's bulk texture tables instead. See TextureDefTable for the
+        // derived layout; the overlay holding a given encrypted texture is gated by the same TACT
+        // key as its pixels, so if the payload decodes the definition does too.
+        TextureDefTable::instance().ensureBuilt(reader);
+        const TextureDefTable::Def d = TextureDefTable::instance().lookup(int(texSno));
+        if (d.valid()) {
+            meta.width = d.width;
+            meta.height = d.height;
+            meta.eTexFormat = d.format;
+            meta.valid = true;
+        }
+    }
     if (!meta.valid) return {};
     const QByteArray payload = reader->readPayloadBySno(quint64(texSno));
     if (payload.isEmpty()) return {};
