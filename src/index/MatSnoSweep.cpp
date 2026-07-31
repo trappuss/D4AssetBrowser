@@ -511,6 +511,8 @@ QString runHealthAudit(const QString& d4, SnoIndex* idx, CascReader* rd, QWidget
     prog.setMinimumDuration(0);
 
     QMap<Health, int> tally;
+    int namelessOk = 0;                  // decode fine, but no name -> unreachable in every roster
+    QStringList namelessExamples;
     QMap<Health, QStringList> examples;
     QHash<QString, QString> current;   // name -> status, for the diff against last run
     int scanned = 0;
@@ -571,6 +573,16 @@ QString runHealthAudit(const QString& d4, SnoIndex* idx, CascReader* rd, QWidget
         }
 
         ++tally[h];
+        // NAMELESS-BUT-RENDERABLE is tracked separately from the health verdict, because it is a
+        // different kind of defect: the asset is perfectly fine and simply cannot be REACHED, since
+        // every roster in the tool is name-shaped. Counting it as OK is what made an earlier
+        // "100% of wardrobe appearances OK" claim blind to exactly the pieces the user was asking
+        // about — the name filter excluded them from the denominator.
+        if (h == Health::Ok && e.name.startsWith(QLatin1String("~unnamed_"))) {
+            ++namelessOk;
+            if (namelessExamples.size() < 30) namelessExamples << QStringLiteral("%1 (%2 mats)")
+                                                                     .arg(e.name).arg(mats);
+        }
         if (h != Health::Ok && examples[h].size() < 25) examples[h] << e.name;
         current.insert(e.name, QLatin1String(healthName(h)));
 
@@ -625,6 +637,18 @@ QString runHealthAudit(const QString& d4, SnoIndex* idx, CascReader* rd, QWidget
                       .arg(tally.value(h), 8);
         ts << "\nLOCKED is not a defect — those need a TACT key we do not hold. Everything else\n"
               "above OK is something the tool should be able to show and cannot.\n";
+        ts << QStringLiteral(
+                  "\n  NAMELESS BUT RENDERABLE  %1\n"
+                  "  These decode completely — geometry, materials and textures all resolve — and are\n"
+                  "  still invisible, because every roster in the tool matches on NAME. They are\n"
+                  "  counted in OK above; this line exists so they can never again be hidden by a\n"
+                  "  name-shaped filter. Recovering a name for one makes it appear with no other\n"
+                  "  change. THIS IS THE REAL BACKLOG.\n")
+                  .arg(namelessOk, 8);
+        if (!namelessExamples.isEmpty()) {
+            ts << "\n  first " << namelessExamples.size() << ":\n";
+            for (const QString& n : namelessExamples) ts << "    " << n << '\n';
+        }
         for (Health h : {Health::NoTexDefs, Health::NoMaterials,
                          Health::NoGeometry, Health::NoData}) {
             if (examples.value(h).isEmpty()) continue;
@@ -647,11 +671,12 @@ QString runHealthAudit(const QString& d4, SnoIndex* idx, CascReader* rd, QWidget
     QFile::copy(outDir + QStringLiteral("/asset_health.csv"), basePath);
 
     const QString head =
-        QStringLiteral("health: %1 OK, %2 locked, %3 broken (%4 newly broken, %5 newly working)")
+        QStringLiteral("health: %1 OK (%6 nameless+renderable), %2 locked, %3 broken "
+                       "(%4 newly broken, %5 newly working)")
             .arg(tally.value(Health::Ok)).arg(tally.value(Health::Locked))
             .arg(tally.value(Health::NoTexDefs) + tally.value(Health::NoMaterials)
                  + tally.value(Health::NoGeometry) + tally.value(Health::NoData))
-            .arg(broken.size()).arg(fixed.size());
+            .arg(broken.size()).arg(fixed.size()).arg(namelessOk);
     qInfo().noquote() << head;
     return head;
 }
