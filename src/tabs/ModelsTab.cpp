@@ -1296,7 +1296,9 @@ ModelsTab::ModelsTab(QWidget* parent) : BrowserTab(parent)
                 QMenu m(this);
                 m.addAction(QStringLiteral("Copy"), this,
                             [label] { QGuiApplication::clipboard()->setText(label); });
-                m.exec(gp);
+                // gp is declared further down for the root-row path; map here instead of hoisting
+                // it, so this branch stays self-contained.
+                m.exec(m_list->viewport()->mapToGlobal(p));
                 return;
             }
             QMenu menu(this);
