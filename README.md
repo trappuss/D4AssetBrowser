@@ -22,7 +22,7 @@ hair, makeup and animations.
    writes lives in `data\` next to the exe.
 2. Run **`D4AssetBrowser.exe`**.
 3. **File → Settings** — set your **Diablo IV game folder**.
-4. **File → Dependencies…** — download **d4data** (community metadata snapshot). One click.
+4. **File → Dependencies…** — download **d4data** (community metadata snapshot)(don't panic when extracting folders takes a long time). One click.
 5. **File → Update TACT Keys** — fetches the community decryption keys.
 
 No Python. No `pip`. No d4extract.
