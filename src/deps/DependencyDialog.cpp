@@ -16,11 +16,16 @@
 DependencyDialog::DependencyDialog(QWidget* parent) : QDialog(parent)
 {
     setWindowTitle(QStringLiteral("Dependencies — d4data"));
-    resize(620, 440);
+    resize(620, 460);
+    setMaximumWidth(760);   // a long label must never be able to stretch the window again
 
     auto* lay = new QVBoxLayout(this);
 
-    lay->addWidget(new QLabel(QStringLiteral(
+    // Word-wrapped and width-capped. Without both, a QLabel sizes itself to fit its text on ONE
+    // line and drags the dialog with it — this description grew long enough to stretch the window
+    // across a 2560px display. setWordWrap alone is not sufficient: the label still reports a wide
+    // sizeHint, so the maximum width is what actually pins it.
+    auto* intro = new QLabel(QStringLiteral(
         "<b>d4data</b> — community-maintained game metadata (asset names, item/appearance "
         "definitions, materials, textures and translated strings). The Textures, Models, "
         "Wardrobe and String-List tabs read it to name and resolve assets.<br><br>"
@@ -28,17 +33,17 @@ DependencyDialog::DependencyDialog(QWidget* parent) : QDialog(parent)
         "<code>json/enUS_Text</code> — as a shallow, blob-filtered <i>sparse</i> git checkout, "
         "so it's a fraction of the full repo. Update it whenever the game patches."
         "<br><br>"
-        "<b>Budget ~4-6 GB of disk space and 10-20 minutes.</b> The download itself is modest; "
-        "what takes the time is writing roughly <b>460,000 small JSON files</b> "
-        "(Texture ~141,000, Material ~101,000, Appearance ~67,000). Only the <b>20 asset groups "
-        "this tool actually reads</b> are fetched, out of 133 in the repository — that alone "
-        "skips 317,000 files, and the folder is set to <b>NTFS-compressed</b> as it is written "
-        "(JSON compresses roughly 5-10x, and compression also recovers the 4 KB-per-file cluster "
-        "slack that dominates a folder of this shape). "
-        "The <i>Extracting</i> step is therefore limited by your drive's file-creation rate, not "
-        "by your connection — it is much slower on a hard drive than an SSD, and antivirus "
-        "real-time scanning can double it. It is working even when it looks still; the progress "
-        "line below counts asset groups as they appear."), this));
+        "<b>Budget ~4-6 GB and 10-20 minutes.</b> The download is small; the time goes on writing "
+        "~460,000 tiny JSON files, so this is limited by your drive, not your connection — slower "
+        "on a hard drive, and antivirus scanning can double it.<br>"
+        "Only the 20 asset groups this tool reads are fetched (of 133), and the folder is "
+        "NTFS-compressed as it is written.<br><br>"
+        "<b>The <i>Extracting</i> step looks frozen and is not</b> — the progress line below counts "
+        "asset groups as they appear."), this);
+    intro->setWordWrap(true);
+    intro->setMaximumWidth(580);          // slightly inside resize(620, ...) below, less the margins
+    intro->setTextFormat(Qt::RichText);
+    lay->addWidget(intro);
 
     m_status = new QLabel(this);
     m_status->setTextInteractionFlags(Qt::TextSelectableByMouse);
