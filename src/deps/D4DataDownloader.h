@@ -1,5 +1,7 @@
 #pragma once
+#include <QElapsedTimer>
 #include <QObject>
+#include <QTimer>
 #include <QStringList>
 #include <QVector>
 
@@ -35,6 +37,15 @@ signals:
 private:
     void runNext();
     void parseGitProgress(const QString& line);   // emits phaseProgress from a git stderr line
+    // "Extracting folders" is `git sparse-checkout set`, which materialises roughly a MILLION small
+    // JSON files (Texture alone is ~141k, Material ~101k, Appearance ~67k, across 133 groups). git
+    // prints checkout progress only to a TTY, and QProcess gives it a pipe, so that step emitted
+    // NOTHING for several minutes and looked hung. These poll the filesystem instead, which works
+    // regardless of what git chooses to print.
+    void startExtractWatch(const QString& dest);
+    void stopExtractWatch();
+    QTimer*  m_extractTimer = nullptr;
+    QElapsedTimer m_extractClock;
 
     QProcess*            m_proc = nullptr;
     QString              m_dest;

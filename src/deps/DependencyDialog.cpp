@@ -26,7 +26,15 @@ DependencyDialog::DependencyDialog(QWidget* parent) : QDialog(parent)
         "Wardrobe and String-List tabs read it to name and resolve assets.<br><br>"
         "Only the two folders the app needs are fetched — <code>json/base</code> and "
         "<code>json/enUS_Text</code> — as a shallow, blob-filtered <i>sparse</i> git checkout, "
-        "so it's a fraction of the full repo. Update it whenever the game patches."), this));
+        "so it's a fraction of the full repo. Update it whenever the game patches."
+        "<br><br>"
+        "<b>Budget ~20 GB of disk space and 10-30 minutes.</b> The download itself is modest; "
+        "what takes the time is writing roughly <b>one million small JSON files</b> "
+        "(Texture ~141,000, Material ~101,000, Appearance ~67,000, across 133 asset groups). "
+        "The <i>Extracting</i> step is therefore limited by your drive's file-creation rate, not "
+        "by your connection — it is much slower on a hard drive than an SSD, and antivirus "
+        "real-time scanning can double it. It is working even when it looks still; the progress "
+        "line below counts asset groups as they appear."), this));
 
     m_status = new QLabel(this);
     m_status->setTextInteractionFlags(Qt::TextSelectableByMouse);

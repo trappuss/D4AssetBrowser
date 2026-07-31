@@ -54,7 +54,11 @@ void D4DataDownloader::start(const QString& dest)
                         "--progress", QString::fromLatin1(kRepoUrl), dest});
         m_stepLabels.append(QStringLiteral("Downloading metadata"));
         m_steps.append(QStringList{"-C", dest, "sparse-checkout", "set"} + kSparse);
-        m_stepLabels.append(QStringLiteral("Extracting folders"));
+        // Named for what it costs, not for what it does. This step writes ~1 million small files
+        // and takes minutes on an SSD, considerably longer on a hard drive — with the old label
+        // and no output it read as a hang, which is the single most common "is it broken?" moment
+        // in first-run setup.
+        m_stepLabels.append(QStringLiteral("Extracting ~1 million files (several minutes)"));
     }
     runNext();
 }
@@ -77,6 +81,47 @@ void D4DataDownloader::parseGitProgress(const QString& line)
                        m.captured(QStringLiteral("pct")).toInt(), detail);
 }
 
+// ── Extraction progress, measured from the filesystem ───────────────────────────────────────────
+// The 133 directories under json/base/meta are the asset GROUPS (Appearance, Texture, Material...),
+// and git creates them as it writes. Counting those is one cheap readdir of ~133 entries — counting
+// the ~1,000,000 FILES underneath would itself take longer than the UI refresh interval and make
+// the freeze worse rather than better.
+//
+// The count is a floor, not a percentage of work: groups differ enormously in size (Texture ~141k
+// files, most groups a few hundred), so it is reported as "N of 133 groups" alongside elapsed time
+// rather than converted into a misleading percent.
+void D4DataDownloader::startExtractWatch(const QString& dest)
+{
+    stopExtractWatch();
+    m_extractClock.start();
+    m_extractTimer = new QTimer(this);
+    m_extractTimer->setInterval(1500);
+    const QString metaDir = dest + QStringLiteral("/json/base/meta");
+    connect(m_extractTimer, &QTimer::timeout, this, [this, metaDir] {
+        const int groups = QDir(metaDir).entryList(QDir::Dirs | QDir::NoDotAndDotDot).size();
+        const qint64 secs = m_extractClock.elapsed() / 1000;
+        const QString elapsed = QStringLiteral("%1:%2").arg(secs / 60)
+                                    .arg(secs % 60, 2, 10, QLatin1Char('0'));
+        // Percent is deliberately capped at 99: the last group finishing is not the step finishing,
+        // and a bar that sits at 100% while the app is still busy is worse than one that sits at 99.
+        const int pct = groups > 0 ? qMin(99, groups * 100 / 133) : 0;
+        emit phaseProgress(QStringLiteral("Extracting"), pct,
+                           groups > 0
+                               ? QStringLiteral("%1 of ~133 asset groups · %2 elapsed")
+                                     .arg(groups).arg(elapsed)
+                               : QStringLiteral("writing ~1 million files · %1 elapsed").arg(elapsed));
+    });
+    m_extractTimer->start();
+}
+
+void D4DataDownloader::stopExtractWatch()
+{
+    if (!m_extractTimer) return;
+    m_extractTimer->stop();
+    m_extractTimer->deleteLater();
+    m_extractTimer = nullptr;
+}
+
 void D4DataDownloader::runNext()
 {
     if (m_cancelled) {
@@ -89,8 +134,12 @@ void D4DataDownloader::runNext()
     }
 
     const QStringList args = m_steps[m_stepIndex];
-    emit stepChanged(m_stepIndex + 1, m_steps.size(),
-                     m_stepLabels.value(m_stepIndex, QStringLiteral("Working")));
+    const QString label = m_stepLabels.value(m_stepIndex, QStringLiteral("Working"));
+    emit stepChanged(m_stepIndex + 1, m_steps.size(), label);
+    // sparse-checkout is the silent, slow one — watch the filesystem for the whole of it.
+    stopExtractWatch();
+    if (args.contains(QStringLiteral("sparse-checkout")) || label.startsWith(QStringLiteral("Applying")))
+        startExtractWatch(m_dest);
     m_proc = new QProcess(this);
     m_proc->setProgram(gitPath());
     m_proc->setArguments(args);
@@ -107,6 +156,7 @@ void D4DataDownloader::runNext()
     });
     connect(m_proc, &QProcess::finished, this,
             [this](int code, QProcess::ExitStatus) {
+                stopExtractWatch();   // whatever happens, the poller must not outlive the step
                 if (m_proc) { m_proc->deleteLater(); m_proc = nullptr; }
                 if (m_cancelled) { emit finished(false, QStringLiteral("Cancelled.")); return; }
                 if (code != 0) {
