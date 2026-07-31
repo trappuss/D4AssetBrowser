@@ -25,6 +25,7 @@
 #include "index/AppearanceMeta.h"
 #include "index/BackTrophyIndex.h"
 #include "index/MatSnoSweep.h"
+#include "util/LookIcon.h"
 #include "index/WardrobeAnimIndex.h"
 #include "index/IconIndex.h"
 #include "index/CoreToc.h"
@@ -4939,18 +4940,9 @@ void WardrobeTab2::populateSlots()
 // ── Equipment icon-grid view (pure view over the hidden m_slot[] combos) ─────
 // An appearance's REAL 2D inventory icon (AppearanceMeta handle → atlas crop). 2D only.
 // Null until both indexes are ready; the grid refills on readyChanged (lazy build on show).
-static QImage wardrobeLookImage(int sno, CascReader* reader)
-{
-    if (sno <= 0 || !reader) return QImage();
-    if (!AppearanceMeta::instance().ready() || !IconIndex::instance().ready()) return QImage();
-    static QHash<int, QImage> cache;   // sno → icon is stable once the indexes are ready
-    const auto it = cache.constFind(sno);
-    if (it != cache.constEnd()) return *it;
-    const quint32 h = AppearanceMeta::instance().iconFor(sno);
-    QImage img = h ? IconIndex::instance().iconImage(h, reader) : QImage();
-    if (!img.isNull()) cache.insert(sno, img);   // don't cache misses — retry on the next refill
-    return img;
-}
+// Moved to util/LookIcon.h so the Stable tab can use the same implementation rather than growing a
+// second copy. Kept as a thin alias because three call sites here read better with the short name.
+static QImage wardrobeLookImage(int sno, CascReader* reader) { return LookIcon::image(sno, reader); }
 
 // The block of actions an EQUIPPED ITEM offers, shared by the slot cells and the look-grid cards so
 // the two cannot drift. Modelled on the Models tab's icon-grid menu — image actions, then export,

@@ -1,4 +1,5 @@
 #include "tabs/StableTab2.h"
+#include "util/LookIcon.h"
 #include "util/ViewportPartMenu.h"
 
 #include "app/ExportNotifier.h"
@@ -249,6 +250,10 @@ StableTab2::StableTab2(QWidget* parent) : BrowserTab(parent)
                 const QString coll = AppearanceMeta::instance().collectionFor(sno);
                 auto clip = [](const QString& s) { QGuiApplication::clipboard()->setText(s); };
                 auto prev = [](const QString& s) { return s.size() > 30 ? s.left(29) + QChar(0x2026) : s; };
+                // Image pair first, then export, then copy — the order Wardrobe's slot cells use.
+                // These were missing here purely because the icon helper was a file-static inside
+                // WardrobeTab2.cpp; a Stable slot cell and a Wardrobe slot cell are the same idea.
+                LookIcon::addActions(menu, this, sno, appr, m_reader);
                 menu.addSeparator();
                 const QString exDir = ViewportPartMenu::condensePath(
                     QSettings().value(QStringLiteral("stable2/exportDir")).toString());
@@ -1573,6 +1578,7 @@ void StableTab2::fillGrid()
                             menu.addAction(QStringLiteral("Export Model") + extra, this,
                                            [this, entry] { exportAppearanceModel(entry.apprSno, entry.appr, false); });
                         }
+                        LookIcon::addActions(menu, this, entry.apprSno, entry.appr, m_reader);
                         menu.addSeparator();
                         auto clip = [](const QString& s) { QGuiApplication::clipboard()->setText(s); };
                         auto prev = [](const QString& s) { return s.size() > 30 ? s.left(29) + QChar(0x2026) : s; };
