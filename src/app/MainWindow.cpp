@@ -967,7 +967,7 @@ void MainWindow::finishReload(const ReloadResult& r)
 {
     QElapsedTimer tailT; tailT.start();
     const bool cascOk = r.cascOk, idx = r.idx;
-    if (cascOk) applyAppIcon(m_casc);
+    if (cascOk) applyAppIcon(m_casc.get());   // m_casc is a unique_ptr
     if (r.nKeys > 0) qInfo("CASC: %d TACT keys registered before open()", r.nKeys);
     qInfo().noquote() << "reload: gameDir=" << Config::gameDir()
                       << "product=" << Config::cascProduct()
