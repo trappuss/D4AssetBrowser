@@ -1,0 +1,16 @@
+<!DOCTYPE RCC>
+<!--
+  The window/taskbar icon, COMPILED INTO the exe.
+
+  It used to be painter-drawn in main.cpp specifically so a portable copy could not lose the file.
+  A .qrc keeps that guarantee — the PNG is linked into the binary, not read from disk — while
+  letting the icon be a real image rather than something reconstructed with drawPolygon.
+
+  Same artwork as res/app.ico, which the Windows resource (res/app.rc) uses for the FILE icon in
+  Explorer and on the desktop. Two mechanisms, one source image; update both together.
+-->
+<RCC>
+    <qresource prefix="/">
+        <file>app_256.png</file>
+    </qresource>
+</RCC>

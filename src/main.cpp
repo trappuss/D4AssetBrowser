@@ -160,38 +160,18 @@ int main(int argc, char** argv)
     // Show real checkmarks (not the platform's filled blue box) on every toggle.
     installCheckmarkStyle(app);
 
-    // Window/taskbar icon — painter-drawn (self-contained; no file to lose in a portable copy):
-    // the same gold faceted gem on charcoal as the exe's embedded res/app.ico.
+    // Window/taskbar icon — the same artwork as the exe's embedded res/app.ico, loaded from the
+    // Qt resource that res/app.qrc compiles into the binary. Still self-contained: a portable copy
+    // has no file to lose. It replaces a painter-drawn gem that existed only because there was no
+    // embedded image to use.
+    //
+    // NOTE these are two different mechanisms and BOTH are needed: this one gives the WINDOW and
+    // taskbar their icon at runtime; res/app.rc gives the .exe FILE its icon in Explorer and on the
+    // desktop. Neither substitutes for the other.
     {
-        QPixmap pm(256, 256);
-        pm.fill(Qt::transparent);
-        QPainter p(&pm);
-        p.setRenderHint(QPainter::Antialiasing);
-        p.setPen(Qt::NoPen);
-        p.setBrush(QColor(0x2a, 0x2a, 0x2c));
-        p.drawRoundedRect(QRectF(6, 6, 244, 244), 44, 44);
-        const QPointF c(128, 132);
-        const double gw = 78, gh = 104;   // gem half-extents
-        auto facet = [&](const QPointF& a, const QPointF& b, const QColor& col) {
-            p.setBrush(col);
-            p.drawPolygon(QPolygonF() << c << a << b);
-        };
-        const QPointF top(c.x(), c.y() - gh), bot(c.x(), c.y() + gh);
-        const QPointF lft(c.x() - gw, c.y()), rgt(c.x() + gw, c.y());
-        facet(top, rgt, QColor(0xf0, 0xc0, 0x5e));   // lit upper-right
-        facet(top, lft, QColor(0xe2, 0xae, 0x46));
-        facet(bot, lft, QColor(0xa8, 0x79, 0x26));
-        facet(bot, rgt, QColor(0x8f, 0x66, 0x1e));   // shadowed lower-right
-        p.setBrush(QColor(0x8a, 0x14, 0x14));        // Diablo-red core
-        p.drawPolygon(QPolygonF() << QPointF(c.x(), c.y() - gh * 0.38)
-                                  << QPointF(c.x() + gw * 0.38, c.y())
-                                  << QPointF(c.x(), c.y() + gh * 0.38)
-                                  << QPointF(c.x() - gw * 0.38, c.y()));
-        p.setPen(QPen(QColor(0x5a, 0x43, 0x18), 5));
-        p.setBrush(Qt::NoBrush);
-        p.drawPolygon(QPolygonF() << top << rgt << bot << lft);
-        p.end();
-        app.setWindowIcon(QIcon(pm));
+        const QIcon appIcon(QStringLiteral(":/app_256.png"));
+        if (!appIcon.isNull()) app.setWindowIcon(appIcon);
+        else qWarning("app icon: :/app_256.png missing from the Qt resource — using the default");
     }
 
     MainWindow window;

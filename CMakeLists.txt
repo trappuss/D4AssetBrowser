@@ -34,6 +34,7 @@ qt_standard_project_setup()
 
 qt_add_executable(D4AssetBrowser WIN32
     res/app.rc
+    res/app.qrc     # window icon, embedded (AUTORCC compiles it in)
     src/main.cpp
 
     src/app/Config.h            src/app/Config.cpp

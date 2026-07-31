@@ -924,50 +924,10 @@ void MainWindow::reload()
     }).detach();
 }
 
-// The window/taskbar icon, taken from the game's own ui_placeholder_square_mask (sno 1286628,
-// 256x256, eTexFormat 41 = BC4). Decoded from CASC at startup rather than shipped as a .ico,
-// because the tool already has the whole path — readPayloadBySno + BcDecode — and a baked copy
-// would be one more thing to regenerate when the game updates.
-//
-// BC4 is single-channel, so the decode is a greyscale MASK, not a picture: used directly it would
-// be a white square. Alpha comes from the mask and the RGB is left white, which is what makes it
-// read as a shape against both light and dark taskbars.
-static void applyAppIcon(CascReader* casc)
-{
-    if (!casc || !casc->isReady()) return;
-    constexpr int kIconSno = 1286628;
-    const QByteArray payload = casc->readPayloadBySno(kIconSno);
-    if (payload.isEmpty()) {
-        qInfo("app icon: ui_placeholder_square_mask (sno %d) not readable — keeping the default",
-              kIconSno);
-        return;
-    }
-    QImage mask = BcDecode::decode(payload, 256, 256, 41);
-    if (mask.isNull()) {
-        qInfo("app icon: sno %d failed to decode — keeping the default", kIconSno);
-        return;
-    }
-    mask = mask.convertToFormat(QImage::Format_RGBA8888);
-    QImage icon(mask.size(), QImage::Format_RGBA8888);
-    for (int y = 0; y < mask.height(); ++y)
-        for (int x = 0; x < mask.width(); ++x)
-            // Red carries the BC4 value; treat it as coverage and keep the fill white.
-            icon.setPixelColor(x, y, QColor(255, 255, 255, qRed(mask.pixel(x, y))));
-    QIcon ic;
-    // Several sizes so Windows picks a good one for the taskbar, alt-tab and the title bar
-    // instead of scaling 256 down each time.
-    for (int sz : {16, 24, 32, 48, 64, 128, 256})
-        ic.addPixmap(QPixmap::fromImage(
-            icon.scaled(sz, sz, Qt::KeepAspectRatio, Qt::SmoothTransformation)));
-    QApplication::setWindowIcon(ic);
-    qInfo("app icon: set from ui_placeholder_square_mask (sno %d)", kIconSno);
-}
-
 void MainWindow::finishReload(const ReloadResult& r)
 {
     QElapsedTimer tailT; tailT.start();
     const bool cascOk = r.cascOk, idx = r.idx;
-    if (cascOk) applyAppIcon(m_casc.get());   // m_casc is a unique_ptr
     if (r.nKeys > 0) qInfo("CASC: %d TACT keys registered before open()", r.nKeys);
     qInfo().noquote() << "reload: gameDir=" << Config::gameDir()
                       << "product=" << Config::cascProduct()
