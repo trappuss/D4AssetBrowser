@@ -22,12 +22,15 @@ hair, makeup and animations.
    writes lives in `data\` next to the exe.
 2. Run **`D4AssetBrowser.exe`**.
 3. **File → Settings** — set your **Diablo IV game folder**.
-4. **File → Dependencies…** — download **d4data** (community metadata snapshot)(don't panic when extracting folders takes a long time). One click.
+4. **File → Dependencies…** — download **d4data** (community metadata snapshot). One click.
+   Budget **~4–6 GB** and 10–20 minutes: it writes ~460,000 small JSON files, so the
+   *Extracting* step is limited by your drive, not your connection. Only the 20 asset
+   groups the tool reads are fetched (of 133), and the folder is NTFS-compressed.
 5. **File → Update TACT Keys** — fetches the community decryption keys.
 
 No Python. No `pip`. No d4extract.
 
-**Requirements:** Windows 10/11 x64 · a Diablo IV install (Battle.net Tested Only) ·
+**Requirements:** Windows 10/11 x64 · a Diablo IV install (Battle.net or Steam) ·
 GPU with OpenGL 4.5 · internet on first run.
 
 ---
@@ -131,7 +134,7 @@ working / newly broken" rather than being discovered months later.
 | Wardrobe tab is slow | **Rewritten** — sync rebuild ~150 ms for 6 pieces |
 | D4Extract as a dependency | **Removed** |
 
-### Honest limitations (7/31/2026)
+### Honest limitations
 
 - **~10% of wardrobe appearances render incomplete.** The model parser decodes only vertex
   buffer 0; sub-objects on other buffers are dropped rather than drawn scrambled. Measured,
@@ -140,6 +143,29 @@ working / newly broken" rather than being discovered months later.
   name-keyed rosters. Cloth-bearing pieces recover names; plain helms/gloves/boots do not.
 - **~11,500 SNOs stay locked** behind 189 TACT keys nobody has harvested. Not fixable here.
 - Windows only.
+
+---
+
+## Portable — everything lives in `data\`
+
+No registry keys, no `%APPDATA%`, no user-profile files. Everything the tool writes goes in
+`data\` beside the exe:
+
+| | |
+|---|---|
+| `D4AssetBrowser\*.ini` | settings (INI, not the registry) |
+| `coretoc_v2.bin` · `casc_index_v1.bin` | asset index caches, keyed to the game build |
+| `appearance_meta_v21.json` · `icon_index_v3.json` | metadata and icon caches |
+| `model_thumbs\` · `stable_thumbs\` · `icon_overrides\` | rendered thumbnails |
+| `ensembles\` | saved wardrobe outfits |
+| `d4data\` | the metadata checkout |
+| `D4AssetBrowser.log` | attach this to bug reports |
+
+Move the folder to another drive or a USB stick and it keeps working. Delete it and nothing
+is left behind. Superseded cache versions are pruned automatically at startup.
+
+The only exception, deliberately: **export** dialogs default to Documents/Pictures, because a
+`.glb` you exported belongs with your files, not inside the tool.
 
 ---
 
