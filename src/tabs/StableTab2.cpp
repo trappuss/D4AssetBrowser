@@ -3129,7 +3129,33 @@ void StableTab2::buildAnimPanel()
     m_anims->setMinimumHeight(220);
     m_anims->setMaximumHeight(420);
     v->addWidget(m_anims, 1);
-    installCopyMenu(m_anims, 0);   // right-click → Copy clip name / Copy all
+    // Play + Copy file name, then the shared Copy/Copy all. This list could only be played by
+    // LEFT-clicking a row (:3142) while its context menu offered copy alone — the Models and
+    // Wardrobe animation panels both expose the action their tab actually performs, and this one
+    // did not. Installed before installCopyMenu so the copy pair stays at the bottom, matching the
+    // ordering everywhere else.
+    m_anims->setContextMenuPolicy(Qt::CustomContextMenu);
+    connect(m_anims, &QWidget::customContextMenuRequested, this, [this](const QPoint& p) {
+        QListWidgetItem* hit = m_anims->itemAt(p);
+        QMenu menu(this);
+        if (hit) {
+            const QString clip = hit->data(Qt::UserRole).toString();
+            if (!clip.isEmpty()) {
+                menu.addAction(QStringLiteral("Play"), this, [this, clip] { playAnimByName(clip); });
+                menu.addSeparator();
+                menu.addAction(QStringLiteral("Copy file name  (%1)")
+                                   .arg(clip.size() > 30 ? clip.left(29) + QChar(0x2026) : clip),
+                               this, [clip] { QGuiApplication::clipboard()->setText(clip); });
+            }
+        }
+        if (!menu.isEmpty()) menu.addSeparator();
+        menu.addAction(QStringLiteral("Copy all"), this, [this] {
+            QStringList all;
+            for (int i = 0; i < m_anims->count(); ++i) all << m_anims->item(i)->text().trimmed();
+            QGuiApplication::clipboard()->setText(all.join(QLatin1Char('\n')));
+        });
+        menu.exec(m_anims->viewport()->mapToGlobal(p));
+    });
 
     auto* resetBtn = new QPushButton(QStringLiteral("Reset to default"));
     resetBtn->setToolTip(QStringLiteral("Reset to the base horse mount with no armor or trophy, "

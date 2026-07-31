@@ -1371,14 +1371,33 @@ void TexturesTab::showBrowserMenu(QAbstractItemView* view, const QPoint& viewpor
             const QImage img = decodeTexCpu(firstSno);
             if (!img.isNull()) QApplication::clipboard()->setImage(img);
         });
+        // A texture browser offering "Copy image" but no way to SAVE one was the odd gap here —
+        // every other image surface in the app (Models rows, channel tiles, GL preview, frame
+        // gallery) has the save pair. Same wording as those, so the three spellings this tab used
+        // to have do not come back.
+        menu.addAction(QStringLiteral("Save image as…"), this, [this, firstSno, first] {
+            if (!m_snoName.contains(firstSno)) m_snoName.insert(firstSno, first);
+            const QImage img = decodeTexCpu(firstSno);
+            if (img.isNull()) return;
+            const QString fn = QFileDialog::getSaveFileName(
+                this, QStringLiteral("Save texture"),
+                QDir(QSettings().value(QStringLiteral("textures/lastImageDir")).toString())
+                    .filePath(first + QStringLiteral(".png")),
+                QStringLiteral("PNG (*.png);;JPEG (*.jpg)"));
+            if (fn.isEmpty()) return;
+            QSettings().setValue(QStringLiteral("textures/lastImageDir"), QFileInfo(fn).absolutePath());
+            img.save(fn);
+        });
     }
     menu.addSeparator();
     if (n == 1) {
         menu.addAction(QStringLiteral("Copy SNO id  (%1)").arg(snoStrs.first()), this, [snoStrs, copy] { copy(snoStrs); });
         menu.addAction(QStringLiteral("Copy file name  (%1)").arg(prev(names.first())), this, [names, copy] { copy(names); });
         menu.addAction(QStringLiteral("Copy name  (%1)").arg(prev(names.first())), this, [names, copy] { copy(names); });
-        QAction* aC = menu.addAction(QStringLiteral("Copy collection name  (—)"));   // textures have no collection
-        aC->setEnabled(false);
+        // No "Copy collection name" here, in either branch: a texture has no collection, so the
+        // action could never do anything. It used to appear permanently disabled in the
+        // single-select branch and be absent from the multi-select one — inconsistent AND useless.
+        // An action that can never apply is not parity, it is clutter.
     } else {
         menu.addAction(QStringLiteral("Copy %1 SNO ids").arg(n), this, [snoStrs, copy] { copy(snoStrs); });
         menu.addAction(QStringLiteral("Copy %1 file names").arg(n), this, [names, copy] { copy(names); });

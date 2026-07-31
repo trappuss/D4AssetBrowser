@@ -1286,7 +1286,19 @@ ModelsTab::ModelsTab(QWidget* parent) : BrowserTab(parent)
             }
             // Part nodes: Blender-style isolate tools.
             const QList<int> parts = m_treeModel->partsUnder(hit);
-            if (parts.isEmpty()) return;   // bones/looks/groups: no menu (yet)
+            if (parts.isEmpty()) {
+                // Bones, looks and group headers have no parts, so none of the visibility actions
+                // apply — but opening NO menu at all reads as a dead control. Copying the label is
+                // the one action that is always meaningful for a tree node, and it matches what
+                // every other detail view in the app offers via CsvCopy.
+                const QString label = hit.data(Qt::DisplayRole).toString();
+                if (label.isEmpty()) return;
+                QMenu m(this);
+                m.addAction(QStringLiteral("Copy"), this,
+                            [label] { QGuiApplication::clipboard()->setText(label); });
+                m.exec(gp);
+                return;
+            }
             QMenu menu(this);
             auto applyAll = [this](const std::function<bool(int, bool)>& want) {
                 QHash<int, bool> all;   // prim → currently checked
@@ -2489,6 +2501,8 @@ ModelsTab::ModelsTab(QWidget* parent) : BrowserTab(parent)
         if (!hit || hit->flags() == Qt::NoItemFlags) return;   // ignore the group-header rows
         const QString clip = hit->data(Qt::UserRole).toString();
         const QString set = m_clipSet.value(clip.toLower());
+        // Copy file name: the Wardrobe animations panel has had this and this one did not, for the
+        // same kind of list showing the same kind of clip. Added at the end of the menu below.
         // Gather a set's clips in the list's (grouped) display order.
         auto clipsInSet = [this](const QString& s) {
             QStringList out;
@@ -2540,6 +2554,10 @@ ModelsTab::ModelsTab(QWidget* parent) : BrowserTab(parent)
             fem->setChecked(m_previewFemale);
             connect(fem, &QAction::toggled, this, [this](bool on) { m_previewFemale = on; });
         }
+        menu.addSeparator();
+        menu.addAction(QStringLiteral("Copy file name  (%1)")
+                           .arg(clip.size() > 30 ? clip.left(29) + QChar(0x2026) : clip),
+                       this, [clip] { QGuiApplication::clipboard()->setText(clip); });
         menu.exec(m_anims->viewport()->mapToGlobal(p));
     });
     // (Rig-only animation export lives on the Export menu — "Export animation(s) only (.glb)".)
