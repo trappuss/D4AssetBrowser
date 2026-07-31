@@ -38,13 +38,13 @@ qt_standard_project_setup()
 # the built exe for the PNG's bytes and not finding them.
 set(CMAKE_AUTORCC ON)
 
-qt_# rc.exe reads app.ico THROUGH app.rc, and CMake does not know that. Replacing the .ico leaves the
+# rc.exe reads app.ico THROUGH app.rc, and CMake does not know that. Replacing the .ico leaves the
 # .rc byte-identical, so ninja sees nothing to do and the exe keeps the OLD icon while every
 # timestamp says the build is current — indistinguishable from "the icon change did not work".
 set_property(SOURCE res/app.rc APPEND PROPERTY
              OBJECT_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/res/app.ico")
 
-add_executable(D4AssetBrowser WIN32
+qt_add_executable(D4AssetBrowser WIN32
     res/app.rc
     res/app.qrc     # window icon, embedded (AUTORCC compiles it in)
     src/main.cpp
