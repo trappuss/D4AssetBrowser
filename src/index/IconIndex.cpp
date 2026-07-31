@@ -177,12 +177,26 @@ QImage IconIndex::iconImage(quint32 handle, CascReader* reader) const
     const Frame& fr = it.value();
     QImage atlas = m_atlasCache.value(fr.atlasSno);
     if (atlas.isNull()) {
+        // An entire ATLAS failing takes out every icon on it at once — potentially hundreds of
+        // rows going blank with no hint they share one root cause. Warned once per atlas, so the
+        // log says "this atlas" rather than repeating for each icon.
+        static QSet<int> warnedAtlas;
+        auto warnOnce = [&](const char* what) {
+            if (warnedAtlas.contains(fr.atlasSno)) return;
+            warnedAtlas.insert(fr.atlasSno);
+            qWarning("icons: atlas sno %d %s — every icon on it renders blank (%dx%d fmt %d)",
+                     fr.atlasSno, what, fr.w, fr.h, fr.fmt);
+        };
         const QByteArray payload = reader->readPayloadBySno(quint64(fr.atlasSno));
-        if (payload.isEmpty())
+        if (payload.isEmpty()) {
+            warnOnce("has no payload in CASC (usually a TACT key we do not hold)");
             return {};
+        }
         atlas = BcDecode::decode(payload, fr.w, fr.h, fr.fmt);
-        if (atlas.isNull())
+        if (atlas.isNull()) {
+            warnOnce("failed to decode");
             return {};
+        }
         if (m_atlasCache.size() > 8)
             m_atlasCache.clear();            // simple cap; icons are also cached upstream
         m_atlasCache.insert(fr.atlasSno, atlas);

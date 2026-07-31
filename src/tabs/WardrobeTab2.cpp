@@ -8395,7 +8395,15 @@ bool WardrobeTab2::exportOutfitGlb(const QString& path, const QVector<int>& keep
         const int si = keep.isEmpty() ? k : keep[k];
         if (si >= 0 && si < geo.primitives.size()) src << si;
     }
-    if (src.isEmpty()) return false;
+    if (src.isEmpty()) {
+        // Returned false BEFORE the "Export failed" status at the end of this function, and two of
+        // the three callers only act on true — so clicking Export produced no file, no status text
+        // and no dialog. Say it here, where the reason is known.
+        if (m_status) m_status->setText(QStringLiteral("Export failed: nothing to export "
+                                                       "(no parts selected, or the outfit is empty)"));
+        qWarning("wardrobe export: no source parts — nothing written");
+        return false;
+    }
     if (!keep.isEmpty()) {
         QVector<MeshPrimitive> sub;
         sub.reserve(src.size());

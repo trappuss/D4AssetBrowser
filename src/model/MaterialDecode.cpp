@@ -11,6 +11,7 @@
 
 #include <QByteArray>
 #include <QFile>
+#include <QSet>
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
@@ -99,10 +100,38 @@ QImage MaterialDecode::texture(CascReader* reader, const QString& d4,
             meta.valid = true;
         }
     }
-    if (!meta.valid) return {};
+    // Both routes have failed by here — JSON and the bulk texture tables — so this is the most
+    // diagnostically useful moment in the whole texture pipeline, and it was silent. Rate-limited
+    // per sno: a model with 20 parts sharing one bad texture should say it once.
+    static QSet<qint64> warnedMeta, warnedPayload;
+    if (!meta.valid) {
+        if (!warnedMeta.contains(texSno)) {
+            warnedMeta.insert(texSno);
+            qWarning("texture sno %lld: no dimensions from .tex.json or the bulk tables — parts "
+                     "using it render untextured", qint64(texSno));
+        }
+        return {};
+    }
     const QByteArray payload = reader->readPayloadBySno(quint64(texSno));
-    if (payload.isEmpty()) return {};
+    if (payload.isEmpty()) {
+        // Distinct from the above: we KNOW its size and format, the pixels are simply not here.
+        if (!warnedPayload.contains(texSno)) {
+            warnedPayload.insert(texSno);
+            qWarning("texture sno %lld: %dx%d fmt %d resolved but no payload in CASC — usually a "
+                     "TACT key we do not hold", qint64(texSno), meta.width, meta.height,
+                     meta.eTexFormat);
+        }
+        return {};
+    }
     return BcDecode::decode(payload, meta.width, meta.height, meta.eTexFormat);
+}
+
+QVector<MatTexture> MaterialDecode::texturesFor(CascReader* reader, const QString& d4,
+                                                const QString& matName)
+{
+    const QByteArray j = readMat(d4, matName);
+    return j.isEmpty() ? matTexFromMeta(reader, snoFromPlaceholder(matName))
+                       : parseMaterialJson(j);
 }
 
 QVector<qint64> MaterialDecode::textureSnosFor(CascReader* reader, const QString& d4,

@@ -6809,8 +6809,30 @@ void ModelsTab::showMaterialTextures(const QString& materialName)
 
     const QString d4 = Config::d4dataDir();
     QFile f(QStringLiteral("%1/json/base/meta/Material/%2.mat.json").arg(d4, materialName));
-    if (d4.isEmpty() || !f.open(QIODevice::ReadOnly))
+    if (d4.isEmpty() || !f.open(QIODevice::ReadOnly)) {
+        // The panel was cleared above and would now stay blank forever, reading as "this material
+        // has no textures". The usual cause is an ENCRYPTED material with no .mat.json — 1184 of
+        // them — so fill the texture list from the meta binary and say so. Values and shaders still
+        // need the JSON (no binary reader for those yet), hence the partial fill rather than a
+        // silent return.
+        const QVector<MatTexture> texs =
+            MaterialDecode::texturesFor(m_reader, d4, materialName);
+        qWarning("material '%s': no .mat.json%s", qPrintable(materialName),
+                 texs.isEmpty() ? " and no meta binary — panel stays empty"
+                                : " — textures read from the meta binary; values/shaders unavailable");
+        for (const MatTexture& t : texs) {
+            if (t.texSno <= 0) continue;
+            // Column order is SHADERTEX, SNO, NAME (set at :2697) — not role/name/sno.
+            m_matTexModel->appendRow(QList<QStandardItem*>{
+                new QStandardItem(t.role),
+                new QStandardItem(QString::number(t.texSno)),
+                new QStandardItem(t.texName.isEmpty()
+                                      ? QStringLiteral("~unnamed_%1").arg(t.texSno)
+                                      : t.texName) });
+        }
+        updateTabCounts();
         return;
+    }
     const QByteArray data = f.readAll();
 
     // Full material-value table (tUberMaterial.ptRunTimeMaterialValues[0]).
@@ -9210,15 +9232,21 @@ QImage ModelsTab::baseColorForMaterial(const QString& matName)
     if (matName.isEmpty()) return {};
     const QString d4 = Config::d4dataDir();
     if (d4.isEmpty()) return {};
-    QFile f(QStringLiteral("%1/json/base/meta/Material/%2.mat.json").arg(d4, matName));
-    if (!f.open(QIODevice::ReadOnly)) return {};
-    const QVector<MatTexture> texs = parseMaterialJson(f.readAll());
+    // Via MaterialDecode, NOT QFile: it falls back to the meta binary when there is no .mat.json,
+    // which is the case for every encrypted material. Reading the JSON directly here is what made
+    // encrypted models render grey in this tab while the Wardrobe showed them correctly.
+    const QVector<MatTexture> texs = MaterialDecode::texturesFor(m_reader, d4, matName);
+    if (texs.isEmpty()) {
+        qWarning("material '%s': no textures via JSON or meta binary — parts using it render "
+                 "untextured", qPrintable(matName));
+        return {};
+    }
     // Pick the primary (non-effect) BASE_COLOR, plus a separate opacity map if present
     // (hair/cloth keep transparency in a dedicated *_Alpha / opacity texture).
     QString baseTex; int baseSno = 0; bool baseNonEffect = false;
     QString opTex; int opSno = 0;
     for (const MatTexture& t : texs) {
-        if (t.texName.isEmpty()) continue;
+        if (t.texSno <= 0) continue;   // name is absent for encrypted textures; the sno is not
         if (t.role == QLatin1String("BASE_COLOR")) {
             const bool effect = t.texName.contains(QLatin1String("tileable"), Qt::CaseInsensitive)
                              || t.texName.contains(QLatin1String("energyColor"), Qt::CaseInsensitive)
@@ -9263,11 +9291,11 @@ QImage ModelsTab::ormForMaterial(const QString& matName)
     if (matName.isEmpty()) return {};
     const QString d4 = Config::d4dataDir();
     if (d4.isEmpty()) return {};
-    QFile f(QStringLiteral("%1/json/base/meta/Material/%2.mat.json").arg(d4, matName));
-    if (!f.open(QIODevice::ReadOnly)) return {};
+    // MaterialDecode, not QFile — see baseColorForMaterial. Encrypted materials have no .mat.json.
+    const QVector<MatTexture> texs = MaterialDecode::texturesFor(m_reader, d4, matName);
     QString rN, mN, aN; int rS = 0, mS = 0, aS = 0;
-    for (const MatTexture& t : parseMaterialJson(f.readAll())) {
-        if (t.texName.isEmpty()) continue;
+    for (const MatTexture& t : texs) {
+        if (t.texSno <= 0) continue;   // name is absent for encrypted textures; the sno is not
         if (rN.isEmpty() && t.role == QLatin1String("ROUGHNESS")) { rN = t.texName; rS = t.texSno; }
         if (mN.isEmpty() && t.role == QLatin1String("METALLIC")) { mN = t.texName; mS = t.texSno; }
         if (aN.isEmpty() && t.role == QLatin1String("AO"))       { aN = t.texName; aS = t.texSno; }
@@ -9305,10 +9333,9 @@ QImage ModelsTab::normalForMaterial(const QString& matName)
     if (matName.isEmpty()) return {};
     const QString d4 = Config::d4dataDir();
     if (d4.isEmpty()) return {};
-    QFile f(QStringLiteral("%1/json/base/meta/Material/%2.mat.json").arg(d4, matName));
-    if (!f.open(QIODevice::ReadOnly)) return {};
-    for (const MatTexture& t : parseMaterialJson(f.readAll()))
-        if (t.role == QLatin1String("NORMAL") && !t.texName.isEmpty())
+    // MaterialDecode, not QFile — see baseColorForMaterial.
+    for (const MatTexture& t : MaterialDecode::texturesFor(m_reader, d4, matName))
+        if (t.role == QLatin1String("NORMAL") && t.texSno > 0)
             return decodeTexImage(t.texName, t.texSno);
     return {};
 }
@@ -9324,10 +9351,9 @@ QImage ModelsTab::textureByRole(const QString& matName, const char* role)
     if (matName.isEmpty()) return {};
     const QString d4 = Config::d4dataDir();
     if (d4.isEmpty()) return {};
-    QFile f(QStringLiteral("%1/json/base/meta/Material/%2.mat.json").arg(d4, matName));
-    if (!f.open(QIODevice::ReadOnly)) return {};
+    // MaterialDecode, not QFile — see baseColorForMaterial.
     const QLatin1String want(role);
-    for (const MatTexture& t : parseMaterialJson(f.readAll()))
+    for (const MatTexture& t : MaterialDecode::texturesFor(m_reader, d4, matName))
         if (t.role == want && !t.texName.isEmpty())
             return decodeTexImage(t.texName, t.texSno);
     return {};
@@ -9338,10 +9364,9 @@ bool ModelsTab::materialHasRole(const QString& matName, const char* role)
     if (matName.isEmpty()) return false;
     const QString d4 = Config::d4dataDir();
     if (d4.isEmpty()) return false;
-    QFile f(QStringLiteral("%1/json/base/meta/Material/%2.mat.json").arg(d4, matName));
-    if (!f.open(QIODevice::ReadOnly)) return false;
+    // MaterialDecode, not QFile — see baseColorForMaterial.
     const QLatin1String want(role);
-    for (const MatTexture& t : parseMaterialJson(f.readAll()))
+    for (const MatTexture& t : MaterialDecode::texturesFor(m_reader, d4, matName))
         if (t.role == want) return true;
     return false;
 }

@@ -5,6 +5,8 @@
 #include <QStringList>
 #include <QVector>
 
+#include "model/Material.h"
+
 class SnoIndex;
 
 class CascReader;
@@ -62,5 +64,11 @@ QStringList appearanceRosterFromMeta(const QByteArray& meta, const SnoIndex* idx
 // the meta binary when it does not. Used by the health audit to check a material can resolve its
 // textures without paying for a pixel decode.
 QVector<qint64> textureSnosFor(CascReader* reader, const QString& d4, const QString& matName);
+
+// The material's full texture list, via whichever route works — .mat.json when it exists, the meta
+// binary when it does not. THE ONLY correct way to read a material's textures: the Models tab used
+// to open the JSON directly in five separate functions, so encrypted materials (1184 of them) fell
+// out of every one and the model rendered grey with no explanation. Use this, never QFile.
+QVector<MatTexture> texturesFor(CascReader* reader, const QString& d4, const QString& matName);
 
 }  // namespace MaterialDecode
