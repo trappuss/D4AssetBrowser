@@ -1,157 +1,164 @@
-# Diablo4AssetBrowserNative
+# Diablo4AssetBrowser **Native**
 
-A native Diablo IV asset browser:
+A Diablo IV asset browser and 3D wardrobe / mount studio. Reads your installed game
+directly (CASC), decodes textures, and previews or exports appearances, armour sets,
+weapons, mounts and pets as animated `.glb` — with cloth physics, dyes, markings,
+hair, makeup and animations.
 
-> **C++17 · Qt 6 Widgets · OpenGL 4.5 · native CASC reader · fastgltf + tinygltf**, built with **CMake + vcpkg (MSVC x64)**.
+**A full C++17 / Qt6 / OpenGL rewrite** of
+[trappuss/Diablo4AssetBrowser](https://github.com/trappuss/Diablo4AssetBrowser)
+(Python / PySide6). Single native executable — no Python, no external extractor.
 
-Five tabs — **Textures · Models · Wardrobe · Stable · Bulk Extract** — over a
-self-contained pipeline: CASC storage → SNO index → parsers (.app/.mat/.tex/anim)
-→ PBR GL viewport → `.glb`/image export.
-
-> Not affiliated with or endorsed by Blizzard. For personal use with a copy of
-> Diablo IV you own. No game assets are included.
-
----
-
-## What it does today
-
-- **Textures** — browse group 44, GPU BC preview (BC1/3/4/5/7), TexFrames, PNG/JPEG export.
-- **Models** — browse all 67k+ appearances with a Blender-style outliner (parts,
-  looks, materials, textures, animations hang off the loaded model's row), smart
-  search (`c:` collection · `#tag` · digits = SNO), tag/category/class/gender/type
-  filters verified against real d4data, icon/3D thumbnails, and a full PBR viewport:
-  shading spheres (wire/flat/shaded/rendered), channel viewer, Overlays panel
-  (grid/axes/skeleton/bone names), animation playback, cloth (spring-bone solver),
-  dye pigments, shell fur, mesh FX. Right side: stacking toggle panels
-  (Info/Parts/Looks/Materials/Shading/Cloth/Animations) with drag-resize + reorder,
-  and a Blender N-strip of settings popovers on the viewport edge. Exports:
-  skinned `.glb` (+ textures/animations), screenshots, turntable GIFs, rig-only
-  animation libraries.
-- **Wardrobe** — assemble a full character (class/gender, equipment slots,
-  character creator, weapons, dyes, markings), same viewport + panel system as
-  Models (shared code, not a copy), ensembles, theme equipping, outfit `.glb` export.
-- **Stable** — mounts + trophies (W.I.P.).
-- **Bulk Extract** — batch model/texture export with a manifest ledger.
-
-Viewport quick keys: **F** fullscreen · **Esc** unselect/exit · **H / Shift+H /
-Alt+H** hide / solo / show-all parts · **middle-click** re-frame · double-click
-selects a part (camera snap is a Camera-panel option).
+> Not affiliated with or endorsed by Blizzard. For personal use with a copy of Diablo IV
+> that you own. **No game assets and no decryption keys are included in this repository.**
 
 ---
 
-## Prerequisites (Windows)
+## Quick start
 
-- **Visual Studio 2022** with the *Desktop development with C++* workload (MSVC v143).
-- **CMake ≥ 3.21** and **Ninja** (both ship with VS 2022, or install separately).
-- **vcpkg** — clone and bootstrap once:
-  ```bat
-  git clone https://github.com/microsoft/vcpkg
-  .\vcpkg\bootstrap-vcpkg.bat
-  setx VCPKG_ROOT C:\path\to\vcpkg
-  ```
-  `Qt 6` itself is pulled by vcpkg from `vcpkg.json` (no separate Qt install needed;
-  the first configure builds Qt and can take a while).
+1. Download the release `.zip` and unzip anywhere. Fully portable — everything the tool
+   writes lives in `data\` next to the exe.
+2. Run **`D4AssetBrowser.exe`**.
+3. **File → Settings** — set your **Diablo IV game folder**.
+4. **File → Dependencies…** — download **d4data** (community metadata snapshot). One click.
+5. **File → Update TACT Keys** — fetches the community decryption keys.
+
+No Python. No `pip`. No d4extract.
+
+**Requirements:** Windows 10/11 x64 · a Diablo IV install (Battle.net or Steam) ·
+GPU with OpenGL 4.5 · internet on first run.
 
 ---
 
-## Run it (one-click)
+## Tabs
 
-Once the prerequisites above are installed, just:
+| Tab | What it does |
+|---|---|
+| **Models** | All 67k+ appearances in three views (list / outliner / icon grid). Live PBR viewport, parts, looks, materials, textures, LODs, bones, animations, dependency graph. Smart search: `c:` collection, `#tag`, digits = SNO. |
+| **Wardrobe** | Build a character — class, gender, face, hair, facial hair, armour per slot, weapons, back trophy. Dyes, skin/hair tint, eye colour, makeup, markings. Cloth physics, auto-animations, saved ensembles. |
+| **Stable** | The same for mounts and pets — bodies, barding, trophies. |
+| **Textures** | Browse and decode every texture (BC1/3/4/5/7); channel split, frame galleries, model associations. |
+| **Bulk Extract** | Queue and export many assets at once. |
+
+**Export:** rigged animated `.glb` · PNG / JPEG / WebP stills · animated GIF with
+palette + inter-frame optimisation and a size budget · turntables.
+
+---
+
+## Building from source
 
 ```bat
-build.bat      ::  finds VS 2022, builds everything (first run compiles Qt6 — slow)
-run.bat        ::  launches the app
+build.bat          :: first build — vcpkg fetches Qt6, slow (~30-60 min)
+rebuild.bat        :: incremental, then launch
+Diagnostics.bat    :: menu of audits and self-tests
 ```
 
-`build.bat` locates Visual Studio automatically (via `vswhere`), pulls every
-dependency through vcpkg, builds, and deploys a stand-alone `dist\` folder with the
-Qt DLLs. `run.bat` launches `dist\D4AssetBrowser.exe`. After it starts: **File ▸
-Settings** → your Diablo IV folder.
-
-> `rebuild.bat` does an incremental build (day-to-day); `build.bat` is the full
-> reconfigure that re-resolves vcpkg.
-
-## Build (manual)
-
-From a **x64 Native Tools Command Prompt for VS 2022** (so MSVC is on PATH), in this
-folder:
-
-```bat
-:: one-time: pin a vcpkg baseline matching your vcpkg checkout (manifest mode needs it)
-"%VCPKG_ROOT%\vcpkg" x-update-baseline --add-initial-baseline
-
-cmake --preset windows-msvc-release
-cmake --build --preset release
-```
-
-The configure step reads `vcpkg.json` (manifest mode) and builds every dependency
-into `vcpkg_installed/`. The executable lands in `build/release/`.
-
-For a **stand-alone folder** with the Qt runtime DLLs + plugins deployed next to the
-exe (the way d4analyzer ships), run the install step, then launch from there:
-```bat
-cmake --install build/release --prefix dist
-dist\D4AssetBrowser.exe
-```
-(You can also run `build\release\D4AssetBrowser.exe` directly from the **x64 Native
-Tools** prompt if vcpkg's Qt `bin/` is on `PATH`, but the installed `dist/` folder is
-the portable, double-clickable result.)
-
-Then **File ▸ Settings** → point *Diablo IV folder* at your install (the folder
-containing `.build.info`). The CASC product defaults to **`fenris`** (live D4); set
-a different code for a PTR build. The tabs then list the storage.
+Visual Studio 2022 with "Desktop development with C++". Qt6, fastgltf, lz4 and zlib come
+from vcpkg automatically.
 
 ---
 
-## Build notes / first-build gotchas
+## What's different from the original
 
-These are the spots most likely to need a one-line tweak on your machine; each is
-flagged in the source:
+The original is Python/PySide, shells out to **d4extract** for geometry, and reads
+**d4data** JSON for all metadata. This is native C++, parses the game's binary formats
+itself, and uses d4data only as a fallback.
 
-- **vcpkg target names.** If a port's config exports a slightly different target
-  name than CMakeLists links, CMake will tell you at configure time — adjust the
-  `target_link_libraries` line. (CASC needs no library: the reader is native.)
-- **tinygltf** is header-only; CMake locates `tiny_gltf.h` via `find_path`. If it
-  isn't found, confirm the `tinygltf` port installed and `vcpkg_installed/.../include`
-  is on the toolchain's search path.
-- **First configure is slow** — vcpkg compiles Qt 6 from source. Subsequent builds
-  are fast.
+### Architecture
+
+| | Original v1.0 | Native |
+|---|---|---|
+| Language | Python 3.11 + PySide6 | C++17 + Qt6 |
+| Distribution | repo + `pip install` into `deps\py` | single portable `.exe` |
+| Geometry | **d4extract** subprocess per model | built-in binary parser |
+| Renderer | Qt3D / offscreen | direct OpenGL 4.5, PBR + IBL |
+| Metadata | d4data JSON only | **CASC binary first**, d4data as fallback |
+| Startup | Python import + dependency check | native, per-build binary caches |
+
+Dropping the d4extract subprocess is the biggest structural change: geometry, materials
+and textures decode in-process, so there is no per-model process spawn, no temp files, and
+no external tool that can drift from your installed patch.
+
+### Capabilities the original does not have
+
+**Encrypted and brand-new content.** The original's known issues list *"Warlock models are
+bugged and or missing, probably encrypted"* and *"Paladin animations are missing, probably
+encrypted"*. This version resolves encrypted assets end to end from CASC:
+
+- Nameless (encrypted) records are **indexed instead of dropped** — 14,100 of them.
+- Appearance names recovered from ClothData embedded in the payload.
+- `ptAppearanceMaterials`, material→texture lists, and texture dimensions/formats read
+  from the **binary**, so assets missing from the d4data snapshot still render fully.
+- Texture definitions read from CASC's bulk tables (`texture-base-global.dat` plus per-key
+  overlays) — textures have no per-sno meta entry, which is why this was the last gap.
+- **"Only encrypted (TACT)"** filter to browse exactly that content.
+
+**A multi-frame BLTE decode bug is fixed.** Any encrypted asset stored in more than one
+BLTE frame silently lost every frame after the first — a Salsa20 nonce block-index
+problem, invisible on single-frame assets (which is nearly all of them). It truncated
+large payloads and surfaced as unrelated "missing texture" and "incomplete mesh" bugs.
+
+**Cloth physics.** Authored ClothData drives a real solver — capsule colliders, driver
+skinning, tethers, per-piece tuning resolved through `snoCloth`. Chain weapons (flails)
+simulate. The original has none of this.
+
+**Rendering.** PBR with image-based lighting, detail maps, per-part material overrides,
+proper transparency (the original lists *"Stable models don't have proper transparency"*
+as a known issue), hair and skin shading, marking and dye layers, shell fur.
+
+**Wardrobe depth.** Hardpoint-correct weapon placement per class and weapon type, derived
+from `ItemType.tHardpointOffsets` rather than guessed. Auto-animations driven by the
+game's own `ui_wardrobe` AnimSets across all classes and genders. Per-class defaults and
+saved ensembles.
+
+**Diagnostics.** `Audit Asset Health.bat` walks every appearance, classifies what can and
+cannot be shown (OK / no-textures / no-materials / no-geometry / locked / no-data), and
+**diffs against the previous run** — so a game patch or a new TACT key reports "newly
+working / newly broken" rather than being discovered months later.
+`Test Encrypted Chain.bat` verifies the appearance → material → texture chain in seconds.
+
+### Original's known issues — status here
+
+| Original known issue | Status |
+|---|---|
+| Warlock models bugged / missing (encrypted) | **Fixed** — encrypted content resolves from CASC |
+| Paladin animations missing (encrypted) | **Fixed** — same route |
+| Horse armour isn't rigged to the skeleton | **Fixed** |
+| Stable models don't have proper transparency | **Fixed** |
+| Facial hair is buggy | **Fixed** |
+| Wardrobe tab is slow | **Rewritten** — sync rebuild ~150 ms for 6 pieces |
+| D4Extract as a dependency | **Removed** |
+
+### Honest limitations
+
+- **~10% of wardrobe appearances render incomplete.** The model parser decodes only vertex
+  buffer 0; sub-objects on other buffers are dropped rather than drawn scrambled. Measured,
+  documented, not yet fixed.
+- **93 appearances decode perfectly but have no name**, so they cannot appear in
+  name-keyed rosters. Cloth-bearing pieces recover names; plain helms/gloves/boots do not.
+- **~11,500 SNOs stay locked** behind 189 TACT keys nobody has harvested. Not fixable here.
+- Windows only.
 
 ---
 
-## Project layout
+## Data and keys
 
-```
-Diablo4AssetBrowserNative/
-├── CMakeLists.txt          ← targets, dependencies, Windows deploy
-├── CMakePresets.json       ← MSVC x64 + vcpkg toolchain presets
-├── vcpkg.json              ← qtbase, qtsvg, fastgltf, tinygltf, zlib, lz4
-├── src/
-│   ├── main.cpp
-│   ├── app/   MainWindow, SettingsDialog, Config, ExportCapture, hotkeys
-│   ├── casc/  CascReader                      ← native CASC (Salsa20/idx/BLTE/TVFS)
-│   ├── index/ CoreToc, SnoIndex, AppearanceMeta, IconIndex, ItemDef, …
-│   ├── tex/   TexFormat, TexMeta, BcDecode    ← eTexFormat→GL + BC decoding
-│   ├── gl/    GLModelWidget, GLTextureWidget, GifEncoder
-│   ├── model/ ModelParser, ModelExporter, MaterialDecode, AnimParser, Retarget
-│   ├── deps/  first-run d4data download + update check
-│   └── tabs/  BrowserTab.h (shared skin) · PanelBox.h (stacking panels)
-│              ViewGlyphs.h (toolbar glyphs) · ModelOutliner
-│              TexturesTab · ModelsTab(+Panels/Export) · WardrobeTab2(+Panels)
-│              StableTab/2 · BulkExtractorTab · MarkingCompose
-└── README.md · STATUS.md ← per-session engineering log
-```
+Nothing proprietary ships in this repository. On first run the tool downloads **d4data**
+(community metadata) and fetches **TACT keys** from the public community list. Both live
+next to the exe and are gitignored; delete the folder to remove everything.
 
-The three shared headers are deliberate: **BrowserTab.h** carries the button/panel
-QSS + bar height, **PanelBox.h** the right-column stacking-panel system, and
-**ViewGlyphs.h** the painter-drawn toolbar icons — so the Models and Wardrobe tabs
-wear literally the same code and can't drift apart.
+TACT keys decrypt content Blizzard has already shipped to your client. This repo does not
+distribute them.
 
 ---
 
 ## Credits
 
-Builds on the Diablo IV community tooling — **fastgltf** (spnda), **tinygltf**
-(Syoyo Fujita), **Qt** (The Qt Company) — and the research of the **d4analyzer** /
-d4data community. No game assets or third-party sources are bundled; vcpkg fetches
-all dependencies.
+Original tool and design: **[trappuss](https://github.com/trappuss/Diablo4AssetBrowser)**.
+Community tooling: **d4data** (DiabloTools) · **d4extract** (narascode, no longer
+required) · **[rustydemon](https://github.com/HoldMyBeer-gg/rustydemon)** (TACT keys) ·
+**d4analyzer** (reference extractions used to verify binary format derivations).
+
+## License
+
+MIT — see [LICENSE](LICENSE).
