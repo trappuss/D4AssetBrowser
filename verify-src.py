@@ -131,6 +131,46 @@ def check_header_only_includes(path: Path, raw: str, code: str) -> list[str]:
 FMT_CALL = re.compile(r"\b(qInfo|qWarning|qCritical|qDebug|printf|fprintf)\s*\(", re.M)
 
 
+CTX_INSTALL_RE = re.compile(r"\b(?:CsvCopy::install|installCopyMenu)\s*\(\s*([A-Za-z_][A-Za-z0-9_]*)")
+CTX_POLICY_RE = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*->\s*setContextMenuPolicy\s*\(\s*Qt::(\w+)")
+
+
+def check_ctx_menu_order(text: str) -> list[str]:
+    """CsvCopy::install must come AFTER the view sets its own context-menu policy.
+
+    CsvCopy::install only declines to add its Copy/Copy all menu when the view ALREADY has a
+    policy set. Called first, it sees DefaultContextMenu, installs a handler, and the caller's
+    later connect() adds a SECOND handler to the same signal — Qt runs both, CsvCopy's is
+    connected first, so its menu opens and the real one is unreachable until dismissed.
+
+    This shipped in three views (ModelsTab m_list, ModelsTab m_partsView, TexturesTab m_view) and
+    is invisible in review: every line is individually correct and the menu simply never changes.
+    Cheap to check mechanically, so it is checked on every build.
+    """
+    problems: list[str] = []
+    installs: dict[str, list[int]] = {}
+    policies: dict[str, list[tuple[int, str]]] = {}
+    for i, line in enumerate(text.split("\n"), 1):
+        m = CTX_INSTALL_RE.search(line)
+        if m:
+            installs.setdefault(m.group(1), []).append(i)
+        m2 = CTX_POLICY_RE.search(line)
+        if m2:
+            policies.setdefault(m2.group(1), []).append((i, m2.group(2)))
+    for var, lines_ in installs.items():
+        for il in lines_:
+            later = [(pl, pk) for pl, pk in policies.get(var, [])
+                     if pl > il and pk != "DefaultContextMenu"]
+            if later:
+                pl, pk = later[0]
+                problems.append(
+                    f"line {il}: CsvCopy::install({var}) runs BEFORE {var} sets its own "
+                    f"context-menu policy at line {pl} (Qt::{pk}) — CsvCopy will install a "
+                    f"competing Copy/Copy all menu that hides the real one. Move the install "
+                    f"AFTER the setContextMenuPolicy call.")
+    return problems
+
+
 def _split_args(s: str) -> list[str]:
     """Top-level comma split, respecting nesting AND string/char literals.
 
@@ -336,7 +376,8 @@ def main() -> int:
                     + check_header_only_includes(f, raw, code)
                     + check_format_args(f, raw)
                     + check_qt_macro_names(f, code)
-                    + check_duplicate_locals(f, code))
+                    + check_duplicate_locals(f, code)
+                    + check_ctx_menu_order(raw))
         if problems:
             total += len(problems)
             rel = f.relative_to(ROOT) if ROOT in f.parents or f.is_relative_to(ROOT) else f

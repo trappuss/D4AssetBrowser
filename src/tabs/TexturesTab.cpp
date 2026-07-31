@@ -705,8 +705,12 @@ QWidget* TexturesTab::buildLeft()
         QSettings().setValue(QStringLiteral("tex/listHeader"),
                              m_view->horizontalHeader()->saveState());
     });
-    CsvCopy::install(m_view);
+    // Policy BEFORE install — otherwise CsvCopy sees DefaultContextMenu, installs its own
+    // Copy/Copy all handler, and the connect() below adds a SECOND handler to the same signal.
+    // Both run, CsvCopy's is first, so ITS menu appears and the browser menu only shows after you
+    // dismiss it. See the note in CsvCopy::install.
     m_view->setContextMenuPolicy(Qt::CustomContextMenu);
+    CsvCopy::install(m_view);
     connect(m_view, &QWidget::customContextMenuRequested, this,
             [this](const QPoint& p) { showBrowserMenu(m_view, p); });
     m_view->viewport()->setMouseTracking(true);      // row hover → info popup
