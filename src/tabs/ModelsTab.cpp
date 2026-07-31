@@ -1263,13 +1263,13 @@ ModelsTab::ModelsTab(QWidget* parent) : BrowserTab(parent)
                     if (img.isNull()) return;
                     QString dir = QSettings().value(QStringLiteral("models/lastImageSaveDir")).toString();
                     if (dir.isEmpty() || !QDir(dir).exists()) {   // first use: fall back to a prompt
-                        dir = QFileDialog::getExistingDirectory(this, QStringLiteral("Save image to…"));
+                        dir = QFileDialog::getExistingDirectory(this, QStringLiteral("Save image as…"));
                         if (dir.isEmpty()) return;
                         QSettings().setValue(QStringLiteral("models/lastImageSaveDir"), dir);
                     }
                     img.save(QDir(dir).filePath(QStringLiteral("%1%2.png").arg(xName, sfx2)), "PNG");
                 });
-                menu.addAction(QStringLiteral("Save image to…"), this, [this, image, xName, sfx2]() {
+                menu.addAction(QStringLiteral("Save image as…"), this, [this, image, xName, sfx2]() {
                     const QImage img = image();
                     if (img.isNull()) return;
                     const QString fn = QFileDialog::getSaveFileName(
@@ -1310,16 +1310,21 @@ ModelsTab::ModelsTab(QWidget* parent) : BrowserTab(parent)
         const QList<int> snos = contextSnos(p);
         if (snos.isEmpty()) return;
         const QPoint gp = m_list->viewport()->mapToGlobal(p);
-        const int n = snos.size();
-        const QString sfx = n > 1 ? QStringLiteral("s") : QString();
         QMenu menu(this);
 
-        if (hit.column() == 1) {   // ── Icon column: image actions ──
-            addRowImageActions(menu, snos);
-            menu.exec(gp);
-            return;
-        }
-
+        // PARITY with the grid. This used to branch on the clicked COLUMN — icon column got the
+        // image actions and returned, every other column got export/copy — so the two halves were
+        // mutually exclusive and neither view ever showed the full set. Worse, List mode hides the
+        // icon column entirely (applyDisplayMode), so in List the image actions were unreachable by
+        // any click at all.
+        //
+        // The row is the same asset whichever cell you happen to hit, so the menu no longer depends
+        // on where in the row the cursor was. Same composition and order as the grid at :1370.
+        const int sno = snos.first();
+        menu.addAction(QStringLiteral("Load / preview"), this, [this, sno]() { selectModelBySno(sno); });
+        menu.addSeparator();
+        addRowImageActions(menu, snos);
+        menu.addSeparator();
         addRowExportCopyActions(menu, snos);
         menu.exec(gp);
     });

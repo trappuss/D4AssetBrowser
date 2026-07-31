@@ -2290,7 +2290,7 @@ void StableTab2::installCopyMenu(QWidget* view, int nameCol)
                 if (lw->item(i)->flags() != Qt::NoItemFlags) all << disp(lw->item(i));
         }
         QMenu m;
-        QAction* aCopy = m.addAction(QStringLiteral("Copy name"));  aCopy->setEnabled(!cur.isEmpty());
+        QAction* aCopy = m.addAction(QStringLiteral("Copy"));  aCopy->setEnabled(!cur.isEmpty());
         QAction* aAll  = m.addAction(QStringLiteral("Copy all"));   aAll->setEnabled(!all.isEmpty());
         QAction* chosen = m.exec(g);
         if (chosen == aCopy && !cur.isEmpty()) QGuiApplication::clipboard()->setText(cur);

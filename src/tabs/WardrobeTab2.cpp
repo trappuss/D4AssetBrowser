@@ -5711,32 +5711,12 @@ void WardrobeTab2::appendLookCards(int maxCards)
                                        this, [this, sno, fullName] { equipTheme(sno, fullName, ThemeMarkings); });
                         menu.addAction(QStringLiteral("Equip Theme Weapons  (%1)").arg(themeNames(r, ThemeWeapons)),
                                        this, [this, sno, fullName] { equipTheme(sno, fullName, ThemeWeapons); });
-                        menu.addSeparator();
-                        const QString exSuffix = exportMenuSuffix(sno, fullName);
-                        // "1 model" was noise — you can only pick one item here. Show the DESTINATION
-                        // and the size instead, matching the viewport part menu's wording.
-                        const QString exDir = ViewportPartMenu::condensePath(
-                            QSettings().value(QStringLiteral("wardrobe2/lastExportDir")).toString());
-                        const QString exExtra = exportMenuExtras(exSuffix);
-                        if (!exDir.isEmpty())
-                            menu.addAction(ViewportPartMenu::withValue(
-                                               QStringLiteral("Export Model Last dir"), exDir) + exExtra, this,
-                                           [this, sno, fullName] { exportItemModel(sno, fullName, true); });
-                        menu.addAction(QStringLiteral("Export Model") + exExtra, this,
-                                       [this, sno, fullName] { exportItemModel(sno, fullName, false); });
-                        menu.addSeparator();
-                        auto clip = [](const QString& s) { QGuiApplication::clipboard()->setText(s); };
-                        auto prev = [](const QString& s) { return s.size() > 30 ? s.left(29) + QChar(0x2026) : s; };
-                        const QString dispName = title.isEmpty() ? fname : title;
-                        menu.addAction(QStringLiteral("Copy SNO id  (%1)").arg(sno), this,
-                                       [sno, clip] { clip(QString::number(sno)); });
-                        menu.addAction(QStringLiteral("Copy file name  (%1)").arg(prev(fullName)), this,
-                                       [fullName, clip] { clip(fullName); });
-                        menu.addAction(QStringLiteral("Copy name  (%1)").arg(prev(dispName)), this,
-                                       [dispName, clip] { clip(dispName); });
-                        QAction* aColl = menu.addAction(QStringLiteral("Copy collection name  (%1)").arg(prev(coll.isEmpty() ? QStringLiteral("—") : coll)), this,
-                                       [coll, clip] { clip(coll); });
-                        aColl->setEnabled(!coll.isEmpty());
+                        // addItemActions supplies export + the four copies AND the image pair
+                        // (Copy image / Save image…). This card used to re-implement that block
+                        // inline and omit exactly the image actions, so a look-grid card silently
+                        // offered less than the slot cell for the same item. The helper's own
+                        // comment already claimed the two shared it; now they actually do.
+                        addItemActions(menu, sno, fullName);
                         menu.exec(b->mapToGlobal(p));
                     });
         }
