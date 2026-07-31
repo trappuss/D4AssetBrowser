@@ -1301,6 +1301,18 @@ ModelsTab::ModelsTab(QWidget* parent) : BrowserTab(parent)
                 m.exec(m_list->viewport()->mapToGlobal(p));
                 return;
             }
+            // A SINGLE part node is the same object the PARTS panel and the 3D viewport act on, so
+            // it raises the same menu they do — export part/model, the copy block, frame/select/
+            // hide/isolate, show-all/hide-all/invert. It used to offer three actions out of
+            // twenty-one for the identical object, which is the mismatch being reported.
+            //
+            // A GROUP node (several parts under one header) keeps the group-scoped menu below:
+            // "Export Part" and "Frame Part" have no single subject there, and Solo over the whole
+            // group is genuinely a different operation from isolating one part.
+            if (parts.size() == 1) {
+                showPartContextMenu(parts.first(), m_list->viewport()->mapToGlobal(p));
+                return;
+            }
             QMenu menu(this);
             auto applyAll = [this](const std::function<bool(int, bool)>& want) {
                 QHash<int, bool> all;   // prim → currently checked
