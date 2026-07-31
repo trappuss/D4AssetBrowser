@@ -35,5 +35,5 @@ Deeper references — read when relevant, don't guess instead:
 - Cloth `attachLen` is **normalized 0..1**, not a world distance; capsule visual scale **0.52** (1.0 is wrong, tested); sim cages (`*_sim`) are driver proxies, never rendered by default.
 - `HP_rightWeapon` = 3636304447, `HP_leftWeapon` = 4036545548; per-class weapon orientation from ItemType `tHardpointOffsets`.
 - appearance→AnimSets accumulates EVERY referencing actor — always family-filter set expansions.
-- d4data snapshot: `C:\Users\notso\AppData\Roaming\Diablo4AssetBrowser\Diablo4AssetBrowserNative\d4data` · game: `G:\G Games\Diablo IV`.
+- d4data snapshot: `C:\Users\notso\AppData\Roaming\Diablo4AssetBrowser\D4AssetBrowser\d4data` · game: `G:\G Games\Diablo IV`.
 - Repro assets: `barF_base03_TRS` (cape physics) · `barF_base03_HLM`+`barF_stor161_TRS` (shared cage) · `barF_stor151_TRS` (fur, fragile) · `barF_stor189_LEG` (anim flood) · `barF_base00` (canonical rig, ~700 clips).

@@ -95,7 +95,7 @@ MainWindow::MainWindow(QWidget* parent)
     , m_casc(std::make_unique<CascReader>())
 {
     QElapsedTimer ctorT; ctorT.start();   // window-construction timing → the log
-    setWindowTitle(QStringLiteral("Diablo4AssetBrowserNative v%1")
+    setWindowTitle(QStringLiteral("D4AssetBrowser v%1")
                        .arg(QApplication::applicationVersion()));
     resize(1280, 800);
 
@@ -341,7 +341,7 @@ void MainWindow::buildMenu()
     });
     help->addAction(QStringLiteral("&Copy diagnostic info"), this, [this] {
         const QString diag = QStringLiteral(
-            "Diablo4AssetBrowserNative v%1 (built %2)\nQt %3 · %4\nGPU: %5\n"
+            "D4AssetBrowser v%1 (built %2)\nQt %3 · %4\nGPU: %5\n"
             "CASC: %6 · build %7\nGame: %8\nd4data: %9\nIndex: %10 assets / %11 groups")
             .arg(QApplication::applicationVersion(), QStringLiteral(__DATE__),
                  QString::fromLatin1(qVersion()), QSysInfo::prettyProductName(),
@@ -360,7 +360,7 @@ void MainWindow::buildMenu()
         dlg.setWindowTitle(QStringLiteral("About"));
         auto* lay = new QFormLayout(&dlg);
         lay->addRow(new QLabel(
-            QStringLiteral("<b>Diablo4AssetBrowserNative</b> v%1 &nbsp;<span style='color:#888'>"
+            QStringLiteral("<b>D4AssetBrowser</b> v%1 &nbsp;<span style='color:#888'>"
                            "(built %2 · Qt %3)</span><br><br>"
                            "Native C++/Qt6 Diablo IV asset browser:<br>"
                            "Qt 6 Widgets · OpenGL 4.5 · native CASC (TVFS) · fastgltf · tinygltf.<br><br>"

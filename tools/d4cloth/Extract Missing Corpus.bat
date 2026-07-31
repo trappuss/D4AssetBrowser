@@ -13,7 +13,7 @@ if not exist "%EXE%" ( echo Build the harness first ^(tools\d4cloth^). & pause &
 
 :: Adjust if your install moved. --d4data must point at the SNAPSHOT the app uses.
 set "GAME=G:\G Games\Diablo IV"
-set "D4DATA=%APPDATA%\Diablo4AssetBrowser\Diablo4AssetBrowserNative\d4data"
+set "D4DATA=%APPDATA%\Diablo4AssetBrowser\D4AssetBrowser\d4data"
 
 if not exist "%GAME%" (
     echo.

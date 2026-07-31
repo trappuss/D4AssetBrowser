@@ -1,4 +1,4 @@
-// Diablo4AssetBrowserNative — entry point.
+// D4AssetBrowser — entry point.
 //
 // A native C++/Qt6 rewrite of the asset browser in d4analyzer's exact stack:
 //   C++17 · Qt 6 Widgets · OpenGL 4.5 · CascLib · fastgltf + tinygltf · Draco.
@@ -139,9 +139,9 @@ int main(int argc, char** argv)
 
     QApplication app(argc, argv);
     LogBuffer::instance();   // construct on the GUI thread (queued log delivery)
-    QApplication::setOrganizationName("Diablo4AssetBrowser");
-    QApplication::setApplicationName("Diablo4AssetBrowserNative");
-    QApplication::setApplicationVersion("2.1.0");
+    QApplication::setOrganizationName("D4AssetBrowser");
+    QApplication::setApplicationName("D4AssetBrowser");
+    QApplication::setApplicationVersion("2.2.0");
 
     // Portable: every QSettings() default-ctor writes to an INI in the beside-exe data/ folder
     // (no Windows registry). Must run before any QSettings use. Combined with AppPaths, the whole
@@ -154,7 +154,7 @@ int main(int argc, char** argv)
                               .filePath(QStringLiteral("D4AssetBrowser.log")));
     g_logFile.open(QIODevice::WriteOnly | QIODevice::Truncate | QIODevice::Text);
     qInstallMessageHandler(logHandler);
-    qInfo("Diablo4AssetBrowserNative v%s starting",
+    qInfo("D4AssetBrowser v%s starting",
           QApplication::applicationVersion().toLatin1().constData());
 
     // Show real checkmarks (not the platform's filled blue box) on every toggle.

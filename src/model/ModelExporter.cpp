@@ -797,7 +797,7 @@ bool ModelExporter::exportGlb(const ModelGeometry& geo, const QString& path,
         }
 
         QJsonObject root;
-        root["asset"] = QJsonObject{{"version", "2.0"}, {"generator", "Diablo4AssetBrowserNative"}};
+        root["asset"] = QJsonObject{{"version", "2.0"}, {"generator", "D4AssetBrowser"}};
         root["buffers"] = QJsonArray{QJsonObject{{"byteLength", 0}}};  // patched below
         root["bufferViews"] = bufferViews;
         root["accessors"] = accessors;
@@ -834,7 +834,7 @@ bool ModelExporter::exportGlb(const ModelGeometry& geo, const QString& path,
 
     // ── Static (rigid) export ──
     QJsonObject root;
-    root["asset"] = QJsonObject{{"version", "2.0"}, {"generator", "Diablo4AssetBrowserNative"}};
+    root["asset"] = QJsonObject{{"version", "2.0"}, {"generator", "D4AssetBrowser"}};
     root["bufferViews"] = bufferViews;
     root["accessors"] = accessors;
     root["meshes"] = meshes;

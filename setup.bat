@@ -1,10 +1,10 @@
 @echo off
 setlocal enabledelayedexpansion
-title Diablo4AssetBrowserNative - setup, build, and run
+title D4AssetBrowser - setup, build, and run
 cd /d "%~dp0"
 
 echo ============================================================
-echo   Diablo4AssetBrowserNative - one-time setup / recovery
+echo   D4AssetBrowser - one-time setup / recovery
 echo   Checks tools, sets up vcpkg, wipes stale cache, builds
 echo   Qt6, and launches the app. Run this after a PC reset, a
 echo   Visual Studio upgrade, or a fresh checkout.

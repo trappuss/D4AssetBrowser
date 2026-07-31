@@ -1,6 +1,6 @@
 @echo off
 setlocal enabledelayedexpansion
-title Rebuild Diablo4AssetBrowserNative (fast)
+title Rebuild D4AssetBrowser (fast)
 cd /d "%~dp0"
 
 :: Close any running instance so the linker can overwrite the .exe (avoids LNK1104).

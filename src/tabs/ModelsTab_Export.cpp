@@ -632,7 +632,7 @@ void ModelsTab::exportModels(const QVector<QPair<int, QString>>& models, const Q
     if (sink && sink->progress) sink->progress(step, jobs.size());   // final tick
     if (setAware && !manifest.isEmpty()) {
         // Reproducible re-exports after game patches: what was exported, from which SNOs.
-        QJsonObject root{{"generator", QStringLiteral("Diablo4AssetBrowserNative")},
+        QJsonObject root{{"generator", QStringLiteral("D4AssetBrowser")},
                          {"exported", QDateTime::currentDateTime().toString(Qt::ISODate)},
                          {"models", manifest}};
         QFile mf(QDir(dir).filePath(QStringLiteral("manifest.json")));

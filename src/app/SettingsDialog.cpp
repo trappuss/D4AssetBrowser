@@ -1632,7 +1632,7 @@ void SettingsDialog::updateChecks()
 
 void SettingsDialog::updateVersion()
 {
-    m_version->setText(QStringLiteral("Diablo4AssetBrowserNative  v%1")
+    m_version->setText(QStringLiteral("D4AssetBrowser  v%1")
                            .arg(QApplication::applicationVersion()));
 }
 

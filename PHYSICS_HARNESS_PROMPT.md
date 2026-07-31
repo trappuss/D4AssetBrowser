@@ -28,7 +28,7 @@ distinguish "the solver is wrong" from "the overlay is drawing something mislead
 | Application source | `C:\Users\notso\Downloads\Claude Current\Diablo4AssetBrowser Native` |
 | Cloth/physics code | `src/gl/GLModelWidget.cpp` (`buildSpringBones`, `springBoneStep`, `buildClothSim`, `buildPhysBones`) |
 | Parser | `src/model/ModelParser.cpp` (cloth payload at the `ClothData` block) |
-| d4data JSON snapshot | `C:\Users\notso\AppData\Roaming\Diablo4AssetBrowser\Diablo4AssetBrowserNative\d4data` |
+| d4data JSON snapshot | `C:\Users\notso\AppData\Roaming\Diablo4AssetBrowser\D4AssetBrowser\d4data` |
 | Game install | `G:\G Games\Diablo IV` |
 | Prior audit (read first) | `PHYSICS_AUDIT.md` in the app root |
 | Backups (pre-cage-driving) | `.Backups/src_20260716_200352_pre-npanel`, `_backups/src_20260712_*` |

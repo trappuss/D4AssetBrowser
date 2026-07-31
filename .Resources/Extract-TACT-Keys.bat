@@ -65,9 +65,9 @@ if not defined D4PID (
 
 REM ---- Read the app's configured TACT keys folder from the registry --
 REM  QSettings stores it under HKCU\Software\Diablo4AssetBrowser\
-REM  Diablo4AssetBrowserNative\paths\tactKeysPath.
+REM  D4AssetBrowser\paths\tactKeysPath.
 set "KEYSET="
-for /f "tokens=2,*" %%A in ('reg query "HKCU\Software\Diablo4AssetBrowser\Diablo4AssetBrowserNative\paths" /v tactKeysPath 2^>nul ^| find "tactKeysPath"') do set "KEYSET=%%B"
+for /f "tokens=2,*" %%A in ('reg query "HKCU\Software\Diablo4AssetBrowser\D4AssetBrowser\paths" /v tactKeysPath 2^>nul ^| find "tactKeysPath"') do set "KEYSET=%%B"
 
 set "KEYDIR="
 if defined KEYSET (
@@ -78,7 +78,7 @@ if defined KEYSET (
     )
 )
 if not defined KEYDIR (
-    set "KEYDIR=%APPDATA%\Diablo4AssetBrowser\Diablo4AssetBrowserNative\tact_keys"
+    set "KEYDIR=%APPDATA%\Diablo4AssetBrowser\D4AssetBrowser\tact_keys"
     set "NEEDSET=1"
 )
 if not exist "%KEYDIR%" mkdir "%KEYDIR%"

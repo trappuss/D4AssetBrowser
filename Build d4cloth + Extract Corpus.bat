@@ -48,7 +48,7 @@ if not "%errorlevel%"=="0" (
 :: 3. Extract the corpus. The Qt DLLs live in the build dir's vcpkg tree; put them on PATH.
 echo [3/3] Extracting the test-matrix corpus from CASC...
 set "PATH=%~dp0tools\d4cloth\build\vcpkg_installed\x64-windows\bin;%PATH%"
-set "D4DATA=%APPDATA%\Diablo4AssetBrowser\Diablo4AssetBrowserNative\d4data"
+set "D4DATA=%APPDATA%\Diablo4AssetBrowser\D4AssetBrowser\d4data"
 tools\d4cloth\build\d4cloth.exe extract ^
     --casc "G:\G Games\Diablo IV" ^
     --d4data "%D4DATA%" ^

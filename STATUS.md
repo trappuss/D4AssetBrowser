@@ -1,4 +1,4 @@
-# Diablo4AssetBrowserNative — status & handoff
+# D4AssetBrowser — status & handoff
 
 Native C++/Qt6 Diablo IV asset browser (Qt6 Widgets · OpenGL 4.5 · native CASC ·
 fastgltf/tinygltf). This file is the per-session engineering log; newest entries at

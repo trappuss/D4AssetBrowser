@@ -42,12 +42,12 @@ TexMeta parseTexMetaJson(const QByteArray& json);
 // patched the atlas but the JSON snapshot lags — the CASC payload has no descriptor, only pixels).
 // Returns true and fills w/h when a real dimension override exists for `texName`. Sources, merged:
 //   1. a compiled-in table of known inventory atlases (real dims from d4analyzer PNG exports),
-//   2. a user file  <AppData>/Diablo4AssetBrowserNative/texture_dims_override.txt  (name<TAB>W<TAB>H),
-//   3. PNGs dropped in <AppData>/Diablo4AssetBrowserNative/texture_overrides/  (stem = name, size = dims).
+//   2. a user file  <AppData>/D4AssetBrowser/texture_dims_override.txt  (name<TAB>W<TAB>H),
+//   3. PNGs dropped in <AppData>/D4AssetBrowser/texture_overrides/  (stem = name, size = dims).
 bool textureDimOverride(const QString& texName, int& w, int& h);
 
 // Per-frame icon override: a decoded icon for an atlas frame, loaded from PNGs the user exported
-// with d4analyzer (Export ▸ TexFrames) into <AppData>/Diablo4AssetBrowserNative/icon_overrides/.
+// with d4analyzer (Export ▸ TexFrames) into <AppData>/D4AssetBrowser/icon_overrides/.
 // d4analyzer names those files "<atlasName> [<atlasSno>] - <frameIdx> <frameName>.png", so we index
 // by (atlasSno, frameIdx). Returns a null QImage when none is present. This lets wardrobe / model /
 // texture-tab icons use the exported frames when the atlas ptFrame layout in d4data is stale/missing

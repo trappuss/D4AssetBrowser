@@ -1,6 +1,6 @@
 @echo off
 setlocal enabledelayedexpansion
-title CLEAN Rebuild Diablo4AssetBrowserNative
+title CLEAN Rebuild D4AssetBrowser
 cd /d "%~dp0"
 
 :: ---------------------------------------------------------------------------

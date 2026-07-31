@@ -1,6 +1,6 @@
 @echo off
 setlocal
-title Diablo4AssetBrowserNative
+title D4AssetBrowser
 cd /d "%~dp0"
 
 set "DESTDIR=build\release"

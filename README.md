@@ -1,4 +1,6 @@
-# Diablo4AssetBrowser **Native**
+# D4AssetBrowser
+
+*(formerly Diablo4AssetBrowser Native)*
 
 A Diablo IV asset browser and 3D wardrobe / mount studio. Reads your installed game
 directly (CASC), decodes textures, and previews or exports appearances, armour sets,

@@ -1,13 +1,13 @@
 @echo off
 setlocal enabledelayedexpansion
-title Build Diablo4AssetBrowserNative
+title Build D4AssetBrowser
 cd /d "%~dp0"
 
 :: Close any running instance so the linker can overwrite the .exe (avoids LNK1104).
 taskkill /im D4AssetBrowser.exe /f >nul 2>&1
 
 echo ============================================================
-echo  Diablo4AssetBrowserNative - build
+echo  D4AssetBrowser - build
 echo  (native C++/Qt6 - first build compiles Qt6 via vcpkg, slow)
 echo ============================================================
 echo.
