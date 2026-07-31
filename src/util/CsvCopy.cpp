@@ -82,7 +82,15 @@ void CsvCopy::install(QAbstractItemView* view)
     // offered a menu — a keyboard-only affordance next to a dozen menus reads as "no copy here".
     // Installed here rather than per call site so the fourteen views that already ask for CsvCopy
     // all get it, and so a fifteenth cannot be added without it.
-    if (view->contextMenuPolicy() != Qt::DefaultContextMenu) return;   // a view with its own menu keeps it
+    // A view that already declared its own policy keeps its own menu — Ctrl+C above still applies.
+    //
+    // THE TRAP THIS GUARD DOES NOT CATCH: it only works if install() runs AFTER the view sets its
+    // policy. Called first, it sees DefaultContextMenu, installs, and the caller's later connect()
+    // adds a SECOND handler to the same signal — Qt runs both, this one is connected first, so its
+    // menu wins and the caller's is unreachable. That is a silent, confusing failure: the code
+    // looks right and the menu never changes. Two views in ModelsTab were wired that way.
+    // Set your policy BEFORE calling install().
+    if (view->contextMenuPolicy() != Qt::DefaultContextMenu) return;
     view->setContextMenuPolicy(Qt::CustomContextMenu);
     QObject::connect(view, &QWidget::customContextMenuRequested, view, [view](const QPoint& p) {
         QMenu menu;

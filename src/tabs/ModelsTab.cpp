@@ -1220,10 +1220,14 @@ ModelsTab::ModelsTab(QWidget* parent) : BrowserTab(parent)
     connect(hh, &QHeaderView::sectionMoved, this, [saveHdr](int, int, int) { saveHdr(); });
     connect(hh, &QHeaderView::sortIndicatorChanged, this,
             [saveHdr](int, Qt::SortOrder) { saveHdr(); });
-    CsvCopy::install(m_list);
-    // Right-click: icon column → image actions (copy/save/render); other columns →
-    // name + export actions. Both honor the current multi-selection.
+    // ORDER MATTERS. CsvCopy::install skips its menu only when the view ALREADY has a policy set
+    // (CsvCopy.cpp:85), and it used to run first — so it saw DefaultContextMenu, installed its own
+    // Copy/Copy all handler, and then this one connected a SECOND handler to the same signal. Both
+    // fired; CsvCopy's was connected first, so its menu is the one that appeared and the real menu
+    // was unreachable. That is why the list and outliner looked unchanged after being fixed.
+    // The Ctrl+C shortcut is registered before that guard, so it still applies.
     m_list->setContextMenuPolicy(Qt::CustomContextMenu);
+    CsvCopy::install(m_list);
     connect(m_list, &QWidget::customContextMenuRequested, this, [this](const QPoint& p) {
         const QModelIndex hit = m_list->indexAt(p);
         // ── Subtree nodes get their own menus ──
@@ -2857,11 +2861,10 @@ ModelsTab::ModelsTab(QWidget* parent) : BrowserTab(parent)
                                                  QStringLiteral("SLOT"), QStringLiteral("MATERIAL")});
         m_partsView = makeTable(right, m_partsModel);
         m_partsView->setSelectionMode(QAbstractItemView::ExtendedSelection);
-        CsvCopy::install(m_partsView);
-        // The same part menu the viewport raises. This panel had nothing at all on right-click,
-        // while the equivalent panels in Wardrobe and Stable offered the full set — CsvCopy gives
-        // Ctrl+C and no menu, which is easy to miss when every neighbouring panel has one.
+        // Same ordering trap as m_list above — set the policy BEFORE CsvCopy::install, or CsvCopy
+        // adds a competing Copy/Copy all menu that wins over this one.
         m_partsView->setContextMenuPolicy(Qt::CustomContextMenu);
+        CsvCopy::install(m_partsView);
         connect(m_partsView, &QWidget::customContextMenuRequested, this, [this](const QPoint& pos) {
             // customContextMenuRequested delivers viewport coordinates for an item view.
             const QModelIndex ix = m_partsView->indexAt(pos);
