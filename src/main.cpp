@@ -149,6 +149,35 @@ int main(int argc, char** argv)
     QSettings::setDefaultFormat(QSettings::IniFormat);
     QSettings::setPath(QSettings::IniFormat, QSettings::UserScope, AppPaths::dataDir());
 
+    // ── Carry settings across the rename ────────────────────────────────────────────────────────
+    // QSettings keys off organisation + application name, so renaming to D4AssetBrowser orphaned
+    // every existing preference: game folder, export dirs, panel layout, ensembles. The old file is
+    // still sitting in data/ under the previous names — copy it once rather than making everyone
+    // re-configure. Only when the new file does not exist yet, so it can never clobber newer
+    // settings, and the old one is left in place as a manual fallback.
+    {
+        const QString oldIni = AppPaths::dataDir()
+            + QStringLiteral("/Diablo4AssetBrowser/Diablo4AssetBrowserNative.ini");
+        const QString newDir = AppPaths::dataDir() + QStringLiteral("/D4AssetBrowser");
+        const QString newIni = newDir + QStringLiteral("/D4AssetBrowser.ini");
+        if (QFile::exists(oldIni) && !QFile::exists(newIni)) {
+            QDir().mkpath(newDir);
+            if (QFile::copy(oldIni, newIni))
+                qInfo("settings: migrated from the pre-rename file (%s)", qPrintable(oldIni));
+        }
+    }
+
+    // Superseded cache versions accumulate otherwise — back_trophy_v1..v4 were all still present,
+    // and appearance_meta/icon_index are 2-3 MB each per version. Keep the numbers in step with the
+    // kCacheVersion constants they mirror; a stale number here only under-prunes, never deletes a
+    // live cache, because pruneOldCaches removes strictly LOWER versions.
+    AppPaths::pruneOldCaches(QStringLiteral("back_trophy_v"),    4,  QStringLiteral(".json"));
+    AppPaths::pruneOldCaches(QStringLiteral("appearance_meta_v"), 21, QStringLiteral(".json"));
+    AppPaths::pruneOldCaches(QStringLiteral("icon_index_v"),      3,  QStringLiteral(".json"));
+    AppPaths::pruneOldCaches(QStringLiteral("stable_index_v"),    6,  QStringLiteral(".bin"));
+    AppPaths::pruneOldCaches(QStringLiteral("asset_links_v"),     1,  QStringLiteral(".bin"));
+    AppPaths::pruneOldCaches(QStringLiteral("coretoc_v"),         2,  QStringLiteral(".bin"));
+
     // Runtime log next to the exe (truncated each launch) for diagnostics.
     g_logFile.setFileName(QDir(QCoreApplication::applicationDirPath())
                               .filePath(QStringLiteral("D4AssetBrowser.log")));

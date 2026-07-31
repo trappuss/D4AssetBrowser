@@ -6,6 +6,9 @@
 // resolves here too.
 #include <QCoreApplication>
 #include <QDir>
+#include <QDebug>
+#include <QFile>
+#include <QRegularExpression>
 #include <QString>
 
 namespace AppPaths {
@@ -26,6 +29,29 @@ inline QString dataDir()
 
 // A file directly inside data/ (e.g. "checkmark.png", "model_render.guard").
 inline QString file(const QString& name) { return QDir(dataDir()).filePath(name); }
+
+// Delete superseded versions of a versioned cache. Caches are versioned in the FILENAME (see
+// util/CacheVersioning.h) so an old build's file can never be read by a new one — but nothing was
+// deleting them, so every bump left its predecessor behind forever. back_trophy_v1..v4 were all
+// still on disk, and appearance_meta is 2 MB and icon_index 3 MB per version.
+//
+// Call with the stem and the CURRENT version, e.g. pruneOldCaches("back_trophy_v", 4, ".json").
+// Only files matching <stem><digits><ext> with a LOWER number are removed — an unrelated file that
+// happens to share the prefix cannot match, and the current one is never touched.
+inline void pruneOldCaches(const QString& stem, int currentVersion, const QString& ext)
+{
+    const QDir d(dataDir());
+    const QRegularExpression re(QStringLiteral("^%1(\\d+)%2$")
+                                    .arg(QRegularExpression::escape(stem),
+                                         QRegularExpression::escape(ext)));
+    for (const QString& fn : d.entryList(QDir::Files)) {
+        const QRegularExpressionMatch m = re.match(fn);
+        if (!m.hasMatch()) continue;
+        const int v = m.captured(1).toInt();
+        if (v > 0 && v < currentVersion && QFile::remove(d.filePath(fn)))
+            qInfo().noquote() << "cache: removed superseded" << fn;
+    }
+}
 
 // A subdirectory inside data/ (created), e.g. "model_thumbs", "index_cache".
 inline QString subDir(const QString& name)
