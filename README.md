@@ -27,7 +27,7 @@ hair, makeup and animations.
 
 No Python. No `pip`. No d4extract.
 
-**Requirements:** Windows 10/11 x64 · a Diablo IV install (Battle.net or Steam) ·
+**Requirements:** Windows 10/11 x64 · a Diablo IV install (Battle.net Tested Only) ·
 GPU with OpenGL 4.5 · internet on first run.
 
 ---
@@ -131,7 +131,7 @@ working / newly broken" rather than being discovered months later.
 | Wardrobe tab is slow | **Rewritten** — sync rebuild ~150 ms for 6 pieces |
 | D4Extract as a dependency | **Removed** |
 
-### Honest limitations
+### Honest limitations (7/31/2026)
 
 - **~10% of wardrobe appearances render incomplete.** The model parser decodes only vertex
   buffer 0; sub-objects on other buffers are dropped rather than drawn scrambled. Measured,
