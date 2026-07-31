@@ -6,6 +6,7 @@
 #include "tex/BcDecode.h"
 #include "tex/TexMeta.h"
 
+#include <QSet>
 #include <QDir>
 #include <QDirIterator>
 #include <QFile>
