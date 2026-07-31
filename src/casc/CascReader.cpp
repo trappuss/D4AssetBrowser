@@ -262,6 +262,8 @@ bool CascReader::loadAllIndices()
         sigH.addData(QByteArray::number(fi.lastModified().toMSecsSinceEpoch()));
     }
     const QString sig = QString::fromLatin1(sigH.result().toHex());
+    // Version is in the FILENAME on purpose — see util/CacheVersioning.h. Bump it whenever what
+    // this file MEANS changes, so a previous build's cache cannot be read at all.
     const QString cachePath = AppPaths::dataDir() + QStringLiteral("/casc_index_v1.bin");
     QElapsedTimer et; et.start();
     if (loadIndexCacheFile(cachePath, sig)) {
@@ -1019,6 +1021,7 @@ bool CascReader::open(const QString& gameDir, const QString& /*product*/)
     // expansion over a million paths) yet is a pure function of the vfs-root manifest (whose
     // hash IS m_buildId) and the TACT key set (keys gate which encrypted containers expand).
     // Cache it on disk keyed by both; a game patch or a new key rebuilds automatically.
+    // Version in the filename — see util/CacheVersioning.h.
     const QString cachePath = AppPaths::dataDir() + QStringLiteral("/tvfs_paths_v1.bin");
     const QString cacheSig = rootCacheSignature();
     QElapsedTimer tvfsT; tvfsT.start();

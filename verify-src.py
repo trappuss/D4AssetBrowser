@@ -132,9 +132,33 @@ FMT_CALL = re.compile(r"\b(qInfo|qWarning|qCritical|qDebug|printf|fprintf)\s*\("
 
 
 def _split_args(s: str) -> list[str]:
-    """Top-level comma split, respecting nesting and (already-stripped) literals."""
+    """Top-level comma split, respecting nesting AND string/char literals.
+
+    The literal handling is the fix for a long-standing false positive: the docstring used to
+    claim literals were "already-stripped", but the argument list handed here still contains
+    them, so a comma INSIDE a string — qWarning("...", "a, b") or any message containing a
+    comma — was counted as an argument separator. Every such call was reported as an arg/spec
+    mismatch, and the workaround was to reword messages with em dashes, i.e. the checker was
+    quietly dictating prose. Now a literal is skipped whole, escapes included.
+    """
     args, depth, cur = [], 0, ""
-    for ch in s:
+    i, n = 0, len(s)
+    while i < n:
+        ch = s[i]
+        if ch in "\"'":
+            quote = ch
+            j = i + 1
+            while j < n:
+                if s[j] == "\\":       # escape: consume the next char whatever it is
+                    j += 2
+                    continue
+                if s[j] == quote:
+                    j += 1
+                    break
+                j += 1
+            cur += s[i:j]
+            i = j
+            continue
         if ch in "([{":
             depth += 1
         elif ch in ")]}":
@@ -144,6 +168,7 @@ def _split_args(s: str) -> list[str]:
             cur = ""
         else:
             cur += ch
+        i += 1
     if cur.strip():
         args.append(cur)
     return args

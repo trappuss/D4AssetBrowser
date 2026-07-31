@@ -134,6 +134,7 @@ bool SnoIndex::loadFromCasc(CascReader& casc)
 // Stored AFTER exclude+sort, so a warm launch is a bulk read straight into m_byGroup.
 static constexpr quint32 kTocCacheMagic = 0x544F4331;   // 'TOC1'
 
+// See util/CacheVersioning.h for the rule this follows.
 // v2: entry NAMES changed meaning — encrypted appearances now carry the name recovered from their
 // cloth data instead of "~unnamed_<sno>". A v1 cache is still perfectly valid data, which is exactly
 // the problem: it loads clean, the recovery pass is skipped because it only runs on a cache MISS,
