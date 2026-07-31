@@ -8,7 +8,29 @@
 
 namespace {
 constexpr auto kRepoUrl = "https://github.com/DiabloTools/d4data.git";
-const QStringList kSparse = {"json/base", "json/enUS_Text"};
+// The tool reads exactly TWENTY of d4data's 133 asset groups. Fetching all of json/base pulled
+// 780,780 files; these twenty are 462,954 — so 317,826 files, ~41% of the extract time and a
+// matching slice of the disk cost, were being spent on groups nothing ever opens.
+//
+// Derived by grepping every "json/base/meta/<Group>" literal in the source, not by judgement.
+// If a new reader is added for another group, ADD IT HERE — a missing group is not fatal (the
+// binary CASC path covers most of it) but it silently loses whatever the JSON provided.
+//
+// Cone mode also includes files sitting directly in the listed parents, so json/base/CoreTOC.dat.json
+// arrives without being named — it is the only top-level file the code reads.
+const QStringList kSparse = {
+    "json/enUS_Text",
+    "json/base/meta/Actor",         "json/base/meta/Anim",
+    "json/base/meta/AnimSet",       "json/base/meta/Appearance",
+    "json/base/meta/AppearanceSet", "json/base/meta/Cloth",
+    "json/base/meta/Dye",           "json/base/meta/Emote",
+    "json/base/meta/EyeColor",      "json/base/meta/FacialHair",
+    "json/base/meta/HairColor",     "json/base/meta/Item",
+    "json/base/meta/ItemType",      "json/base/meta/Makeup",
+    "json/base/meta/MarkingColor",  "json/base/meta/MarkingShape",
+    "json/base/meta/Material",      "json/base/meta/PlayerClass",
+    "json/base/meta/StoreProduct",  "json/base/meta/Texture",
+};
 }
 
 D4DataDownloader::D4DataDownloader(QObject* parent) : QObject(parent) {}
@@ -58,7 +80,7 @@ void D4DataDownloader::start(const QString& dest)
         // and takes minutes on an SSD, considerably longer on a hard drive — with the old label
         // and no output it read as a hang, which is the single most common "is it broken?" moment
         // in first-run setup.
-        m_stepLabels.append(QStringLiteral("Extracting ~1 million files (several minutes)"));
+        m_stepLabels.append(QStringLiteral("Extracting ~460k files (several minutes)"));
     }
     runNext();
 }
