@@ -209,12 +209,28 @@ if(D4_STATIC_QT)
             MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
     endif()
 elseif(WIN32)
-    # Dynamic Qt: deploy the Qt runtime DLLs + plugins next to the .exe so it launches stand-alone.
-    qt_generate_deploy_app_script(
-        TARGET D4AssetBrowser
-        OUTPUT_SCRIPT deploy_script
-        NO_UNSUPPORTED_PLATFORM_ERROR)
-    install(SCRIPT ${deploy_script})
+    # Dynamic Qt: copy the runtime DLLs + plugins next to the .exe so it launches stand-alone.
+    #
+    # NOT qt_generate_deploy_app_script. That generates a call to
+    # qt6_deploy_runtime_dependencies, which needs windeployqt.exe — and THIS VCPKG QT DOES NOT
+    # SHIP IT. vcpkg_installed/x64-windows contains only share/Qt6/mkspecs/features/win32/
+    # windeployqt.prf, the qmake feature file, not the tool. So the install step always failed with
+    # "No Qt deploy tool available for this target platform", and NO_UNSUPPORTED_PLATFORM_ERROR only
+    # downgrades the configure-time check, not the run-time failure.
+    #
+    # run.bat has been deploying correctly this whole time by copying the same files by hand, so
+    # this does what run.bat does. Same source, same plugin set, no external tool.
+    set(_qt_bin "${CMAKE_BINARY_DIR}/vcpkg_installed/x64-windows/bin")
+    set(_qt_plugins "${CMAKE_BINARY_DIR}/vcpkg_installed/x64-windows/Qt6/plugins")
+    install(DIRECTORY "${_qt_bin}/" DESTINATION . FILES_MATCHING PATTERN "*.dll")
+    # Only the plugin families a Widgets/OpenGL app actually loads. platforms is mandatory —
+    # without qwindows.dll the exe dies at startup with "no Qt platform plugin could be initialized".
+    foreach(_p platforms imageformats styles iconengines)
+        if(EXISTS "${_qt_plugins}/${_p}")
+            install(DIRECTORY "${_qt_plugins}/${_p}" DESTINATION .
+                    FILES_MATCHING PATTERN "*.dll")
+        endif()
+    endforeach()
 endif()
 
 install(TARGETS D4AssetBrowser

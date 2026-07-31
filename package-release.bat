@@ -6,7 +6,7 @@ cd /d "%~dp0"
 :: ============================================================================
 ::  Builds the portable RELEASE folder:
 ::    * D4AssetBrowser.exe + the exact Qt6 runtime DLLs and plugins it needs
-::      (copied by windeployqt) + README
+::      (copied from vcpkg_installed) + README
 ::    * settings + caches live in a data\ folder beside the exe (no registry, no AppData)
 ::  Output: dist\D4AssetBrowser\   (+ dist\D4AssetBrowser.zip)
 ::
@@ -54,8 +54,9 @@ set "RC=%errorlevel%"
 findstr /i /c:"error C" /c:": error" /c:"error LNK" /c:"fatal error" /c:"FAILED" /c:"ninja: build stopped" "%~dp0build_log.txt" > "%~dp0build_errors.txt"
 if not "%RC%"=="0" ( echo   BUILD FAILED ^(see build_errors.txt^). & pause & exit /b 1 )
 
-:: 5. Install into the dist folder. The CMake install runs the generated deploy step
-::    (windeployqt) which copies the exact Qt6 DLLs + plugins next to the exe.
+:: 5. Install into the dist folder. The CMake install copies the Qt6 DLLs + the plugin
+::    families the app loads next to the exe — by hand, because this vcpkg Qt ships no
+::    windeployqt.exe (only the qmake .prf). See the elseif(WIN32) block in CMakeLists.txt.
 echo [4/5] Deploying Qt runtime into dist\D4AssetBrowser ...
 set "OUT=%~dp0dist\D4AssetBrowser"
 if exist "%OUT%" rmdir /s /q "%OUT%"
@@ -63,6 +64,24 @@ cmake --install "%~dp0build\release" --prefix "%OUT%" > "%~dp0build_log.txt" 2>&
 set "RC=%errorlevel%"
 type "%~dp0build_log.txt"
 if not "%RC%"=="0" ( echo   DEPLOY FAILED ^(see build_log.txt^). & pause & exit /b 1 )
+
+:: Verify the deploy actually produced a runnable tree. Without platforms\qwindows.dll the exe
+:: dies at startup with "no Qt platform plugin could be initialized" — and that would only be
+:: discovered by whoever downloads the release, which is the worst possible place to find it.
+if not exist "%OUT%\D4AssetBrowser.exe" (
+    echo   [X] No exe in %OUT% - the install step produced nothing.
+    pause & exit /b 1
+)
+if not exist "%OUT%\platforms\qwindows.dll" (
+    echo   [X] platforms\qwindows.dll is MISSING from %OUT%.
+    echo       The zip would build fine and fail to START on every machine.
+    pause & exit /b 1
+)
+if not exist "%OUT%\Qt6Core.dll" (
+    echo   [X] Qt6Core.dll is missing from %OUT% - Qt runtime was not copied.
+    pause & exit /b 1
+)
+echo   Deploy verified: exe + Qt6Core.dll + platforms\qwindows.dll present.
 if not exist "%OUT%\D4AssetBrowser.exe" ( echo   ERROR: exe missing in "%OUT%". & pause & exit /b 1 )
 if exist "%~dp0RELEASE_README.txt" copy /y "%~dp0RELEASE_README.txt" "%OUT%\README.txt" >nul
 
