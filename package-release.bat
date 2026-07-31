@@ -92,7 +92,13 @@ set "APPVER="
 for /f tokens^=2^ delims^=^" %%v in ('findstr /c:"setApplicationVersion" "%~dp0src\main.cpp"') do set "APPVER=%%v"
 if "%APPVER%"=="" set "APPVER=dev"
 set "ZIP=%~dp0dist\D4AssetBrowser_v%APPVER%.zip"
-powershell -NoProfile -Command "Compress-Archive -Force -Path '%OUT%' -DestinationPath '%ZIP%'"
+REM ZipFile::CreateFromDirectory, not Compress-Archive. Compress-Archive on Windows PowerShell
+REM writes BACKSLASH path separators, which the zip spec says must be forward slashes. Windows
+REM Explorer and 7-Zip cope; Linux/macOS unzip does not — it creates single files literally named
+REM "D4AssetBrowser\platforms\qwindows.dll" instead of a folder tree. For a GitHub release that
+REM anyone can download on any OS, that is a broken archive for some of them.
+powershell -NoProfile -Command "Add-Type -AssemblyName System.IO.Compression.FileSystem; if (Test-Path '%ZIP%') { Remove-Item '%ZIP%' -Force }; [System.IO.Compression.ZipFile]::CreateFromDirectory('%OUT%', '%ZIP%', [System.IO.Compression.CompressionLevel]::Optimal, $true)"
+if not exist "%ZIP%" ( echo   [X] Zip was not created. & pause & exit /b 1 )
 
 echo.
 echo ============================================================

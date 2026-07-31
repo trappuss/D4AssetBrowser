@@ -40,3 +40,7 @@ rebuild_out.txt
 .Resources/d4_tact_keys*.txt
 tactkeys/
 *.keys
+
+# Release output and build leftovers — generated, never committed.
+dist/
+build.del/
