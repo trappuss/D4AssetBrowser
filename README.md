@@ -146,6 +146,29 @@ working / newly broken" rather than being discovered months later.
 
 ---
 
+## Portable — everything lives in `data\`
+
+No registry keys, no `%APPDATA%`, no user-profile files. Everything the tool writes goes in
+`data\` beside the exe:
+
+| | |
+|---|---|
+| `D4AssetBrowser\*.ini` | settings (INI, not the registry) |
+| `coretoc_v2.bin` · `casc_index_v1.bin` | asset index caches, keyed to the game build |
+| `appearance_meta_v21.json` · `icon_index_v3.json` | metadata and icon caches |
+| `model_thumbs\` · `stable_thumbs\` · `icon_overrides\` | rendered thumbnails |
+| `ensembles\` | saved wardrobe outfits |
+| `d4data\` | the metadata checkout |
+| `D4AssetBrowser.log` | attach this to bug reports |
+
+Move the folder to another drive or a USB stick and it keeps working. Delete it and nothing
+is left behind. Superseded cache versions are pruned automatically at startup.
+
+The only exception, deliberately: **export** dialogs default to Documents/Pictures, because a
+`.glb` you exported belongs with your files, not inside the tool.
+
+---
+
 ## Data and keys
 
 Nothing proprietary ships in this repository. On first run the tool downloads **d4data**
