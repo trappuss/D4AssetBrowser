@@ -38,11 +38,13 @@ inline QImage image(int sno, CascReader* reader)
 // Copy image / Save image… — disabled rather than hidden when there is no icon, so the menu keeps
 // a stable shape and the absence reads as "this item has no icon" instead of "this menu is
 // different". Same wording and order as the Models tab's icon-grid menu.
-inline void addActions(QMenu& menu, QWidget* parent, int sno, const QString& fullName,
-                       CascReader* reader)
+// Takes the ICON, not an sno, deliberately. The two tabs resolve icons differently and must keep
+// doing so: Stable's slotIcon() consults its own mount/barding/trophy/pet crawl (m_iconByApp)
+// before falling back to AppearanceMeta, so resolving here via image() would hand it a wrong or
+// empty icon for precisely the content it shows. What is worth sharing is the pair of actions —
+// wording, order, and the disabled-not-hidden behaviour — not the lookup.
+inline void addActions(QMenu& menu, QWidget* parent, const QImage& icon, const QString& fullName)
 {
-    if (sno <= 0) return;
-    const QImage icon = image(sno, reader);
     menu.addSeparator();
     QAction* aCopy = menu.addAction(QObject::tr("Copy image"), parent,
                                     [icon] { QGuiApplication::clipboard()->setImage(icon); });

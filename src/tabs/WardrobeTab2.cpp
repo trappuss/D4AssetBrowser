@@ -4960,24 +4960,8 @@ void WardrobeTab2::addItemActions(QMenu& menu, int sno, const QString& fullName)
     auto clip = [](const QString& t) { QGuiApplication::clipboard()->setText(t); };
     auto prev = [](const QString& t) { return t.size() > 30 ? t.left(29) + QChar(0x2026) : t; };
 
-    // ── image ──
-    const QImage icon = wardrobeLookImage(sno, m_reader);
-    menu.addSeparator();
-    QAction* aCopyImg = menu.addAction(QStringLiteral("Copy image"), this,
-        [icon] { QGuiApplication::clipboard()->setImage(icon); });
-    aCopyImg->setEnabled(!icon.isNull());
-    QAction* aSaveImg = menu.addAction(QStringLiteral("Save image…"), this, [this, icon, fullName] {
-        QSettings st;
-        QString dir = st.value(QStringLiteral("export/captureDir")).toString();
-        if (dir.isEmpty()) dir = QStandardPaths::writableLocation(QStandardPaths::PicturesLocation);
-        const QString f = QFileDialog::getSaveFileName(this, QStringLiteral("Save icon"),
-            QDir(dir).filePath(fullName + QStringLiteral(".png")),
-            QStringLiteral("PNG image (*.png)"));
-        if (f.isEmpty()) return;
-        st.setValue(QStringLiteral("export/captureDir"), QFileInfo(f).absolutePath());
-        icon.save(f);
-    });
-    aSaveImg->setEnabled(!icon.isNull());
+    // ── image ── (shared with the Stable tab's cards via LookIcon)
+    LookIcon::addActions(menu, this, wardrobeLookImage(sno, m_reader), fullName);
 
     // ── export ──
     menu.addSeparator();
