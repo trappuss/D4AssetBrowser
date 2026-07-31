@@ -23,6 +23,9 @@ hair, makeup and animations.
 2. Run **`D4AssetBrowser.exe`**.
 3. **File → Settings** — set your **Diablo IV game folder**.
 4. **File → Dependencies…** — download **d4data** (community metadata snapshot). One click.
+   Budget **~4–6 GB** and 10–20 minutes: it writes ~460,000 small JSON files, so the
+   *Extracting* step is limited by your drive, not your connection. Only the 20 asset
+   groups the tool reads are fetched (of 133), and the folder is NTFS-compressed.
 5. **File → Update TACT Keys** — fetches the community decryption keys.
 
 No Python. No `pip`. No d4extract.

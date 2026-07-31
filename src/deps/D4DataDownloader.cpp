@@ -72,6 +72,7 @@ void D4DataDownloader::start(const QString& dest)
         m_stepLabels.append(QStringLiteral("Applying update"));
     } else {
         QDir().mkpath(dest);
+        enableNtfsCompression(dest);
         m_steps.append({"clone", "--depth", "1", "--filter=blob:none", "--sparse",
                         "--progress", QString::fromLatin1(kRepoUrl), dest});
         m_stepLabels.append(QStringLiteral("Downloading metadata"));
@@ -101,6 +102,38 @@ void D4DataDownloader::parseGitProgress(const QString& line)
                                                m.captured(QStringLiteral("tot")));
     emit phaseProgress(m.captured(QStringLiteral("phase")).trimmed(),
                        m.captured(QStringLiteral("pct")).toInt(), detail);
+}
+
+// ── NTFS compression on the destination ─────────────────────────────────────────────────────────
+// d4data is ~460,000 small JSON files. Two things make that far more expensive on disk than the
+// logical size suggests: JSON is highly compressible (5-10x), and every file rounds up to a 4 KB
+// NTFS cluster, so a 700-byte definition still costs 4 KB. Compressed NTFS files are allocated
+// sparsely, which recovers most of that slack as well as the content.
+//
+// Set on the DIRECTORY before the clone, so git writes already-compressed files rather than us
+// re-writing 460,000 of them afterwards. Decompression is transparent — nothing else in the tool
+// needs to know, and reads of small files are typically FASTER compressed because there is less
+// physical I/O.
+//
+// Best-effort by design: fails harmlessly on FAT32/exFAT/ReFS or a network share, where the
+// attribute is unsupported. A failure costs disk space, never correctness, so it is logged and
+// ignored rather than surfaced to the user as an error.
+void D4DataDownloader::enableNtfsCompression(const QString& dir)
+{
+#ifdef Q_OS_WIN
+    QProcess p;
+    // /c compress · /s recurse (so subdirs created later inherit) · /i ignore errors · /q quiet
+    p.start(QStringLiteral("compact"),
+            {QStringLiteral("/c"), QStringLiteral("/s:") + QDir::toNativeSeparators(dir),
+             QStringLiteral("/i"), QStringLiteral("/q")});
+    if (!p.waitForFinished(15000)) { p.kill(); return; }
+    emit progress(p.exitCode() == 0
+                      ? QStringLiteral("> NTFS compression enabled on %1 "
+                                       "(JSON compresses ~5-10x; also recovers 4 KB-cluster slack)").arg(dir)
+                      : QStringLiteral("> NTFS compression unavailable here — continuing uncompressed"));
+#else
+    Q_UNUSED(dir);
+#endif
 }
 
 // ── Extraction progress, measured from the filesystem ───────────────────────────────────────────

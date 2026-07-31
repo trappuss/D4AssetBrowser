@@ -42,6 +42,7 @@ private:
     // prints checkout progress only to a TTY, and QProcess gives it a pipe, so that step emitted
     // NOTHING for several minutes and looked hung. These poll the filesystem instead, which works
     // regardless of what git chooses to print.
+    void enableNtfsCompression(const QString& dir);   // best-effort; see the .cpp for why
     void startExtractWatch(const QString& dest);
     void stopExtractWatch();
     QTimer*  m_extractTimer = nullptr;
