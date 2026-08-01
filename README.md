@@ -1,7 +1,5 @@
 # D4AssetBrowser
 
-*(formerly Diablo4AssetBrowser Native)*
-
 A Diablo IV asset browser and 3D wardrobe / mount studio. Reads your installed game
 directly (CASC), decodes textures, and previews or exports appearances, armour sets,
 weapons, mounts and pets as animated `.glb` — with cloth physics, dyes, markings,
@@ -53,11 +51,13 @@ GPU with OpenGL 4.5 · internet on first run.
 
 | Tab | What it does |
 |---|---|
-| **Models** | All 67k+ appearances in three views (list / outliner / icon grid). Live PBR viewport, parts, looks, materials, textures, LODs, bones, animations, dependency graph. Smart search: `c:` collection, `#tag`, digits = SNO. |
-| **Wardrobe** | Build a character — class, gender, face, hair, facial hair, armour per slot, weapons, back trophy. Dyes, skin/hair tint, eye colour, makeup, markings. Cloth physics, auto-animations, saved ensembles. |
-| **Stable** | The same for mounts and pets — bodies, barding, trophies. |
-| **Textures** | Browse and decode every texture (BC1/3/4/5/7); channel split, frame galleries, model associations. |
-| **Bulk Extract** | Queue and export many assets at once. |
+| **Models** | Browse and inspect all 67k+ appearances in a live PBR viewport. |
+| **Wardrobe** | Dress a character — armour, weapons, dyes, hair, markings, animations. |
+| **Stable** | The same for mounts and pets. |
+| **Textures** | Browse and decode every texture in the game. |
+| **Bulk Extract** | Filter the index and export in one run. |
+
+Each is covered in detail below.
 
 ---
 
@@ -110,10 +110,11 @@ play their own clips from a pinned ATTACHED list · camera snap-to-slot · cloth
 the loaded model's parts, looks, animations and bones hang off its row), and **Grid**
 (thumbnails). Switch from the display dropdown in the header.
 
-**Search.** One box: `text` for name/tags, `123456` for a SNO, `c:some collection` for
-collection (reads to end of line, so put it last). Space-separated terms all have to match, and
-a leading `-` excludes — `pandem -destroyed -pillar`. `Ctrl+F` focuses, `Esc` clears, `↓`
-recalls your last ten searches.
+**Search.** One box: `text` for name/tags, `123456` for a SNO, `#tag` to match tags, title and
+collection but *not* the filename, `c:some collection` for collection (reads to end of line, so
+put it last). Space-separated terms all have to match, and a leading `-` excludes —
+`pandem -destroyed -pillar`, `-#cape`. `Ctrl+F` focuses, `Esc` clears, `↓` recalls your last
+ten searches. The same syntax drives Bulk Extract and the Textures tab.
 
 **Filters** live in a funnel popup that stays open while you tick things: grouped tag
 checkboxes (Category, Class, Gender, Type) with **Match any (OR)**, plus **Only decrypted**,
@@ -375,7 +376,7 @@ distribute them.
 
 Roadmap, what's in progress and what's planned live on the project board:
 
-### ➡️ **[D4AssetBrowser project board](https://github.com/users/trappuss/projects/3/views/1)**
+### **[D4AssetBrowser project board](https://github.com/users/trappuss/projects/3/views/1)**
 
 - **[Issues](https://github.com/trappuss/Diablo4AssetBrowser/issues)** — bugs and requests.
   A missing or broken model is worth reporting: attach `data\D4AssetBrowser.log`, which names
