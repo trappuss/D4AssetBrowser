@@ -325,18 +325,6 @@ cannot be shown (OK / no-textures / no-materials / no-geometry / locked / no-dat
 working / newly broken" rather than being discovered months later.
 `Test Encrypted Chain.bat` verifies the appearance → material → texture chain in seconds.
 
-### Original's known issues — status here
-
-| Original known issue | Status |
-|---|---|
-| Warlock models bugged / missing (encrypted) | **Fixed** — encrypted content resolves from CASC |
-| Paladin animations missing (encrypted) | **Fixed** — same route |
-| Horse armour isn't rigged to the skeleton | **Fixed** |
-| Stable models don't have proper transparency | **Fixed** |
-| Facial hair is buggy | **Fixed** |
-| Wardrobe tab is slow | **Rewritten** — sync rebuild ~150 ms for 6 pieces |
-| D4Extract as a dependency | **Removed** |
-
 ### Honest limitations
 
 - **~10% of wardrobe appearances render incomplete.** The model parser decodes only vertex
@@ -380,6 +368,25 @@ next to the exe and are gitignored; delete the folder to remove everything.
 
 TACT keys decrypt content Blizzard has already shipped to your client. This repo does not
 distribute them.
+
+---
+
+## Keeping up with the project
+
+Roadmap, what's in progress and what's planned live on the project board:
+
+### ➡️ **[D4AssetBrowser project board](https://github.com/users/trappuss/projects/3/views/1)**
+
+- **[Issues](https://github.com/trappuss/Diablo4AssetBrowser/issues)** — bugs and requests.
+  A missing or broken model is worth reporting: attach `data\D4AssetBrowser.log`, which names
+  the exact asset and, where relevant, the TACT key it needs.
+- **[Releases](https://github.com/trappuss/Diablo4AssetBrowser/releases)** — watch the repo to
+  be told about new builds.
+
+**After a game patch:** run **File → Update TACT Keys**, then re-run **File → Dependencies…**
+to refresh d4data. New seasonal and collab content usually needs both. If something still
+won't load, `Audit Asset Health.bat` diffs against your last run and reports exactly what
+changed — attach that output to an issue and it saves a lot of back-and-forth.
 
 ---
 
