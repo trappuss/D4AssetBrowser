@@ -59,8 +59,197 @@ GPU with OpenGL 4.5 · internet on first run.
 | **Textures** | Browse and decode every texture (BC1/3/4/5/7); channel split, frame galleries, model associations. |
 | **Bulk Extract** | Queue and export many assets at once. |
 
-**Export:** rigged animated `.glb` · PNG / JPEG / WebP stills · animated GIF with
-palette + inter-frame optimisation and a size budget · turntables.
+---
+
+## Features by tab
+
+### Wardrobe
+
+**Pigments — the game's dye system, rebuilt.** Dyes are read from the game's own
+`Dye` records, taking each swatch as **four colours, one per DyeMask zone**, and rendered
+the way the game shader does it: the mask's red channel picks the zone, a ramp texture
+supplies the value multiplier, and unmasked texels stay undyed. NPC, debug and
+hidden-from-UI dyes are filtered out.
+
+- **Set Look / Set Pigment** toggle per slot, mirroring the in-game flow.
+- **Per-slot pigments**, or an **Apply to all slots** checkbox that hits the five armour slots.
+- **Custom pigments** — a colour wheel, four numbered zone buttons, hex entry, and
+  **Save Pigment** to name and store your own. Customs appear in the library with a gold border.
+- **8 memory swatches** — drag a colour in to store it, click to apply, right-click to clear.
+  Colours can also be dragged from one zone onto another.
+- **Copy / Paste / Clear pigment** between slots from the slot right-click menu.
+- Weapons are correctly **not dyeable** (greyed with a reason), matching the game.
+
+**Character.** 8 classes including Paladin and Warlock · both genders · nine creator
+categories drawn from real game data — Face, Hair style, Hair colour, Eye colour, Facial hair,
+Makeup, Marking, Marking colour, Jewelry — each filtered to what your class and gender can
+actually use. Plus skin tone and a skin-detail overlay (freckles / vitiligo). Eye colour is
+composited from the game's own base/normal/ORM/emissive maps.
+
+**Equipment — 10 slots.** Helm · Torso · Gloves · Legs · Boots · Main · Off · Sheath ·
+Sheath 2 · Back trophy. Weapon slots your class can't use are greyed out. Each slot has its
+own search box and collection filter.
+
+**Ensembles.** Save the whole look — class, gender, skin, all nine creator picks, all ten
+slots, every per-slot pigment, and the animation. The tile art is **a real viewport snapshot
+taken at save time**, not a generic icon. Save · Overwrite · Delete · Rename; double-click to load.
+
+**Equip Theme.** Right-click any look card to equip its whole matching set, with four scopes —
+everything, armour only, markings only, or weapons only — and the camera frames what changed.
+
+**Auto Animate** *(Settings ▸ Wardrobe)*. When your **weapon class** changes, plays the game's
+own wardrobe unsheathe clip once then settles into that loadout's idle, resolved from the
+shipped `ui_wardrobe` AnimSets. Armour changes don't trigger it.
+
+**Also:** Ctrl+Z undo (30 deep) · attached models (back trophy, weapons) keep their own rigs and
+play their own clips from a pinned ATTACHED list · camera snap-to-slot · cloth physics.
+
+### Models
+
+**Three views of the same list** — **List** (dense flat rows), **Outliner** (a scene tree where
+the loaded model's parts, looks, animations and bones hang off its row), and **Grid**
+(thumbnails). Switch from the display dropdown in the header.
+
+**Search.** One box: `text` for name/tags, `123456` for a SNO, `c:some collection` for
+collection (reads to end of line, so put it last). Space-separated terms all have to match, and
+a leading `-` excludes — `pandem -destroyed -pillar`. `Ctrl+F` focuses, `Esc` clears, `↓`
+recalls your last ten searches.
+
+**Filters** live in a funnel popup that stays open while you tick things: grouped tag
+checkboxes (Category, Class, Gender, Type) with **Match any (OR)**, plus **Only decrypted**,
+**Only encrypted (TACT)**, **Hide un-renderable**, and usage facets — **Latest** (new this
+update), **Animated**, **Rigged**, **Orphaned**. Every active filter shows as a removable chip.
+
+**Viewport.** Four shading modes (Wireframe · Flat · Shaded · Rendered with IBL, shadows, SSAO,
+tonemap). A **channel viewer** — Base Colour, Normal, Roughness, Metallic, AO, Emissive —
+which you can cycle by scrolling the `⌄` next to the shading balls. **Overlays**: statistics,
+ground grid, axis gizmo, skeleton, hardpoints, collision capsules, physics bones (anchored grey
+/ simulated orange), bone names and translated bone names. **FX / SIM / GIB** submesh toggles.
+Popovers for Graphics, Pigment, Camera, Lighting.
+
+### Stable
+
+Mounts and pets across three slots — **Mount** (labelled *Pet* for companions) · **Mount Armor**
+· **Trophy**. Species-aware (horse / cat / basilisk). **Equip matching set** builds the themed
+trio from the game's own bundle data, with individual *Equip Armor* / *Equip Trophy* entries.
+Trophies seat onto the correct mount bone. Mounts aren't dyeable in Diablo IV, so there's
+deliberately no dye control here.
+
+### Textures
+
+Every texture in the game, decoded (BC1/3/4/5/7). **Channel isolation** (RGB · R · G · B · A),
+**alpha checkerboard**, cubemap/array face selector, and a **pixel inspector** that reports
+`(x, y) RGBA` under the cursor. Scroll to zoom, drag to pan, double-click to reset.
+
+Filter by **format**, by **gear tags** (the class/type/gender of appearances that use the
+texture), orphans-only, or decrypted-only. Search supports `#tag`, SNO digits, and `-exclude`.
+
+**TEXFRAMES** lists the sprite frames packed into an atlas, with an optional **Trim** that crops
+each export to its tight bounds. **ASSOCIATED MODELS** walks texture → material → appearance and
+lets you jump straight to the model in the Models tab. Images can be dragged out of the preview
+straight into another application.
+
+### Bulk Extract
+
+Filter the whole index, watch the match count update live, then export everything at once.
+Same funnel filters as the Models tab. **Pick items manually** moves matches into a persistent
+**Queue** that survives filter changes, mode switches and restarts.
+
+Options: include textures · all animations · pulled animations · raw sources · raw buffers ·
+loose textures · a CSV report. **Parallel** workers (auto = core count). Output can be flat or
+organised into subfolders by class or type. **Only new** skips anything already exported —
+tracked in a `_bulk_manifest.json` ledger — or **Overwrite**. Live console with a working
+Cancel (or `Esc`) and Pause/Resume that excludes paused time from the ETA. Failures are
+written to `_bulk_failed.txt` with a reason each, and one bad model can't take the run down.
+
+---
+
+## Panels
+
+The right-hand column is a stack of panels, Blender-style. A vertical **icon strip** toggles
+them; each panel header carries **▲ ▼** to reorder and **✕** to hide. They live in a splitter,
+so drag the handles to resize — a drag can never fully erase one, and a newly-opened panel
+takes a sensible height from the slack of the panels already up rather than forcing an equal
+split. The whole column collapses to just the strip via the `»` arrow. Layout is remembered
+between sessions (*Settings ▸ Remember the right-hand panel layout*).
+
+| Tab | Panels |
+|---|---|
+| **Models** | `LOOKS` · `MATERIALS` · `SHADING` · `INFO` · `PARTS` · `CLOTH` · `ANIMATIONS` · `ATTACHMENTS` |
+| **Wardrobe** | `PARTS` · `MATERIALS` · `MATERIAL TEXTURES` · `TEXTURE PREVIEW` · `ANIMATIONS` |
+| **Stable** | `PARTS` · `MATERIALS` · `TEXTURES` · `INFO` |
+
+- **INFO** — filename, title, SNO, collection, tags, sets, filesize, format, bounds, LODs, bones,
+  material/texture/animation counts, actor, physics, what uses it, and clickable **Variants** links.
+- **PARTS** — per-part triangle counts, slot and material, with visibility checkboxes.
+- **MATERIALS** — App Materials / SubObject Apps / Materials / Vertex Buffers.
+- **CLOTH** — the authored physics tuning per piece, showing the game's value beside the live one.
+- **TEXTURE PREVIEW** (Wardrobe) — six channel tiles (colour, roughness, metal, normal, alpha,
+  emissive) with a hover zoom you can resize with the wheel.
+
+---
+
+## Context menus
+
+Right-click works nearly everywhere, and the same object offers the same actions wherever you
+find it — the list, the grid and the outliner all raise one menu, as do the Parts panel, the
+outliner's part nodes and the 3D viewport.
+
+**An asset row / grid tile / outliner row**
+Load / preview · Copy image · Save image(s) · Save image(s) as… · Render icon(s) ·
+Export to last dir · Export to… · Copy SNO id · Copy file name · Copy name ·
+Copy collection name · Variants ▸ · Show dependencies…
+
+**A part** (Parts panel · outliner part node · clicking a part in the 3D view)
+Export Model / Export Part (to last dir or chosen) · Copy part file name · Copy source file name,
+SNO, name and collection · Frame Part · Select Part · Hide/Show Part · Isolate Part ·
+Show All · Hide All · Invert.
+
+**A wardrobe slot** — Clear · Copy/Paste/Clear pigment · Copy image · Save image… ·
+Export Model · Copy SNO / file name / name / collection.
+**A look card** — Equip · Equip Theme (all / armour / markings / weapons) · the same
+export and copy block.
+**A pigment card** — Apply to this slot · Apply to all slots · Copy name · Copy colours ·
+Delete custom pigment.
+**A texture** — Export to… · Copy image · Save image as… · Copy SNO / file name / name.
+**Any detail table** — Copy · Copy all (also `Ctrl+C`).
+
+---
+
+## Exporting
+
+**Models** — rigged, animated `.glb`. Exports exactly what's visible: hidden parts stay out
+unless you explicitly picked them. Batch-export a multi-selection, or **drag models straight
+out of the list** into Blender or Explorer. Wardrobe exports the assembled outfit; Stable
+exports the mount.
+
+**Animation libraries** — skeleton plus selected clips, no mesh, for retargeting in Blender.
+
+**Images** — PNG (lossless, alpha), JPEG (smallest, no alpha) or WebP (small, keeps alpha).
+Resolution 25–400%; **above 100% the scene is genuinely re-rendered larger** rather than
+upscaling a screenshot. Optional **transparent background** (native alpha, single render) and
+**crop to model**, which applies to stills as well as GIFs.
+
+**GIFs** — turntable or animation loop. Median-cut palette, optional dithering, inter-frame
+differencing, and an **optimise-to-target-size** mode that tries palette reduction, then
+dithering off, then aimed downscales, and **ships the smallest result rather than the last
+attempt** — telling you plainly when a target isn't reachable. Turntables snap to whole
+animation loops so orbit and pose wrap together, and run a warm-up lap so cloth settles before
+the first captured frame. A turntable follows the animation only if it's actually playing.
+
+**Textures** — single, batch, or every frame of an atlas, PNG or JPEG, with optional trimming
+to non-transparent bounds. Filenames follow templates using `{{FileName}}`, `{{SNO}}`,
+`{{FrameIdx}}` and `{{FrameName}}`.
+
+**Modding / retarget options** *(Settings ▸ Export ▸ Advanced)* — engine presets for Blender,
+Unreal/Skyrim and Unity (unit scale and normal-map convention), rebuild normal-map blue
+channel, readable bone names, hardpoints as empties, Blender-friendly `.L`/`.R` rig names,
+symmetrise for X-Axis Mirror, reduce to a 26-bone humanoid rig, strip cloth chains, include the
+base body as a fit reference, and batch the whole armour set with a `manifest.json`.
+
+**Shortcuts** — `Ctrl+E` export selection · `Ctrl+Shift+E` export to last dir ·
+`Ctrl+Shift+A` animations only · `Ctrl+Shift+I` save preview image. All rebindable in
+*Settings ▸ Hotkeys*, along with unbound slots for the two GIF exports.
 
 ---
 
