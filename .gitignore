@@ -20,6 +20,8 @@ tools/d4cloth/reports/
 # Logs and generated diagnostics
 build_log.txt
 build_errors.txt
+smoke_test.txt
+smoke_test_app.log
 d4browser_log_*.txt
 cloth_console.txt
 cloth_overlay_report.txt
