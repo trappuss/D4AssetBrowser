@@ -15,7 +15,21 @@ hair, makeup and animations.
 > that you own. **No game assets and no decryption keys are included in this repository.**
 
 ---
+## Preview
 
+
+
+
+
+
+<img width="2560" height="1440" alt="D4AssetBrowser_uyVybhfc02" src="https://github.com/user-attachments/assets/31178753-07f5-44db-895a-83e40711f383" />
+<img width="2560" height="1440" alt="D4AssetBrowser_UHzm9rGzEQ" src="https://github.com/user-attachments/assets/561be044-63c3-47a9-8289-0b2d21810fa2" />
+<img width="2560" height="1440" alt="D4AssetBrowser_5I2ww9Q7qQ-ezgif com-optimize" src="https://github.com/user-attachments/assets/30c566a0-f817-4ffb-a946-ec5638ddfb53" />
+<img width="2560" height="1440" alt="D4AssetBrowser_Tt26Xz2lEq" src="https://github.com/user-attachments/assets/7d032717-77ef-4837-b68e-8a16416f946b" />
+<img width="2048" height="1152" alt="1d0c449d-0529-4640-98e4-955b84bd3013" src="https://github.com/user-attachments/assets/368024e1-b7b2-4d6b-909d-bb4b0ad24075" />
+<img width="2560" height="1440" alt="D4AssetBrowser_gCZWlx9gDc" src="https://github.com/user-attachments/assets/6075e323-42e8-49ed-9f4b-a19c7ab8c38f" />
+
+---
 ## Quick start
 
 1. Download the release `.zip` and unzip anywhere. Fully portable — everything the tool
