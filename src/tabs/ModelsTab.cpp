@@ -1637,9 +1637,10 @@ ModelsTab::ModelsTab(QWidget* parent) : BrowserTab(parent)
         m_hdrSearch->setToolTip(QStringLiteral(
             "Smart search — combine freely, space-separated:\n"
             "  text — filename / name / tags        (default color)\n"
-            "  #tag — exact tag match               (green)\n"
+            "  #tag — tags / title / collection only, NOT the filename   (green)\n"
             "  2642029 or #2642029 — SNO            (gold)\n"
             "  c:text — collection contains, reads to END of line — put it last   (blue)\n"
+            "  -term  or  -#tag — exclude\n"
             "e.g.   barb 260 c:the soulstained\n"
             "Ctrl+F focuses · Esc clears · ↓ recalls recent searches"));
         connect(m_hdrSearch, &QLineEdit::textChanged, this, [this](const QString& raw) {
@@ -4171,13 +4172,23 @@ QVector<QPair<int, QString>> ModelsTab::queryEntries(int group, const FilterSpec
     if (!m_index) return out;
     ensureFilterIndexes(f.category);
 
-    // Parse the NAME box exactly like SnoListModel::setFilter (space = AND include, leading '-' = exclude).
-    QStringList inc, exc;
+    // Parse the NAME box exactly like SnoListModel::setFilter (space = AND include, leading '-' =
+    // exclude, leading '#' = match the metadata blob only). This MUST stay in step with that
+    // parser: the two are the same query language reached by two paths, and Bulk Extract silently
+    // returning a different set from the list it was filtered in is the failure mode to avoid.
+    QStringList inc, exc, incTag, excTag;
     for (const QString& tok : f.nameSearch.trimmed().split(QLatin1Char(' '), Qt::SkipEmptyParts)) {
-        if (tok.startsWith(QLatin1Char('-')) && tok.size() > 1) exc << tok.mid(1);
-        else if (!tok.startsWith(QLatin1Char('-')))             inc << tok;
+        QString s = tok;
+        bool neg = false;
+        if (s.startsWith(QLatin1Char('-'))) { neg = true; s = s.mid(1); }
+        const bool tag = s.startsWith(QLatin1Char('#'));
+        if (tag) s = s.mid(1);
+        if (s.isEmpty()) continue;
+        if (tag) (neg ? excTag : incTag) << s;
+        else     (neg ? exc    : inc)    << s;
     }
-    const bool hasNameTerms = !inc.isEmpty() || !exc.isEmpty();
+    const bool hasNameTerms = !inc.isEmpty() || !exc.isEmpty()
+                              || !incTag.isEmpty() || !excTag.isEmpty();
     const bool ready = AppearanceMeta::instance().ready();
 
     // Usage facets (mirror applyCategoryFilter): a facet selection is NOT a real category tag.
@@ -4194,10 +4205,13 @@ QVector<QPair<int, QString>> ModelsTab::queryEntries(int group, const FilterSpec
 
     for (const SnoEntry& e : m_index->entries(group)) {
         if (hasNameTerms) {   // include/exclude against the name + (meta-ready) tag/collection/title blob
-            const QString hay = ready ? (e.name + QLatin1Char(' ') + modelSearchBlob(e.snoId)) : e.name;
+            const QString meta = ready ? modelSearchBlob(e.snoId) : QString();
+            const QString hay  = ready ? (e.name + QLatin1Char(' ') + meta) : e.name;
             bool ok = true;
             for (const QString& t : inc) if (!hay.contains(t, Qt::CaseInsensitive)) { ok = false; break; }
             if (ok) for (const QString& t : exc) if (hay.contains(t, Qt::CaseInsensitive)) { ok = false; break; }
+            if (ok) for (const QString& t : incTag) if (!meta.contains(t, Qt::CaseInsensitive)) { ok = false; break; }
+            if (ok) for (const QString& t : excTag) if (meta.contains(t, Qt::CaseInsensitive)) { ok = false; break; }
             if (!ok) continue;
         }
         if (f.hideUnrenderable

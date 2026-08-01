@@ -1780,7 +1780,9 @@ void TexturesTab::applyNameFilter()
     // Unified predicate: search terms (name / #tag / title / collection, "-" excludes; a pure-digit
     // term matches the SNO) + funnel tag checkboxes (AND/OR, via the appearance-derived blob) +
     // selected formats (match ANY) + orphan toggle.
-    QStringList terms, excl, snoTerms;
+    // A '#' term is narrowed to the METADATA blob (gear tags / title / collection) rather than the
+    // name, matching the Models tab's parser so the same query means the same thing in both.
+    QStringList terms, excl, snoTerms, tagTerms, tagExcl;
     for (const QString& part : m_search->text().split(QLatin1Char(' '), Qt::SkipEmptyParts)) {
         QString t = part.trimmed().toLower();
         bool neg = false;
@@ -1788,11 +1790,13 @@ void TexturesTab::applyNameFilter()
         const bool tag = t.startsWith(QLatin1Char('#'));
         if (tag) t = t.mid(1);
         if (t.isEmpty()) continue;
-        // A bare all-digits term (not a #tag) filters by SNO.
-        bool allDigits = !tag && !t.isEmpty();
+        // An all-digits term filters by SNO, with or without the '#' — the Models tab accepts both
+        // spellings (its regex is "^#?\d+$"), so the two tabs must not disagree.
+        bool allDigits = true;
         for (const QChar c : t) if (!c.isDigit()) { allDigits = false; break; }
-        if (allDigits && !neg) snoTerms << t;
-        else (neg ? excl : terms) << t;
+        if (allDigits && !neg)   snoTerms << t;
+        else if (tag)            (neg ? tagExcl : tagTerms) << t;
+        else                     (neg ? excl : terms) << t;
     }
     const bool orphan = m_orphanCheck && m_orphanCheck->isChecked();
     const QSet<QString> tagSel = m_tagFilter;
@@ -1800,7 +1804,8 @@ void TexturesTab::applyNameFilter()
     const bool tagOr = m_tagOrMode;
     const QSet<QString> fmtSel = m_fmtFilter;
 
-    if (terms.isEmpty() && excl.isEmpty() && snoTerms.isEmpty() && !orphan
+    if (terms.isEmpty() && excl.isEmpty() && snoTerms.isEmpty()
+        && tagTerms.isEmpty() && tagExcl.isEmpty() && !orphan
         && tagSel.isEmpty() && catSel.isEmpty() && fmtSel.isEmpty()) {
         m_model->setPredicate(nullptr);
         updateSelLabel();
@@ -1808,7 +1813,8 @@ void TexturesTab::applyNameFilter()
         saveTexFilterState();
         return;
     }
-    m_model->setPredicate([this, terms, excl, snoTerms, orphan, tagSel, catSel, tagOr, fmtSel](const SnoEntry& e) {
+    m_model->setPredicate([this, terms, excl, snoTerms, tagTerms, tagExcl, orphan, tagSel, catSel,
+                           tagOr, fmtSel](const SnoEntry& e) {
         if (!snoTerms.isEmpty()) {
             const QString s = QString::number(e.snoId);
             for (const QString& d : snoTerms) if (!s.contains(d)) return false;
@@ -1833,6 +1839,11 @@ void TexturesTab::applyNameFilter()
             const QString& b = haveBlob();
             for (const QString& t : terms) if (!b.contains(t)) return false;
             for (const QString& x : excl)  if (b.contains(x))  return false;
+        }
+        if (!tagTerms.isEmpty() || !tagExcl.isEmpty()) {   // '#' terms: metadata only, never the name
+            const QString meta = texBlob(e.snoId);
+            for (const QString& t : tagTerms) if (!meta.contains(t)) return false;
+            for (const QString& x : tagExcl)  if (meta.contains(x))  return false;
         }
         if (!tagSel.isEmpty()) {
             const QString& b = haveBlob();

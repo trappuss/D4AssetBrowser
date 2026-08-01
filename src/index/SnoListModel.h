@@ -88,6 +88,11 @@ private:
     QString           m_filter;        // raw text
     QStringList       m_incTerms;      // required substrings (AND)
     QStringList       m_excTerms;      // excluded substrings (NOT) — "-term" in the search box
+    // "#term" / "-#term": the same AND/NOT logic but matched against the METADATA blob only
+    // (tags / collection / title), never the file name. Kept separate because the '#' has to be
+    // stripped before matching — leaving it on made every #tag query match nothing at all.
+    QStringList       m_incTags;
+    QStringList       m_excTags;
     QString           m_snoFilter;
     QString           m_classFilter;
     QString           m_genderFilter;

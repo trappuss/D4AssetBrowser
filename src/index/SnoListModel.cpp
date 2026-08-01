@@ -43,13 +43,23 @@ void SnoListModel::setFilter(const QString& text)
     m_filter = t;
     // Parse space-separated terms: a leading '-' excludes (name must NOT contain it), everything
     // else is a required substring (AND). e.g. "pandem -destroyed -pillar".
+    // A leading '#' (after any '-') narrows that term to the METADATA blob — tags, collection and
+    // title — so "#trophy" finds things TAGGED trophy rather than files merely named trophy.
+    // The '#' MUST be stripped: it never appears in the haystack, so an unstripped "#tag" matched
+    // nothing while the search box advertised the syntax.
     m_incTerms.clear();
     m_excTerms.clear();
+    m_incTags.clear();
+    m_excTags.clear();
     for (const QString& tok : t.split(QLatin1Char(' '), Qt::SkipEmptyParts)) {
-        if (tok.startsWith(QLatin1Char('-')) && tok.size() > 1)
-            m_excTerms << tok.mid(1);
-        else if (!tok.startsWith(QLatin1Char('-')))
-            m_incTerms << tok;
+        QString s = tok;
+        bool neg = false;
+        if (s.startsWith(QLatin1Char('-'))) { neg = true; s = s.mid(1); }
+        const bool tag = s.startsWith(QLatin1Char('#'));
+        if (tag) s = s.mid(1);
+        if (s.isEmpty()) continue;   // a bare "-" or "#" is not a term
+        if (tag) (neg ? m_excTags : m_incTags) << s;
+        else     (neg ? m_excTerms : m_incTerms) << s;
     }
     rebuild();
     endResetModel();
@@ -106,16 +116,24 @@ void SnoListModel::rebuild()
     m_visible.reserve(m_all.size());
     for (int i = 0; i < m_all.size(); ++i) {
         const SnoEntry& e = m_all[i];
-        if (!m_incTerms.isEmpty() || !m_excTerms.isEmpty()) {
-            // Match the name PLUS any extra searchable text (tags / collection) so include/exclude
-            // terms like "-player" or "-armor" work on metadata, not just the file name.
-            const QString hay = m_searchBlob ? (e.name + QLatin1Char(' ') + m_searchBlob(e.snoId))
-                                             : e.name;
+        if (!m_incTerms.isEmpty() || !m_excTerms.isEmpty()
+            || !m_incTags.isEmpty() || !m_excTags.isEmpty()) {
+            // Plain terms match the name PLUS any extra searchable text (tags / collection) so
+            // include/exclude terms like "-player" or "-armor" work on metadata, not just the file
+            // name. '#' terms match the metadata blob ALONE.
+            const QString meta = m_searchBlob ? m_searchBlob(e.snoId) : QString();
+            const QString hay  = m_searchBlob ? (e.name + QLatin1Char(' ') + meta) : e.name;
             bool ok = true;
             for (const QString& inc : m_incTerms)
                 if (!hay.contains(inc, Qt::CaseInsensitive)) { ok = false; break; }
             if (ok) for (const QString& exc : m_excTerms)
                 if (hay.contains(exc, Qt::CaseInsensitive)) { ok = false; break; }
+            // Without a blob provider there is no metadata to test, so a '#' term cannot be
+            // satisfied — reject rather than silently matching everything.
+            if (ok) for (const QString& inc : m_incTags)
+                if (!meta.contains(inc, Qt::CaseInsensitive)) { ok = false; break; }
+            if (ok) for (const QString& exc : m_excTags)
+                if (meta.contains(exc, Qt::CaseInsensitive)) { ok = false; break; }
             if (!ok) continue;
         }
         if (!m_snoFilter.isEmpty() && !QString::number(e.snoId).contains(m_snoFilter))
