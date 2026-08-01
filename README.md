@@ -375,7 +375,7 @@ distribute them.
 
 Roadmap, what's in progress and what's planned live on the project board:
 
-### ➡️ **[D4AssetBrowser project board](https://github.com/users/trappuss/projects/3/views/1)**
+### **[D4AssetBrowser project board](https://github.com/users/trappuss/projects/3/views/1)**
 
 - **[Issues](https://github.com/trappuss/Diablo4AssetBrowser/issues)** — bugs and requests.
   A missing or broken model is worth reporting: attach `data\D4AssetBrowser.log`, which names
