@@ -28,7 +28,9 @@ REM   3. Run this bat.
 REM ---------------------------------------------------------------------------
 
 cd /d "%~dp0"
-set "LOG=%~dp0build\release\D4AssetBrowser.log"
+REM data\ beside the exe - see the note in Test Encrypted Chain.bat. The old path still
+REM exists on disk from earlier runs, so leaving it here reads a stale log silently.
+set "LOG=%~dp0build\release\data\D4AssetBrowser.log"
 
 if not exist "%LOG%" (
     echo.

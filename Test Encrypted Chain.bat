@@ -26,7 +26,11 @@ REM ---------------------------------------------------------------------------
 
 cd /d "%~dp0"
 set "EXE=%~dp0build\release\D4AssetBrowser.exe"
-set "LOG=%~dp0build\release\D4AssetBrowser.log"
+REM The runtime log lives in data\ beside the exe, not next to it - it moved there so it
+REM matches where the README and RELEASE_README.txt tell people to look. A path left at the
+REM old location does not error; it reads a stale file from before the move and reports its
+REM contents as this run's result, which is the exact failure this project has been bitten by.
+set "LOG=%~dp0build\release\data\D4AssetBrowser.log"
 
 taskkill /im D4AssetBrowser.exe /f >nul 2>&1
 

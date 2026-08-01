@@ -139,8 +139,22 @@ REM a pass this run did not earn.
 set "APPDATA_BEFORE=0"
 if exist "%APPDATA%\D4AssetBrowser"      set "APPDATA_BEFORE=1"
 if exist "%APPDATA%\Diablo4AssetBrowser" set "APPDATA_BEFORE=1"
+
+REM The registry needs the SAME baseline, and the first version of this script did not take
+REM one. It reported HKCU\Software\Diablo4AssetBrowser as a failure when that key predates the
+REM portability work - the app sets org "D4AssetBrowser" with IniFormat and cannot create it -
+REM so the run was marked FAILED on evidence it never gathered. An unbaselined check is not a
+REM check; it just reports the state of the machine.
+set "REG_D4AB_BEFORE=0"
+set "REG_OLD_BEFORE=0"
+reg query "HKCU\Software\D4AssetBrowser"      >nul 2>&1 && set "REG_D4AB_BEFORE=1"
+reg query "HKCU\Software\Diablo4AssetBrowser" >nul 2>&1 && set "REG_OLD_BEFORE=1"
+
 >>"%LOG%" echo.
->>"%LOG%" echo TRACE: entered step 3 (launch), AppData pre-existing = %APPDATA_BEFORE%
+>>"%LOG%" echo TRACE: entered step 3 (launch)
+>>"%LOG%" echo   pre-existing AppData folder ........ %APPDATA_BEFORE%
+>>"%LOG%" echo   pre-existing HKCU\D4AssetBrowser ... %REG_D4AB_BEFORE%
+>>"%LOG%" echo   pre-existing HKCU\Diablo4AssetBrowser %REG_OLD_BEFORE%
 
 echo.
 echo  ============================================================
@@ -201,17 +215,44 @@ if exist "%APP%\data\D4AssetBrowser.log" (
     echo  [?]  no app log
 )
 
+REM Only a key that appeared DURING this run is a portability failure. One that was already
+REM there is a leftover from an older non-portable build - reported, because the README
+REM promises "delete the folder and nothing is left behind", but not counted as a failure of
+REM the build under test.
+REM
+REM Written out twice rather than through a subroutine on purpose: a "call :label" that echoed
+REM its argument is what corrupted the log on the first two runs, so the pattern is avoided
+REM here even where the argument (a registry path) looks harmless.
 >>"%LOG%" echo.
-for %%K in ("HKCU\Software\D4AssetBrowser" "HKCU\Software\Diablo4AssetBrowser") do (
-    reg query %%K >nul 2>&1
-    if errorlevel 1 (
-        >>"%LOG%" echo [OK] no registry key %%~K
-        echo  [OK] no registry key %%~K
-    ) else (
-        >>"%LOG%" echo [X]  REGISTRY KEY EXISTS: %%~K
-        echo  [X]  REGISTRY KEY EXISTS: %%~K
-        set "FAIL=1"
-    )
+set "REG_NOW=0"
+reg query "HKCU\Software\D4AssetBrowser" >nul 2>&1 && set "REG_NOW=1"
+if "%REG_NOW%"=="0" (
+    >>"%LOG%" echo [OK] no registry key HKCU\Software\D4AssetBrowser
+    echo  [OK] no registry key HKCU\Software\D4AssetBrowser
+) else if "%REG_D4AB_BEFORE%"=="1" (
+    >>"%LOG%" echo [-]  HKCU\Software\D4AssetBrowser existed BEFORE this run - stale, not written now
+    echo  [-]  HKCU\Software\D4AssetBrowser is a pre-existing leftover
+) else (
+    >>"%LOG%" echo [X]  this run CREATED HKCU\Software\D4AssetBrowser
+    echo  [X]  this run CREATED HKCU\Software\D4AssetBrowser
+    set "FAIL=1"
+)
+
+set "REG_NOW=0"
+reg query "HKCU\Software\Diablo4AssetBrowser" >nul 2>&1 && set "REG_NOW=1"
+if "%REG_NOW%"=="0" (
+    >>"%LOG%" echo [OK] no registry key HKCU\Software\Diablo4AssetBrowser
+    echo  [OK] no registry key HKCU\Software\Diablo4AssetBrowser
+) else if "%REG_OLD_BEFORE%"=="1" (
+    >>"%LOG%" echo [-]  HKCU\Software\Diablo4AssetBrowser existed BEFORE this run - a leftover from
+    >>"%LOG%" echo      a pre-portability build. This build cannot create it: main.cpp sets the org
+    >>"%LOG%" echo      to D4AssetBrowser and forces QSettings::IniFormat. Safe to delete with
+    >>"%LOG%" echo      reg delete "HKCU\Software\Diablo4AssetBrowser" /f
+    echo  [-]  HKCU\Software\Diablo4AssetBrowser is a pre-existing leftover - see the log
+) else (
+    >>"%LOG%" echo [X]  this run CREATED HKCU\Software\Diablo4AssetBrowser
+    echo  [X]  this run CREATED HKCU\Software\Diablo4AssetBrowser
+    set "FAIL=1"
 )
 
 if "%APPDATA_BEFORE%"=="0" (

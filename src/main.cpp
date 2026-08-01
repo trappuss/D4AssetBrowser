@@ -178,9 +178,18 @@ int main(int argc, char** argv)
     AppPaths::pruneOldCaches(QStringLiteral("asset_links_v"),     1,  QStringLiteral(".bin"));
     AppPaths::pruneOldCaches(QStringLiteral("coretoc_v"),         2,  QStringLiteral(".bin"));
 
-    // Runtime log next to the exe (truncated each launch) for diagnostics.
-    g_logFile.setFileName(QDir(QCoreApplication::applicationDirPath())
-                              .filePath(QStringLiteral("D4AssetBrowser.log")));
+    // Runtime log inside data/ (truncated each launch) for diagnostics.
+    //
+    // This used to write beside the EXE, which contradicted the three places that tell people where
+    // to find it — README's portable-layout table, README's bug-report instruction and
+    // RELEASE_README.txt all say data\D4AssetBrowser.log — and contradicted AppPaths.h's own promise
+    // that everything the tool writes lives in data/. A release smoke test from a fresh unzip caught
+    // it: data/ appeared correctly but held no log. Anyone following the bug-report instructions
+    // would have found nothing at the path they were given.
+    //
+    // dataDir() is safe here: QApplication is constructed, and QSettings::setPath above has already
+    // forced its one-time mkpath.
+    g_logFile.setFileName(AppPaths::file(QStringLiteral("D4AssetBrowser.log")));
     g_logFile.open(QIODevice::WriteOnly | QIODevice::Truncate | QIODevice::Text);
     qInstallMessageHandler(logHandler);
     qInfo("D4AssetBrowser v%s starting",
