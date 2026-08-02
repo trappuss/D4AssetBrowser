@@ -45,6 +45,10 @@ No Python. No `pip`. No d4extract.
 **Requirements:** Windows 10/11 x64 · a Diablo IV install (Battle.net or Steam) ·
 GPU with OpenGL 4.5 · internet on first run.
 
+**False Positive:** I guess because it's an .exe file it gets flagged at a virus, it's not.
+<img width="522" height="440" alt="ApplicationFrameHost_pqj4REMhxN" src="https://github.com/user-attachments/assets/85705de9-b710-4896-beee-02c69ef684b4" />
+
+
 ---
 
 ## Tabs
