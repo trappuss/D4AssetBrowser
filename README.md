@@ -25,6 +25,7 @@ hair, makeup and animations.
 <img width="2560" height="1440" alt="D4AssetBrowser_5I2ww9Q7qQ-ezgif com-optimize" src="https://github.com/user-attachments/assets/30c566a0-f817-4ffb-a946-ec5638ddfb53" />
 <img width="2560" height="1440" alt="D4AssetBrowser_Tt26Xz2lEq" src="https://github.com/user-attachments/assets/7d032717-77ef-4837-b68e-8a16416f946b" />
 <img width="2048" height="1152" alt="1d0c449d-0529-4640-98e4-955b84bd3013" src="https://github.com/user-attachments/assets/368024e1-b7b2-4d6b-909d-bb4b0ad24075" />
+<img width="2560" height="1440" alt="D4AssetBrowser_c0aFS6riGg" src="https://github.com/user-attachments/assets/e7a684ee-8a4a-4bad-8fdd-837268e56350" />
 <img width="2560" height="1440" alt="D4AssetBrowser_gCZWlx9gDc" src="https://github.com/user-attachments/assets/6075e323-42e8-49ed-9f4b-a19c7ab8c38f" />
 
 ---
