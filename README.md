@@ -25,7 +25,6 @@ hair, makeup and animations.
 <img width="2560" height="1440" alt="D4AssetBrowser_5I2ww9Q7qQ-ezgif com-optimize" src="https://github.com/user-attachments/assets/30c566a0-f817-4ffb-a946-ec5638ddfb53" />
 <img width="2560" height="1440" alt="D4AssetBrowser_Tt26Xz2lEq" src="https://github.com/user-attachments/assets/7d032717-77ef-4837-b68e-8a16416f946b" />
 <img width="2048" height="1152" alt="1d0c449d-0529-4640-98e4-955b84bd3013" src="https://github.com/user-attachments/assets/368024e1-b7b2-4d6b-909d-bb4b0ad24075" />
-<img width="2560" height="1440" alt="D4AssetBrowser_c0aFS6riGg" src="https://github.com/user-attachments/assets/e7a684ee-8a4a-4bad-8fdd-837268e56350" />
 <img width="2560" height="1440" alt="D4AssetBrowser_gCZWlx9gDc" src="https://github.com/user-attachments/assets/6075e323-42e8-49ed-9f4b-a19c7ab8c38f" />
 
 ---
@@ -49,7 +48,6 @@ GPU with OpenGL 4.5 · internet on first run.
 **False Positive:** I guess because it's an .exe file it gets flagged at a virus, it's not.
 <img width="522" height="440" alt="ApplicationFrameHost_pqj4REMhxN" src="https://github.com/user-attachments/assets/85705de9-b710-4896-beee-02c69ef684b4" />
 
-
 ---
 
 ## Tabs
@@ -60,6 +58,7 @@ GPU with OpenGL 4.5 · internet on first run.
 | **Wardrobe** | Dress a character — armour, weapons, dyes, hair, markings, animations. |
 | **Stable** | The same for mounts and pets. |
 | **Textures** | Browse and decode every texture in the game. |
+| **Catalogue** | The Cosmetics Shop — every bundle, what was in it, and export the lot. |
 | **Bulk Extract** | Filter the index and export in one run. |
 
 Each is covered in detail below.
@@ -155,6 +154,30 @@ each export to its tight bounds. **ASSOCIATED MODELS** walks texture → materia
 lets you jump straight to the model in the Models tab. Images can be dragged out of the preview
 straight into another application.
 
+### Catalogue
+
+The Cosmetics Shop, browsable. Every bundle it has sold — hero art, card, lore text — with each
+item inside resolved to the appearance or texture it actually is. Search matches the shop title,
+the SNO name and the lore.
+
+**Filters** live behind the same funnel the other tabs use: contents kind, patch, season, and
+**Latest** (new in this game update), plus a sort by name, season or patch. Active filters show as
+removable chips and tint the funnel.
+
+**Two views of the contents.** The shop's own *INCLUDES 8 ITEMS* strip, showing each piece's real
+inventory icon — one row per gender, because armour resolves to a female and a male appearance and
+both are openable — and a tree beneath it carrying SNOs, the **SLOT** each piece occupies (read
+from the item → gear reference graph, not guessed from the name), and a plain *no appearance found*
+wherever a product could not be resolved. Selection is mirrored between the two panes. The bundle's
+own shop art is listed as its own branch.
+
+**Double-click** any item to open it in Models — textured, with its parts tree and animations.
+Bundle art opens in Textures.
+
+**Provenance.** Supported classes, whether it shipped with VFX, its associated season, and the
+shop's own *requires* / *add-on to* / *excludes* relationships — which is how you discover a mount
+trophy was never sold at all, but was a Season 3 premium pass reward.
+
 ### Bulk Extract
 
 Filter the whole index, watch the match count update live, then export everything at once.
@@ -246,6 +269,14 @@ the first captured frame. A turntable follows the animation only if it's actuall
 **Textures** — single, batch, or every frame of an atlas, PNG or JPEG, with optional trimming
 to non-transparent bounds. Filenames follow templates using `{{FileName}}`, `{{SNO}}`,
 `{{FrameIdx}}` and `{{FrameName}}`.
+
+**Catalogue** — a whole bundle into its own folder (`models\`, `art\`, `icons\` and a
+`manifest.json` naming everything that resolved *and* everything that did not), several bundles in
+one run with **Multi select**, or just the rows you highlighted in the includes strip or the
+contents list. The Export menu names what it will act on before you commit — *Export 2 models…*,
+*Export 1 image…*, *Export 3 bundles…*. Everything routes through the Models and Textures
+pipelines, so every option here applies. *Settings ▸ Export ▸ Catalogue export* adds every frame of
+each shop atlas as its own PNG.
 
 **Modding / retarget options** *(Settings ▸ Export ▸ Advanced)* — engine presets for Blender,
 Unreal/Skyrim and Unity (unit scale and normal-map convention), rebuild normal-map blue
@@ -352,7 +383,7 @@ No registry keys, no `%APPDATA%`, no user-profile files. Everything the tool wri
 |---|---|
 | `D4AssetBrowser\*.ini` | settings (INI, not the registry) |
 | `coretoc_v2.bin` · `casc_index_v1.bin` | asset index caches, keyed to the game build |
-| `appearance_meta_v21.json` · `icon_index_v3.json` | metadata and icon caches |
+| `appearance_meta_v22.json` · `icon_index_v3.json` | metadata and icon caches |
 | `model_thumbs\` · `stable_thumbs\` · `icon_overrides\` | rendered thumbnails |
 | `ensembles\` | saved wardrobe outfits |
 | `d4data\` | the metadata checkout |
@@ -381,12 +412,12 @@ distribute them.
 
 Roadmap, what's in progress and what's planned live on the project board:
 
-### **[D4AssetBrowser project board](https://github.com/users/trappuss/projects/3/views/1)**
+### **[D4AssetBrowser project board](https://github.com/users/trappuss/projects/3)**
 
-- **[Issues](https://github.com/trappuss/Diablo4AssetBrowser/issues)** — bugs and requests.
+- **[Issues](https://github.com/trappuss/D4AssetBrowser/issues)** — bugs and requests.
   A missing or broken model is worth reporting: attach `data\D4AssetBrowser.log`, which names
   the exact asset and, where relevant, the TACT key it needs.
-- **[Releases](https://github.com/trappuss/Diablo4AssetBrowser/releases)** — watch the repo to
+- **[Releases](https://github.com/trappuss/D4AssetBrowser/releases)** — watch the repo to
   be told about new builds.
 
 **After a game patch:** run **File → Update TACT Keys**, then re-run **File → Dependencies…**
