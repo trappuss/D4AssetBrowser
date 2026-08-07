@@ -43,7 +43,7 @@ hair, makeup and animations.
 
 No Python. No `pip`. No d4extract.
 
-**Requirements:** Windows 10/11 x64 · a Diablo IV install (Battle.net or Steam) ·
+**Requirements:** Windows 10/11 x64 · a Diablo IV install (Battle.net Tested Only) ·
 GPU with OpenGL 4.5 · internet on first run.
 
 **False Positive:** I guess because it's an .exe file it gets flagged at a virus, it's not.
