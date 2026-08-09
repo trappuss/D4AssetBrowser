@@ -126,6 +126,13 @@ checkboxes (Category, Class, Gender, Type) with **Match any (OR)**, plus **Only 
 **Only encrypted (TACT)**, **Hide un-renderable**, and usage facets — **Latest** (new this
 update), **Animated**, **Rigged**, **Orphaned**. Every active filter shows as a removable chip.
 
+**ANIMATIONS.** Clips are grouped under the game's own AnimSet headers, and each set carries its
+own colour — header saturated, its rows tinted the same hue — so a run of rows stays attached to its
+set once the header has scrolled away. Gold still means *pulled from another model* and muted cyan
+*matches this skeleton but has no explicit in-game assignment*; those win over the set tint, because
+they say something about the row rather than which block it is in. The header counts both what the
+model can reach and what an export would actually embed (`ANIMATIONS · 758 (378 export)`).
+
 **Viewport.** Four shading modes (Wireframe · Flat · Shaded · Rendered with IBL, shadows, SSAO,
 tonemap). A **channel viewer** — Base Colour, Normal, Roughness, Metallic, AO, Emissive —
 which you can cycle by scrolling the `⌄` next to the shading balls. **Overlays**: statistics,
@@ -185,8 +192,9 @@ Filter the whole index, watch the match count update live, then export everythin
 Same funnel filters as the Models tab. **Pick items manually** moves matches into a persistent
 **Queue** that survives filter changes, mode switches and restarts.
 
-Options: include textures · all animations · pulled animations · raw sources · raw buffers ·
-loose textures · a CSV report. **Parallel** workers (auto = core count). Output can be flat or
+Options are split by lifetime: an **Export settings…** button opens the shared export settings
+(textures, animations, raw sources), and a **This run:** group holds the per-run switches — loose
+textures · raw buffers · write report · **Parallel** workers (auto = core count). Output can be flat or
 organised into subfolders by class or type. **Only new** skips anything already exported —
 tracked in a `_bulk_manifest.json` ledger — or **Overwrite**. Live console with a working
 Cancel (or `Esc`) and Pause/Resume that excludes paused time from the ETA. Failures are
@@ -253,7 +261,19 @@ unless you explicitly picked them. Batch-export a multi-selection, or **drag mod
 out of the list** into Blender or Explorer. Wardrobe exports the assembled outfit; Stable
 exports the mount.
 
-**Animation libraries** — skeleton plus selected clips, no mesh, for retargeting in Blender.
+**Animation libraries** — skeleton plus selected clips, no mesh, for retargeting in Blender. The
+Export menu names the count it is about to write (*Export animations only — 378 clips…*), so a scope
+or filter change is visible before you commit to the file rather than after.
+
+**Which animations get embedded** *(Settings ▸ Export ▸ Models)* is two independent questions.
+*Which clips belong to this model* — **Original** (named in the model's own family: gameplay,
+emotes, wardrobe and UI poses), **Cutscene & conversation** (the `IGC_` / `Conv_` performances the
+same body appears in), **Previewed**, **Pulled**, **Base** (the base-rig clips a gear piece
+inherits). Then *which of those you want* — a **length cap** and **exclude-by-name** patterns.
+`barM_base00` declares 758 clips: 378 in its own family and 380 cutscene, and eight long clips carry
+about a quarter of the animation payload against a 75-frame mean — so the cap is usually the biggest
+single lever on file size. Filters apply only to the data-derived sources; a clip you are previewing
+or have pulled is an explicit choice and is never filtered out from under you.
 
 **Images** — PNG (lossless, alpha), JPEG (smallest, no alpha) or WebP (small, keeps alpha).
 Resolution 25–400%; **above 100% the scene is genuinely re-rendered larger** rather than
@@ -279,7 +299,7 @@ contents list. The Export menu names what it will act on before you commit — *
 pipelines, so every option here applies. *Settings ▸ Export ▸ Catalogue export* adds every frame of
 each shop atlas as its own PNG.
 
-**Modding / retarget options** *(Settings ▸ Export ▸ Advanced)* — engine presets for Blender,
+**Modding / retarget options** *(Settings ▸ Experimental)* — engine presets for Blender,
 Unreal/Skyrim and Unity (unit scale and normal-map convention), rebuild normal-map blue
 channel, readable bone names, hardpoints as empties, Blender-friendly `.L`/`.R` rig names,
 symmetrise for X-Axis Mirror, reduce to a 26-bone humanoid rig, strip cloth chains, include the
@@ -383,8 +403,8 @@ No registry keys, no `%APPDATA%`, no user-profile files. Everything the tool wri
 | | |
 |---|---|
 | `D4AssetBrowser\*.ini` | settings (INI, not the registry) |
-| `coretoc_v2.bin` · `casc_index_v1.bin` | asset index caches, keyed to the game build |
-| `appearance_meta_v22.json` · `icon_index_v3.json` | metadata and icon caches |
+| `coretoc_v3.bin` · `casc_index_v1.bin` | asset index caches, keyed to the game build |
+| `appearance_meta_v23.json` · `icon_index_v4.json` | metadata and icon caches |
 | `model_thumbs\` · `stable_thumbs\` · `icon_overrides\` | rendered thumbnails |
 | `ensembles\` | saved wardrobe outfits |
 | `d4data\` | the metadata checkout |
@@ -422,7 +442,11 @@ Roadmap, what's in progress and what's planned live on the project board:
   be told about new builds.
 
 **After a game patch:** run **File → Update TACT Keys**, then re-run **File → Dependencies…**
-to refresh d4data. New seasonal and collab content usually needs both. If something still
+to refresh d4data. New seasonal and collab content usually needs both. **File ▸ Index** then lists
+every background index with its state — *not started* / a live percentage / *done* — with **Index
+all** to start whatever is outstanding and **Re-index everything** to drop the caches and rebuild;
+clicking a single row rebuilds just that one. The status bar carries the same summary (`Indexes
+6/9`), so a half-built index is visible rather than something you discover from a worse result. If something still
 won't load, `Audit Asset Health.bat` diffs against your last run and reports exactly what
 changed — attach that output to an issue and it saves a lot of back-and-forth.
 
