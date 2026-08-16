@@ -1,6 +1,9 @@
 #include "index/MatSnoSweep.h"
 
+#include "app/AppPaths.h"           // dataDir() — diagnostics write into data\, never beside the exe
 #include "casc/CascReader.h"
+#include "index/AppearanceMeta.h"   // icon coverage — see the ICONLESS tally in runHealthAudit
+#include "tabs/MarkingCompose.h"    // marking sweep: the SAME ramp/composite the viewport uses
 #include "index/SnoIndex.h"
 #include "model/MaterialDecode.h"
 #include "model/ModelParser.h"
@@ -12,7 +15,9 @@
 
 #include <QCoreApplication>
 #include <QDir>
+#include <QDirIterator>   // marking sweep walks the MarkingColor folder
 #include <QFile>
+#include <QFileInfo>
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
@@ -491,16 +496,207 @@ const char* healthName(Health h)
 
 }  // namespace
 
+// ── Body-marking model sweep ────────────────────────────────────────────────────────────────────
+// See the header. One run, every fact, plus pictures.
+QString runMarkingSweep(const QString& d4, SnoIndex* idx, CascReader* rd, QWidget* parent)
+{
+    if (!idx || !rd || !rd->isReady()) return QStringLiteral("marking: reader not ready");
+    // data\, NOT beside the exe. The older sweeps in this file write to applicationDirPath and the
+    // Release Smoke Test flags exactly that as a portability failure ("nothing is written outside
+    // data\"), which is how data\icon_audit.txt being written beside the exe once survived a
+    // passing run. New diagnostics follow the rule.
+    const QString outDir = AppPaths::dataDir();
+    const QString imgDir = outDir + QStringLiteral("/marking_swatch");
+    QDir().mkpath(outDir);
+    QDir().mkpath(imgDir);
+    QFile rep(outDir + QStringLiteral("/marking_sweep.txt"));
+    if (!rep.open(QIODevice::WriteOnly | QIODevice::Text))
+        return QStringLiteral("marking: cannot write marking_sweep.txt");
+    QTextStream ts(&rep);
+
+    auto lum = [](const QColor& c) {
+        return 0.2126 * c.redF() + 0.7152 * c.greenF() + 0.0722 * c.blueF(); };
+    auto hex = [](const QColor& c) { return c.isValid()
+        ? QStringLiteral("#%1%2%3").arg(c.red(),2,16,QLatin1Char('0'))
+              .arg(c.green(),2,16,QLatin1Char('0')).arg(c.blue(),2,16,QLatin1Char('0'))
+        : QStringLiteral("#------"); };
+
+    // ── PART A — every MarkingColor ─────────────────────────────────────────────────────────────
+    // The 93 colours with their samples in BOTH spaces, their luminance order, and the authored
+    // surface values. This is what decides whether "sample[0] is the shadow" is a rule or an
+    // accident, and it cannot be answered from one marking.
+    ts << "PART A — MarkingColor table\n";
+    ts << "  samples are LINEAR in the file; sRGB column is pow(1/2.2) as the tool encodes them\n";
+    ts << "  DIR = luminance order of the three samples\n\n";
+    ts << QStringLiteral("%1 %2 %3 %4  %5  %6  %7 %8\n")
+              .arg("NAME", -34).arg("TAT", 3).arg("ROUGH", 6).arg("METAL", 6)
+              .arg("s0 sRGB / lum", -22).arg("s1 sRGB / lum", -22).arg("s2 sRGB / lum", -22).arg("DIR");
+    int nTat = 0, nAsc = 0, nDesc = 0, nFlat = 0, nCol = 0;
+    QDirIterator cit(d4 + QStringLiteral("/json/base/meta/MarkingColor"),
+                     QStringList{QStringLiteral("*.mcl.json")}, QDir::Files);
+    while (cit.hasNext()) {
+        const QString path = cit.next();
+        QString stem = QFileInfo(path).fileName();
+        stem.chop(int(qstrlen(".mcl.json")));
+        const MarkingPaint p = markingPaint(d4, stem);
+        if (!p.valid) continue;
+        ++nCol;
+        if (p.isTattoo) ++nTat;
+        const double l0 = lum(p.ramp[0]), l1 = lum(p.ramp[1]), l2 = lum(p.ramp[2]);
+        QString dir = QStringLiteral("flat");
+        if (l0 < l1 && l1 < l2)      { dir = QStringLiteral("dark->light"); ++nAsc; }
+        else if (l0 > l1 && l1 > l2) { dir = QStringLiteral("light->dark"); ++nDesc; }
+        else                         ++nFlat;
+        auto cell = [&](const QColor& c, double l) {
+            return QStringLiteral("%1/%2").arg(hex(c)).arg(l, 0, 'f', 3); };
+        ts << QStringLiteral("%1 %2 %3 %4  %5  %6  %7 %8\n")
+                  .arg(stem, -34).arg(p.isTattoo ? "yes" : "no", 3)
+                  .arg(p.roughness, 6, 'f', 2).arg(p.metalness, 6, 'f', 2)
+                  .arg(cell(p.ramp[0], l0), -22).arg(cell(p.ramp[1], l1), -22)
+                  .arg(cell(p.ramp[2], l2), -22).arg(dir);
+    }
+    ts << QStringLiteral("\n  %1 colours · %2 tattoos · direction: %3 dark->light, %4 light->dark, "
+                         "%5 flat/mixed\n").arg(nCol).arg(nTat).arg(nAsc).arg(nDesc).arg(nFlat);
+    ts << "  If DIR is not one value, sample index alone cannot mean shadow-or-highlight and the\n"
+          "  ramp must be driven by the mask, not by an assumed ordering.\n\n";
+
+    // ── PART B — every MarkingShape's mask, measured ────────────────────────────────────────────
+    ts << "PART B — MarkingShape masks\n";
+    ts << "  ink%  = texels with R>=128 (the design)\n";
+    ts << "  G/B   = mean over INK ONLY. A whole-sheet mean is meaningless: the design is a few\n";
+    ts << "          percent of the sheet, so the empty background pulls every average to ~0.\n";
+    ts << "  OUT   = rampLerp(ramp, G/255) averaged over ink — the colour the model produces.\n\n";
+    ts << QStringLiteral("%1 %2 %3 %4 %5 %6 %7 %8 %9\n")
+              .arg("SHAPE", -38).arg("COLOUR", -22).arg("MASK", 10).arg("INK%", 6)
+              .arg("G", 4).arg("B", 4).arg("G<64", 6).arg("G>=192", 7).arg("OUT");
+    const QString shapeDir = d4 + QStringLiteral("/json/base/meta/MarkingShape");
+    QStringList shapes = QDir(shapeDir).entryList(QStringList{QStringLiteral("*.msh.json")}, QDir::Files);
+    QProgressDialog prog(QStringLiteral("Marking sweep: %1 shapes…").arg(shapes.size()),
+                         QStringLiteral("Cancel"), 0, shapes.size(), parent);
+    prog.setWindowModality(Qt::ApplicationModal);
+    prog.setMinimumDuration(0);
+    // Pictures for a representative handful: the reported case, plus both ramp directions and a
+    // paint alongside a tattoo. Named so the set is obvious rather than arbitrary.
+    const QStringList wantImg = {
+        QStringLiteral("global_bodyMarking_08"),   // the reported one (Winds of Fate / Inked Tattoo)
+        QStringLiteral("global_bodyMarking_01"),
+        QStringLiteral("Barbarian_bodyMarking_01"),
+    };
+    int done = 0, imgN = 0;
+    for (const QString& fn : shapes) {
+        if ((++done % 4) == 0) { prog.setValue(done); QCoreApplication::processEvents();
+                                 if (prog.wasCanceled()) break; }
+        QString stem = fn; stem.chop(int(qstrlen(".msh.json")));
+        const MarkingDef md = markingDef(d4, stem);
+        if (md.bodyTex.isEmpty() && md.faceTex.isEmpty()) continue;
+        const MarkingPaint mp = markingPaint(d4, md.colorStem);
+        const QString texName = md.bodyTex.isEmpty() ? md.faceTex : md.bodyTex;
+        const int texSno = idx->snoForName(44, texName);
+        const QImage mask = MaterialDecode::texture(rd, d4, texName, texSno);
+        if (mask.isNull() || !mp.valid) {
+            ts << QStringLiteral("%1 %2 %3\n").arg(stem, -38).arg(md.colorStem, -22)
+                      .arg(mask.isNull() ? QStringLiteral("(mask did not decode)")
+                                         : QStringLiteral("(no colour)"));
+            continue;
+        }
+        const QImage m = mask.convertToFormat(QImage::Format_RGBA8888);
+        const int sxx = qMax(1, m.width()/192), syy = qMax(1, m.height()/192);
+        long n = 0, ink = 0, gLo = 0, gHi = 0;
+        double sG = 0, sB = 0, oR = 0, oG = 0, oB = 0;
+        for (int y = 0; y < m.height(); y += syy) {
+            const uchar* s = m.constScanLine(y);
+            for (int x = 0; x < m.width(); x += sxx) {
+                const uchar* p = s + x*4; ++n;
+                if (p[0] < 128) continue;
+                ++ink; sG += p[1]; sB += p[2];
+                if (p[1] < 64) ++gLo; else if (p[1] >= 192) ++gHi;
+                const QColor c = rampLerp(mp.ramp, p[1] / 255.0f);
+                oR += c.red(); oG += c.green(); oB += c.blue();
+            }
+        }
+        const double inkPct = n ? 100.0*ink/n : 0;
+        const QColor out = ink ? QColor(int(oR/ink), int(oG/ink), int(oB/ink)) : QColor();
+        ts << QStringLiteral("%1 %2 %3 %4 %5 %6 %7 %8 %9\n")
+                  .arg(stem, -38).arg(md.colorStem, -22)
+                  .arg(QStringLiteral("%1x%2").arg(m.width()).arg(m.height()), 10)
+                  .arg(inkPct, 6, 'f', 1)
+                  .arg(ink ? sG/ink : 0, 4, 'f', 0).arg(ink ? sB/ink : 0, 4, 'f', 0)
+                  .arg(ink ? 100.0*gLo/ink : 0, 5, 'f', 1).arg(ink ? 100.0*gHi/ink : 0, 6, 'f', 1)
+                  .arg(hex(out));
+
+        // ── PART C — pictures ───────────────────────────────────────────────────────────────────
+        if (wantImg.contains(stem)) {
+            ++imgN;
+            const int S = 512;
+            const QImage small = m.scaled(S, S, Qt::KeepAspectRatio, Qt::SmoothTransformation);
+            QImage rCh(small.size(), QImage::Format_RGBA8888), gCh(small.size(), QImage::Format_RGBA8888);
+            for (int y = 0; y < small.height(); ++y) {
+                const uchar* s = small.constScanLine(y);
+                uchar* a = rCh.scanLine(y); uchar* b = gCh.scanLine(y);
+                for (int x = 0; x < small.width(); ++x) {
+                    a[x*4+0] = a[x*4+1] = a[x*4+2] = s[x*4+0]; a[x*4+3] = 255;
+                    b[x*4+0] = b[x*4+1] = b[x*4+2] = s[x*4+1]; b[x*4+3] = 255;
+                }
+            }
+            rCh.save(QStringLiteral("%1/%2_maskR_coverage.png").arg(imgDir, stem));
+            gCh.save(QStringLiteral("%1/%2_maskG_rampPos.png").arg(imgDir, stem));
+            // The ramp itself, left = G 0, right = G 255.
+            QImage strip(256, 48, QImage::Format_RGBA8888);
+            for (int x = 0; x < 256; ++x) {
+                const QColor c = rampLerp(mp.ramp, x / 255.0f);
+                for (int y = 0; y < 48; ++y) strip.setPixelColor(x, y, c);
+            }
+            strip.save(QStringLiteral("%1/%2_ramp.png").arg(imgDir, stem));
+            // The composite over FLAT skin — flat so the marking colour is unambiguous rather than
+            // entangled with a skin texture. This is the picture that says dark or bright.
+            QImage skin(small.size(), QImage::Format_RGBA8888);
+            skin.fill(QColor(214, 163, 138));
+            applyMarking(skin, small, mp.ramp).save(
+                QStringLiteral("%1/%2_composite_on_flat_skin.png").arg(imgDir, stem));
+        }
+    }
+    prog.setValue(shapes.size());
+    ts << QStringLiteral("\n  %1 shape(s) scanned · %2 picture set(s) in marking_swatch\\\n")
+              .arg(done).arg(imgN);
+    rep.close();
+
+    const QString head = QStringLiteral("marking sweep: %1 colours, %2 shapes → marking_sweep.txt "
+                                        "+ %3 picture set(s)").arg(nCol).arg(done).arg(imgN);
+    qInfo().noquote() << head;
+    return head;
+}
+
 QString runHealthAudit(const QString& d4, SnoIndex* idx, CascReader* rd, QWidget* parent)
 {
     if (!idx || !rd || !rd->isReady()) return QStringLiteral("health: reader not ready");
-    const QString outDir = QCoreApplication::applicationDirPath();
+    // data\, not beside the exe. "Audit Asset Health.bat" is a SHIPPED script, so a user running it
+    // from an unzipped release used to dirty the release folder with three files — the portability
+    // claim is "nothing is written outside data\", and the smoke test cannot catch this one because
+    // it is env-gated and never runs during that test.
+    const QString outDir = AppPaths::dataDir();
     QFile csv(outDir + QStringLiteral("/asset_health.csv"));
     if (!csv.open(QIODevice::WriteOnly | QIODevice::Text))
         return QStringLiteral("health: cannot write asset_health.csv");
     QTextStream cs(&csv);
     cs << "name,sno,status,encrypted,keyHeld,metaBytes,payloadBytes,prims,materials,"
-          "texturesResolved,droppedSubObjects\n";
+          "texturesResolved,droppedSubObjects,iconHandle\n";
+
+    // ── Icon coverage ───────────────────────────────────────────────────────────────────────────
+    // Rendering health is not the only way an asset can be unusable. An appearance with no icon is
+    // present in every list as a blank row, and the tool's icon binding is NAME-joined — which is
+    // the single most failure-prone thing in this codebase. Weapons (armour-only name rule) and
+    // headstones (art on the actor, not the item) were both invisible here for exactly that
+    // reason, and neither showed up in any audit because no audit measured it.
+    //
+    // Reported like NAMELESS-BUT-RENDERABLE, not as a health verdict: a missing icon does not make
+    // the model broken, and folding the two together would hide whichever is smaller.
+    //
+    // Only measured when the index is actually READY. The audit fires 1500 ms after startup and
+    // AppearanceMeta builds in the background, so scoring an unbuilt index would report every
+    // appearance as iconless — a metric that is confidently wrong is worse than one that abstains.
+    const bool amReady = AppearanceMeta::instance().ready();
+    int iconless = 0;
+    QStringList iconlessExamples;
 
     TextureDefTable::instance().ensureBuilt(rd);
 
@@ -586,9 +782,18 @@ QString runHealthAudit(const QString& d4, SnoIndex* idx, CascReader* rd, QWidget
         if (h != Health::Ok && examples[h].size() < 25) examples[h] << e.name;
         current.insert(e.name, QLatin1String(healthName(h)));
 
+        const quint32 icon = amReady ? AppearanceMeta::instance().iconFor(e.snoId) : 0u;
+        // Named + renderable + no icon = a row that will be blank in every list in the tool.
+        // Nameless ones are excluded: they are already counted above and cannot be reached at all,
+        // so an icon would not help them.
+        if (amReady && h == Health::Ok && !icon && !e.name.startsWith(QLatin1String("~unnamed_"))) {
+            ++iconless;
+            if (iconlessExamples.size() < 30) iconlessExamples << e.name;
+        }
+
         cs << e.name << ',' << e.snoId << ',' << healthName(h) << ',' << (enc ? "yes" : "no") << ','
            << (held ? "yes" : "no") << ',' << meta.size() << ',' << pay.size() << ',' << prims
-           << ',' << mats << ',' << texOk << ',' << geoDropped << '\n';
+           << ',' << mats << ',' << texOk << ',' << geoDropped << ',' << icon << '\n';
     }
     prog.setValue(int(apps.size()));
     csv.close();
@@ -648,6 +853,28 @@ QString runHealthAudit(const QString& d4, SnoIndex* idx, CascReader* rd, QWidget
         if (!namelessExamples.isEmpty()) {
             ts << "\n  first " << namelessExamples.size() << ":\n";
             for (const QString& n : namelessExamples) ts << "    " << n << '\n';
+        }
+        // Icon coverage. Diffable run-to-run like everything else here, so a name-rule regression
+        // that costs a whole category its icons shows up as a number rather than as a bug report.
+        // Re-checked, not assumed: the scan loop calls processEvents(), and AppearanceMeta::install
+        // arrives by queued connection, so the index can finish MID-SCAN. The figure would then be
+        // half from an empty index and half from a built one — worse than not reporting it.
+        if (!amReady || !AppearanceMeta::instance().ready()) {
+            ts << "\n  ICONLESS BUT RENDERABLE  not measured — the appearance index was not ready\n"
+                  "  for the whole scan (it builds in the background, and the audit starts 1.5 s\n"
+                  "  after launch). Re-run once it is ready for this figure.\n";
+        } else {
+            ts << QStringLiteral(
+                      "\n  ICONLESS BUT RENDERABLE  %1\n"
+                      "  Named, decodes completely, and has no inventory icon — a blank row in every\n"
+                      "  list in the tool. Icon binding is NAME-joined, so this number is the early\n"
+                      "  warning for a name-rule regression: weapons and headstones were both fully\n"
+                      "  invisible here and no audit measured it.\n")
+                      .arg(iconless, 8);
+            if (!iconlessExamples.isEmpty()) {
+                ts << "\n  first " << iconlessExamples.size() << ":\n";
+                for (const QString& n : iconlessExamples) ts << "    " << n << '\n';
+            }
         }
         for (Health h : {Health::NoTexDefs, Health::NoMaterials,
                          Health::NoGeometry, Health::NoData}) {

@@ -28,15 +28,15 @@ REM   Each run saves a baseline. The next run reports "newly working" and
 REM   "newly BROKEN" against it. After a patch: run it, read two numbers.
 REM   After adding TACT keys: newly working tells you what the keys bought.
 REM
-REM Writes next to the exe:
+REM Writes into data\ beside the exe (everything this tool writes lives there):
 REM   asset_health.txt           summary, ranked, with the change since last run
-REM   asset_health.csv           one row per appearance
+REM   asset_health.csv           one row per appearance, incl. the icon handle
 REM   asset_health_baseline.csv  this run, for the next run to diff against
 REM ---------------------------------------------------------------------------
 
 cd /d "%~dp0"
 set "EXE=%~dp0build\release\D4AssetBrowser.exe"
-set "TXT=%~dp0build\release\asset_health.txt"
+set "TXT=%~dp0build\release\data\asset_health.txt"
 
 taskkill /im D4AssetBrowser.exe /f >nul 2>&1
 

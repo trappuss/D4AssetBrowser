@@ -11,6 +11,7 @@
 #include "model/AnimParser.h"
 #include "gl/GLModelWidget.h"
 #include "index/SnoIndex.h"
+#include "index/StoreProductIndex.h"
 #include "index/SnoListModel.h"
 #include "model/Appearance.h"
 #include "model/Attachments.h"
@@ -29,6 +30,9 @@
 #include "util/CsvCopy.h"
 #include "util/DyeColorWheel.h"
 #include "util/HoverInfo.h"
+#include "util/AnimExportScope.h"
+#include "util/AnimClipFilter.h"   // per-clip length / name filters
+#include "util/QueryTerm.h"   // '|' OR-alternatives — shared with SnoListModel/BulkExtractorTab
 #include "util/PanelPersist.h"
 
 #include <QAbstractItemView>
@@ -41,6 +45,7 @@
 #include <QClipboard>
 #include <QSpinBox>
 #include <QGroupBox>
+#include <QHash>
 #include <QContextMenuEvent>
 #include <QDrag>
 #include <QDragEnterEvent>
@@ -75,6 +80,7 @@
 #include <QKeyEvent>
 #include <QMap>
 #include <QRegularExpression>
+#include <QMutex>
 #include <QSet>
 #include <QSlider>
 
@@ -128,6 +134,7 @@
 #include <QTreeView>
 #include <QTreeWidget>
 #include "tabs/ModelOutliner.h"
+#include "tabs/TexturesTab.h"
 #include "tabs/HintBar.h"
 #include <QVBoxLayout>
 
@@ -135,6 +142,13 @@
 
 namespace {
 constexpr int kGroupAppearance = 9;
+// Name-pinned, matching TexturesTab: if a patch ever renumbers the SNO groups only the name map
+// needs correcting. Resolved once — groupIdByName walks the whole table.
+inline int kGroupTextureId()
+{
+    static const int g = SnoIndex::groupIdByName(QStringLiteral("Texture"), 44);
+    return g;
+}
 
 // Grid-view cell painter: a square, aspect-preserved thumbnail (never cropped/stretched) with a
 // single elided caption line beneath it. The default IconMode delegate wraps long D4 names onto
@@ -537,16 +551,21 @@ std::vector<R> parallelMap(const QStringList& files, ParseFn parse, ReportFn rep
 
 // ── Disk cache for the heavy background indexes (anim + entity) ───────────────────────────────────
 namespace {
-// Cache key = game build + buildVersion.txt mtime. A game patch (new build) OR a d4data re-extraction
-// (which rewrites buildVersion.txt, changing its mtime) invalidates the cache → forces a re-scan.
-QString d4dataSignature()
+// Cache key = d4data buildVersion.txt (content + mtime) AND the game build id.
+//
+// The comment here used to claim the game build was included; it was not — the signature was
+// snapshot-only. Phase 2 of the anim scan parses rig bones through CascReader, so a game patch that
+// reskeletons a rig served stale family/bone data from the cache with nothing to indicate it. The
+// caller passes the build id because this helper has no reader.
+QString d4dataSignature(const QString& gameBuildId = QString())
 {
     const QString bv = Config::d4dataDir() + QStringLiteral("/buildVersion.txt");
     QString ver;
     QFile f(bv);
     if (f.open(QIODevice::ReadOnly)) ver = QString::fromUtf8(f.readAll()).trimmed();
     const QDateTime m = QFileInfo(bv).lastModified();
-    return ver + QLatin1Char('|') + (m.isValid() ? m.toString(Qt::ISODate) : QString());
+    return ver + QLatin1Char('|') + (m.isValid() ? m.toString(Qt::ISODate) : QString())
+               + QLatin1Char('|') + gameBuildId;
 }
 QString indexCachePath(const QString& name)
 {
@@ -666,15 +685,15 @@ QString humanSize(qint64 n)
 // Decode a material texture (by sno+name) from CASC → RGBA QImage, or null.
 QImage decodeMatTex(CascReader* reader, const QString& d4, const QString& name, int sno)
 {
-    if (!reader || !reader->isReady() || d4.isEmpty() || name.isEmpty())
-        return {};
-    QFile tf(QStringLiteral("%1/json/base/meta/Texture/%2.tex.json").arg(d4, name));
-    if (!tf.open(QIODevice::ReadOnly)) return {};
-    const TexMeta tmeta = parseTexMetaJson(tf.readAll());
-    if (!tmeta.valid) return {};
-    const QByteArray pl = reader->readPayloadBySno(quint64(sno));
-    if (pl.isEmpty()) return {};
-    return BcDecode::decode(pl, tmeta.width, tmeta.height, tmeta.eTexFormat);
+    // Via MaterialDecode, NOT a direct .tex.json read. This opened Texture/<name>.tex.json and
+    // returned null when it was missing — which is EVERY encrypted texture, since d4data has no
+    // JSON for them and their names arrive as "~unnamed_<sno>". This function builds the materials
+    // for the glTF EXPORT, so encrypted models exported with no base colour, no normal, no ORM.
+    //
+    // The name is no longer a precondition either: MaterialDecode::texture resolves dimensions
+    // from the CASC texture tables by SNO when there is no name to look up.
+    if (!reader || !reader->isReady()) return {};
+    return MaterialDecode::texture(reader, d4, name, sno);
 }
 
 // Reconstruct a glTF tangent-space normal map from a BC5 (RG) decode: B = +Z.
@@ -732,11 +751,27 @@ QImage packORM(const QImage& ao, const QImage& rough, const QImage& metal)
 // Default-look material roster (index == materialIndex): first non-empty
 // snoMaterial across the SOAs, else the cloth name. Used for batch export of
 // models that aren't the currently-loaded one (no live look state for them).
-QStringList appearancePalette(const QString& d4, const QString& name)
+QStringList appearancePalette(const QString& d4, const QString& name,
+                              CascReader* reader, const SnoIndex* idx, qint64 sno)
 {
     QStringList palette;
     QFile af(QStringLiteral("%1/json/base/meta/Appearance/%2.app.json").arg(d4, name));
-    if (!af.open(QIODevice::ReadOnly)) return palette;
+    if (!af.open(QIODevice::ReadOnly)) {
+        // ── No .app.json — read the roster from the CASC meta binary instead ────────────────────
+        // This early return used to be the whole story, and it is why encrypted and newly-patched
+        // armour exported UNTEXTURED: no JSON → empty palette → buildExportMats produces no
+        // materials at all → a .glb with geometry and nothing on it. The model rendered correctly
+        // in the viewport the entire time, because the viewport already falls back to the binary
+        // (ModelsTab.cpp:6152) — only the export path was still JSON-only.
+        //
+        // Same fallback the viewport and the health audit use, so all three now agree. The Doom
+        // collab set is the case that exposed it: those appearances postdate the d4data snapshot,
+        // so NONE of them have a .app.json.
+        if (reader && reader->isReady() && sno > 0)
+            palette = MaterialDecode::appearanceRosterFromMeta(
+                reader->readMetaBySno(quint64(sno)), idx);
+        return palette;
+    }
     const QJsonArray rawMats = QJsonDocument::fromJson(af.readAll()).object()
                                    .value(QStringLiteral("ptAppearanceMaterials")).toArray();
     for (const QJsonValue& mv : rawMats) {
@@ -768,6 +803,18 @@ QVector<ModelExporter::ExportMaterial> buildExportMats(
     // pigment is just the 4 dye-colour slots (set by the dropdown or custom).
     const bool bakeDye = QSettings().value(QStringLiteral("export/bakeDye"), false).toBool()
                          && QSettings().value(QStringLiteral("models/viewport/dye"), false).toBool();
+    // Bake the tiled leather/fabric/metal detail grain into the exported normal + ORM (opt-in).
+    // This is the Models tab AND the Bulk Extract path — `export/bakeDetail` used to be read only by
+    // the Wardrobe export, so ticking it here did nothing at all.
+    //
+    // Read ONCE per call, not per material: this runs per model in a bulk run, and the decode is the
+    // expensive part, so the flag gates the decode itself rather than just the bake. With it off the
+    // cost is exactly what it was before.
+    const bool bakeDetail = QSettings().value(QStringLiteral("export/bakeDetail"), false).toBool();
+    // Baked normal/ORM per material NAME, so a palette that names one material N times (and the
+    // fallback material, which is most of them) decodes and bakes once. Cleared with the call.
+    // Two hashes rather than QPair: <QPair> is not included in this TU.
+    QHash<QString, QImage> bakedN, bakedO;
     QColor pigment[4];
     for (int k = 0; k < 4; ++k)
         pigment[k] = QColor(QSettings().value(QStringLiteral("models/viewport/dyeColor%1").arg(k),
@@ -802,37 +849,60 @@ QVector<ModelExporter::ExportMaterial> buildExportMats(
                     em.emisMult = v.hasEmisMult ? v.emisMult : 1.0f;
                 }
             }
-            if (wantTex && reader) {
-                QImage normalRG, aoImg, roughImg, metalImg, dyeMaskImg, dyeRampImg;
-                for (const MatTexture& mt : parseMaterialJson(matData)) {
-                    if (mt.texName.isEmpty()) continue;
-                    const QString& role = mt.role;
-                    if (role == QLatin1String("BASE_COLOR")) {
-                        if (em.baseColor.isNull()) em.baseColor = decodeMatTex(reader, d4, mt.texName, mt.texSno);
-                    } else if (role == QLatin1String("NORMAL")) {
-                        if (normalRG.isNull()) normalRG = decodeMatTex(reader, d4, mt.texName, mt.texSno);
-                    } else if (role == QLatin1String("ROUGHNESS")) {
-                        if (roughImg.isNull()) roughImg = decodeMatTex(reader, d4, mt.texName, mt.texSno);
-                    } else if (role == QLatin1String("METALLIC")) {
-                        if (metalImg.isNull()) metalImg = decodeMatTex(reader, d4, mt.texName, mt.texSno);
-                    } else if (role == QLatin1String("AO")) {
-                        if (aoImg.isNull()) aoImg = decodeMatTex(reader, d4, mt.texName, mt.texSno);
-                    } else if (role == QLatin1String("EMISSIVE")) {
-                        if (em.emissive.isNull()) em.emissive = decodeMatTex(reader, d4, mt.texName, mt.texSno);
-                    } else if (bakeDye && role == QLatin1String("DYE_MASK")) {
-                        if (dyeMaskImg.isNull()) dyeMaskImg = decodeMatTex(reader, d4, mt.texName, mt.texSno);
-                    } else if (bakeDye && role == QLatin1String("DYE_RAMP")) {
-                        if (dyeRampImg.isNull()) dyeRampImg = decodeMatTex(reader, d4, mt.texName, mt.texSno);
-                    }
+        }
+        // Textures live OUTSIDE the .mat.json gate. They used to be inside it, so an
+        // ENCRYPTED material — which by definition has no .mat.json — exported with no
+        // base colour, normal or ORM at all. That is the same early-return that left the
+        // preview panels blank, one file over. Values/shaders still need the JSON and stay
+        // above; texturesFor reads the JSON when there is one and the meta binary when
+        // there is not, so the named case is unchanged.
+        if (wantTex && reader) {
+            QImage normalRG, aoImg, roughImg, metalImg, dyeMaskImg, dyeRampImg;
+            for (const MatTexture& mt : MaterialDecode::texturesFor(reader, d4, matName)) {
+                // By SNO, not name — see baseColorForMaterial. decodeMatTex needs only the sno,
+                // and an encrypted texture has no name to test.
+                if (mt.texSno <= 0) continue;
+                const QString& role = mt.role;
+                if (role == QLatin1String("BASE_COLOR")) {
+                    if (em.baseColor.isNull()) em.baseColor = decodeMatTex(reader, d4, mt.texName, mt.texSno);
+                } else if (role == QLatin1String("NORMAL")) {
+                    if (normalRG.isNull()) normalRG = decodeMatTex(reader, d4, mt.texName, mt.texSno);
+                } else if (role == QLatin1String("ROUGHNESS")) {
+                    if (roughImg.isNull()) roughImg = decodeMatTex(reader, d4, mt.texName, mt.texSno);
+                } else if (role == QLatin1String("METALLIC")) {
+                    if (metalImg.isNull()) metalImg = decodeMatTex(reader, d4, mt.texName, mt.texSno);
+                } else if (role == QLatin1String("AO")) {
+                    if (aoImg.isNull()) aoImg = decodeMatTex(reader, d4, mt.texName, mt.texSno);
+                } else if (role == QLatin1String("EMISSIVE")) {
+                    if (em.emissive.isNull()) em.emissive = decodeMatTex(reader, d4, mt.texName, mt.texSno);
+                } else if (bakeDye && role == QLatin1String("DYE_MASK")) {
+                    if (dyeMaskImg.isNull()) dyeMaskImg = decodeMatTex(reader, d4, mt.texName, mt.texSno);
+                } else if (bakeDye && role == QLatin1String("DYE_RAMP")) {
+                    if (dyeRampImg.isNull()) dyeRampImg = decodeMatTex(reader, d4, mt.texName, mt.texSno);
                 }
-                em.normal = reconstructNormal(normalRG);
-                em.orm = packORM(aoImg, roughImg, metalImg);
-                // Bake the active pigment into the exported base colour (matches preview).
-                if (bakeDye && !dyeMaskImg.isNull() && !em.baseColor.isNull())
-                    em.baseColor = applyDyeBake(em.baseColor, dyeMaskImg, dyeRampImg, pigment);
+            }
+            em.normal = reconstructNormal(normalRG);
+            em.orm = packORM(aoImg, roughImg, metalImg);
+            // Bake the active pigment into the exported base colour (matches preview).
+            if (bakeDye && !dyeMaskImg.isNull() && !em.baseColor.isNull())
+                em.baseColor = applyDyeBake(em.baseColor, dyeMaskImg, dyeRampImg, pigment);
+            // …then the surface detail, AFTER the normal and ORM exist — it edits both in place.
+            // bakeDetailForMaterial does its own decode (this loop above never reads the DETAIL_*
+            // slots or the dye mask when bakeDye is off), derives this material's own dye bands and
+            // zone→map table, and no-ops when the material authors no detail maps.
+            if (bakeDetail && !em.normal.isNull()) {
+                auto it = bakedN.constFind(matName);
+                if (it != bakedN.constEnd()) {
+                    em.normal = it.value();
+                    em.orm = bakedO.value(matName);
+                } else {
+                    MaterialDecode::bakeDetailForMaterial(reader, d4, matName, em.normal, em.orm);
+                    bakedN.insert(matName, em.normal);
+                    bakedO.insert(matName, em.orm);
+                }
             }
         }
-        return em;
+    return em;
     };
     mats.reserve(palette.size());
     for (int mi = 0; mi < palette.size(); ++mi) {
@@ -1230,6 +1300,20 @@ ModelsTab::ModelsTab(QWidget* parent) : BrowserTab(parent)
     CsvCopy::install(m_list);
     connect(m_list, &QWidget::customContextMenuRequested, this, [this](const QPoint& p) {
         const QModelIndex hit = m_list->indexAt(p);
+        // ── Is this the outliner ROOT row — the loaded model hosting the subtree? ──
+        // It is a TOP-LEVEL row, so `hit.parent().isValid()` is false for it and it fell through to
+        // the plain browse menu: every submesh under it offered the shared part menu while the
+        // model itself did not. Flagged here and handled at the browse-menu build below.
+        //
+        // NOT routed to showPartContextMenu(-1): the root is still a real browse row, and replacing
+        // its menu wholesale would take away Load / preview, the image actions, Render icon,
+        // Variants and Show dependencies — and, on a multi-row selection, "Export N models". It
+        // gains the whole-model visibility actions instead, which were the only thing it lacked.
+        // subtreeRow() survives a switch to flat List mode (setFlatMode only flips m_flat), so the
+        // display mode is part of the test.
+        const bool isLoadedRoot = m_treeModel && hit.isValid() && !hit.parent().isValid()
+                               && m_displayMode != 0 && m_treeModel->subtreeRow() >= 0
+                               && hit.row() == m_treeModel->subtreeRow() && m_curGeo.valid;
         // ── Subtree nodes get their own menus ──
         if (hit.isValid() && hit.parent().isValid() && m_treeModel) {
             // Texture leaf / channel tile: Copy + Save the decoded image.
@@ -1256,13 +1340,13 @@ ModelsTab::ModelsTab(QWidget* parent) : BrowserTab(parent)
                 };
                 const QString sfx2 = xChan >= 0 ? QStringLiteral("_%1").arg(xLabel) : xLabel.isEmpty()
                                      ? QString() : QStringLiteral("_%1").arg(xLabel);
-                menu.addAction(QStringLiteral("Copy image"), this, [image]() {
+                menu.addAction(MenuText::kCopyImage, this, [image]() {
                     const QImage img = image();
                     if (!img.isNull()) QApplication::clipboard()->setImage(img);
                 });
                 // Mirrors the model export pair: bare = straight to the last folder, "to…" = pick
                 // one (and that pick becomes the new last folder).
-                menu.addAction(QStringLiteral("Save image"), this, [this, image, xName, sfx2]() {
+                menu.addAction(MenuText::kSaveImageLast, this, [this, image, xName, sfx2]() {
                     const QImage img = image();
                     if (img.isNull()) return;
                     QString dir = QSettings().value(QStringLiteral("models/lastImageSaveDir")).toString();
@@ -1273,7 +1357,7 @@ ModelsTab::ModelsTab(QWidget* parent) : BrowserTab(parent)
                     }
                     img.save(QDir(dir).filePath(QStringLiteral("%1%2.png").arg(xName, sfx2)), "PNG");
                 });
-                menu.addAction(QStringLiteral("Save image as…"), this, [this, image, xName, sfx2]() {
+                menu.addAction(MenuText::kSaveImage, this, [this, image, xName, sfx2]() {
                     const QImage img = image();
                     if (img.isNull()) return;
                     const QString fn = QFileDialog::getSaveFileName(
@@ -1295,7 +1379,12 @@ ModelsTab::ModelsTab(QWidget* parent) : BrowserTab(parent)
                 // apply — but opening NO menu at all reads as a dead control. Copying the label is
                 // the one action that is always meaningful for a tree node, and it matches what
                 // every other detail view in the app offers via CsvCopy.
-                const QString label = hit.data(Qt::DisplayRole).toString();
+                // Column 0 explicitly. Reading the CLICKED column's DisplayRole meant right-clicking
+                // a bone or look node anywhere except the FILENAME column produced an empty label
+                // and the `return` below — no menu at all, which is exactly the dead control this
+                // branch exists to prevent.
+                const QString label =
+                    hit.siblingAtColumn(ModelOutlinerModel::kTreeCol).data(Qt::DisplayRole).toString();
                 if (label.isEmpty()) return;
                 QMenu m(this);
                 m.addAction(QStringLiteral("Copy"), this,
@@ -1337,7 +1426,7 @@ ModelsTab::ModelsTab(QWidget* parent) : BrowserTab(parent)
             menu.exec(m_list->viewport()->mapToGlobal(p));
             return;
         }
-        const QList<int> snos = contextSnos(p);
+        const QList<int> snos = contextSnos(m_list, p);
         if (snos.isEmpty()) return;
         const QPoint gp = m_list->viewport()->mapToGlobal(p);
         QMenu menu(this);
@@ -1350,12 +1439,37 @@ ModelsTab::ModelsTab(QWidget* parent) : BrowserTab(parent)
         //
         // The row is the same asset whichever cell you happen to hit, so the menu no longer depends
         // on where in the row the cursor was. Same composition and order as the grid at :1370.
-        const int sno = snos.first();
-        menu.addAction(QStringLiteral("Load / preview"), this, [this, sno]() { selectModelBySno(sno); });
+        // The CLICKED row, not snos.first(). With rows 10–40 selected, right-clicking row 30 used to
+        // load row 10 — the grid path never had this because it uses its own indexAt. Single-subject
+        // actions take the clicked row; list actions (export, multi-copy) still take the whole set.
+        const int clicked = clickedSno(m_list, p, snos);
+        menu.addAction(QStringLiteral("Load / preview"), this,
+                       [this, clicked]() { selectModelBySno(clicked); });
         menu.addSeparator();
-        addRowImageActions(menu, snos);
+        addRowImageActions(menu, snos, clicked);
         menu.addSeparator();
         addRowExportCopyActions(menu, snos);
+        // The loaded model's own row gets the whole-model visibility actions its submeshes already
+        // offer, so the top of the tree and everything under it finally agree.
+        if (isLoadedRoot && m_treeModel) {
+            auto applyAll = [this](bool on) {
+                QHash<int, bool> all;
+                m_treeModel->partChecks(all);
+                for (auto it = all.constBegin(); it != all.constEnd(); ++it)
+                    m_treeModel->setPartCheck(it.key(), on);
+                recomputePartVisibility();
+            };
+            menu.addSeparator();
+            menu.addAction(QStringLiteral("Show all"), this, [applyAll] { applyAll(true); });
+            menu.addAction(QStringLiteral("Hide all"), this, [applyAll] { applyAll(false); });
+            menu.addAction(QStringLiteral("Invert"), this, [this] {
+                QHash<int, bool> all;
+                m_treeModel->partChecks(all);
+                for (auto it = all.constBegin(); it != all.constEnd(); ++it)
+                    m_treeModel->setPartCheck(it.key(), !it.value());
+                recomputePartVisibility();
+            });
+        }
         menu.exec(gp);
     });
 
@@ -1401,13 +1515,17 @@ ModelsTab::ModelsTab(QWidget* parent) : BrowserTab(parent)
         // PARITY: the grid is the same model + selection as the list, so it gets the same actions.
         // Use the multi-selection when the clicked tile is part of it, exactly like the list does;
         // a grid tile is entirely icon, so BOTH the image actions and the export/copy set apply.
-        QList<int> snos = contextSnos(p);
+        // m_gridView, not m_list. `p` is in the GRID's viewport space and contextSnos used to
+        // hit-test the list regardless — different row height, different column count, and m_list
+        // keeps its geometry while hidden in the stack, so it returned a plausible WRONG row and
+        // every copy/export action here acted on a model you had not clicked.
+        QList<int> snos = contextSnos(m_gridView, p);
         if (snos.isEmpty()) snos = { e->snoId };
         const int sno = e->snoId;
         QMenu menu(this);
         menu.addAction(QStringLiteral("Load / preview"), this, [this, sno]() { selectModelBySno(sno); });
         menu.addSeparator();
-        addRowImageActions(menu, snos);
+        addRowImageActions(menu, snos, sno);
         menu.addSeparator();
         addRowExportCopyActions(menu, snos);
         menu.exec(m_gridView->viewport()->mapToGlobal(p));
@@ -2706,6 +2824,17 @@ ModelsTab::ModelsTab(QWidget* parent) : BrowserTab(parent)
     m_matTabs->addTab(m_mats, QStringLiteral("App Materials"));
     m_matTabs->addTab(m_subObjView, QStringLiteral("SubObject Apps"));
     m_matTabs->addTab(m_matListView, QStringLiteral("Materials"));
+    // The "Materials" (by-SNO) table drives the SHADING panel too. Until now only "App Materials"
+    // did — and that table is built from the .app.json, so for an ENCRYPTED appearance it is empty
+    // and there was nothing to select: SHADING and TEXTURE PREVIEW stayed blank even though the
+    // material had resolved and its textures decode fine. This gives the by-SNO list, which the
+    // meta-binary roster DOES populate, the same job.
+    connect(m_matListView->selectionModel(), &QItemSelectionModel::currentRowChanged, this,
+            [this](const QModelIndex& cur, const QModelIndex&) {
+                if (!cur.isValid() || !m_matListModel) return;
+                if (QStandardItem* it = m_matListModel->item(cur.row(), 1))
+                    showMaterialTextures(it->text());
+            });
     m_matTabs->addTab(m_vbView, QStringLiteral("Vertex Buffers"));
     m_matsHdr = section(QStringLiteral("MATERIALS"), m_matTabs,
                         ModelOutlinerModel::kindIcon(ModelOutlinerModel::Material),
@@ -2778,11 +2907,11 @@ ModelsTab::ModelsTab(QWidget* parent) : BrowserTab(parent)
                 [this, i](const QPoint& p) {
             if (m_chanFull[i].isNull()) return;
             QMenu menu(this);
-            menu.addAction(QStringLiteral("Copy image"), this, [this, i]() {
+            menu.addAction(MenuText::kCopyImage, this, [this, i]() {
                 QApplication::clipboard()->setImage(m_chanFull[i]);
             });
-            menu.addAction(QStringLiteral("Save image"), this, [this, i]() { saveTileImage(i, false); });
-            menu.addAction(QStringLiteral("Save image as…"), this, [this, i]() { saveTileImage(i, true); });
+            menu.addAction(MenuText::kSaveImageLast, this, [this, i]() { saveTileImage(i, false); });
+            menu.addAction(MenuText::kSaveImage, this, [this, i]() { saveTileImage(i, true); });
             menu.exec(m_chanImg[i]->mapToGlobal(p));
         });
         // Caption overlaid on the image, bottom-left, child of the tile.
@@ -2826,7 +2955,7 @@ ModelsTab::ModelsTab(QWidget* parent) : BrowserTab(parent)
                                    QStringLiteral("Family"), QStringLiteral("Actor"),
                                    QStringLiteral("Physics"), QStringLiteral("Used by"),
                                    QStringLiteral("Items"), QStringLiteral("Item facts"),
-                                   QStringLiteral("Variants")}) {
+                                   QStringLiteral("Sold in"), QStringLiteral("Variants")}) {
             auto* v = new QLabel(QStringLiteral("—"), dataBody);
             v->setTextInteractionFlags(Qt::TextSelectableByMouse);
             v->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Preferred);   // never widens the column
@@ -2915,6 +3044,16 @@ ModelsTab::ModelsTab(QWidget* parent) : BrowserTab(parent)
             v->setTextInteractionFlags(Qt::LinksAccessibleByMouse | Qt::TextSelectableByMouse);
             connect(v, &QLabel::linkActivated, this,
                     [this](const QString& href) { selectModelBySno(href.toInt()); });
+        }
+        // "Sold in" the same way, but the jump leaves this tab: a store product is a Catalogue
+        // subject, not a model. The row already knew which bundles sold the piece and could only
+        // print their names, so the answer was one-way — you could learn the bundle existed and
+        // then had to go and find it by hand.
+        if (QLabel* s = m_dataVals.value(QStringLiteral("Sold in"))) {
+            s->setTextFormat(Qt::RichText);
+            s->setTextInteractionFlags(Qt::LinksAccessibleByMouse | Qt::TextSelectableByMouse);
+            connect(s, &QLabel::linkActivated, this,
+                    [this](const QString& href) { emit revealBundleRequested(href.toInt()); });
         }
     }
     strip->addStretch(1);
@@ -3021,6 +3160,12 @@ ModelsTab::ModelsTab(QWidget* parent) : BrowserTab(parent)
         m_metaPct = p;
     });
     connect(&AppearanceMeta::instance(), &AppearanceMeta::readyChanged, this, &ModelsTab::onMetaReady);
+    // The store catalogue lands late — it is only started when the Catalogue tab is pre-warmed or
+    // opened — so a model selected in the first seconds shows "Sold in: —" and would keep showing
+    // it until reselected. The same repaint-on-ready connection IconIndex and AppearanceMeta get.
+    connect(&StoreProductIndex::instance(), &StoreProductIndex::readyChanged, this, [this] {
+        if (m_curSno > 0) updateEntityInfo(m_curSno);
+    });
     connect(m_list->selectionModel(), &QItemSelectionModel::currentRowChanged, this,
             [this](const QModelIndex&, const QModelIndex&) { onAppearanceSelected(); });
     // Auto-render 3D thumbnails for rows scrolled into view (3D / Original+3D modes).
@@ -3259,7 +3404,42 @@ ModelsTab::ModelsTab(QWidget* parent) : BrowserTab(parent)
 
     // Restore the display mode last — everything it touches (tree model, grid button, header
     // dropdown) exists by now, and it routes through the same one-path appliers.
-    applyDisplayMode(QSettings().value(QStringLiteral("models/displayMode"), 1).toInt());
+    // Display-mode restore, with a crash sentinel — the same recipe the thumbnail renderer uses,
+    // and for the same reason. Restoring Grid faulted during construction, which bricked the tool:
+    // it died before the window existed, so there was no way to change the mode back from inside
+    // the UI. Recovering it took a settings bisect.
+    //
+    // A setting that is applied during startup and can fault MUST be able to undo itself. The
+    // sentinel is written before the mode is applied and cleared after; if it is still there on the
+    // next launch, that mode killed us and we fall back to Outliner.
+    {
+        QSettings s;
+        int mode = s.value(QStringLiteral("models/displayMode"), 1).toInt();
+        // The sentinel records the PID that set it, not just the mode. Two instances starting
+        // together would otherwise have B read A's still-uncleared guard, conclude the mode had
+        // crashed, and permanently rewrite models/displayMode — changing a preference that was
+        // never at fault. A guard left by a LIVE sibling is not evidence of a crash; only one left
+        // by a process that is no longer us is.
+        const QString guard = s.value(QStringLiteral("models/displayGuard")).toString();
+        const int guardMode = guard.section(QLatin1Char(':'), 0, 0).toInt();
+        const qint64 guardPid = guard.section(QLatin1Char(':'), 1, 1).toLongLong();
+        if (!guard.isEmpty() && guardMode == mode && mode != 1
+            && guardPid != QCoreApplication::applicationPid()) {
+            qWarning("ModelsTab: display mode %d crashed the previous launch — falling back to "
+                     "Outliner. Switch back from the display-mode button once the cause is fixed.",
+                     mode);
+            mode = 1;
+            s.setValue(QStringLiteral("models/displayMode"), mode);
+        }
+        // Written AFTER the fallback decision, so it records the mode we are about to APPLY. Built
+        // before it, the sentinel would have named the rejected mode while a different one ran.
+        s.setValue(QStringLiteral("models/displayGuard"),
+                   QStringLiteral("%1:%2").arg(mode).arg(QCoreApplication::applicationPid()));
+        s.sync();   // must reach disk BEFORE the risky call, or a hard crash leaves no marker
+        applyDisplayMode(mode);
+        s.setValue(QStringLiteral("models/displayGuard"), QString());
+        s.sync();
+    }
     m_tagOrMode = QSettings().value(QStringLiteral("models/tagOrMode"), false).toBool();
 
     // The ANIMATIONS page was BUILT with the center column but registers only now — the strip
@@ -3481,6 +3661,20 @@ void ModelsTab::setScan(const QString& key, const QString& msg)
     QStringList parts;
     for (const QString& k : keys) parts << m_scan.value(k);
     emit scanStatus(parts.join(QStringLiteral("     ·     ")));
+}
+
+void ModelsTab::flashScan(const QString& key, const QString& msg, int ms)
+{
+    // MARSHALLED. bulkExport runs on the Bulk Extract tab's worker thread, and setScan mutates
+    // m_scan — a QHash the GUI thread writes concurrently from the icon-render and model-load
+    // scans. The old raw `emit scanStatus(...)` was thread-safe because a queued signal crosses
+    // for you; routing it through setScan quietly removed that. Every other off-thread setScan in
+    // this file is wrapped the same way.
+    QMetaObject::invokeMethod(this, [this, key, msg, ms] {
+        setScan(key, msg);
+        // Context object `this`, so a destroyed tab never fires it.
+        QTimer::singleShot(ms, this, [this, key] { setScan(key, QString()); });
+    }, Qt::QueuedConnection);
 }
 
 // Clear the transient per-action messages (model load / icon render). Background scans clear their
@@ -3720,8 +3914,10 @@ void ModelsTab::showIconPreview(int sno)
     if (HoverInfo::on("mdl/latest") && m_index && m_index->isNew(sno)) {
         lines << QStringLiteral("★ new this update"); cols << HoverInfo::Col::kNew;
     }
+    // Every source: the badge says "owns / inherits", which is a question about the DATA, not
+    // about what an export would embed — it must not follow the export scope setting.
     if (HoverInfo::on("mdl/anim") && m_animatedScanned && !name.isEmpty()
-        && !animClipsFor(sno, name.toLower()).isEmpty()) {
+        && !animClipsFor(sno, name.toLower(), /*original*/ true, /*sets*/ true, /*base*/ true).isEmpty()) {
         lines << QStringLiteral("animated (owns / inherits clips)"); cols << HoverInfo::Col::kGood;
     }
 
@@ -3872,7 +4068,7 @@ void ModelsTab::refresh()
     // disk after the first build; powers the authoritative Type filter once ready.
     AppearanceMeta::instance().ensureBuilt(Config::d4dataDir(), m_index, m_reader);
     // Original 2D inventory icons need the icon-atlas index (handle → atlas + UV).
-    IconIndex::instance().ensureBuilt(Config::d4dataDir());
+    IconIndex::instance().ensureBuilt(Config::d4dataDir(), m_reader);
     updateIndexStatus();   // reflect any in-progress background build
 }
 
@@ -3919,17 +4115,17 @@ void ModelsTab::loadList()
             if (m_reader->payloadSize(quint64(e.snoId)) > 0) kept.append(e);
         entries = kept;
     }
-    // "Only encrypted (TACT)": keep the ones that ARE gated. Decided from the BLTE frame header
-    // rather than from the ~unnamed_ placeholder, because the two are not the same set — a handful
-    // of encrypted assets do recover a real name via EncryptedNameDict, and a name-based test would
-    // miss exactly those.
+    // "Only encrypted (TACT)": keep the ones the game's own EncryptedSNOs manifest lists — NOT a
+    // BLTE frame-header probe, which is both slower (an archive open per sno) and less correct (it
+    // cannot see assets whose container never expanded). See CascReader::encryptedSnos.
     if (m_onlyEncrypted && m_onlyEncrypted->isChecked() && m_reader && m_reader->isReady()) {
-        QVector<SnoEntry> kept; kept.reserve(entries.size() / 8 + 8);
+        const QHash<int, QByteArray>& enc = m_reader->encryptedSnos();
+        QVector<SnoEntry> kept; kept.reserve(enc.size() / 2 + 8);
         int locked = 0;
         for (const SnoEntry& e : entries) {
-            const QByteArray kn = m_reader->tactKeyFor(quint64(e.snoId));
-            if (kn.isEmpty()) continue;
-            if (!m_reader->haveTactKey(kn)) ++locked;
+            const auto hit = enc.constFind(e.snoId);
+            if (hit == enc.constEnd()) continue;
+            if (!m_reader->haveTactKey(hit.value())) ++locked;
             kept.append(e);
         }
         qInfo("models: %d encrypted asset(s) in this group, %d of them without a key",
@@ -3992,7 +4188,14 @@ void ModelsTab::setInfo(const QString& key, const QString& value)
     // The INFO page is the visible surface (and carries extra keys the old overlay didn't have).
     if (QLabel* d = m_dataVals.value(key, nullptr)) {
         d->setText(value.isEmpty() ? QStringLiteral("—") : value);
-        d->setToolTip(value);   // values clip rather than widen — hover reads in full
+        // Tooltip gets the TEXT, not the markup. Rows that carry links (Variants, Sold in) pass
+        // <a href=…> here, and echoing that into the tooltip showed the raw tags on hover.
+        QString tip = value;
+        if (tip.contains(QLatin1String("<a "))) {
+            static const QRegularExpression rxTag(QStringLiteral("<[^>]*>"));
+            tip.remove(rxTag);
+        }
+        d->setToolTip(tip);   // values clip rather than widen — hover reads in full
     }
 }
 
@@ -4208,10 +4411,10 @@ QVector<QPair<int, QString>> ModelsTab::queryEntries(int group, const FilterSpec
             const QString meta = ready ? modelSearchBlob(e.snoId) : QString();
             const QString hay  = ready ? (e.name + QLatin1Char(' ') + meta) : e.name;
             bool ok = true;
-            for (const QString& t : inc) if (!hay.contains(t, Qt::CaseInsensitive)) { ok = false; break; }
-            if (ok) for (const QString& t : exc) if (hay.contains(t, Qt::CaseInsensitive)) { ok = false; break; }
-            if (ok) for (const QString& t : incTag) if (!meta.contains(t, Qt::CaseInsensitive)) { ok = false; break; }
-            if (ok) for (const QString& t : excTag) if (meta.contains(t, Qt::CaseInsensitive)) { ok = false; break; }
+            for (const QString& t : inc) if (!QueryTerm::matches(hay, t)) { ok = false; break; }
+            if (ok) for (const QString& t : exc) if (QueryTerm::matches(hay, t)) { ok = false; break; }
+            if (ok) for (const QString& t : incTag) if (!QueryTerm::matches(meta, t)) { ok = false; break; }
+            if (ok) for (const QString& t : excTag) if (QueryTerm::matches(meta, t)) { ok = false; break; }
             if (!ok) continue;
         }
         if (f.hideUnrenderable
@@ -4301,7 +4504,9 @@ void ModelsTab::ensureAnimatedIndex()
     setScan(QStringLiteral("anim"), QStringLiteral("Loading animation index…"));
     const QString animDir = QStringLiteral("%1/json/base/meta/Anim").arg(Config::d4dataDir());
     CascReader* reader = m_reader;   // thread-safe (mutex-locked reads); used for the Phase-2 rig parse
-    const QString sig = d4dataSignature();
+    // Build id included: phase 2 below parses rig bones out of CASC, so a game patch must
+    // invalidate this even when the d4data snapshot is unchanged.
+    const QString sig = d4dataSignature(m_reader ? m_reader->buildId() : QString());
     const QString cachePath = indexCachePath(QStringLiteral("anim_index.bin"));
     std::thread([this, animDir, reader, sig, cachePath]() {
         // Load the cached index if it matches the current game/d4data build → skip the whole scan.
@@ -4363,7 +4568,10 @@ void ModelsTab::ensureAnimatedIndex()
                 r.row = fm.hasMatch()
                     ? QStringLiteral("%1  ·  %2 frames").arg(animName, fm.captured(1)) : animName;
                 auto mi = rxApp.globalMatch(raw);
-                while (mi.hasNext()) { const int sno = mi.next().captured(1).toInt(); if (sno > 0) r.snos << sno; }
+                while (mi.hasNext()) {
+                    const int sno = mi.next().captured(1).toInt();
+                    if (sno > 0) r.snos << sno;
+                }
                 return r;
             },
             [this](int d, int t) {
@@ -4585,7 +4793,7 @@ void ModelsTab::ensureEntityIndex()
     m_entityScanning = true;
     setScan(QStringLiteral("entity"), QStringLiteral("Loading model-usage index…"));
     const QString d4 = Config::d4dataDir();
-    const QString sig = d4dataSignature();
+    const QString sig = d4dataSignature(m_reader ? m_reader->buildId() : QString());
     const QString cachePath = indexCachePath(QStringLiteral("entity_index.bin"));
     std::thread([this, d4, sig, cachePath]() {
         // Load the cached index if it matches the current game/d4data build → skip the whole scan.
@@ -4851,6 +5059,43 @@ void ModelsTab::updateEntityInfo(int sno)
     };
     setInfo(QStringLiteral("Used by"), summarize(m_apprActors.value(sno), m_apprActorN.value(sno)));
     setInfo(QStringLiteral("Items"),   summarize(m_apprItems.value(sno),  m_apprItemN.value(sno)));
+    // ── "Sold in": which shop bundle this cosmetic came from ────────────────────────────────────
+    // From d4data's SNO reference graph, inverted at index time. The chain the store itself uses is
+    // Bundle -> child product -> Item -> Actor, so an appearance is reached through its actor and
+    // item; both are checked because which one carries the edge varies by product kind.
+    //
+    // Empty for anything the graph does not reach — every asset newer than the d4data snapshot's
+    // game build, and everything that was never sold. That is a real answer, not a failure.
+    {
+        const StoreProductIndex& spi = StoreProductIndex::instance();
+        QStringList sold;
+        QSet<int> seenProd;
+        if (spi.ready() && m_index) {
+            // The graph reaches Item and Actor, never Appearance (Actor -> Appearance is not in
+            // it), so probing this appearance's sno alone would always come back empty. The caches
+            // above hold the actor/item NAMES, so they are turned back into snos through the
+            // index — which is what snoForName exists for.
+            QVector<int> probe;
+            for (const QString& itemName : m_apprItems.value(sno))
+                if (const int is = m_index->snoForName(73, itemName)) probe << is;   // 73 Item
+            for (const QString& actName : m_apprActors.value(sno))
+                if (const int as = m_index->snoForName(1, actName)) probe << as;     // 1 Actor
+            for (int q : probe)
+                for (int ps : spi.soldIn(q)) {
+                    if (seenProd.contains(ps)) continue;
+                    seenProd.insert(ps);
+                    const auto* p = spi.product(ps);
+                    if (!p) continue;
+                    QString one = p->title.isEmpty() ? p->name : p->title;
+                    if (!p->seasonName.isEmpty()) one += QStringLiteral(" (%1)").arg(p->seasonName);
+                    // A link to the bundle in the Catalogue. toHtmlEscaped because shop titles are
+                    // free text and a stray & or < would otherwise eat the rest of the row.
+                    sold << QStringLiteral("<a href=\"%1\" style=\"color:#d8a23a;\">%2</a>")
+                                .arg(ps).arg(one.toHtmlEscaped());
+                }
+        }
+        setInfo(QStringLiteral("Sold in"), sold.join(QStringLiteral(", ")));
+    }
     // The rows show 6 names; the index stores up to 50. Put the FULL stored list in the tooltip
     // (one per line) so the "+N more" isn't a dead end. NOT links: every actor/item here resolves
     // to the appearance you're already viewing — that's how the index is keyed — so a jump would
@@ -5115,18 +5360,19 @@ void ModelsTab::pullSuggestedAnims()
     QString why;
     const int src = suggestedAnimSource(&why);
     if (src <= 0) {
-        emit scanStatus(why.isEmpty() ? QStringLiteral("No matching rig found to pull from.") : why);
+        flashScan(QStringLiteral("animpull"),
+              why.isEmpty() ? QStringLiteral("No matching rig found to pull from.") : why);
         return;
     }
     const QString srcName = apprNameForSno(src);
     if (m_pullSources.contains(src)) {
-        emit scanStatus(QStringLiteral("Already pulling from %1.").arg(srcName));
+        flashScan(QStringLiteral("animpull"), QStringLiteral("Already pulling from %1.").arg(srcName));
         return;
     }
     m_pullSources.append(src);
     if (m_pullClearBtn) m_pullClearBtn->setEnabled(true);
     if (m_curSno >= 0) populateAnimList(m_curSno, m_curName.toLower());
-    emit scanStatus(QStringLiteral("Pulled animations from %1 (matched to %2).")
+    flashScan(QStringLiteral("animpull"), QStringLiteral("Pulled animations from %1 (matched to %2).")
                         .arg(srcName, m_curName));
 }
 
@@ -5301,6 +5547,73 @@ QStringList ModelsTab::modelAnimRows(int sno, const QString& nameLower, bool* fa
     return rows;
 }
 
+// Does this clip name belong to one of the model's own animation families?
+static bool clipInFamily(const QString& clipName, const QStringList& fams)
+{
+    const QString c = clipName.toLower();
+    for (const QString& f : fams)
+        if (c == f || c.startsWith(f + QLatin1Char('_'))) return true;
+    return false;
+}
+
+// ── AnimSet colour ──────────────────────────────────────────────────────────────────────────────
+// A stable hue per AnimSet, so the panel bands by set while you scroll instead of relying on the
+// header you have already scrolled past.
+//
+// A CURATED palette indexed by a name hash, not hue = hash % 360. A free-running hue would sooner
+// or later land a set on gold (#d8a23a, "pulled") or on the unconfirmed cyan (#6fb7d4) and make a
+// state colour ambiguous — those two must stay unmistakable, so every entry here is kept clear of
+// their hues (~39° and ~197°; the closest entry is 34° away). Keying on the set NAME rather than
+// its position also means a set keeps its colour across models and across game patches, which is
+// what makes it learnable.
+// SIX hues, not eight. Eight fitted the palette but not the eye: after the row tint pulls each
+// one 48% toward plain text, neighbouring hues collapse — an eight-colour set measured ΔE 3.6
+// between indigo and lavender (indistinguishable) and 5.8 between violet and lavender. Six spread
+// ~60° apart keep a worst pair of ΔE 11.8, which stays readable after the blend. Verified against
+// the two state colours too: every row tint is ΔE 47+ from gold and 21+ from cyan.
+static constexpr int kAnimSetColors = 6;
+
+static QColor animSetColorAt(int idx)
+{
+    static const QColor kPalette[kAnimSetColors] = {
+        QColor(0xe0, 0x8c, 0x8c),   // salmon    0°
+        QColor(0xb9, 0xd6, 0x83),   // lime     81°
+        QColor(0x6f, 0xcf, 0x93),   // green   142°
+        QColor(0x8f, 0x9c, 0xe8),   // indigo  231°
+        QColor(0xc9, 0x8a, 0xdd),   // violet  286°
+        QColor(0xe8, 0x96, 0xc2),   // pink    328°
+    };
+    if (idx < 0 || idx >= kAnimSetColors) return QColor(0x9a, 0x9a, 0x9a);   // "(ungrouped)"
+    return kPalette[idx];
+}
+
+// The row tint for that set: the same hue pulled part of the way back toward the normal text
+// colour. Enough to group a run of rows at a glance, muted enough that gold and cyan still read as
+// "this row is special" rather than "this row is another set".
+static QColor animSetRowColorAt(int idx)
+{
+    if (idx < 0) return QColor(0xc8, 0xc8, 0xc8);
+    const QColor c = animSetColorAt(idx);
+    constexpr int kMix = 48;   // % of the way from the set hue toward plain text
+    auto blend = [](int a, int b) { return (a * (100 - kMix) + b * kMix) / 100; };
+    return QColor(blend(c.red(), 0xd0), blend(c.green(), 0xd0), blend(c.blue(), 0xd0));
+}
+
+// FNV-1a rather than qHash: Qt6 randomises the QString hash seed per process, so qHash would
+// repaint every set on each launch. Passing an explicit seed fixes that but still leaves the
+// mapping tied to the Qt version's hashing internals. Eight lines of arithmetic buy a colour that
+// is the same today, after a rebuild, and after a Qt upgrade.
+static int animSetPaletteIndex(const QString& setName)
+{
+    if (setName.isEmpty()) return -1;
+    quint32 h = 2166136261u;
+    for (const QChar& c : setName.toLower()) {
+        h ^= quint32(c.unicode() & 0xFF);
+        h *= 16777619u;
+    }
+    return int(h % quint32(kAnimSetColors));
+}
+
 void ModelsTab::populateAnimList(int sno, const QString& nameLower)
 {
     if (!m_anims) return;
@@ -5344,17 +5657,30 @@ void ModelsTab::populateAnimList(int sno, const QString& nameLower)
         if (sa != sb) return sa.compare(sb, Qt::CaseInsensitive) < 0;
         return a.compare(b, Qt::CaseInsensitive) < 0;
     });
+    // Hoisted: clipFamiliesFor can fall through to a bone-hash skeleton search, and the loop below
+    // runs once per row (758 on barM_base00).
+    const QStringList rowFams = clipFamiliesFor(sno, nameLower);
     QString curSet;   // header row inserted whenever the set changes
+    QHash<QString, int> setIdx;   // set → the palette slot its header settled on
+    int prevIdx = -2;             // palette slot of the previous block (-2 = none yet)
     for (const QString& r : rows) {
         const QString setName = m_clipSet.value(clipOf(r));
         if (setName != curSet) {   // group header (non-selectable, no export)
             curSet = setName;
+            // Hash first, then step off a collision with the block immediately above. Two ADJACENT
+            // blocks sharing a hue is the one failure that defeats the point of colouring them at
+            // all — they read as a single group. Everything else stays name-stable.
+            int idx = animSetPaletteIndex(setName);
+            if (idx >= 0 && idx == prevIdx) idx = (idx + 1) % kAnimSetColors;
+            prevIdx = idx;
+            setIdx.insert(setName, idx);
             auto* hdr = new QListWidgetItem(setName.isEmpty() ? QStringLiteral("— (ungrouped) —")
                                                               : QStringLiteral("— %1 —").arg(setName), m_anims);
             hdr->setFlags(Qt::NoItemFlags);   // not selectable/checkable → never exported or played
             QFont hf = hdr->font(); hf.setBold(true); hdr->setFont(hf);
-            hdr->setForeground(QColor(0x9a, 0x9a, 0x9a));   // AnimSet name = a section title, not
-            // state — neutral like every other header (gold stays for pulled/compatible clips).
+            // Coloured per set (was flat grey): the header is the key for the tinted rows beneath
+            // it, so the two have to be the same hue to read as one group.
+            hdr->setForeground(animSetColorAt(idx));
         }
         // Lead the row with the readable action (from the clip's snoPower) so the list scans as
         // "Walk / Idle / Attack / Get Hit…" instead of raw filenames. UserRole keeps the real clip id.
@@ -5366,6 +5692,9 @@ void ModelsTab::populateAnimList(int sno, const QString& nameLower)
         if (!action.isEmpty()) tip << QStringLiteral("Action: %1").arg(action);
         if (!setName.isEmpty()) tip << QStringLiteral("AnimSet: %1").arg(setName);
         if (m_femaleClips.contains(clipOf(r))) tip << QStringLiteral("Female-override variant");
+        // PRECEDENCE: state beats grouping. Gold and cyan say something about the ROW (where it
+        // came from, whether it is a guess); the set tint only says which block it belongs to. A
+        // row that is both pulled and in a set must read as pulled.
         if (pulledRows.contains(r)) {            // user explicitly pulled this from another model
             item->setForeground(QColor(0xd8, 0xa2, 0x3a));   // gold = manually pulled
             item->setData(Qt::UserRole + 1, true);           // marker: NOT one of this model's own clips
@@ -5374,6 +5703,24 @@ void ModelsTab::populateAnimList(int sno, const QString& nameLower)
             item->setForeground(QColor(0x6f, 0xb7, 0xd4));   // muted cyan = "compatible, unconfirmed"
             tip << QStringLiteral("Compatible with this model's skeleton — no explicit in-game "
                                   "assignment found (best-effort, may not actually play).");
+        } else {
+            item->setForeground(animSetRowColorAt(setIdx.value(setName, -1)));
+            // ownSet is m_animRowsBySno — the clips whose own snoAppearance names THIS model. A row
+            // outside it reached the list through an AnimSet its actors reference, matched on clip
+            // name only, which is where the in-game-cutscene clips come from. Worth saying on the
+            // row itself: this is the difference between the two "Original"/"AnimSet" export
+            // sources, and it is the reason a base-model export can come out far larger than the
+            // clip count suggests. See util/AnimExportScope.h.
+            // What decides whether a row is EXPORTED by "Original" is the clip-NAME family, not
+            // ownSet membership — ownSet is m_animRowsBySno, which is every clip this model's
+            // snoAppearance claims, in-family or not. Say which half the row falls in.
+            if (!clipInFamily(clipOf(r), rowFams))
+                tip << QStringLiteral("Named outside this model's family (cutscene / conversation) — "
+                                      "embedded only with Export ▸ Models ▸ \"Cutscene && "
+                                      "conversation clips\" ticked.");
+            else
+                tip << QStringLiteral("In this model's own clip family — embedded by "
+                                      "\"Original animations\".");
         }
         if (!tip.isEmpty()) item->setToolTip(tip.join(QLatin1Char('\n')));
     }
@@ -5383,9 +5730,24 @@ void ModelsTab::populateAnimList(int sno, const QString& nameLower)
         m_pullClearBtn->setEnabled(!m_pullSources.isEmpty() || (fallback && rows.size() > own.size()));
     setInfo(QStringLiteral("Animations"), QString::number(rows.size()));
     m_animCount = rows.size();   // outliner badge ("Animations · N") reads this at subtree build
-    if (m_animsHdr)
-        m_animsHdr->setText(rows.isEmpty() ? QStringLiteral("ANIMATIONS")
-                                           : QStringLiteral("ANIMATIONS · %1").arg(rows.size()));
+    // Both counts. The list total answers "what can this model reach"; the second answers "what
+    // would an export write right now" — different questions with very different answers (758 vs
+    // ~378 on barM_base00), and showing only the first is what made the export scope look broken.
+    if (m_animsHdr) {
+        if (rows.isEmpty()) {
+            m_animsHdr->setText(QStringLiteral("ANIMATIONS"));
+        } else {
+            const int willExport = plannedExportAnimNames().size();
+            m_animsHdr->setText(QStringLiteral("ANIMATIONS · %1  (%2 export)")
+                                    .arg(rows.size()).arg(willExport));
+            m_animsHdr->setToolTip(QStringLiteral(
+                "%1 clip(s) reachable from this model — everything the panel lists.\n"
+                "%2 would be embedded by an export right now, per Settings ▸ Export ▸ Models ▸ "
+                "\"Animations to embed\".\n\n"
+                "The list always shows everything; only the second number follows the export scope.")
+                    .arg(rows.size()).arg(willExport));
+        }
+    }
 }
 
 // Reverse-map appearance name → the AppearanceSet registries containing it (BarbF_Armor, …).
@@ -5715,12 +6077,31 @@ void ModelsTab::showAppearance(int sno, const QString& name)
                              QStringLiteral("Bounds"), QStringLiteral("LODs"),
                              QStringLiteral("Bones"), QStringLiteral("Actor"),
                              QStringLiteral("Physics"), QStringLiteral("Item facts"),
-                             QStringLiteral("Sets")})
+                             // "Sold in" clears here too. updateEntityInfo normally sets it
+                             // unconditionally, but its early return during the entity scan bails
+                             // BEFORE that line — so selecting model A then model B mid-scan left
+                             // B showing A's bundles. Every other key on that page already clears.
+                             QStringLiteral("Sold in"), QStringLiteral("Sets")})
         setInfo(k, QString());
 
     m_curSno = sno;
     m_curName = name;
     m_curGeo = ModelGeometry();
+    // Cleared HERE, not at the roster block further down, because two early returns sit between
+    // the two points (render blocklist, and no d4data dir). The roster now gets seated onto
+    // m_curGeo.primitives[].materialName, so leaving it stale meant selecting a blocklisted model
+    // after a normal one gave the NEW model the OLD model's material names — in the parts tree, the
+    // MATERIAL column, and the exported glTF. A short stale list applies partially, so .value()
+    // returning empty was never a guard.
+    m_appMatNames.clear();
+    m_soaNames.clear();
+    m_clothMats.clear();
+    m_fxMats.clear();
+    m_gibMats.clear();
+    // The BASE snapshot has to go with them. Clearing only the live roster still left m_haveBase
+    // set and m_baseGeo/m_baseMatNames holding the previous model, with its attachments still
+    // listed in the panel — ticking one re-assembled the OLD model under the NEW model's name.
+    resetAttachments();
     if (m_modelView) { m_modelView->clearGeometry(); m_modelView->setOverlayText(QString()); }
     if (m_exportBtn) m_exportBtn->setEnabled(false);
     setInfo(QStringLiteral("Filename"), QStringLiteral("%1 [%2]").arg(name).arg(sno));
@@ -5787,11 +6168,16 @@ void ModelsTab::showAppearance(int sno, const QString& name)
     if (d4.isEmpty())
         return;
     QFile f(QStringLiteral("%1/json/base/meta/Appearance/%2.app.json").arg(d4, name));
-    if (!f.open(QIODevice::ReadOnly))
-        return;
-
+    // NOT an early return, though it was one for a long time. Everything below — the material
+    // roster included — was unreachable for any appearance d4data has no JSON for, which is EVERY
+    // encrypted one. The meta-binary fallback further down was written for exactly those assets and
+    // could never run, so they loaded geometry and rendered white with no material, no bounds and
+    // no LOD facts. The JSON-only work is now scoped to the JSON; the rest always runs.
+    const bool hasJson = f.open(QIODevice::ReadOnly);
+    AppearanceInfo app;
+    if (hasJson) {
     const QByteArray appBytes = f.readAll();
-    const AppearanceInfo app = parseAppearanceJson(appBytes);
+    app = parseAppearanceJson(appBytes);
     setInfo(QStringLiteral("Format"), QStringLiteral("glTF (.glb)"));
     setInfo(QStringLiteral("Materials"), QString::number(app.materials.size()));
     // Structure facts (INFO page) — authored bounds, LOD ladder, base bone count, straight from
@@ -5832,15 +6218,12 @@ void ModelsTab::showAppearance(int sno, const QString& name)
             if (nb > 0) setInfo(QStringLiteral("Bones"), QString::number(nb));
         }
     }
+    }   // end hasJson
     // Material roster (real .mat names), indexed by the RAW ptAppearanceMaterials
     // position so it lines up with each primitive's materialIndex. (Rebuilt in the
     // raw parse loop below — parseAppearanceJson drops empties and flattens per-SOA,
     // which misaligns the index for multi-material models like Lilith.)
-    m_appMatNames.clear();
-    m_soaNames.clear();
-    m_clothMats.clear();
-    m_fxMats.clear();
-    m_gibMats.clear();
+    // Cleared at the top of this function, before the early returns — see there.
 
     // Looks table (INDEX | HASH HEX | HASH DEC | NAME). Hashes unavailable from the
     // .app.json look list, so those cells are left blank.
@@ -5950,6 +6333,46 @@ void ModelsTab::showAppearance(int sno, const QString& name)
                     new QStandardItem(m_clothMats.contains(midx) ? QStringLiteral("yes")
                                                                  : QString())});
             }
+        } else if (m_reader && m_reader->isReady()) {
+            // No .app.json — which is the NORMAL case for encrypted content, not an edge case: the
+            // whole material chain above is JSON-only, so every encrypted appearance arrived here
+            // with an empty roster and rendered untextured white. The binary roster that fixes it
+            // has existed since the Wardrobe needed it (WardrobeTab2.cpp:7335); the Models tab was
+            // simply never wired to it, so the same asset textured in one tab and not the other.
+            //
+            // d4data lagging the game produces the identical symptom for anything newer than the
+            // snapshot, so this is not only about encryption.
+            const QByteArray meta = m_reader->readMetaBySno(quint64(sno));
+            QString why;
+            const QStringList roster = MaterialDecode::appearanceRosterFromMeta(meta, m_index, &why);
+            for (const QString& matName : roster) {
+                m_appMatNames.append(matName);
+                m_soaNames.append(QVector<QString>{matName});   // no look table without the JSON
+                if (matName.contains(QLatin1String("fx"), Qt::CaseInsensitive)
+                    || matName.contains(QLatin1String("effect"), Qt::CaseInsensitive)
+                    || matName.contains(QLatin1String("glow"), Qt::CaseInsensitive))
+                    m_fxMats.insert(mi);
+                if (matName.contains(QLatin1String("gib"), Qt::CaseInsensitive)
+                    || matName.contains(QLatin1String("gore"), Qt::CaseInsensitive)
+                    || matName.contains(QLatin1String("flesh"), Qt::CaseInsensitive)
+                    || matName.contains(QLatin1String("viscera"), Qt::CaseInsensitive))
+                    m_gibMats.insert(mi);
+                // Cloth is flagged from the name here rather than from snoCloth, which lives in the
+                // JSON we do not have. Only affects the SIM toggle's classification, never the
+                // geometry: a cloth part still renders, it is just grouped by name.
+                if (matName.contains(QLatin1String("_sim"), Qt::CaseInsensitive)
+                    || matName.contains(QLatin1String("cloth"), Qt::CaseInsensitive))
+                    m_clothMats.insert(mi);
+                const qint64 ms = MaterialDecode::snoForMaterial(matName);
+                if (ms > 0) matBySno.insert(int(ms), matName);
+                ++mi;
+            }
+            // Logged whether or not it worked. The previous round logged only the success case, so a
+            // silent empty roster looked exactly like the code never running — which cost a build to
+            // find out. A path that can fail must say so.
+            qInfo().noquote() << QStringLiteral("ModelsTab: sno %1 has no .app.json — meta roster: "
+                                                "%2 entries [%3]")
+                                     .arg(sno).arg(roster.size()).arg(why);
         }
         Q_UNUSED(row);
     }
@@ -5958,7 +6381,74 @@ void ModelsTab::showAppearance(int sno, const QString& name)
         m_matListModel->appendRow(QList<QStandardItem*>{
             new QStandardItem(QString::number(it.key())),
             new QStandardItem(it.value())});
+    // Auto-select the first material when the App Materials table has nothing to offer, so the
+    // SHADING / TEXTURE PREVIEW panels fill in on load instead of waiting for a click that has no
+    // row to land on. Encrypted appearances are exactly this case.
+    // Stage breadcrumbs across the one window the crash logs kept dying in. Both existing sentinels
+    // (models/loadGuard and model_render.guard) were CLEAR after the last crash, which rules out the
+    // geometry load and the icon renderer and leaves exactly this stretch — the panel fill — where
+    // nothing was instrumented. Three lines per model load, and the last one printed is the stage
+    // that died.
+    const bool autoPick = (m_matModel && m_matModel->rowCount() == 0
+                           && m_matListModel->rowCount() > 0 && m_matListView);
+    qInfo("appearance %d: panel fill — %d material(s) by sno, auto-select %s",
+          sno, m_matListModel->rowCount(), autoPick ? "YES" : "no");
+    if (autoPick) {
+        // Fills SHADING and, via showMaterialChannels, decodes up to six textures inline on the GUI
+        // thread. Encrypted appearances are exactly this case.
+        //
+        // SEH-guarded, because this is a decode path and convention 8 says decode paths are guarded
+        // — this one was not, and it was the last unguarded stretch of the model load. The
+        // breadcrumbs proved it: for druF_stor235_TRS the "panel fill" line printed and the
+        // "material selected" line never did, while both existing sentinels (models/loadGuard and
+        // model_render.guard) were clear. A fault here took the whole tool down and left no record.
+        //
+        // m_decodingTexSno names the texture that was in the decoder when it died, so a fault is
+        // actionable instead of just "somewhere in the panel fill".
+        seh::HardwareFault fault;
+        m_decodingTexSno = 0;
+        const bool ok = seh::runGuarded("panelfill", [&]() { m_matListView->selectRow(0); }, &fault);
+        if (ok) {
+            qInfo("appearance %d: panel fill — material selected, textures decoded", sno);
+        } else {
+            qWarning("appearance %d: panel fill FAULTED (%s) while decoding texture sno %d — "
+                     "panels left empty, tool kept running", sno,
+                     fault.what.isEmpty() ? "unknown" : qPrintable(fault.what), m_decodingTexSno);
+            clearTexturePreview();
+        }
+        m_decodingTexSno = 0;
+    }
     updateTabCounts();
+    qInfo("appearance %d: panel fill — done", sno);
+
+    // ── D4_DUMP_ICONH=1: locate the inventory-icon HANDLE inside the appearance META binary ──────
+    // Why encrypted items show no original icon today: originalIcon() asks AppearanceMeta, which is
+    // crawled from d4data's .app.json — and an encrypted appearance has none. The existing CASC
+    // fallback goes Item -> Actor -> Appearance, which is a MEASURED dead end (all seven classes'
+    // chest items resolve to appearance 217477, the proxy body), and the icon audit bears that out:
+    // 8,654 appearances covered, exactly 1 recovered through CASC.
+    //
+    // The handle is very likely in the appearance's own meta binary, next to the material roster we
+    // already parse from it. This finds out the same way the material table was found, rather than
+    // guessing an offset: for a NAMED appearance the handle is already known, so its u32 is searched
+    // for in the blob and every hit reported. A constant offset across many samples is the field;
+    // anything less is not an answer and must not be treated as one.
+    if (qEnvironmentVariableIsSet("D4_DUMP_ICONH") && m_reader && m_reader->isReady()
+        && AppearanceMeta::instance().ready()) {
+        const quint32 want = AppearanceMeta::instance().iconFor(sno);
+        if (want) {   // only named appearances have ground truth to search for
+            const QByteArray meta = m_reader->readMetaBySno(quint64(sno));
+            QStringList offs;
+            for (int off = 0; off + 4 <= meta.size() && offs.size() < 8; ++off) {
+                const quint32 v = quint32(uchar(meta[off])) | quint32(uchar(meta[off + 1])) << 8
+                                | quint32(uchar(meta[off + 2])) << 16 | quint32(uchar(meta[off + 3])) << 24;
+                if (v == want) offs << QStringLiteral("0x%1").arg(off, 0, 16);
+            }
+            qInfo("icon-probe: appearance %d handle 0x%08x in %lld-byte meta -> %s",
+                  sno, want, qint64(meta.size()),
+                  offs.isEmpty() ? "ABSENT" : qPrintable(offs.join(QLatin1Char(' '))));
+        }
+    }
 
     // ── D4_DUMP_MATSNO=1: locate the material-sno table inside the appearance META binary ────
     // Encrypted appearances have no .app.json, so the entire material chain above is unavailable
@@ -6686,7 +7176,12 @@ void ModelsTab::showPartContextMenu(int part, const QPoint& gp)
     if (part >= 0 && part < m_curGeo.primitives.size()) {
         QHash<int, bool> checks; m_treeModel->partChecks(checks);
         in.part         = part;
-        in.partName     = m_curGeo.primitives[part].materialName;
+        // The ROSTER name (barF_base00_TRS_mat), which is what the outliner and the sub-object
+        // table display. MeshPrimitive::materialName is the parser's placeholder "Material_<n>"
+        // until something overwrites it, so copying that handed you a string you never saw on
+        // screen. Fall back to it only when the roster has no entry for this index.
+        in.partName     = m_appMatNames.value(m_curGeo.primitives[part].materialIndex);
+        if (in.partName.isEmpty()) in.partName = m_curGeo.primitives[part].materialName;
         in.partFileName = in.partName;
         in.partTris     = m_modelView->partTriangles(part);
         in.visible      = checks.value(part, true);
@@ -6853,15 +7348,37 @@ void ModelsTab::showMaterialTextures(const QString& materialName)
                                 : " — textures read from the meta binary; values/shaders unavailable");
         for (const MatTexture& t : texs) {
             if (t.texSno <= 0) continue;
+            // The material binary carries SNOs and no names, so this used to print
+            // "~unnamed_<sno>" for every texture — including ones the index can name perfectly
+            // well from the encrypted name dictionaries. The Textures tab showed
+            // "DruM_stor235_HLM_Color" while this panel showed "~unnamed_2334281" for the SAME
+            // asset, which reads as the tool having resolved the wrong textures when the SNOs were
+            // right all along. Ask the index before falling back to the placeholder.
+            QString shown = t.texName;
+            if (shown.isEmpty() && m_index)
+                shown = m_index->nameForSno(kGroupTextureId(), int(t.texSno));
+            if (shown.isEmpty()) shown = QStringLiteral("~unnamed_%1").arg(t.texSno);
             // Column order is SHADERTEX, SNO, NAME (set at :2697) — not role/name/sno.
             m_matTexModel->appendRow(QList<QStandardItem*>{
                 new QStandardItem(t.role),
                 new QStandardItem(QString::number(t.texSno)),
-                new QStandardItem(t.texName.isEmpty()
-                                      ? QStringLiteral("~unnamed_%1").arg(t.texSno)
-                                      : t.texName) });
+                new QStandardItem(shown) });
         }
         updateTabCounts();
+        // THE bug behind "encrypted models are untextured". The .mat.json branch below ends with
+        // showMaterialChannels(); this branch returned without it, so the six TEXTURE PREVIEW tiles
+        // kept the "—" that clearTexturePreview() set at the top of this function, and the viewport
+        // never got a base colour either.
+        //
+        // It presented as a decode failure and was not one. SHADING listed all sixteen textures with
+        // correct SNOs, so the roster was right; the tiles were empty because NOTHING EVER ASKED for
+        // a decode — which is also why no warning was ever logged, and why three separate fixes to
+        // the decode path changed nothing. D4_DUMP_TEX settled it: every one of this helmet's
+        // textures decodes fine on demand (512x512, 1024x1024, …), while decodeTexImage was never
+        // called once.
+        //
+        // Every encrypted material takes this branch, because an encrypted material has no .mat.json.
+        showMaterialChannels();
         return;
     }
     const QByteArray data = f.readAll();
@@ -6924,8 +7441,18 @@ void ModelsTab::showMaterialTextures(const QString& materialName)
         auto* sno = new QStandardItem;
         sno->setData(double(texs[r].texSno), Qt::DisplayRole);            // SNO
         m_matTexModel->setItem(r, 1, sno);
-        m_matTexModel->setItem(r, 2, new QStandardItem(texs[r].texName)); // NAME
-        if (texs[r].role == QLatin1String("BASE_COLOR") && !texs[r].texName.isEmpty())
+        // Through the same index lookup the encrypted branch uses: a JSON material can carry a
+        // blank name too, and a blank NAME cell is what made correct textures look wrong.
+        QString shownJ = texs[r].texName;
+        if (shownJ.isEmpty() && m_index)
+            shownJ = m_index->nameForSno(kGroupTextureId(), int(texs[r].texSno));
+        if (shownJ.isEmpty() && texs[r].texSno > 0)
+            shownJ = QStringLiteral("~unnamed_%1").arg(texs[r].texSno);
+        m_matTexModel->setItem(r, 2, new QStandardItem(shownJ));          // NAME
+        // By SNO. Name-based, this flagged "no base texture - renders black" for a material whose
+        // base colour resolves and renders perfectly, because baseColorForMaterial is sno-keyed
+        // and this was not. The warning row contradicted the viewport.
+        if (texs[r].role == QLatin1String("BASE_COLOR") && texs[r].texSno > 0)
             hasBase = true;
     }
     // No base-colour texture → the model renders this material BLACK (no borrowed
@@ -6936,6 +7463,11 @@ void ModelsTab::showMaterialTextures(const QString& materialName)
         auto* note = new QStandardItem(QStringLiteral("⚠ FALLBACK"));
         note->setForeground(QBrush(QColor(0xd8, 0xa2, 0x3a)));
         m_matTexModel->setItem(r, 0, note);
+        // Column 1 too, even though it holds nothing meaningful. Leaving a hole in the middle of a
+        // row makes every reader of this table responsible for null-checking it, and one of them
+        // (showMaterialChannels) was not — a null deref that killed the tool. A complete row costs
+        // one allocation; an incomplete one costs a crash in whichever reader forgets.
+        m_matTexModel->setItem(r, 1, new QStandardItem);
         m_matTexModel->setItem(r, 2,
             new QStandardItem(QStringLiteral("no base texture — renders black")));
     }
@@ -7046,18 +7578,126 @@ AnimParser::DecodedAnim ModelsTab::decodeAnimByName(const QString& animName) con
 // A model's clip NAMES (own + inherited base-rig, deduped) from the animation index — the batch
 // export's clip lister, so "include all animations" works for models that were never LOADED in
 // the viewport. Requires the anim index (ensureAnimatedIndex) to have completed.
-QStringList ModelsTab::animClipsFor(int sno, const QString& nameLower) const
+// Row list → clip names, deduped and sorted. Rows are "clip  ·  extra".
+static QStringList clipNamesOf(const QStringList& rows)
 {
-    QStringList rows = m_animRowsBySno.value(sno);                 // directly-owned clips
-    const QString fam = animLongestFamily(nameLower, m_animFamilyPrefixes);
-    if (!fam.isEmpty())
-        for (const QString& r : m_animFamilyRows.value(fam))       // + inherited base-rig clips
-            if (!rows.contains(r)) rows << r;
     QStringList names;
     for (const QString& r : rows) {
         const QString nm = r.section(QStringLiteral("  ·  "), 0, 0);
         if (!nm.isEmpty() && !names.contains(nm)) names << nm;
     }
+    names.sort();
+    return names;
+}
+
+// ── Two halves of ONE authoritative set ─────────────────────────────────────────────────────────
+// MEASURED, not reasoned about (barM_base00, sno 218797, parsed straight out of anim_index.bin):
+//
+//   758 clips declare barM_base00 as their snoAppearance. They split cleanly by NAME:
+//
+//       378  barM_*                     gameplay, emotes, wardrobe, UI poses
+//       380  IGC_*, Conv_*, …           in-game cutscene and conversation performances
+//
+// That name split is the whole distinction, and it is why the Wardrobe tab reports 378 for this
+// body: WardrobeTab2::scanFor pre-filters on the filename prefix before it ever checks
+// snoAppearance. Nothing about reference POSITION separates them — an earlier attempt to split on
+// first-vs-any snoAppearance produced two identical sets, because no shipped clip names more
+// than one appearance.
+//
+// authoredAnimClips() takes the in-family half; setAnimClips() takes the complement. Disjoint, and
+// together they are everything the data attributes to this model.
+QStringList ModelsTab::authoredAnimClips(int sno, const QString& nameLower) const
+{
+    const QStringList all = clipNamesOf(m_animRowsBySno.value(sno));
+    const QStringList fams = clipFamiliesFor(sno, nameLower);
+    // Unresolvable family → keep the whole set. This is a REFINEMENT of an already-authoritative
+    // list, not an expansion of a speculative one: failing closed here would mean exporting
+    // nothing. (The fail-closed rule applies to expansions — see modelAnimRows, where an unknown
+    // family must expand NOTHING.)
+    if (fams.isEmpty()) return all;
+
+    QStringList out;
+    QSet<QString> have;
+    auto add = [&](const QString& nm) {
+        if (nm.isEmpty() || have.contains(nm)) return;
+        have.insert(nm);
+        out << nm;
+    };
+    for (const QString& nm : all)
+        if (clipInFamily(nm, fams)) add(nm);
+
+    // The clips of the AnimSets the game assigns to this appearance's ACTORS, filtered to the same
+    // family. This belongs HERE, not in setAnimClips: it is how a gear piece or a prop — which owns
+    // no .ani.json rows of its own — gets any animation at all. Moving it to the opt-in source made
+    // every such model export with zero clips by default, and put in-family clips behind a checkbox
+    // labelled "named outside this model's family". m_apprSets is usually empty for a BASE rig (the
+    // player body is applied at runtime, so no Actor references it), which is why this line does
+    // nothing for barM_base00 and everything for barM_stor191_LEG.
+    const QStringList authSets = m_apprSets.value(sno);
+    if (!authSets.isEmpty()) {
+        QStringList rows;
+        for (const QString& sn : authSets)
+            for (const QString& r : m_setClips.value(sn)) {
+                const QString clip = r.section(QStringLiteral("  ·  "), 0, 0).toLower();
+                if (clipInFamily(clip, fams) && !rows.contains(r)) rows << r;
+            }
+        for (const QString& nm : clipNamesOf(rows)) add(nm);
+    }
+    out.sort();
+    return out;
+}
+
+// The complement: clips this model's snoAppearance claims but whose NAME is outside its family —
+// the IGC_* / Conv_* cutscene and conversation performances. Disjoint from authoredAnimClips() by
+// the same predicate, so ticking both can never double-count.
+QStringList ModelsTab::setAnimClips(int sno, const QString& nameLower) const
+{
+    const QStringList fams = clipFamiliesFor(sno, nameLower);
+    if (fams.isEmpty()) return {};   // no family → authoredAnimClips already returned everything
+    QStringList out;
+    for (const QString& nm : clipNamesOf(m_animRowsBySno.value(sno)))
+        if (!clipInFamily(nm, fams)) out << nm;
+    return out;
+}
+
+// Authored ∪ complement. NOT an export source — it exists only as the dedup baseline for
+// baseAnimClips, so a clip supplied by either of those two is never counted a second time as
+// "base". It does NOT keep out-of-family clips out of `base`: m_animFamilyRows is built from
+// m_animRowsBySno without a name filter, so a family's rows include its IGC_/Conv_ clips too.
+QStringList ModelsTab::ownAnimClips(int sno, const QString& nameLower) const
+{
+    QStringList names = authoredAnimClips(sno, nameLower);
+    for (const QString& nm : setAnimClips(sno, nameLower))
+        if (!names.contains(nm)) names << nm;
+    names.sort();
+    return names;
+}
+
+// The base-rig clips this model INHERITS — sorF_base00's clips for sorF_stor191_LEG, reached
+// through the model's longest matching animation family. Excludes anything already returned by
+// ownAnimClips, so "original" always wins and the two sets never double-count.
+QStringList ModelsTab::baseAnimClips(int sno, const QString& nameLower) const
+{
+    const QString fam = animLongestFamily(nameLower, m_animFamilyPrefixes);
+    if (fam.isEmpty()) return {};
+    const QStringList own = ownAnimClips(sno, nameLower);
+    QStringList out;
+    for (const QString& nm : clipNamesOf(m_animFamilyRows.value(fam)))
+        if (!own.contains(nm)) out << nm;
+    return out;
+}
+
+QStringList ModelsTab::animClipsFor(int sno, const QString& nameLower,
+                                    bool wantOriginal, bool wantSets, bool wantBase) const
+{
+    QStringList names;
+    if (wantOriginal) names = authoredAnimClips(sno, nameLower);
+    if (wantSets)
+        for (const QString& nm : setAnimClips(sno, nameLower))
+            if (!names.contains(nm)) names << nm;
+    if (wantBase)
+        for (const QString& nm : baseAnimClips(sno, nameLower))
+            if (!names.contains(nm)) names << nm;
     names.sort();
     return names;
 }
@@ -7105,50 +7745,128 @@ AnimParser::DecodedAnim ModelsTab::decodeAnimForSkeleton(const QString& animName
     return out;
 }
 
-// Gather the animations to embed on export. Priority: an explicit multi-selection in the
-// ANIMATIONS list wins; else the export/animScope setting (0 = only the playing clip,
-// 1 = every clip for the current model). Current-model only.
-void ModelsTab::collectExportAnims(QVector<AnimParser::DecodedAnim>& anims, QStringList& names) const
+// The clip names an export WOULD embed, without decoding any of them. Cheap enough to call from a
+// menu-label refresh, and it is the SINGLE definition of "what will be exported" — collectExportAnims
+// below decodes exactly this list. The panel count and the menu count therefore cannot disagree with
+// the file, which is the failure this whole area kept producing: the ANIMATIONS panel says 758
+// because it shows everything the model can reach, while an export with only "Original" ticked
+// writes far fewer, and nothing on screen said so.
+QStringList ModelsTab::plannedExportAnimNames(bool ignoreSelection) const
 {
-    if (m_anims && m_anims->selectedItems().size() > 1) {   // exactly the ctrl/shift-selected clips
-        for (const QListWidgetItem* it : m_anims->selectedItems()) {
-            const QString nm = it->data(Qt::UserRole).toString();
-            const AnimParser::DecodedAnim a = decodeAnimByName(nm);
-            if (a.valid && !a.bones.isEmpty()) { anims << a; names << nm; }
-        }
-        if (!anims.isEmpty()) return;
+    QStringList names;
+    QSet<QString> seen;   // not names.contains() — this runs over ~750 clips on every menu open
+    auto add = [&](const QString& nm) {
+        if (nm.isEmpty() || seen.contains(nm)) return;
+        seen.insert(nm);
+        names << nm;
+    };
+
+    // An explicit multi-selection in the list wins outright — asking for specific clips is
+    // unambiguous and should not be second-guessed by a setting.
+    if (!ignoreSelection && m_anims && m_anims->selectedItems().size() > 1) {
+        for (const QListWidgetItem* it : m_anims->selectedItems())
+            add(it->data(Qt::UserRole).toString());
+        if (!names.isEmpty()) return names;
     }
-    if (QSettings().value(QStringLiteral("export/animScope"), 0).toInt() == 1) {
-        // Every TRUE clip the model owns/inherits, taken from the ANIMATIONS list (m_anims is
-        // populated on load in BOTH the authoritative and pre-scan states). The old path read
-        // m_animCache, but that cache is cleared once the authoritative anim index finishes its
-        // scan — so "all clips" silently exported nothing after the scan completed.
-        if (m_anims) {
-            for (int i = 0; i < m_anims->count(); ++i) {
-                const QListWidgetItem* it = m_anims->item(i);
-                if (it->flags() == Qt::NoItemFlags) continue;         // group-header row
-                if (it->data(Qt::UserRole + 1).toBool()) continue;    // pulled row (added below if enabled)
-                const QString nm = it->data(Qt::UserRole).toString();
-                if (nm.isEmpty() || names.contains(nm)) continue;
-                const AnimParser::DecodedAnim a = decodeAnimByName(nm);
-                if (a.valid && !a.bones.isEmpty()) { anims << a; names << nm; }
-            }
+
+    // The five independent sources (util/AnimExportScope.h). Each is additive and deduped by clip
+    // name, so ticking more can only ever ADD clips — no combination silently subtracts.
+    //
+    // Resolved from the DATA (authoredAnimClips / setAnimClips / baseAnimClips), not by walking the
+    // ANIMATIONS list. The list was the old source for "all", and it carries the unconfirmed
+    // skeleton-guess rows, so the interactive export embedded guessed clips while the batch export
+    // of the very same model did not. One setting must not have two answers.
+    const AnimExportScope sc = AnimExportScope::load();
+    const QString nameLower = apprNameForSno(m_curSno).toLower();
+    // ── Per-clip filters ────────────────────────────────────────────────────────────────────────
+    // Applied to the DATA-DERIVED sources only. `previewed` and `pulled` are things you did on
+    // purpose — playing a clip, or pulling one from another model — and the same rule that lets a
+    // multi-selection override the scope applies here: an explicit choice is never filtered out
+    // from under you. Sources answer "which clips belong to this model"; filters answer "which of
+    // those do I actually want in the file", and the second question only makes sense for a set
+    // you did not hand-pick.
+    const AnimClipFilter cf = AnimClipFilter::load();
+    QHash<QString, int> frames;
+    if (cf.maxFrames > 0) frames = clipFrameMap(m_curSno, nameLower);
+    int droppedLen = 0, droppedPat = 0;
+    auto addFiltered = [&](const QString& nm) {
+        if (nm.isEmpty() || seen.contains(nm)) return;
+        if (cf.excludes(nm))                       { ++droppedPat; return; }
+        if (cf.maxFrames > 0) {
+            const int f = frames.value(nm, 0);     // unknown length is never dropped — fail open
+            if (f > cf.maxFrames)                  { ++droppedLen; return; }
         }
-    } else if (m_curAnim.valid && !m_playingAnim.isEmpty()) {
-        anims << m_curAnim; names << m_playingAnim;
-    }
-    // Pulled clips (manually retargeted from another model — the gold rows). Included when the export
-    // setting is on, on top of whatever scope produced above, deduped by clip name.
-    if (m_anims && QSettings().value(QStringLiteral("export/includePulledAnims"), false).toBool()) {
+        add(nm);
+    };
+
+    if (sc.previewed && m_curAnim.valid && !m_playingAnim.isEmpty()) add(m_playingAnim);
+    if (sc.original) for (const QString& nm : authoredAnimClips(m_curSno, nameLower)) addFiltered(nm);
+    if (sc.sets)     for (const QString& nm : setAnimClips(m_curSno, nameLower))    addFiltered(nm);
+    if (sc.base)     for (const QString& nm : baseAnimClips(m_curSno, nameLower))   addFiltered(nm);
+    // Pulled clips (manually retargeted from another model — the gold rows in the list). These
+    // exist ONLY as list state, so this one is still a list walk, correctly.
+    if (sc.pulled && m_anims)
         for (int i = 0; i < m_anims->count(); ++i) {
             const QListWidgetItem* it = m_anims->item(i);
-            if (!it->data(Qt::UserRole + 1).toBool()) continue;   // only the "pulled" rows
-            const QString nm = it->data(Qt::UserRole).toString();
+            if (it->data(Qt::UserRole + 1).toBool()) add(it->data(Qt::UserRole).toString());
+        }
+    if (droppedLen || droppedPat)
+        qInfo("export anims: filters dropped %d clip(s) over %d frames, %d by name pattern",
+              droppedLen, cf.maxFrames, droppedPat);
+    return names;
+}
+
+// clip name -> keyframe count, for the length filter. Built from the row strings this model can
+// reach ("name  ·  N frames"), which the anim index already carries — so no extra parse and no
+// cache-format change. Only built when the length filter is actually on.
+QHash<QString, int> ModelsTab::clipFrameMap(int sno, const QString& nameLower) const
+{
+    QHash<QString, int> out;
+    auto absorb = [&out](const QStringList& rows) {
+        for (const QString& r : rows) {
+            const int sep = r.indexOf(QStringLiteral("  ·  "));
+            if (sep <= 0) continue;
+            const QString nm = r.left(sep);
+            if (out.contains(nm)) continue;
+            const QString tail = r.mid(sep + 5);            // "N frames"
+            const int sp = tail.indexOf(QLatin1Char(' '));
+            if (sp <= 0) continue;
+            bool ok = false;
+            const int n = tail.left(sp).toInt(&ok);
+            if (ok) out.insert(nm, n);
+        }
+    };
+    absorb(m_animRowsBySno.value(sno));                                   // original + sets
+    const QString fam = animLongestFamily(nameLower, m_animFamilyPrefixes);
+    if (!fam.isEmpty()) absorb(m_animFamilyRows.value(fam));              // base
+    for (const QString& sn : m_apprSets.value(sno)) absorb(m_setClips.value(sn));
+    return out;
+}
+
+// Gather the animations to embed on export. Decodes exactly what plannedExportAnimNames() lists.
+void ModelsTab::collectExportAnims(QVector<AnimParser::DecodedAnim>& anims, QStringList& names) const
+{
+    const AnimExportScope sc = AnimExportScope::load();
+    const bool multi = m_anims && m_anims->selectedItems().size() > 1;
+    auto decodeInto = [&](const QStringList& want) {
+        for (const QString& nm : want) {
             if (nm.isEmpty() || names.contains(nm)) continue;
+            // The previewed clip is already decoded and sitting in m_curAnim — reuse it.
+            if (sc.previewed && nm == m_playingAnim && m_curAnim.valid) {
+                anims << m_curAnim; names << nm; continue;
+            }
             const AnimParser::DecodedAnim a = decodeAnimByName(nm);
             if (a.valid && !a.bones.isEmpty()) { anims << a; names << nm; }
         }
-    }
+    };
+    decodeInto(plannedExportAnimNames());
+    // A multi-selection whose clips all failed to decode falls through to the scope, as before.
+    if (anims.isEmpty() && multi) decodeInto(plannedExportAnimNames(/*ignoreSelection=*/true));
+
+    // Say what happened. "Anim was on and the file has no clips" is otherwise indistinguishable
+    // from a decode failure, and this pipeline has shipped that ambiguity before.
+    qInfo("export anims: scope=%s → %lld clip(s) for %s",
+          qUtf8Printable(sc.describe()), qint64(names.size()), qUtf8Printable(apprNameForSno(m_curSno).toLower()));
 }
 
 // (exportAnimationsOnly() moved to ModelsTab_Export.cpp)
@@ -7353,6 +8071,18 @@ void ModelsTab::applyLoadedGeometry(std::shared_ptr<ModelGeometry> geo, int toke
     if (m_curSno > 0 && m_noRenderSnos.remove(m_curSno) && m_listModel) m_listModel->refreshIconForSno(m_curSno);
     m_curGeo = *geo;   // COPY, not move: geo is shared with m_geoCache, so it must stay intact
                        // (QVector members are copy-on-write, so this stays cheap in practice)
+    // Seat the roster onto the primitives. ModelParser can only name a primitive "Material_<n>"
+    // from the binary — the real name lives in the roster, keyed by materialIndex. The Wardrobe and
+    // Stable tabs both do exactly this (WardrobeTab2.cpp:7340, StableTab2.cpp:1863); the Models tab
+    // never did, which is why the same asset shows material names in one tab and a blank MATERIAL
+    // column, "part 7"-style part names, and Material_7 in exported glTF in the other.
+    //
+    // Textures were never routed through this field (they go via m_appMatNames), so this is about
+    // the parts tree, the export, and the material readout — not the render.
+    for (MeshPrimitive& p : m_curGeo.primitives) {
+        const QString rn = m_appMatNames.value(p.materialIndex);
+        if (!rn.isEmpty()) p.materialName = rn;
+    }
     // Rig hardpoints (attach sockets) for the viewport overlay — read once per load from the
     // appearance .app.json (needs the parsed skeleton, which is in m_curGeo now).
     Hardpoints::readInto(m_curGeo, QStringLiteral("%1/json/base/meta/Appearance/%2.app.json")
@@ -8342,6 +9072,13 @@ void ModelsTab::applyLook(int look)
 // Settings dialog changed them). Block signals so the resync doesn't rewrite the keys.
 void ModelsTab::onSettingsChanged()
 {
+    // The ANIMATIONS header carries an "(N export)" count that follows the export scope, so a
+    // change to "Animations to embed" has to re-run the list — otherwise the panel keeps showing
+    // the previous number and the panel and the file disagree, which is the exact failure that
+    // count was added to end.
+    if (m_curSno >= 0 && m_animatedScanned && m_anims)
+        populateAnimList(m_curSno, m_curName.toLower());
+
     // "Fill skin" toggled → re-decode the loaded model's part textures with/without the body-skin
     // substitution. Cache keys are per material name, so no invalidation is needed — the two
     // states simply decode different materials.
@@ -8399,13 +9136,30 @@ void ModelsTab::onSettingsChanged()
 
 // SNOs of the current selection, or — if the right-clicked row isn't selected —
 // just that row. Used by the list context menus.
-QList<int> ModelsTab::contextSnos(const QPoint& viewportPt) const
+int ModelsTab::clickedSno(QAbstractItemView* view, const QPoint& viewportPt,
+                          const QList<int>& fallback) const
+{
+    if (view && m_listModel) {
+        const QModelIndex hit = view->indexAt(viewportPt);
+        if (hit.isValid() && !hit.parent().isValid())
+            if (const SnoEntry* e = m_listModel->entryAt(hit.row())) return e->snoId;
+    }
+    return fallback.isEmpty() ? -1 : fallback.first();
+}
+
+QList<int> ModelsTab::contextSnos(QAbstractItemView* view, const QPoint& viewportPt) const
 {
     QList<int> snos;
-    const QModelIndex hit = m_list->indexAt(viewportPt);
+    // The VIEW is a parameter because this used to hard-code m_list while the grid handler passed
+    // it m_gridView's viewport coordinates. List rows are ~18 px and single-column; grid cells are
+    // ~122 px and multi-column, and m_list keeps its geometry while hidden in the stack — so
+    // indexAt() returned a plausible, wrong row and every copy/export action in Grid mode operated
+    // on a different model than the one highlighted.
+    if (!view || !view->selectionModel()) return snos;
+    const QModelIndex hit = view->indexAt(viewportPt);
     if (hit.isValid() && hit.parent().isValid())
         return snos;   // right-clicked a subtree node — its row number is NOT a browse row
-    QModelIndexList sel = m_list->selectionModel()->selectedRows();
+    QModelIndexList sel = view->selectionModel()->selectedRows();
     // Same aliasing hazard for the selection: keep only top-level (browse) rows.
     sel.erase(std::remove_if(sel.begin(), sel.end(),
                              [](const QModelIndex& i) { return i.parent().isValid(); }),
@@ -8702,8 +9456,13 @@ void ModelsTab::onMatTexSelected()
     const QModelIndex cur = m_matTex->currentIndex();
     if (!cur.isValid())
         return;
-    const QString texName = m_matTexModel->item(cur.row(), 2)->text();          // NAME
-    const int texSno = m_matTexModel->item(cur.row(), 1)->data(Qt::DisplayRole).toInt();  // SNO
+    // Null-checked for the same reason as showMaterialChannels: the "⚠ FALLBACK" row is a note,
+    // not a texture, and clicking it would have dereferenced a null column-1 item.
+    QStandardItem* snoIt  = m_matTexModel->item(cur.row(), 1);
+    QStandardItem* nameIt = m_matTexModel->item(cur.row(), 2);
+    if (!snoIt) { clearTexturePreview(); return; }
+    const QString texName = nameIt ? nameIt->text() : QString();                 // NAME
+    const int texSno = snoIt->data(Qt::DisplayRole).toInt();                     // SNO
     previewTexture(texName, texSno);
 }
 
@@ -8735,15 +9494,21 @@ void ModelsTab::previewTexture(const QString& texName, int texSno)
     static const char* const kTexCaps[6] = {"RGBA", "R", "G", "B", "A", ""};
     setTileCaptions(kTexCaps);
     clearTexturePreview();
-    if (texName.isEmpty())
+    // By SNO. onMatTexSelected was hardened to null-check the row and forward a valid sno, and then
+    // this threw it away on a name test — so clicking a texture whose name is blank (every encrypted
+    // one, and a JSON material can omit one too) left all five channel tiles empty.
+    if (texSno <= 0)
         return;
     // Texture facts under the tiles: dimensions, mip chain, raw format id (cheap meta re-read).
     if (m_texFacts) {
         m_texFacts->clear();
-        QFile mf(QStringLiteral("%1/json/base/meta/Texture/%2.tex.json")
-                     .arg(Config::d4dataDir(), texName));
-        if (mf.open(QIODevice::ReadOnly)) {
-            const TexMeta meta = parseTexMetaJson(mf.readAll());
+        // texMetaFor, not a raw JSON read: same reason as decodeTexImage — an encrypted texture
+        // has no .tex.json, so the facts line stayed blank for exactly the textures whose
+        // dimensions you most want to confirm. mipMin/mipMax/faceCount are JSON-only fields and
+        // read 0/1 on the CASC route, which is honest: the bulk tables do not carry them.
+        {
+            const TexMeta meta =
+                TexturesTab::texMetaFor(m_reader, Config::d4dataDir(), texName, texSno);
             if (meta.valid) {
                 // Human codec name via the tool's own table — it already formats as "BC7 (50)"
                 // (or "Unknown (n)"), so no id juggling here. "format 43" meant nothing.
@@ -8992,7 +9757,11 @@ bool ModelsTab::eventFilter(QObject* obj, QEvent* ev)
         const int n = m_channelCombo->count();
         if (n > 0) {
             const int dir = we->angleDelta().y() > 0 ? -1 : 1;   // wheel-up = previous
-            m_channelCombo->setCurrentIndex((m_channelCombo->currentIndex() + dir + n) % n);
+            // CLAMPED, not wrapped. Wrapping meant scrolling up past "Shaded" jumped to the far end
+            // of the list, so getting back to the lit view — the one you want most of the time —
+            // meant hunting instead of just scrolling up until it stops. The speed combo a few
+            // lines up already clamps; this is the same qBound.
+            m_channelCombo->setCurrentIndex(qBound(0, m_channelCombo->currentIndex() + dir, n - 1));
             // Name it where the eyes are: mid-scroll you're watching the model, not the button.
             showToast(QStringLiteral("Channel: %1").arg(m_channelCombo->currentText()));
         }
@@ -9282,10 +10051,18 @@ QImage ModelsTab::baseColorForMaterial(const QString& matName)
             const bool effect = t.texName.contains(QLatin1String("tileable"), Qt::CaseInsensitive)
                              || t.texName.contains(QLatin1String("energyColor"), Qt::CaseInsensitive)
                              || t.texName.contains(QLatin1String("magic"), Qt::CaseInsensitive);
-            if (baseTex.isEmpty()) { baseTex = t.texName; baseSno = t.texSno; }
+            // "Have I picked one yet?" must be asked of the SNO, not the name. An encrypted
+            // texture's name is always empty, so baseTex.isEmpty() stayed true forever and every
+            // later BASE_COLOR overwrote the first — a material with two of them (2334281 the real
+            // 512x512 colour, then 1662692) shipped the LAST one to the viewport. That is why the
+            // model was textured with the wrong map while the panel listed both correctly.
+            if (baseSno <= 0) { baseTex = t.texName; baseSno = t.texSno; }
             if (!effect && !baseNonEffect) { baseTex = t.texName; baseSno = t.texSno; baseNonEffect = true; }
         }
-        if (opTex.isEmpty()
+        // Same fix: keyed on the sno. (The name-based "_Alpha"/"opacity" sniff below can only ever
+        // fire for named textures — an encrypted one is reachable solely through its ALPHA/OPACITY
+        // role, which is why the role test comes first.)
+        if (opSno <= 0
             && (t.role == QLatin1String("ALPHA") || t.role == QLatin1String("OPACITY")
                 || t.texName.contains(QLatin1String("_Alpha"), Qt::CaseInsensitive)
                 || t.texName.contains(QLatin1String("opacity"), Qt::CaseInsensitive)))
@@ -9297,8 +10074,12 @@ QImage ModelsTab::baseColorForMaterial(const QString& matName)
     if (baseTex.compare(QLatin1String("black"), Qt::CaseInsensitive) == 0) {
         QImage blk(4, 4, QImage::Format_RGBA8888); blk.fill(Qt::black); return blk;
     }
-    QImage base = baseTex.isEmpty() ? QImage() : decodeTexImage(baseTex, baseSno);
-    const QImage op = opTex.isEmpty() ? QImage() : decodeTexImage(opTex, opSno);
+    // Gate on the SNO, never the NAME. An encrypted texture HAS no name — matTexFromMeta leaves it
+    // empty on purpose — so a name test short-circuits to a null image and the decoder is never
+    // called. That is why encrypted models rendered flat grey while SHADING listed all their
+    // textures with correct SNOs, and why nothing was ever logged: nothing asked.
+    QImage base = baseSno <= 0 ? QImage() : decodeTexImage(baseTex, baseSno);
+    const QImage op = opSno <= 0 ? QImage() : decodeTexImage(opTex, opSno);
     if (op.isNull())
         return base.isNull() ? QImage() : normalizeAlpha(base);
 
@@ -9327,13 +10108,17 @@ QImage ModelsTab::ormForMaterial(const QString& matName)
     QString rN, mN, aN; int rS = 0, mS = 0, aS = 0;
     for (const MatTexture& t : texs) {
         if (t.texSno <= 0) continue;   // name is absent for encrypted textures; the sno is not
-        if (rN.isEmpty() && t.role == QLatin1String("ROUGHNESS")) { rN = t.texName; rS = t.texSno; }
-        if (mN.isEmpty() && t.role == QLatin1String("METALLIC")) { mN = t.texName; mS = t.texSno; }
-        if (aN.isEmpty() && t.role == QLatin1String("AO"))       { aN = t.texName; aS = t.texSno; }
+        // "first one wins" has to be tracked by the SNO too — an encrypted texture's name is empty,
+        // so an rN.isEmpty() test never fills and every later candidate overwrites the first.
+        if (rS <= 0 && t.role == QLatin1String("ROUGHNESS")) { rN = t.texName; rS = t.texSno; }
+        if (mS <= 0 && t.role == QLatin1String("METALLIC")) { mN = t.texName; mS = t.texSno; }
+        if (aS <= 0 && t.role == QLatin1String("AO"))       { aN = t.texName; aS = t.texSno; }
     }
-    const QImage rough = rN.isEmpty() ? QImage() : decodeTexImage(rN, rS);
-    const QImage metal = mN.isEmpty() ? QImage() : decodeTexImage(mN, mS);
-    const QImage ao    = aN.isEmpty() ? QImage() : decodeTexImage(aN, aS);
+    // Gate on the SNO, not the name — see baseColorForMaterial. Encrypted ORM maps were being
+    // dropped here for exactly the same reason the base colour was.
+    const QImage rough = rS <= 0 ? QImage() : decodeTexImage(rN, rS);
+    const QImage metal = mS <= 0 ? QImage() : decodeTexImage(mN, mS);
+    const QImage ao    = aS <= 0 ? QImage() : decodeTexImage(aN, aS);
     if (rough.isNull() && metal.isNull() && ao.isNull()) return {};
     int w = 1, h = 1;
     for (const QImage* im : {&rough, &metal, &ao})
@@ -9384,8 +10169,10 @@ QImage ModelsTab::textureByRole(const QString& matName, const char* role)
     if (d4.isEmpty()) return {};
     // MaterialDecode, not QFile — see baseColorForMaterial.
     const QLatin1String want(role);
+    // t.texSno > 0, not !t.texName.isEmpty() — see baseColorForMaterial. This one silently dropped
+    // every encrypted DETAIL_NORMAL / EMISSIVE map.
     for (const MatTexture& t : MaterialDecode::texturesFor(m_reader, d4, matName))
-        if (t.role == want && !t.texName.isEmpty())
+        if (t.role == want && t.texSno > 0)
             return decodeTexImage(t.texName, t.texSno);
     return {};
 }
@@ -9417,20 +10204,22 @@ void ModelsTab::togglePreviewPanel()
 // The list and the thumbnail grid are two views of the SAME model + selection, so they must
 // offer the same actions. They were built independently and drifted: the grid had 4 entries
 // against the list's full set. Both now compose from these two builders.
-void ModelsTab::addRowImageActions(QMenu& menu, const QList<int>& snos)
+void ModelsTab::addRowImageActions(QMenu& menu, const QList<int>& snos, int clicked)
 {
     if (snos.isEmpty()) return;
     const int n = snos.size();
-    const QString sfx = n > 1 ? QStringLiteral("s") : QString();
-    menu.addAction(QStringLiteral("Copy image"), this, [this, snos]() {
-        copyIconImage(snos.first());
-    });
-    menu.addAction(QStringLiteral("Save image%1").arg(sfx), this, [this, snos]() {
-        saveIconImages(snos, false);
-    });
-    menu.addAction(QStringLiteral("Save image%1 as…").arg(sfx), this, [this, snos]() {
-        saveIconImages(snos, true);
-    });
+    // The clipboard holds ONE image, so this is a single-subject action and must use the row you
+    // right-clicked. It took snos.first() — the first SELECTED row — so inside a multi-row
+    // selection it copied the wrong icon. `clicked` < 0 means the caller could not resolve a row.
+    const int one = clicked > 0 ? clicked : snos.first();
+    menu.addAction(MenuText::kCopyImage, this, [this, one]() { copyIconImage(one); });
+    // "…to last folder" vs "…" — the pair used to read "Save image" / "Save image as…", one word
+    // apart for silent-write versus file-dialog, which is a bad thing to guess wrong about.
+    menu.addAction(QStringLiteral("%1%2").arg(MenuText::kSaveImageLast,
+                                              n > 1 ? QStringLiteral(" — %1 icons").arg(n) : QString()),
+                   this, [this, snos]() { saveIconImages(snos, false); });
+    menu.addAction(n > 1 ? QStringLiteral("Save %1 images…").arg(n) : MenuText::kSaveImage,
+                   this, [this, snos]() { saveIconImages(snos, true); });
     menu.addSeparator();
     menu.addAction(n > 1 ? QStringLiteral("Render %1 icons").arg(n)
                          : QStringLiteral("Render icon"),
@@ -9462,7 +10251,6 @@ void ModelsTab::addRowExportCopyActions(QMenu& menu, const QList<int>& snos)
 {
     if (snos.isEmpty()) return;
     const int n = snos.size();
-    const QString sfx = n > 1 ? QStringLiteral("s") : QString();
     // ── Other columns: export + copy (standardized order across tabs) ──
     QStringList snoStrs, filenames, names, colls;
     QVector<QPair<int, QString>> models;
@@ -9488,32 +10276,31 @@ void ModelsTab::addRowExportCopyActions(QMenu& menu, const QList<int>& snos)
     // Destination shown, the way the card and part menus have always shown it. "last dir"
     // named a folder the menu would not tell you, so the two families disagreed on the one
     // thing the label existed to convey. Same helper, so they cannot drift again.
-    menu.addAction(ViewportPartMenu::withValue(QStringLiteral("Export to last dir"), exLastDir)
-                       + QStringLiteral("  —  %1").arg(exCount), this, [this, models]() {
-        const QString dir = QSettings().value(QStringLiteral("models/lastExportDir")).toString();
-        if (dir.isEmpty()) {
-            const QString d = QFileDialog::getExistingDirectory(this, QStringLiteral("Export to…"));
-            if (!d.isEmpty()) exportModels(models, d);
-        } else {
-            exportModels(models, dir);
-        }
-    });
-    menu.addAction(QStringLiteral("Export to…  —  %1").arg(exCount), this, [this, models]() {
+    //
+    // Omitted entirely when there is no remembered folder, matching ViewportPartMenu::exec. It used
+    // to appear anyway, reading "Export 3 models to last folder" with no folder named, and then
+    // open a directory dialog — an action whose label promised the opposite of what it did.
+    if (!exLastDir.isEmpty())
+        menu.addAction(MenuText::exportSetLast(exCount, exLastDir), this, [this, models]() {
+            const QString dir = QSettings().value(QStringLiteral("models/lastExportDir")).toString();
+            if (!dir.isEmpty()) exportModels(models, dir);
+        });
+    menu.addAction(MenuText::exportSetPrompt(exCount), this, [this, models]() {
         const QString d = QFileDialog::getExistingDirectory(this, QStringLiteral("Export to…"));
         if (!d.isEmpty()) exportModels(models, d);
     });
     menu.addSeparator();
     if (n == 1) {
-        menu.addAction(QStringLiteral("Copy SNO id  (%1)").arg(snoStrs.first()), this, [snoStrs, copyList]() { copyList(snoStrs); });
-        menu.addAction(QStringLiteral("Copy file name  (%1)").arg(prev(filenames.first())), this, [filenames, copyList]() { copyList(filenames); });
-        menu.addAction(QStringLiteral("Copy name  (%1)").arg(prev(names.first())), this, [names, copyList]() { copyList(names); });
-        QAction* aC = menu.addAction(QStringLiteral("Copy collection name  (%1)").arg(prev(colls.first().isEmpty() ? QStringLiteral("—") : colls.first())), this, [colls, copyList]() { copyList(colls); });
+        menu.addAction(QStringLiteral("%1  (%2)").arg(MenuText::kCopySno, snoStrs.first()), this, [snoStrs, copyList]() { copyList(snoStrs); });
+        menu.addAction(QStringLiteral("%1  (%2)").arg(MenuText::kCopyFileName, prev(filenames.first())), this, [filenames, copyList]() { copyList(filenames); });
+        menu.addAction(QStringLiteral("%1  (%2)").arg(MenuText::kCopyName, prev(names.first())), this, [names, copyList]() { copyList(names); });
+        QAction* aC = menu.addAction(QStringLiteral("%1  (%2)").arg(MenuText::kCopyCollection, prev(colls.first().isEmpty() ? QStringLiteral("—") : colls.first())), this, [colls, copyList]() { copyList(colls); });
         aC->setEnabled(!colls.first().isEmpty());
     } else {
-        menu.addAction(QStringLiteral("Copy %1 SNO ids").arg(n), this, [snoStrs, copyList]() { copyList(snoStrs); });
-        menu.addAction(QStringLiteral("Copy %1 file names").arg(n), this, [filenames, copyList]() { copyList(filenames); });
-        menu.addAction(QStringLiteral("Copy %1 names").arg(n), this, [names, copyList]() { copyList(names); });
-        menu.addAction(QStringLiteral("Copy %1 collection names").arg(n), this, [colls, copyList]() { copyList(colls); });
+        menu.addAction(QStringLiteral("%1  —  %2 rows").arg(MenuText::kCopySno).arg(n), this, [snoStrs, copyList]() { copyList(snoStrs); });
+        menu.addAction(QStringLiteral("%1  —  %2 rows").arg(MenuText::kCopyFileName).arg(n), this, [filenames, copyList]() { copyList(filenames); });
+        menu.addAction(QStringLiteral("%1  —  %2 rows").arg(MenuText::kCopyName).arg(n), this, [names, copyList]() { copyList(names); });
+        menu.addAction(QStringLiteral("%1  —  %2 rows").arg(MenuText::kCopyCollection).arg(n), this, [colls, copyList]() { copyList(colls); });
     }
     if (models.size() == 1) {
         menu.addSeparator();
@@ -9526,7 +10313,7 @@ void ModelsTab::addRowExportCopyActions(QMenu& menu, const QList<int>& snos)
                 vm->addAction(m_apprName.value(vs, QStringLiteral("appearance %1").arg(vs)),
                               this, [this, vs]() { selectModelBySno(vs); });
         }
-        menu.addAction(QStringLiteral("Show dependencies…"), this, [this, models]() {
+        menu.addAction(MenuText::kShowDeps, this, [this, models]() {
             showDependencies(models.first().first, models.first().second);
         });
     }
@@ -9603,7 +10390,7 @@ void ModelsTab::buildPreviewPanel()
         return gl;
     };
 
-    auto* gLight = addGroup(QStringLiteral("Scene & shadows"));
+    auto* gLight = addGroup(QStringLiteral("Scene && shadows"));
     addChkTo(gLight, QStringLiteral("ibl"), QStringLiteral("Environment lighting (IBL)"), true,
              [this](bool on) { if (m_modelView) m_modelView->setFeatureIbl(on); });
     addChkTo(gLight, QStringLiteral("shadows"), QStringLiteral("Self-shadows"), true,
@@ -9623,7 +10410,7 @@ void ModelsTab::buildPreviewPanel()
     addChkTo(gShade, QStringLiteral("specaa"), QStringLiteral("Specular anti-aliasing"), true,
              [this](bool on) { if (m_modelView) m_modelView->setFeatureSpecAA(on); });
 
-    auto* gGeom = addGroup(QStringLiteral("Geometry & debug"));
+    auto* gGeom = addGroup(QStringLiteral("Geometry && debug"));
     addChkTo(gGeom, QStringLiteral("backfaces"), QStringLiteral("Show back faces (no culling)"), true,
              [this](bool on) { if (m_modelView) m_modelView->setBackfaceCull(!on); });
     addChkTo(gGeom, QStringLiteral("mask"), QStringLiteral("Primary mask"), false,
@@ -10055,23 +10842,41 @@ void ModelsTab::dumpDyeDebug()
 
 QImage ModelsTab::decodeTexImage(const QString& texName, int texSno) const
 {
-    if (texName.isEmpty() || texSno <= 0)
-        return {};
-    const QString d4 = Config::d4dataDir();
-    TexMeta meta;
-    if (!d4.isEmpty()) {
-        QFile f(QStringLiteral("%1/json/base/meta/Texture/%2.tex.json").arg(d4, texName));
-        if (f.open(QIODevice::ReadOnly))
-            meta = parseTexMetaJson(f.readAll());
+    // Via MaterialDecode — the ONE routine that falls back to CASC's bulk texture tables when
+    // d4data has no .tex.json. Reading the JSON directly here meant every ENCRYPTED texture
+    // decoded to nothing, and this feeds the viewport's base colour (baseColorForMaterial), the
+    // outliner thumbnails, the hover preview and the channel tiles. That is why an encrypted model
+    // could list 16 textures in SHADING and still render flat grey with an empty TEXTURE PREVIEW.
+    //
+    // texSno alone is enough: the name is only used for the JSON route, and "~unnamed_<sno>" —
+    // which is what an encrypted texture is called — was never going to match a file.
+    if (texSno <= 0) return {};
+    // Breadcrumb for the panel-fill guard: if the decoder faults, this is what it was holding.
+    m_decodingTexSno = texSno;
+    const QImage img = MaterialDecode::texture(m_reader, Config::d4dataDir(), texName, texSno);
+    m_decodingTexSno = 0;
+    // The other half of D4_DUMP_TEX. That probe proves whether the DECODE works; this proves
+    // whether the UI ever asks. Between them there is no room left to guess: if the probe decodes
+    // 2334281 and this line never appears for it, the panel is not calling here at all, and the
+    // bug is in what populates the tiles, not in the texture pipeline.
+    //
+    // Rate-limited per sno — a 16-texture material must not print sixteen lines per repaint — and
+    // additionally capped, because this is reached from the outliner thumbnail pass, which walks
+    // every part of every model the user scrolls past. Rate-limiting alone bounds it by the number
+    // of DISTINCT textures seen, which over a browsing session is thousands.
+    static QMutex mx;
+    static QSet<int> seen;
+    bool first = false;
+    {
+        QMutexLocker l(&mx);
+        first = seen.size() < 400 && !seen.contains(texSno);
+        if (first) seen.insert(texSno);
     }
-    if (!meta.valid)
-        return {};
-    QByteArray payload;
-    if (m_reader && m_reader->isReady())
-        payload = m_reader->readPayloadBySno(quint64(texSno));
-    if (payload.isEmpty())
-        return {};
-    return BcDecode::decode(payload, meta.width, meta.height, meta.eTexFormat);
+    if (first)
+        qInfo("models decodeTexImage: sno %d name '%s' -> %s", texSno, qPrintable(texName),
+              img.isNull() ? "NULL" : qPrintable(QStringLiteral("%1x%2").arg(img.width())
+                                                     .arg(img.height())));
+    return img;
 }
 
 void ModelsTab::setChannelTile(int idx, const QImage& img)
@@ -10109,9 +10914,19 @@ void ModelsTab::showMaterialChannels()
     QImage baseColor;
     bool filled[6] = {false, false, false, false, false, false};
     for (int r = 0; r < m_matTexModel->rowCount(); ++r) {
-        const QString role    = m_matTexModel->item(r, 0)->text();                       // SHADERTEX
-        const QString texName = m_matTexModel->item(r, 2)->text();                       // NAME
-        const int     texSno  = m_matTexModel->item(r, 1)->data(Qt::DisplayRole).toInt(); // SNO
+        // Null-checked. A QStandardItemModel row is NOT guaranteed to have an item in every
+        // column, and this table has a row that genuinely does not: the "⚠ FALLBACK" note
+        // showMaterialTextures inserts for a material with no base texture fills columns 0 and 2
+        // and leaves column 1 empty. Dereferencing item(r, 1) on that row is an instant access
+        // violation — it took down the whole tool on druF/DruM_stor235_TRS, whose auto-selected
+        // material hits exactly that case.
+        QStandardItem* roleIt = m_matTexModel->item(r, 0);
+        QStandardItem* snoIt  = m_matTexModel->item(r, 1);
+        QStandardItem* nameIt = m_matTexModel->item(r, 2);
+        if (!roleIt || !snoIt) continue;                 // the FALLBACK note is not a texture row
+        const QString role    = roleIt->text();                          // SHADERTEX
+        const QString texName = nameIt ? nameIt->text() : QString();     // NAME
+        const int     texSno  = snoIt->data(Qt::DisplayRole).toInt();    // SNO
 
         int tile = -1;
         if (role == QLatin1String("BASE_COLOR"))      tile = 0;

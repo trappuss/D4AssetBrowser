@@ -46,3 +46,9 @@ tactkeys/
 # Release output and build leftovers — generated, never committed.
 dist/
 build.del/
+
+# "Test - Export Cache.bat" scratch — the A/B run's captured stderr and its export
+# output. The output folder is a full bulk export, so it is large and disposable.
+_perftest_out/
+_perftest_baseline.log
+_perftest_cached.log

@@ -28,6 +28,7 @@
 #include "util/LookIcon.h"
 #include "index/WardrobeAnimIndex.h"
 #include "index/IconIndex.h"
+#include "index/ItemDef.h"        // canonical hero-class table — kClasses() derives from it
 #include "index/CoreToc.h"
 #include "index/SnoIndex.h"
 #include "model/AnimParser.h"
@@ -42,6 +43,7 @@
 #include "model/ModelParser.h"
 #include "index/ItemHoverIndex.h"
 #include "util/DyeColorWheel.h"
+#include "util/AnimExportScope.h"   // which animation sources an export embeds
 #include "util/HoverInfo.h"
 #include "util/PanelPersist.h"
 
@@ -62,6 +64,8 @@
 #include <QComboBox>
 #include <QCursor>
 #include <QContextMenuEvent>
+#include <QDate>       // {{Date}} in the export filename template
+#include <QDateTime>   // QFileInfo::lastModified() — the anim-cache signature
 #include <QDialog>
 #include <QDirIterator>
 #include <QFrame>
@@ -119,6 +123,7 @@
 
 #include <initializer_list>
 #include <algorithm>
+#include <QVector>
 #include <cmath>
 #include <functional>
 #include <thread>
@@ -337,13 +342,30 @@ struct SlotDef { const char* label; const char* code; };
 const SlotDef kSlots[5] = {
     {"Helm", "HLM"}, {"Torso", "TRS"}, {"Gloves", "GLV"}, {"Legs", "LEG"}, {"Boots", "BTS"}};
 
-// fubc = index into entries' fUsableByClass array (game-fixed class order).
+// fubc = index into entries' fUsableByClass array (game-fixed class order) — i.e. eHeroClass.
+// This used to restate all three fields for all eight classes. It now derives them from
+// ItemDef's canonical table, because a re-typed copy of an enum index is exactly the kind of
+// thing that drifts silently: the same ordering, written out a fourth time in
+// StoreProductIndex, had already lost Warlock.
+//
+// The ORDER here is alphabetical by display name and stays that way deliberately — it is the
+// order of the class combo the user sees, not eHeroClass order.
 struct ClassDef { const char* name; const char* code; int fubc; };
-const ClassDef kClasses[8] = {
-    {"Barbarian", "bar", 2}, {"Druid", "dru", 1}, {"Necromancer", "nec", 4},
-    {"Paladin", "pal", 6}, {"Rogue", "rog", 3}, {"Sorcerer", "sor", 0},
-    {"Spiritborn", "spi", 5}, {"Warlock", "war", 7}};
-constexpr int kNumClasses = 8;
+constexpr int kNumClasses = ItemDef::HeroClassCount;
+
+const QVector<ClassDef>& kClasses()
+{
+    static const QVector<ClassDef> v = [] {
+        QVector<ClassDef> out;
+        out.reserve(kNumClasses);
+        for (int i = 0; i < kNumClasses; ++i)
+            out.push_back({ItemDef::heroClassName(i), ItemDef::heroClassCode(i), i});
+        std::sort(out.begin(), out.end(),
+                  [](const ClassDef& a, const ClassDef& b) { return qstrcmp(a.name, b.name) < 0; });
+        return out;
+    }();
+    return v;
+}
 
 
 // Marks a row in the animation list as the equipped back trophy's own clip rather than a body
@@ -1081,73 +1103,11 @@ QImage bakeDye(QImage base, const QImage& maskIn, const QImage& rampIn, const fl
     return base;
 }
 
-// Bake the tiled, zone-routed detail maps into a part's exported normal + ORM(roughness) — a CPU port
-// of the shader's detail block. Per texel: classify the DyeMask into a zone → detail layer, honour the
-// metal routing (metal texels use the metal layer or fade non-metal grain out), sample the TILED detail
-// normal/rough, combine the detail normal into the base normal's xy, and add the detail roughness. So
-// exported armour carries the leather/fabric/brushed-metal surface grain instead of a smooth base map.
-void bakeDetail(QImage& normal, QImage& orm, const QImage& dyeMask,
-                const QImage detN[3], const QImage detR[3], const QVector3D& scale,
-                const QVector4D& zoneMap, const QVector4D& bands, int metalLayer,
-                float nInt, float rInt, float rOff)
-{
-    if (normal.isNull()) return;
-    normal = normal.convertToFormat(QImage::Format_RGBA8888);
-    const int W = normal.width(), H = normal.height();
-    const bool hasOrm = !orm.isNull();
-    if (hasOrm) {   // ORM is indexed with the NORMAL's x/y below, so it MUST match the normal's size
-        orm = orm.convertToFormat(QImage::Format_RGBA8888);
-        if (orm.size() != normal.size()) orm = orm.scaled(W, H, Qt::IgnoreAspectRatio, Qt::SmoothTransformation);
-    }
-    QImage mask = dyeMask.isNull() ? QImage() : dyeMask.convertToFormat(QImage::Format_RGBA8888);
-    if (!mask.isNull() && mask.size() != normal.size())
-        mask = mask.scaled(W, H, Qt::IgnoreAspectRatio, Qt::SmoothTransformation);
-    QImage dN[3], dR[3];
-    for (int k = 0; k < 3; ++k) {
-        if (!detN[k].isNull()) dN[k] = detN[k].convertToFormat(QImage::Format_RGBA8888);
-        if (!detR[k].isNull()) dR[k] = detR[k].convertToFormat(QImage::Format_RGBA8888);
-    }
-    const float bnd[4] = { float(bands.x()), float(bands.y()), float(bands.z()), float(bands.w()) };
-    const int   zmap[4] = { int(zoneMap.x()), int(zoneMap.y()), int(zoneMap.z()), int(zoneMap.w()) };
-    const float sc[3] = { float(scale.x()), float(scale.y()), float(scale.z()) };
-    auto wrap = [](int a, int n) { if (n <= 0) return 0; a %= n; return a < 0 ? a + n : a; };
-    for (int y = 0; y < H; ++y) {
-        uchar* np = normal.scanLine(y);
-        uchar* op = hasOrm ? orm.scanLine(y) : nullptr;
-        const uchar* mp = mask.isNull() ? nullptr : mask.constScanLine(y);
-        const float vv = (y + 0.5f) / H;
-        for (int x = 0; x < W; ++x) {
-            const float uu = (x + 0.5f) / W;
-            int layer = zmap[1];
-            if (mp) { const float mv = mp[x*4] / 255.0f; int zone = 0; float best = 2.0f;
-                      for (int k = 0; k < 4; ++k) { const float e = qAbs(mv - bnd[k]); if (e < best) { best = e; zone = k; } }
-                      layer = zmap[zone]; if (mv <= 0.02f) layer = -1; }
-            const float metalv = op ? op[x*4+2] / 255.0f : 0.0f;
-            float metalMask = 1.0f;
-            if (metalv > 0.5f) { if (metalLayer >= 0) layer = metalLayer; else metalMask = 0.0f; }
-            else if (metalLayer >= 0 && layer == metalLayer) layer = -1;
-            if (metalLayer < 0 || layer != metalLayer) metalMask *= 1.0f - qBound(0.0f, (metalv - 0.30f) / 0.30f, 1.0f);
-            if (layer < 0 || layer > 2 || metalMask <= 0.001f) continue;
-            const float s = sc[layer];
-            if (!dN[layer].isNull()) {
-                const int dw = dN[layer].width(), dh = dN[layer].height();
-                const uchar* dp = dN[layer].constScanLine(wrap(int(vv*s*dh), dh)) + wrap(int(uu*s*dw), dw) * 4;
-                const float dnx = (dp[0]/255.0f)*2.0f-1.0f, dny = (dp[1]/255.0f)*2.0f-1.0f;
-                const float amt = qBound(0.0f, nInt, 1.0f) * metalMask;
-                const float nx = (np[x*4]/255.0f)*2.0f-1.0f + dnx*amt, ny = (np[x*4+1]/255.0f)*2.0f-1.0f + dny*amt;
-                np[x*4]   = uchar(qBound(0.0f, (nx*0.5f+0.5f)*255.0f, 255.0f));
-                np[x*4+1] = uchar(qBound(0.0f, (ny*0.5f+0.5f)*255.0f, 255.0f));
-            }
-            if (hasOrm && !dR[layer].isNull()) {
-                const int dw = dR[layer].width(), dh = dR[layer].height();
-                const float drg = dR[layer].constScanLine(wrap(int(vv*s*dh), dh))[wrap(int(uu*s*dw), dw)*4 + 1] / 255.0f;
-                float dr = ((drg - 0.5f) * qBound(0.0f, rInt, 4.0f) + rOff) * metalMask;
-                if (dr > 0.0f) dr *= 1.0f - 0.85f * qBound(0.0f, (metalv - 0.35f) / 0.35f, 1.0f);
-                op[x*4+1] = uchar(qBound(0.04f, op[x*4+1]/255.0f + dr, 1.0f) * 255.0f);
-            }
-        }
-    }
-}
+// bakeDetail moved to MaterialDecode (model/MaterialDecode.{h,cpp}) — it is material compositing and
+// belongs beside detailMapsSeparate, which decodes what it consumes. Living here as a file-local was
+// the only reason `export/bakeDetail` applied to Wardrobe exports alone. Verbatim move; the call site
+// in exportOutfitGlb() is unchanged, which is the proof the signature and behaviour are identical.
+using MaterialDecode::bakeDetail;
 
 // (marking helpers — MarkingDef/MarkingPaint, markingDef/Ramp/Paint, rampLerp, applyMarking/
 //  applyMarkingMaterial, markingSelfTest — moved to tabs/MarkingCompose.{h,cpp})
@@ -1332,7 +1292,7 @@ WardrobeTab2::WardrobeTab2(QWidget* parent) : BrowserTab(parent)
 
     auto* cgRow = new QHBoxLayout();
     m_class = new QComboBox;
-    for (const ClassDef& c : kClasses) m_class->addItem(QString::fromLatin1(c.name), QString::fromLatin1(c.code));
+    for (const ClassDef& c : kClasses()) m_class->addItem(QString::fromLatin1(c.name), QString::fromLatin1(c.code));
     m_gender = new QComboBox;
     m_gender->addItem(QStringLiteral("Female"), QStringLiteral("f"));
     m_gender->addItem(QStringLiteral("Male"), QStringLiteral("m"));
@@ -2104,16 +2064,48 @@ WardrobeTab2::WardrobeTab2(QWidget* parent) : BrowserTab(parent)
         viewBar->addWidget(ovArrow);
     }
     sep();
-    mkToggle(QStringLiteral("fx"), QStringLiteral("FX"), QStringLiteral("Show FX submeshes"),
-             QSettings().value(QStringLiteral("wardrobe2/showFx"), true).toBool(),
-             [this](bool on) { QSettings().setValue(QStringLiteral("wardrobe2/showFx"), on); recomputePartVisibility(); });
-    mkToggle(QStringLiteral("sim"), QStringLiteral("SIM"), QStringLiteral("Show cloth-sim submeshes"),
+    // FX / SIM / FORM all default OFF. They are effect, simulation and transformation submeshes —
+    // useful to inspect, but not what the piece looks like in game, and having them on by default
+    // made an ordinary outfit look wrong before the user had touched anything.
+    // The default only applies to a fresh profile; anyone who has already toggled one keeps their
+    // stored choice. Keep these in step with recomputePartVisibility's defaults — the toggle's
+    // initial state and the visibility rule read the same keys and must agree.
+    mkToggle(QStringLiteral("fx"), QStringLiteral("FX"),
+             QStringLiteral("Show FX submeshes — hidden by default"),
+             QSettings().value(QStringLiteral("wardrobe2/showFx"), false).toBool(),
+             [this](bool on) { QSettings().setValue(QStringLiteral("wardrobe2/showFx"), on);
+                 // rebuildPartList too: it greys out parts a toggle is suppressing, so that
+                 // state is stale the moment the toggle moves.
+                 rebuildPartList(); recomputePartVisibility(); });
+    // SIM stays ON, unlike FX and FORM. "SIM" is not an effect: it means the submesh has an
+    // authored NvCloth definition — skirts, loincloths, capes, tassets. Those ARE the armour.
+    // Defaulting it off hid half of any cloth-bearing set (barM_stor273's _LEG_skirt_sim and
+    // _LEG_loin_sim, for one) and the parts tree could not bring them back, because the category
+    // toggle ANDs with the checkbox.
+    mkToggle(QStringLiteral("sim"), QStringLiteral("SIM"),
+             QStringLiteral("Show cloth-simulation submeshes (skirts, capes, loincloths) — these are "
+                            "armour, not effects, so they are shown by default"),
              QSettings().value(QStringLiteral("wardrobe2/showSim"), true).toBool(),
-             [this](bool on) { QSettings().setValue(QStringLiteral("wardrobe2/showSim"), on); recomputePartVisibility(); });
+             [this](bool on) { QSettings().setValue(QStringLiteral("wardrobe2/showSim"), on);
+                 // rebuildPartList too: it greys out parts a toggle is suppressing, so that
+                 // state is stale the moment the toggle moves.
+                 rebuildPartList(); recomputePartVisibility(); });
+    // HED defaults ON, unlike its three neighbours: the head is part of the character, not an
+    // effect or a debug view, so hiding it has to be asked for.
+    mkToggle(QStringLiteral("hed"), QStringLiteral("HED"),
+             QStringLiteral("Show the character's head (face, hair and eyes) — shown by default"),
+             QSettings().value(QStringLiteral("wardrobe2/showHed"), true).toBool(),
+             [this](bool on) { QSettings().setValue(QStringLiteral("wardrobe2/showHed"), on);
+                 // rebuildPartList too: it greys out parts a toggle is suppressing, so that
+                 // state is stale the moment the toggle moves.
+                 rebuildPartList(); recomputePartVisibility(); });
     mkToggle(QStringLiteral("form"), QStringLiteral("FORM"),
              QStringLiteral("Show transformation-form submeshes (e.g. Warlock's demon form) — hidden by default"),
              QSettings().value(QStringLiteral("wardrobe2/showForm"), false).toBool(),
-             [this](bool on) { QSettings().setValue(QStringLiteral("wardrobe2/showForm"), on); recomputePartVisibility(); });
+             [this](bool on) { QSettings().setValue(QStringLiteral("wardrobe2/showForm"), on);
+                 // rebuildPartList too: it greys out parts a toggle is suppressing, so that
+                 // state is stale the moment the toggle moves.
+                 rebuildPartList(); recomputePartVisibility(); });
     // (Turntable / Spin moved to the Camera popup, where it has a speed control.)
     viewBar->addStretch(1);
     // (Fullscreen text button removed — the ⛶ strip icon covers it. Graphics/Camera/Lighting/
@@ -2663,20 +2655,51 @@ WardrobeTab2::WardrobeTab2(QWidget* parent) : BrowserTab(parent)
             kept[i] = (m_slot[i] && m_slot[i]->currentIndex() > 0) ? m_slot[i]->currentText() : QString();
         m_restoring = true;
         populateCreator(); populateSlots(); populateWeapons();
+        // INSTRUMENTED: this retention reportedly does not re-equip. The logic has four places to
+        // fail — nothing was captured, the name is not gender-shaped, the twin is absent from the
+        // repopulated list, or the list itself came back empty — and the symptom looks identical
+        // in every case. One line per slot says which, instead of guessing at it.
+        int reEquipped = 0;
         for (int i = 0; i < 5; ++i) {
-            if (kept[i].size() < 4 || !m_slot[i]) continue;
+            if (!m_slot[i]) continue;
+            if (kept[i].isEmpty()) {
+                qInfo("wardrobe gender-swap: slot %d — nothing was equipped, skipped", i);
+                continue;
+            }
+            if (kept[i].size() < 4) {
+                qInfo("wardrobe gender-swap: slot %d — kept '%s' is too short to carry a gender char",
+                      i, qPrintable(kept[i]));
+                continue;
+            }
             QString twin = kept[i];
             const QChar g = twin.at(3).toLower();
             if (g == QLatin1Char('m'))      twin[3] = twin.at(3).isUpper() ? QLatin1Char('F') : QLatin1Char('f');
             else if (g == QLatin1Char('f')) twin[3] = twin.at(3).isUpper() ? QLatin1Char('M') : QLatin1Char('m');
-            else continue;   // not a gendered name (e.g. shared piece) — leave the restore alone
+            else {
+                qInfo("wardrobe gender-swap: slot %d — '%s' has '%s' at index 3, not m/f; left alone",
+                      i, qPrintable(kept[i]), qPrintable(QString(twin.at(3))));
+                continue;   // not a gendered name (e.g. shared piece) — leave the restore alone
+            }
             const int idx = m_slot[i]->findText(twin, Qt::MatchFixedString);   // case-insensitive exact
             if (idx > 0) {
                 m_slot[i]->setCurrentIndex(idx);
                 QSettings().setValue(QStringLiteral("wardrobe2/slot/%1").arg(i),
                                      m_slot[i]->currentText());   // handler is suppressed while restoring
+                ++reEquipped;
+                qInfo("wardrobe gender-swap: slot %d — %s -> %s (row %d)",
+                      i, qPrintable(kept[i]), qPrintable(twin), idx);
+            } else {
+                qInfo("wardrobe gender-swap: slot %d — twin '%s' NOT FOUND among %d entries "
+                      "(kept '%s')", i, qPrintable(twin), m_slot[i]->count() - 1, qPrintable(kept[i]));
             }
         }
+        qInfo("wardrobe gender-swap: %d of 5 armour slot(s) re-equipped", reEquipped);
+        // The cells and the look grid are refreshed at the END of populateSlots — which ran BEFORE
+        // this loop, while the slots were still on their restored defaults. Without repeating them
+        // here the model rebuilds with the right armour but every slot cell reads empty, which is
+        // exactly how this looked: "armour still equipped, slots blank until you touch one".
+        refreshSlotCells();
+        fillLookGrid();
         m_restoring = false;
         rebuildOutfit();
         remapAnimationForRig();
@@ -2833,6 +2856,14 @@ void WardrobeTab2::refresh()
             qInfo().noquote() << msg;
             QCoreApplication::exit(0);
         });
+    // D4_MARKING_SWEEP=1 — the whole marking model in one pass: every colour, every mask, and
+    // pictures of the composite. Unattended, quits when done ("Dump Marking Model.bat").
+    if (qEnvironmentVariableIsSet("D4_MARKING_SWEEP"))
+        QTimer::singleShot(1500, this, [this] {
+            const QString msg = runMarkingSweep(Config::d4dataDir(), m_index, m_reader, this);
+            qInfo().noquote() << msg;
+            QCoreApplication::exit(0);
+        });
     if (qEnvironmentVariableIsSet("D4_CHAINTEST"))
         QTimer::singleShot(1500, this, [this] {
             const QString msg = runChainTest(Config::d4dataDir(), m_index, m_reader);
@@ -2865,7 +2896,7 @@ void WardrobeTab2::refresh()
     });
     // Appearance-icon atlas index (same trigger point as the Models tab). Refill the grid/cells
     // when it finishes; show the live percentage while it scans.
-    IconIndex::instance().ensureBuilt(Config::d4dataDir());
+    IconIndex::instance().ensureBuilt(Config::d4dataDir(), m_reader);
     connect(&IconIndex::instance(), &IconIndex::readyChanged, this, [this] { fillLookGrid(); refreshSlotCells(); fillCreatorGrid(); refreshCreatorCells(); refreshEnsembles(); });
     connect(&AppearanceMeta::instance(), &AppearanceMeta::readyChanged, this, [this] {
         populateSets();   // collection-based theme sets resolve once metadata is ready
@@ -3292,8 +3323,10 @@ void WardrobeTab2::restoreSelection()
 void WardrobeTab2::recomputePartVisibility()
 {
     if (!m_view) return;
-    const bool showFx  = QSettings().value(QStringLiteral("wardrobe2/showFx"), true).toBool();
-    const bool showSim = QSettings().value(QStringLiteral("wardrobe2/showSim"), true).toBool();
+    // Defaults must match the toggle buttons' initial state above — FX/SIM/FORM off, HED on.
+    const bool showFx  = QSettings().value(QStringLiteral("wardrobe2/showFx"), false).toBool();
+    const bool showSim = QSettings().value(QStringLiteral("wardrobe2/showSim"), true).toBool();   // cloth = armour
+    const bool showHed = QSettings().value(QStringLiteral("wardrobe2/showHed"), true).toBool();
     const bool showForm = QSettings().value(QStringLiteral("wardrobe2/showForm"), false).toBool();   // demon/transform form off by default
     QHash<int, bool> checked;
     if (m_partTree)
@@ -3310,8 +3343,10 @@ void WardrobeTab2::recomputePartVisibility()
         const bool isFx   = i < m_partFx.size()   && m_partFx[i];
         const bool isSim  = i < m_partSim.size()  && m_partSim[i];
         const bool isForm = i < m_partForm.size() && m_partForm[i];
+        const bool isHed  = i < m_partHed.size()  && m_partHed[i];
         m_view->setPartVisible(i, checked.value(i, true) && !(isFx && !showFx)
-                                  && !(isSim && !showSim) && !(isForm && !showForm));
+                                  && !(isSim && !showSim) && !(isForm && !showForm)
+                                  && !(isHed && !showHed));
     }
     m_view->update();
 }
@@ -3346,6 +3381,30 @@ void WardrobeTab2::rebuildPartList()
         child->setFlags(child->flags() | Qt::ItemIsUserCheckable);
         // Covered base-body regions start hidden (armour occupies them) but stay re-checkable.
         child->setCheckState(0, covered ? Qt::Unchecked : Qt::Checked);
+
+        // A part suppressed by a CATEGORY toggle cannot be revealed from here — the toggle is
+        // ANDed with this checkbox in recomputePartVisibility, so ticking it does nothing and the
+        // part just stays invisible with no explanation. Say which toggle is responsible instead
+        // of letting the user fight a checkbox that cannot win.
+        {
+            QSettings s;
+            const bool isFx   = i < m_partFx.size()   && m_partFx[i];
+            const bool isSim  = i < m_partSim.size()  && m_partSim[i];
+            const bool isForm = i < m_partForm.size() && m_partForm[i];
+            const bool isHed  = i < m_partHed.size()  && m_partHed[i];
+            QString blockedBy;
+            if (isFx   && !s.value(QStringLiteral("wardrobe2/showFx"),   false).toBool()) blockedBy = QStringLiteral("FX");
+            else if (isSim  && !s.value(QStringLiteral("wardrobe2/showSim"),  true).toBool())  blockedBy = QStringLiteral("SIM");
+            else if (isForm && !s.value(QStringLiteral("wardrobe2/showForm"), false).toBool()) blockedBy = QStringLiteral("FORM");
+            else if (isHed  && !s.value(QStringLiteral("wardrobe2/showHed"),  true).toBool())  blockedBy = QStringLiteral("HED");
+            if (!blockedBy.isEmpty()) {
+                child->setFlags(child->flags() & ~Qt::ItemIsUserCheckable);
+                child->setForeground(0, QBrush(QColor(0x88, 0x88, 0x88)));
+                child->setToolTip(0, QStringLiteral(
+                    "Hidden by the %1 button in the viewport toolbar, not by this checkbox.\n"
+                    "Turn %1 on to show this part.").arg(blockedBy));
+            }
+        }
     }
     // Per-root triangle totals.
     for (int r = 0; r < m_partTree->topLevelItemCount(); ++r) {
@@ -3506,16 +3565,63 @@ void WardrobeTab2::showMaterial(const QString& matName)
     }
     if (matName.isEmpty()) return;
     const QString d4 = Config::d4dataDir();
+
+    // Resolve a display name for a texture the material binary gave us by SNO alone. Encrypted
+    // textures carry no name there, but the index usually knows one from the encrypted name
+    // dictionaries — without this the panel prints "~unnamed_2334281" for a texture the Textures
+    // tab lists as "DruM_stor235_HLM_Color", which reads as the wrong texture having been picked.
+    auto shownName = [this](const MatTexture& t) {
+        if (!t.texName.isEmpty()) return t.texName;
+        QString n;
+        if (m_index) n = m_index->nameForSno(kGroupTexture, int(t.texSno));
+        return n.isEmpty() ? QStringLiteral("~unnamed_%1").arg(t.texSno) : n;
+    };
+
     QFile f(d4 + QStringLiteral("/json/base/meta/Material/") + matName + QStringLiteral(".mat.json"));
-    if (!f.open(QIODevice::ReadOnly)) return;
+    if (!f.open(QIODevice::ReadOnly)) {
+        // No .mat.json — EVERY encrypted material. This used to return here, leaving the Textures
+        // tab and all six channel tiles blank, which reads as "this material has no textures". The
+        // viewport looked right the whole time because it goes through MaterialDecode, so the gap
+        // only ever showed in this panel. Same bug, same fix as ModelsTab::showMaterialTextures.
+        //
+        // Values / Shaders / Detail still need the JSON (no binary reader for those), so this fills
+        // what it can rather than pretending the material is empty.
+        const QVector<MatTexture> texs = MaterialDecode::texturesFor(m_reader, d4, matName);
+        QHash<QString, QPair<QString, qint64>> byRoleBin;
+        for (const MatTexture& t : texs) {
+            if (t.texSno <= 0) continue;   // by SNO, never by name — the name is what is missing
+            new QTreeWidgetItem(m_matTexList,
+                                QStringList{t.role, QString::number(t.texSno), shownName(t)});
+            if (!byRoleBin.contains(t.role)) byRoleBin.insert(t.role, {t.texName, t.texSno});
+        }
+        m_matTexList->resizeColumnToContents(0);
+        if (m_texTabs)
+            m_texTabs->setTabText(0, QStringLiteral("Textures (%1)")
+                                         .arg(m_matTexList->topLevelItemCount()));
+        auto decodeBin = [&](const char* role) {
+            const auto it = byRoleBin.constFind(QLatin1String(role));
+            return it == byRoleBin.constEnd() ? QImage()
+                                              : MaterialDecode::texture(m_reader, d4, it->first, it->second);
+        };
+        const QImage colorBin = decodeBin("BASE_COLOR");
+        setChanTile(0, colorBin);
+        setChanTile(1, decodeBin("ROUGHNESS"));
+        setChanTile(2, decodeBin("METALLIC"));
+        setChanTile(3, decodeBin("NORMAL"));
+        setChanTile(4, colorBin.isNull() ? QImage()
+                                         : colorBin.convertToFormat(QImage::Format_Alpha8)
+                                                   .convertToFormat(QImage::Format_Grayscale8));
+        setChanTile(5, decodeBin("EMISSIVE"));
+        return;
+    }
     const QByteArray json = f.readAll();
 
     // Textures tab.
     const QVector<MatTexture> texs = parseMaterialJson(json);
     QHash<QString, QPair<QString, qint64>> byRole;
     for (const MatTexture& t : texs) {
-        if (t.texName.isEmpty()) continue;
-        new QTreeWidgetItem(m_matTexList, QStringList{t.role, QString::number(t.texSno), t.texName});
+        if (t.texSno <= 0) continue;   // by SNO — a JSON material can still omit a name
+        new QTreeWidgetItem(m_matTexList, QStringList{t.role, QString::number(t.texSno), shownName(t)});
         if (!byRole.contains(t.role)) byRole.insert(t.role, {t.texName, t.texSno});
     }
     m_matTexList->resizeColumnToContents(0);
@@ -3692,7 +3798,8 @@ bool WardrobeTab2::eventFilter(QObject* obj, QEvent* ev)
         const int n = m_channelCombo->count();
         if (n > 0) {
             const int dir = we->angleDelta().y() > 0 ? -1 : 1;   // wheel-up = previous
-            m_channelCombo->setCurrentIndex((m_channelCombo->currentIndex() + dir + n) % n);
+            // Clamped, not wrapped — see ModelsTab: scrolling up must stop at "Shaded".
+            m_channelCombo->setCurrentIndex(qBound(0, m_channelCombo->currentIndex() + dir, n - 1));
         }
         return true;   // consume: never scroll the toolbar under us
     }
@@ -4060,7 +4167,10 @@ void WardrobeTab2::exportAnimLibrary(bool toLast)
 
 // Shared model-export helpers (defined in ModelsTab.cpp, external linkage) — reused so a single
 // wardrobe item exports with the same material/texture pipeline the Models tab uses.
-QStringList appearancePalette(const QString& d4, const QString& name);
+// reader/idx/sno enable the CASC meta-binary fallback for appearances with no .app.json.
+QStringList appearancePalette(const QString& d4, const QString& name,
+                              CascReader* reader = nullptr, const SnoIndex* idx = nullptr,
+                              qint64 sno = 0);
 QVector<ModelExporter::ExportMaterial> buildExportMats(
     const QStringList& palette, const ModelGeometry& geo, const QString& modelName,
     const QString& d4, CascReader* reader, bool wantTex);
@@ -4099,7 +4209,7 @@ void WardrobeTab2::exportItemModel(int sno, const QString& name, bool toLast)
     if (!path.endsWith(QStringLiteral(".glb"), Qt::CaseInsensitive)) path += QStringLiteral(".glb");
 
     const bool wantTex = QSettings().value(QStringLiteral("export/includeTex"), true).toBool();
-    const QStringList palette = appearancePalette(d4, name);
+    const QStringList palette = appearancePalette(d4, name, m_reader, m_index, sno);
     QVector<ModelExporter::ExportMaterial> mats = buildExportMats(palette, geo, name, d4, m_reader, wantTex);
     ModelExporter::Options opt = ModelExporter::optionsFromSettings();
     if (QSettings().value(QStringLiteral("export/hardpointEmpties"), false).toBool())
@@ -4112,7 +4222,9 @@ void WardrobeTab2::exportItemModel(int sno, const QString& name, bool toLast)
     const bool ok = ModelExporter::exportGlb(geo, path, mats, {}, {}, opt);
     const QString folder = QFileInfo(path).absolutePath();
     QSettings().setValue(QStringLiteral("wardrobe2/exportDir"), folder);
-    if (ok) ExportNotifier::instance().notify(QStringLiteral("Exported %1").arg(QFileInfo(path).fileName()), folder);
+    if (ok) ExportNotifier::instance().notify(
+                QStringLiteral("Exported %1%2").arg(QFileInfo(path).fileName(),
+                                                    ExportNotifier::glbOptionsLine(opt)), folder);
     else    QMessageBox::warning(this, QStringLiteral("Export model"), QStringLiteral("Export failed."));
 }
 
@@ -4121,7 +4233,7 @@ void WardrobeTab2::exportItemModel(int sno, const QString& name, bool toLast)
 void WardrobeTab2::populateCreator()
 {
     const QString d4 = Config::d4dataDir();
-    const int fubc = kClasses[qBound(0, m_class ? m_class->currentIndex() : 0, kNumClasses - 1)].fubc;
+    const int fubc = kClasses()[qBound(0, m_class ? m_class->currentIndex() : 0, kNumClasses - 1)].fubc;
     const bool male = m_gender && m_gender->currentData().toString() == QLatin1String("m");
     for (int i = 0; i < 9; ++i) {
         if (!m_creator[i]) continue;
@@ -4204,7 +4316,7 @@ void WardrobeTab2::populateWeapons()
     const bool classRestrict = QSettings().value(QStringLiteral("wardrobe2/weap/classRestrict"), true).toBool();
     m_lastClassRestrict = classRestrict;   // onSettingsLiveChanged diffs against this
     const int fubc = classRestrict
-        ? kClasses[qBound(0, m_class ? m_class->currentIndex() : 0, kNumClasses - 1)].fubc : -1;
+        ? kClasses()[qBound(0, m_class ? m_class->currentIndex() : 0, kNumClasses - 1)].fubc : -1;
 
     // Flatten ALL class-usable, hand-eligible weapons into the model combo, grouped by
     // type (so the icon browser can draw category dividers). `offHand` picks the
@@ -4637,7 +4749,7 @@ void WardrobeTab2::seatWeapon(ModelGeometry& wgeo, int hand, const QString& item
         // A Barbarian holding a Flail was taking row 1 — the DRUID grip — because the old code
         // took whichever row came first. An absent row means "no offset needed", never "borrow
         // another class's".
-        const int fubc = kClasses[qBound(0, m_class ? m_class->currentIndex() : 0, kNumClasses - 1)].fubc;
+        const int fubc = kClasses()[qBound(0, m_class ? m_class->currentIndex() : 0, kNumClasses - 1)].fubc;
         QVector<Off> mine;
         for (const Off& o : offs) if (o.entry == fubc && hp.contains(o.hash)) mine.push_back(o);
 
@@ -4969,21 +5081,21 @@ void WardrobeTab2::addItemActions(QMenu& menu, int sno, const QString& fullName)
     const QString exDir = ViewportPartMenu::condensePath(
         QSettings().value(QStringLiteral("wardrobe2/lastExportDir")).toString());
     if (!exDir.isEmpty())
-        menu.addAction(ViewportPartMenu::withValue(QStringLiteral("Export Model Last dir"), exDir) + exExtra,
+        menu.addAction(ViewportPartMenu::withValue(MenuText::kExportModelLast, exDir) + exExtra,
                        this, [this, sno, fullName] { exportItemModel(sno, fullName, true); });
-    menu.addAction(QStringLiteral("Export Model") + exExtra, this,
+    menu.addAction(ViewportPartMenu::prompts(MenuText::kExportModel + exExtra), this,
                    [this, sno, fullName] { exportItemModel(sno, fullName, false); });
 
     // ── copy ──
     menu.addSeparator();
-    menu.addAction(QStringLiteral("Copy SNO id  (%1)").arg(sno), this,
+    menu.addAction(QStringLiteral("%1  (%2)").arg(MenuText::kCopySno).arg(sno), this,
                    [sno, clip] { clip(QString::number(sno)); });
-    menu.addAction(QStringLiteral("Copy file name  (%1)").arg(prev(fullName)), this,
+    menu.addAction(QStringLiteral("%1  (%2)").arg(MenuText::kCopyFileName).arg(prev(fullName)), this,
                    [fullName, clip] { clip(fullName); });
-    menu.addAction(QStringLiteral("Copy name  (%1)").arg(prev(dispName)), this,
+    menu.addAction(QStringLiteral("%1  (%2)").arg(MenuText::kCopyName).arg(prev(dispName)), this,
                    [dispName, clip] { clip(dispName); });
     QAction* aColl = menu.addAction(
-        QStringLiteral("Copy collection name  (%1)").arg(prev(coll.isEmpty() ? QStringLiteral("—") : coll)),
+        QStringLiteral("%1  (%2)").arg(MenuText::kCopyCollection).arg(prev(coll.isEmpty() ? QStringLiteral("—") : coll)),
         this, [coll, clip] { clip(coll); });
     aColl->setEnabled(!coll.isEmpty());
 }
@@ -5579,6 +5691,67 @@ void WardrobeTab2::fillLookGrid()
         m_lookItems.append(k);
     }
 
+    // Theme matches to the VERY front — above "(none)", not after it — under a header naming the
+    // collection. COPIES: each pinned entry stays in its normal position further down the list too,
+    // so nothing the user is mid-scroll on jumps.
+    //
+    // Duplication is safe HERE and was not in the earlier attempt that duplicated a row in the
+    // COMBO. These are display entries holding combo indices, so an index simply appears twice and
+    // nothing is renumbered; duplicating a combo row shifted every later index, which is what made
+    // clicking a card equip its neighbour. m_lookItems may therefore contain repeats — see the
+    // "shown" count in updateLookHeader, which subtracts them.
+    m_lookThemeCount = 0;
+    m_lookThemeLabel.clear();
+    {
+        // Armour slots carry one match each; weapon slots (5-8) can match any of the theme's
+        // weapons, so both sources are consulted rather than assuming this is an armour slot.
+        const bool weapSlot = (m_activeSlot >= 5 && m_activeSlot <= 8);
+        QStringList wanted;
+        if (weapSlot) wanted = m_activeTheme.weapons;
+        else if (!m_activeTheme.armor.value(m_activeSlot).isEmpty())
+            wanted << m_activeTheme.armor.value(m_activeSlot);
+
+        // EVERY match, not the first one. This used to stop at the first hit — one pinned card per
+        // grid — and since the theme's weapon list is scanned in the same bundle order for all four
+        // weapon slots, every weapon grid pinned the SAME weapon and the theme's other weapons were
+        // pinned nowhere. A themed axe + dagger showed the axe in Main, Off, Sheath and Sheath 2,
+        // and the dagger in none of them.
+        //
+        // A theme's weapons are not authored per hand — ThemeResolved::weapons is a flat list off
+        // the store bundle with no hand metadata — so "which slot does this one belong in" is not a
+        // question the data can answer. Every themed weapon the slot's combo will accept is pinned
+        // in that slot, and the hand rules already exclude what genuinely cannot go there
+        // (two-handers out of the off hand, shields/focuses out of the main; see populateWeapons).
+        QList<int> pins;
+        for (const QString& want : wanted) {
+            for (int pos = 0; pos < m_lookItems.size(); ++pos) {
+                const int k = m_lookItems[pos];
+                if (k == 0) continue;                        // never move "(none)" itself
+                if (pins.contains(k)) continue;              // one card per item, even if listed twice
+                // Weapons carry their real appearance name on UserRole+1; the visible text is a
+                // friendly label, so matching on text alone would miss every weapon.
+                const QString full = c->itemData(k, Qt::UserRole + 1).toString();
+                if (c->itemText(k).compare(want, Qt::CaseInsensitive) != 0
+                    && full.compare(want, Qt::CaseInsensitive) != 0) continue;
+                pins.append(k);
+                break;                                       // next `want`
+            }
+        }
+        if (!pins.isEmpty()) {
+            // COPIES, left in place as well. Removing them from their normal positions would move
+            // icons the user is looking at, which is disorienting mid-scroll for no gain.
+            //
+            // Safe to duplicate HERE, unlike the earlier attempt that duplicated rows in the combo:
+            // these are display entries holding combo indices, so an index simply appears twice.
+            // Nothing is renumbered, and both cards equip the same item because the card's button
+            // id IS that index. Prepended as a block so the theme's own order is preserved.
+            m_lookItems = pins + m_lookItems;
+            m_lookThemeCount = int(pins.size());
+            const QString coll = am.collectionFor(c->itemData(pins.first()).toInt());
+            m_lookThemeLabel = coll.isEmpty() ? QStringLiteral("Matching set") : coll;
+        }
+    }
+
     // Reset the lazy-build cursor and lay out the first chunk; more load on scroll.
     m_lookCursor = nullptr;   // the previous grid's buttons are gone
     m_lookBuildPos = 0; m_lookBuildRow = 0; m_lookBuildCol = 0; m_lookBuildGroup.clear();
@@ -5603,9 +5776,32 @@ void WardrobeTab2::appendLookCards(int maxCards)
     auto wrapRow = [&] { if (m_lookBuildCol != 0) { ++m_lookBuildRow; m_lookBuildCol = 0; } };
     int built = 0;
     while (m_lookBuildPos < m_lookItems.size() && built < maxCards) {
+        const int posInList = m_lookBuildPos;      // position BEFORE the increment below
         const int k = m_lookItems[m_lookBuildPos++];
-        // Full-width category divider whenever the weapon type changes.
-        if (weaponSlot && k > 0) {
+        // Header above the pinned theme match, and a row break after it so the ordinary list
+        // starts clean rather than running on from the pinned card.
+        // Keyed on POSITION 0, not on the index: the pinned card is a copy, so its combo index also
+        // appears later in the list and an index test would print the header twice.
+        if (m_lookThemeCount > 0 && posInList == 0 && !m_lookThemeLabel.isEmpty()) {
+            wrapRow();
+            auto* thdr = new QLabel(m_lookThemeLabel, m_lookContent);
+            thdr->setToolTip(QStringLiteral("The equipped theme's matching piece for this slot"));
+            thdr->setStyleSheet(QStringLiteral(
+                "QLabel{color:#cda85a; font-weight:bold; padding:8px 2px 2px 4px; "
+                "border-bottom:1px solid #4a4133;}"));
+            m_lookLayout->addWidget(thdr, m_lookBuildRow, 0, 1, cols);
+            ++m_lookBuildRow; m_lookBuildCol = 0;
+        } else if (m_lookThemeCount > 0 && posInList == m_lookThemeCount) {
+            // Break AFTER the last pinned card, not after the first — with several pinned weapons
+            // they share a row block of their own and "(none)" starts the ordinary list below.
+            wrapRow();
+        }
+        // Full-width category divider whenever the weapon type changes — but NOT across the pinned
+        // theme block. Two reasons: an axe and a dagger pinned together would each get their own
+        // "Axe"/"Dagger" divider inside the block, which is the opposite of the single shared row
+        // the theme header promises; and the last pinned weapon would leave m_lookBuildGroup set to
+        // its type, so the ordinary list below silently LOST that type's divider when it reached it.
+        if (weaponSlot && k > 0 && posInList >= m_lookThemeCount) {
             const QString grp = c->itemData(k, Qt::UserRole + 2).toString();
             if (!grp.isEmpty() && grp != m_lookBuildGroup) {
                 m_lookBuildGroup = grp;
@@ -5827,7 +6023,7 @@ void WardrobeTab2::fillPigmentGrid()
             menu.addSeparator();
             auto clip = [](const QString& t) { QGuiApplication::clipboard()->setText(t); };
             QAction* aName = menu.addAction(
-                QStringLiteral("Copy name  (%1)").arg(cn.size() > 30 ? cn.left(29) + QChar(0x2026) : cn),
+                QStringLiteral("%1  (%2)").arg(MenuText::kCopyName).arg(cn.size() > 30 ? cn.left(29) + QChar(0x2026) : cn),
                 this, [cn, clip] { clip(cn); });
             aName->setEnabled(!cn.isEmpty());
             QAction* aHex = menu.addAction(QStringLiteral("Copy colours  (%1)").arg(chx.join(QLatin1Char(' '))),
@@ -6216,7 +6412,11 @@ void WardrobeTab2::updateLookHeader()
     QString eq = (c->currentIndex() <= 0) ? QStringLiteral("(none)") : (title.isEmpty() ? fname : title);
     // Show the filtered count ("showing X of Y") when a search/collection filter is active.
     const int total = c->count() - 1;
-    const int shown = qMax(0, int(m_lookItems.size()) - 1);
+    // Minus "(none)" AND minus the pinned theme cards: those are copies of entries that are still
+    // in the list further down, so counting them made the header claim more items than exist —
+    // "Main (365 of 361)". It overshot by one before; with a multi-weapon theme it overshoots by
+    // however many weapons the theme has.
+    const int shown = qMax(0, int(m_lookItems.size()) - 1 - m_lookThemeCount);
     const QString count = (shown == total) ? QString::number(total)
                                            : QStringLiteral("%1 of %2").arg(shown).arg(total);
     QString hdr = QStringLiteral("%1  (%2) - %3").arg(slotLabel(m_activeSlot), count, eq);
@@ -6466,10 +6666,35 @@ void WardrobeTab2::fillCreatorGrid()
     });
     order.prepend(0);   // "(default)" always first
 
+    // Theme match above even "(default)", mirroring the look grid. Creator entries store a STEM
+    // string rather than an appearance SNO, so there is no collection to name here — the header
+    // says so generically instead of inventing one.
+    int themeK = -1;
+    const QString wantStem = m_activeTheme.creator.value(m_activeCreator);
+    if (!wantStem.isEmpty()) {
+        for (int i = 0; i < order.size(); ++i) {
+            if (order[i] == 0) continue;                       // never move "(default)"
+            if (c->itemData(order[i]).toString().compare(wantStem, Qt::CaseInsensitive) != 0) continue;
+            themeK = order[i];
+            order.remove(i);
+            order.prepend(themeK);
+            break;
+        }
+    }
+
     // Resolved ONCE: this opens the selected Marking's .msh.json, and the colour grid can hold
     // 300+ tiles.
     const QString authoredCol = (m_activeCreator == 7) ? markingAuthoredColorStem() : QString();
     int pos = 0;
+    if (themeK >= 0) {   // full-width header, then cards start on the row below it
+        auto* thdr = new QLabel(QStringLiteral("Matching set"), m_creatorContent);
+        thdr->setToolTip(QStringLiteral("The equipped theme's matching choice for this category"));
+        thdr->setStyleSheet(QStringLiteral(
+            "QLabel{color:#cda85a; font-weight:bold; padding:8px 2px 2px 4px; "
+            "border-bottom:1px solid #4a4133;}"));
+        m_creatorLayout->addWidget(thdr, 0, 0, 1, cols);
+        pos = cols;
+    }
     for (int k : order) {
         const QString stem = c->itemData(k).toString();
         auto* b = new QToolButton(m_creatorContent);
@@ -6531,9 +6756,9 @@ void WardrobeTab2::fillCreatorGrid()
                         auto prev = [](const QString& s) { return s.size() > 30 ? s.left(29) + QChar(0x2026) : s; };
                         const QString disp = m_creator[m_activeCreator]
                                                ? m_creator[m_activeCreator]->itemText(k) : stem;
-                        menu.addAction(QStringLiteral("Copy file name  (%1)").arg(prev(stem)), this,
+                        menu.addAction(QStringLiteral("%1  (%2)").arg(MenuText::kCopyFileName).arg(prev(stem)), this,
                                        [stem, clip] { clip(stem); });
-                        menu.addAction(QStringLiteral("Copy name  (%1)").arg(prev(disp)), this,
+                        menu.addAction(QStringLiteral("%1  (%2)").arg(MenuText::kCopyName).arg(prev(disp)), this,
                                        [disp, clip] { clip(disp); });
                         menu.exec(b->mapToGlobal(p));
                     });
@@ -6541,6 +6766,9 @@ void WardrobeTab2::fillCreatorGrid()
         m_creatorGroup->addButton(b, k);
         m_creatorLayout->addWidget(b, pos / cols, pos % cols);
         ++pos;
+        // Round up to the next row so the pinned card sits alone and "(default)" starts a clean
+        // row below it, rather than the ordinary list running on from the same row.
+        if (themeK >= 0 && k == themeK) pos = ((pos + cols - 1) / cols) * cols;
     }
     connect(m_creatorGroup, &QButtonGroup::idClicked, this, [this](int k) {
         if (m_creator[m_activeCreator]) m_creator[m_activeCreator]->setCurrentIndex(k);   // → existing rebuild
@@ -6842,6 +7070,7 @@ void WardrobeTab2::equipTheme(int sno, const QString& appearanceName, ThemeScope
     m_restoring = true;
     QStringList matched;   // categories equipped, for the status line
     int count = 0;
+    int themeMissing = 0;  // theme pieces whose name matched no row in their slot combo
 
     // ── Armour: the matching set's pieces. ──
     if (doArmor) {
@@ -6853,6 +7082,12 @@ void WardrobeTab2::equipTheme(int sno, const QString& appearanceName, ThemeScope
                 mc->setCurrentIndex(idx);
                 QSettings().setValue(QStringLiteral("wardrobe2/slot/%1").arg(it.key()), it.value());
                 ++n;
+            } else {
+                // The theme names a piece this slot's combo has no row for — the appearance is not
+                // in the archive, or the roster spells it differently. Counted rather than dropped:
+                // silently equipping 3 of 5 pieces reads as "the theme only has three", which is
+                // indistinguishable from a partial set and sent people looking for the wrong bug.
+                ++themeMissing;
             }
         }
         if (n) { matched << QStringLiteral("armor"); count += n; }
@@ -6886,11 +7121,23 @@ void WardrobeTab2::equipTheme(int sno, const QString& appearanceName, ThemeScope
 
     // ── Weapons from the resolved store bundle (exact appearance names). ──
     if (doWeap && !r.weapons.isEmpty()) {
+        // `used` is why this is not two independent scans. Both hands walked r.weapons from the
+        // front with no exclusion, so a theme holding a 1H axe and a dagger put the AXE in both
+        // hands and never equipped the dagger — the first-match-wins shape that also capped the
+        // look-grid pin at one card. A weapon already placed is skipped, so distinct theme weapons
+        // fill distinct hands; a single-weapon theme still arms the main hand only.
+        QStringList used;
         auto equipW = [&](QComboBox* mc, const QString& key) -> bool {
             if (!mc) return false;
             for (const QString& wn : r.weapons) {
+                if (used.contains(wn, Qt::CaseInsensitive)) continue;
                 const int i = mc->findData(wn, Qt::UserRole + 1, Qt::MatchFixedString);
-                if (i > 0) { mc->setCurrentIndex(i); QSettings().setValue(key, weaponKeyOf(mc)); return true; }
+                if (i > 0) {
+                    mc->setCurrentIndex(i);
+                    QSettings().setValue(key, weaponKeyOf(mc));
+                    used << wn;
+                    return true;
+                }
             }
             return false;
         };
@@ -6903,8 +7150,28 @@ void WardrobeTab2::equipTheme(int sno, const QString& appearanceName, ThemeScope
     m_restoring = false;
     rebuildOutfit();
     refreshSlotCells();
-    if (m_creatorLayout) refreshCreatorCells();
-    refreshLookSelection();   // update checkmarks in place (preserves scroll position)
+    // Full refill, not just the cells: the theme changed, so the creator grid's ORDER changes too
+    // (its matching choice moves to the front under a header) and only a refill reorders.
+    if (m_creatorLayout) { fillCreatorGrid(); refreshCreatorCells(); }
+    // Full rebuild rather than refreshLookSelection(): the theme just changed, so a pinned copy of
+    // the matching piece has to be inserted at the top, and only a rebuild does that. Done here, on
+    // the explicit Equip Theme action, and deliberately not in setActiveTheme(): that runs on every
+    // card click, where rebuilding would destroy the very button being clicked.
+    //
+    // The scroll position is saved and restored around it. A rebuild resets the scrollbar to 0,
+    // which throws away where the user was reading — and equipping a theme is not a request to be
+    // sent back to the top of the list.
+    const int keepScroll = m_lookScroll && m_lookScroll->verticalScrollBar()
+                               ? m_lookScroll->verticalScrollBar()->value() : 0;
+    fillLookGrid();
+    if (m_lookScroll && m_lookScroll->verticalScrollBar() && keepScroll > 0) {
+        QScrollBar* sb = m_lookScroll->verticalScrollBar();
+        // Queued: the grid builds its first chunk lazily, so the scrollbar's range is still 0 at
+        // this point and setValue would be clamped away to nothing.
+        QMetaObject::invokeMethod(this, [sb, keepScroll] {
+            sb->setValue(qMin(keepScroll, sb->maximum()));
+        }, Qt::QueuedConnection);
+    }
     refreshLookHighlights();
     refreshCreatorHighlights();
     updateCreatorHeader();    // a theme can change the Marking, and the header names it
@@ -6912,69 +7179,26 @@ void WardrobeTab2::equipTheme(int sno, const QString& appearanceName, ThemeScope
     // Overrides rebuildOutfit()'s per-slot snap so the framing matches what was equipped.
     if (m_d4View) frameThemeScope(scope);
     if (m_status) {
+        // The drop count belongs on BOTH branches. Reporting it only alongside a success hid it in
+        // the case it matters most: a theme whose pieces ALL fail to resolve equips nothing, so
+        // count == 0, and "No matching theme found" then blames the search when the theme WAS found
+        // and every piece of it was thrown away.
+        const QString missNote = themeMissing
+            ? QStringLiteral("  ·  %1 piece(s) not in the archive").arg(themeMissing) : QString();
         if (count == 0)
-            m_status->setText(QStringLiteral("No matching theme found for '%1'.").arg(token));
+            m_status->setText(QStringLiteral("No matching theme found for '%1'.%2").arg(token, missNote));
         else
-            m_status->setText(QStringLiteral("Equipped %1 piece(s): %2").arg(count).arg(matched.join(QStringLiteral(", "))));
+            m_status->setText(QStringLiteral("Equipped %1 piece(s): %2%3")
+                                  .arg(count).arg(matched.join(QStringLiteral(", ")), missNote));
     }
 }
 
-// Detect the discrete dye-mask value bands the artist painted, straight from the DYE_MASK texture.
-// D4's dye mask stores each material zone as a specific grey level (single-channel BC4). These
-// levels vary per armor (barF_sets54 clusters near 0.06/0.10/0.29/0.58; others sit elsewhere), so
-// hardcoding band centres is wrong — we read the actual histogram, merge nearby bins into clusters,
-// and return the (up to) four most-populated centres sorted ascending. Fewer than four → the last
-// centre is repeated so the extra zones collapse onto it. This is the game-data source of truth.
-static QVector4D detectDyeBands(const QImage& dyeMaskIn)
-{
-    QVector4D def(0.063f, 0.345f, 0.596f, 0.831f);   // shipped fallback when there's no usable mask
-    if (dyeMaskIn.isNull()) return def;
-    const QImage m = dyeMaskIn.convertToFormat(QImage::Format_RGBA8888);
-    const int W = m.width(), H = m.height();
-    if (W < 2 || H < 2) return def;
-    long hist[256] = {0}; long total = 0;
-    const int sx = qMax(1, W / 256), sy = qMax(1, H / 256);   // sparse sample: fast, plenty accurate
-    for (int y = 0; y < H; y += sy) {
-        const uchar* s = m.constScanLine(y);
-        for (int x = 0; x < W; x += sx) { ++hist[s[x * 4]]; ++total; }
-    }
-    if (total < 16) return def;
-    // Merge adjacent populated bins (gap < 6) into clusters; a bin counts if it holds >0.4% of samples.
-    const long minPop = qMax(2L, long(total / 250));
-    struct Cl { double sum = 0; long pop = 0; };
-    QVector<Cl> clusters;
-    int lastBin = -100;
-    for (int b = 0; b < 256; ++b) {
-        if (hist[b] < minPop) continue;
-        if (b - lastBin > 6 || clusters.isEmpty()) clusters.append(Cl{});
-        Cl& c = clusters.last(); c.sum += double(b) * hist[b]; c.pop += hist[b];
-        lastBin = b;
-    }
-    if (clusters.isEmpty()) return def;
-    std::sort(clusters.begin(), clusters.end(), [](const Cl& a, const Cl& b) { return a.pop > b.pop; });
-    if (clusters.size() > 4) clusters.resize(4);              // keep the four most-populated zones
-    QVector<float> centres;
-    for (const Cl& c : clusters) centres.append(float(c.sum / double(c.pop) / 255.0));
-    std::sort(centres.begin(), centres.end());
-    while (centres.size() < 4) centres.append(centres.last());
-    return QVector4D(centres[0], centres[1], centres[2], centres[3]);
-}
-
-// Derive the dye-zone → detail-map table from which maps are actually present. Non-metal maps are
-// assigned to zones 1..3 in slot order and CLAMPED to the last one (so a 4th zone with only two
-// leather/fabric maps reuses the second); the metal map is excluded here (metalness routes metal
-// texels to it in the shader). zone0 is the bare/lowest band → no detail. Returns 4 layers as floats.
-static QVector4D deriveZoneMap(const QVector<QImage>& detailN, int metalLayer)
-{
-    QVector<int> nm;                                          // present NON-metal detail-map slot indices
-    for (int i = 0; i < detailN.size() && i < 3; ++i)
-        if (!detailN[i].isNull() && i != metalLayer) nm.append(i);
-    auto pick = [&](int zoneIdx) -> int {                    // zoneIdx 1..3 → non-metal map (clamped)
-        if (nm.isEmpty()) return -1;
-        return nm[qMin(zoneIdx - 1, nm.size() - 1)];
-    };
-    return QVector4D(float(-1), float(pick(1)), float(pick(2)), float(pick(3)));
-}
+// detectDyeBands + deriveZoneMap moved to MaterialDecode (model/MaterialDecode.{h,cpp}) alongside
+// bakeDetail, so the Models tab, Stable and Bulk Extract can derive the same per-part bands and
+// zone→detail-map table instead of baking with the shipped fallbacks. Verbatim move; the two call
+// sites below are unchanged.
+using MaterialDecode::detectDyeBands;
+using MaterialDecode::deriveZoneMap;
 
 // Coalesce rapid interactive selections (clicking through slots/creator/weapons) into a single
 // rebuild after a short quiet period, so browsing a list doesn't stack one full rebuild per click.
@@ -7043,6 +7267,7 @@ void WardrobeTab2::rebuildOutfitImpl(bool async)
     QString skelDbg;
     QString loadLog;       // per-piece result, shown in the status label (reliable channel)
     QString bodySkinMat;   // the face's real body-skin material (for test999's placeholder skin)
+    m_clothMatNames.clear();   // rebuilt from each piece's roster as it loads (see below)
     int baseOutfitCount = 0;   // warlock: number of base00 whole-body primitives (they lead `parts`)
     const QString prefix = classPrefix();
 
@@ -7126,18 +7351,24 @@ void WardrobeTab2::rebuildOutfitImpl(bool async)
                      qPrintable(name), sno, slot, qint64(payload.size()));
             return false;
         }
-        QStringList roster = MaterialDecode::appearanceRoster(d4, name);
+        QVector<bool> rosterCloth;
+        QStringList roster = MaterialDecode::appearanceRoster(d4, name, &rosterCloth);
         // Encrypted appearances have no .app.json, so the JSON roster is empty and every primitive
         // lost its material — white mesh, "part 7"/"part 8" labels. Same list read from the meta
         // binary instead; verified to reproduce the JSON exactly on 8 named appearances and the
         // d4analyzer GLB export on 2 encrypted ones.
         if (roster.isEmpty()) {
-            roster = MaterialDecode::appearanceRosterFromMeta(meta, m_index);
+            roster = MaterialDecode::appearanceRosterFromMeta(meta, m_index, nullptr, &rosterCloth);
             if (!roster.isEmpty())
                 qInfo("wardrobe %s: material roster from meta binary — %d entry(ies)",
                       qPrintable(name), int(roster.size()));
         }
         for (MeshPrimitive& p : geo.primitives) p.materialName = roster.value(p.materialIndex);
+        // Record the AUTHORED cloth set, by material name so it survives the multi-piece merge
+        // (materialIndex is per-piece and collides once pieces are merged; names do not). This is
+        // the signal the SIM toggle should always have used — see the classification loop.
+        for (int i = 0; i < roster.size(); ++i)
+            if (rosterCloth.value(i) && !roster[i].isEmpty()) m_clothMatNames.insert(roster[i]);
         // Remember the face's real body-skin material (…_BOD) — test999 body pieces use a
         // black placeholder (armor_skin_mat), so we re-skin them with this.
         if (isBody && bodySkinMat.isEmpty())
@@ -7542,15 +7773,51 @@ void WardrobeTab2::rebuildOutfitImpl(bool async)
         const QImage& dmask = !markBodyImg.isNull() ? markBodyImg : markFaceImg;
         // Report the R (coverage) and G (ink→gold) channels separately — that's the real encoding.
         double sR = 0, sG = 0; long n = 0, covN = 0, goldN = 0;
+        // ── Channel statistics over the COVERED texels only ─────────────────────────────────────
+        // The whole-image mean of G is meaningless here: a marking covers a few percent of the
+        // sheet, so an empty background drags every average to ~0 and makes any mask look like
+        // "G is low". What decides which end of the ramp the design actually lands on is G
+        // WHERE R SAYS THERE IS INK — plus, for the ramp-vs-channel-select question, whether B
+        // carries anything at all. Bucketed rather than averaged: a design split between two ends
+        // of the ramp and one sitting flat in the middle have the same mean and look nothing alike.
+        double sGc = 0, sBc = 0; long nc = 0;
+        long gLo = 0, gMid = 0, gHi = 0;                 // covered texels with G <64 / 64-191 / >=192
         if (!dmask.isNull()) {
             const QImage m = dmask.convertToFormat(QImage::Format_RGBA8888);
             const int sxx = qMax(1, m.width()/128), syy = qMax(1, m.height()/128);
             for (int y = 0; y < m.height(); y += syy) { const uchar* s = m.constScanLine(y);
                 for (int x = 0; x < m.width(); x += sxx) { const uchar* p = s + x*4;
-                    sR += p[0]; sG += p[1]; ++n; if (p[0] >= 128) ++covN; if (p[1] >= 128) ++goldN; } }
+                    sR += p[0]; sG += p[1]; ++n; if (p[0] >= 128) ++covN; if (p[1] >= 128) ++goldN;
+                    if (p[0] >= 128) {                   // this texel is ink
+                        sGc += p[1]; sBc += p[2]; ++nc;
+                        if (p[1] < 64)       ++gLo;
+                        else if (p[1] < 192) ++gMid;
+                        else                 ++gHi;
+                    } } }
         }
         const double mR = n ? sR/n : 0, mG = n ? sG/n : 0;
         const double covPct = n ? 100.0*covN/n : 0, goldPct = n ? 100.0*goldN/n : 0;
+        const double mGc = nc ? sGc/nc : 0, mBc = nc ? sBc/nc : 0;
+        const double gLoP = nc ? 100.0*gLo/nc : 0, gMidP = nc ? 100.0*gMid/nc : 0,
+                     gHiP = nc ? 100.0*gHi/nc : 0;
+        // ── What colour the model SAYS the ink is ───────────────────────────────────────────────
+        // The channel stats above describe the mask; this describes the OUTPUT. The two together
+        // bracket the bug: if this mean is dark and the viewport still shows bright teal, the
+        // fault is downstream of compositing (shading, gamma, a second overlay) and no amount of
+        // ramp tuning will fix it. Measured rather than reasoned about, because the arithmetic
+        // said this was already near-black while the screenshot plainly was not.
+        double iR = 0, iG = 0, iB = 0;
+        if (nc && !dmask.isNull()) {
+            const QImage m = dmask.convertToFormat(QImage::Format_RGBA8888);
+            const int sxx = qMax(1, m.width()/128), syy = qMax(1, m.height()/128);
+            long k = 0;
+            for (int y = 0; y < m.height(); y += syy) { const uchar* s = m.constScanLine(y);
+                for (int x = 0; x < m.width(); x += sxx) { const uchar* p = s + x*4;
+                    if (p[0] < 128) continue;
+                    const QColor c = rampLerp(markPaint.ramp, p[1] / 255.0f);
+                    iR += c.red(); iG += c.green(); iB += c.blue(); ++k; } }
+            if (k) { iR /= k; iG /= k; iB /= k; }
+        }
         auto hex = [](const QColor& c) { return c.isValid()
             ? QStringLiteral("%1%2%3").arg(c.red(),2,16,QLatin1Char('0')).arg(c.green(),2,16,QLatin1Char('0')).arg(c.blue(),2,16,QLatin1Char('0'))
             : QStringLiteral("----"); };
@@ -7562,6 +7829,22 @@ void WardrobeTab2::rebuildOutfitImpl(bool async)
                        .arg(dmask.width()).arg(dmask.height())
                        .arg(mR, 0, 'f', 0).arg(covPct, 0, 'f', 1).arg(mG, 0, 'f', 0).arg(goldPct, 0, 'f', 1)
                        .arg(hex(markPaint.ramp[0])).arg(hex(markPaint.ramp[1])).arg(hex(markPaint.ramp[2]));
+        // ALSO to the log — loadLog is a tooltip string and never reaches the log file, which is
+        // the same trap line 7614 documents. A diagnostic you cannot retrieve from a bug report is
+        // not a diagnostic; this is the one line that says which end of the ramp the design lands
+        // on, and it was unreachable.
+        // ENV-GATED. This runs on every wardrobe rebuild that has a marking selected, and the two
+        // mask scans above plus a 17-argument line is not something to put in every user's log for
+        // a question nobody is asking today. Convention 7: diagnostics stay in the code, gated.
+        // "Dump Marking Model.bat" sets this and is the thorough version of the same enquiry.
+        if (qEnvironmentVariableIsSet("D4_MARKING_SWEEP"))
+        qInfo("MARK %s col=%s tattoo=%d mask=%dx%d | ink %.1f%% of sheet | over ink: G=%.0f B=%.0f "
+              "· G<64 %.1f%% · G 64-191 %.1f%% · G>=192 %.1f%% | ramp #%s / #%s / #%s "
+              "| INK COLOUR OUT = rgb(%.0f,%.0f,%.0f)",
+              qUtf8Printable(sel(6)), qUtf8Printable(markColStem), markPaint.isTattoo ? 1 : 0,
+              dmask.width(), dmask.height(), covPct, mGc, mBc, gLoP, gMidP, gHiP,
+              qUtf8Printable(hex(markPaint.ramp[0])), qUtf8Printable(hex(markPaint.ramp[1])),
+              qUtf8Printable(hex(markPaint.ramp[2])), iR, iG, iB);
     }
 
     // Skin detail overlay (Freckle / Vitiligo): <pref>_<PXX>_BOD/HED_<Style>_color.
@@ -7664,6 +7947,8 @@ void WardrobeTab2::rebuildOutfitImpl(bool async)
     QVector<int> dMetalLayerV;                          // per-part metal detail-map index (-1 = none)
     QVector<QVector4D> dBandsV, dZoneMapV;              // per-part detected dye bands + derived zone→map
     QVector<int> hair, skin, cloth, region, fur, fxAdd, eye, head;
+    QVector<int> hed, headCore;   // head group / head mesh only (see WardrobeOutfitMaps)
+    QVector<QImage> skinExportBase;   // marking-or-black skin base (see WardrobeOutfitMaps)
     QVector<float> hairParams;   // per part ×3: hero_hair (Hair Roughness, Hair Specular, Highlight Shift)
     QVector<QString> matKey;   // per-part VRAM-pool key: material + colour epoch (parallel to parts)
     QVector<float> fxIntensity, fxWobble, fxFresnel, fxAlpha, fxSat;   // authored per-FX-part real values
@@ -7823,6 +8108,28 @@ void WardrobeTab2::rebuildOutfitImpl(bool async)
         }
         if (isBody && !markBodyImg.isNull())
             markEmis = applyMarkingMaterial(base, partOrm, markBodyImg, markPaint, mark.emissive, rg, mt, markEmisMul);
+
+        // ── Skin base colour for the "items and untextured character" export ──────────────────
+        // The rule is deliberately blunt: if a MARKING is equipped, that marking image IS the base
+        // colour; otherwise the part exports flat black. No skin tone, no detail overlay, no
+        // makeup, and no attempt to composite the marking over a white body — an earlier version
+        // did that and produced a white head with the marking lost, because the composite blends
+        // against the skin it is replacing.
+        //
+        // Built here because markFaceImg / markBodyImg only exist during the decode; recovering
+        // them at export time would mean redoing the whole marking resolve.
+        if (isSkin) {
+            const QImage& mk = isHead ? markFaceImg : markBodyImg;
+            if (!mk.isNull()) {
+                skinExportBase << mk;
+            } else {
+                QImage blk(4, 4, QImage::Format_RGBA8888);
+                blk.fill(QColor(0, 0, 0));
+                skinExportBase << blk;
+            }
+        } else {
+            skinExportBase << QImage();
+        }
         tex  << base;
         // VRAM-pool key for this part. effMat fully determines the base/norm/orm decode and the
         // per-part classification (hair/skin/eye/head/body are deterministic from it); colorEpoch
@@ -7846,6 +8153,29 @@ void WardrobeTab2::rebuildOutfitImpl(bool async)
         }
         hair << (isHair ? 1 : 0); skin << (isSkin ? 1 : 0); eye << (isEye ? 1 : 0);
         head << ((isHead && isSkin && !isHair) ? 1 : 0);   // face skin only → warm Fresnel rim
+        // Raw head test + "is this the character rather than a worn item". Hair and eyes count as
+        // the character: hiding the head while leaving the hair floating, or exporting "items only"
+        // with a scalp attached, is not what either option means.
+        // Head test for the HED toggle. Widened past head/face/_HED because a head appearance is
+        // more than its face material — teeth, tongue, brows and lashes are separate submeshes with
+        // their own names, and leaving them behind was the reported "teeth still showing".
+        // `character` is NOT decided here: material names cannot tell a worn item from the body.
+        // applyOutfit derives it from the slot tag instead — see there.
+        // The head MESH proper — barF_P00_HED and nothing else. `hed` below is the whole head
+        // GROUP (teeth, tongue, eyes, lashes, brows, facial hair, and the appearance's own _BOD),
+        // which is what the HED visibility toggle wants; the untextured-character export wants only
+        // the head itself, because the rest are separate submeshes that get in the way once the
+        // textures are gone. "_HED" is the game's own suffix and cleanly separates the two.
+        headCore << (m.contains(QLatin1String("_HED"), Qt::CaseInsensitive) ? 1 : 0);
+        hed << ((isHead || isEye
+                 || m.contains(QLatin1String("teeth"),    Qt::CaseInsensitive)
+                 || m.contains(QLatin1String("tooth"),    Qt::CaseInsensitive)
+                 || m.contains(QLatin1String("tongue"),   Qt::CaseInsensitive)
+                 || m.contains(QLatin1String("mouth"),    Qt::CaseInsensitive)
+                 || m.contains(QLatin1String("eyebrow"),  Qt::CaseInsensitive)
+                 || m.contains(QLatin1String("eyelash"),  Qt::CaseInsensitive)
+                 || m.contains(QLatin1String("brow"),     Qt::CaseInsensitive)
+                 || m.contains(QLatin1String("lash"),     Qt::CaseInsensitive)) ? 1 : 0);
         // Cloth/physics submeshes: D4 names them with cloth/sim/skirt/cape/loincloth
         // tokens — these are the parts the Verlet sim drapes during animation.
         cloth << ((isSimName(m) && !isFxName(m)) ? 1 : 0);
@@ -7983,6 +8313,8 @@ void WardrobeTab2::rebuildOutfitImpl(bool async)
         M.hair=std::move(hair); M.skin=std::move(skin); M.cloth=std::move(cloth); M.region=std::move(region);
         M.hairParams=std::move(hairParams);
         M.fur=std::move(fur); M.fxAdd=std::move(fxAdd); M.eye=std::move(eye); M.head=std::move(head);
+        M.hed=std::move(hed); M.headCore=std::move(headCore);
+        M.skinExportBase=std::move(skinExportBase);
         M.fxIntensity=std::move(fxIntensity); M.fxWobble=std::move(fxWobble); M.fxFresnel=std::move(fxFresnel);
         M.fxAlpha=std::move(fxAlpha); M.fxSat=std::move(fxSat);
         M.furProbe=std::move(furProbe); M.loadLogAdd=std::move(loadLog);
@@ -7993,11 +8325,30 @@ void WardrobeTab2::rebuildOutfitImpl(bool async)
         const WardrobeOutfitMaps M = decode();
         const qint64 tDec = dt.elapsed();
         applyOutfit(ctx, M);
+        const qint64 tApply = dt.elapsed() - tDec;
         // Auto-animate reacts to the WEAPON configuration, not to any rebuild — re-drawing the
         // weapons because a helmet changed would be both wrong and maddening.
         maybeAutoAnimate();
-        qInfo("wardrobe: rebuild(sync) — geometry %lld ms · decode %lld ms · apply %lld ms (%d pieces)",
-              tGeom, tDec, dt.elapsed() - tDec, ctx.pieceCount);
+        const qint64 tAnim = dt.elapsed() - tDec - tApply;
+        // apply and auto-animate are timed SEPARATELY on purpose. Lumped together they read
+        // "apply 84610 ms" on the first rebuild of a session and "apply 49 ms" on the very next
+        // one with MORE pieces — a 1700x swing that says the cost is a cold path, not the work
+        // itself, but not WHICH of the two owns it. Splitting them answers that in one launch.
+        //
+        // MEASURED, and REFUTED: auto-animate is 0 ms. It is not the cost, despite
+        // WardrobeAnimIndex being the obvious suspect (it builds in the background and no-ops
+        // when ready, so it never blocked here). Do not re-investigate without new evidence.
+        //
+        // Also measured: the same first-rebuild apply fell 84610 ms -> 2217 ms once the auto icon
+        // audit stopped running on the GUI thread (MainWindow::autoIconAudit). Caches were
+        // byte-identical across both runs and the log sequence matched line for line, so cache
+        // warmth was not the variable. The mechanism is NOT established — a blocked GUI thread
+        // also expires every staggered prewarm timer at once, which is exactly what the 1800 ms
+        // stagger exists to prevent, so the two may be connected. The residual first-vs-second
+        // asymmetry (2217 ms vs ~40 ms) is the same shape, 40x smaller. If this ever comes back,
+        // this split is what will name it.
+        qInfo("wardrobe: rebuild(sync) — geometry %lld ms · decode %lld ms · apply %lld ms · auto-animate %lld ms (%d pieces)",
+              tGeom, tDec, tApply, tAnim, ctx.pieceCount);
         return;
     }
     // Async: decode on a worker thread, then apply on the main thread; a generation token drops the
@@ -8012,11 +8363,14 @@ void WardrobeTab2::rebuildOutfitImpl(bool async)
             if (gen != m_buildGen) return;
             QElapsedTimer at; at.start();
             applyOutfit(ctx, M);
+            const qint64 tApply = at.elapsed();
             // Auto-animate reacts to the WEAPON configuration, not to any rebuild — re-drawing the
             // weapons because a helmet changed would be both wrong and maddening.
             maybeAutoAnimate();
-            qInfo("wardrobe: rebuild(async) — geometry %lld ms · decode %lld ms (worker) · apply %lld ms (%d pieces)",
-                  tGeom, tDec, at.elapsed(), ctx.pieceCount);
+            // Split for the same reason as the sync path above: both run on the GUI thread here,
+            // so whichever is slow is a freeze, and the combined number cannot tell them apart.
+            qInfo("wardrobe: rebuild(async) — geometry %lld ms · decode %lld ms (worker) · apply %lld ms · auto-animate %lld ms (%d pieces)",
+                  tGeom, tDec, tApply, at.elapsed() - tApply, ctx.pieceCount);
         }, Qt::QueuedConnection);
     });
 }
@@ -8028,9 +8382,20 @@ void WardrobeTab2::applyOutfit(const WardrobeBuildCtx& ctx, const WardrobeOutfit
     // to rebuild). Set-only (no early return): the sync path calls this with the guard already held.
     m_rebuilding = true;
     struct ApplyGuard { bool& f; ~ApplyGuard() { f = false; } } applyGuard{m_rebuilding};
+
+    // ── Stage timing ────────────────────────────────────────────────────────────────────────────
+    // The first applyOutfit of a session measures ~86 000 ms and the very next one ~50 ms doing the
+    // same work with MORE pieces. A 1700x swing is not "this work is slow", it is one stage hitting
+    // a cold path, and a single total tells you nothing about which. Everything in here is on the
+    // GUI thread, so whichever stage it is, it is a frozen window for that whole duration.
+    QElapsedTimer applyT; applyT.start();
+    qint64 tMark = 0;
+    auto lap = [&applyT, &tMark]() { const qint64 n = applyT.elapsed(); const qint64 d = n - tMark; tMark = n; return d; };
+
     const ModelGeometry& merged = ctx.merged;
     const QVector<int>& primSlot = ctx.primSlot;
     const int baseOutfitCount = ctx.baseOutfitCount;
+    m_baseOutfitCount = baseOutfitCount;   // retained for the export-scope options
     QString loadLog = ctx.loadLog + M.loadLogAdd;
     const QString& skelDbg = ctx.skelDbg; const QString& weapDbg = ctx.weapDbg;
     const QVector<QPair<QString,int>>& pieceList = ctx.pieceList;
@@ -8063,6 +8428,7 @@ void WardrobeTab2::applyOutfit(const WardrobeBuildCtx& ctx, const WardrobeOutfit
         m_view->setOverlayText(QStringLiteral("Couldn't display this outfit — skipped."));
         return;
     }
+    const qint64 tGpu = lap();   // setGeometry = flatten + VBO/IBO upload + cloth build
     m_framed = true;
     m_view->setOverlayText(QString());       // model is here → clear any "Loading…"/empty hint
     m_view->setPartTextures(tex);
@@ -8094,6 +8460,21 @@ void WardrobeTab2::applyOutfit(const WardrobeBuildCtx& ctx, const WardrobeOutfit
     m_view->setPartHairParams(M.hairParams);
     m_view->setPartEye(eye);
     m_partEye = eye;   // remember which merged parts are eyes (for the eye-only recompose + isolate)
+    m_partHed      = M.hed;
+    m_partHeadCore = M.headCore;
+    m_partSkin = M.skin;   // "Items only" drops armor_skin_mat-style submeshes carried BY armour
+    m_expSkinBase = M.skinExportBase;   // marking-or-black skin base for the untextured-character export
+
+    // ── Character vs equipment, from the SLOT TAG rather than material names ────────────────────
+    // addPiece() tags every primitive with the slot it came from: 0-4 armour, 9 back trophy, a real
+    // slot for weapons — and -1 for the base body AND for every creator appearance (face, hair,
+    // eyes, teeth). So "is this the character" is exactly "slot < 0". Material-name matching was
+    // guesswork by comparison and is what let teeth through as an "item".
+    m_partCharacter.resize(merged.primitives.size());
+    for (int i = 0; i < merged.primitives.size(); ++i)
+        m_partCharacter[i] = (i < primSlot.size() && primSlot[i] < 0) ? 1 : 0;
+
+    // (The HED group-expansion needs m_partSource, which is rebuilt further down — see there.)
     m_view->setPartHead(head);
     m_view->setPartFur(fur);
     m_view->setPartFurMask(furMask);
@@ -8121,6 +8502,8 @@ void WardrobeTab2::applyOutfit(const WardrobeBuildCtx& ctx, const WardrobeOutfit
         const int s = primSlot[i];
         if (s >= 0 && s < 5 && !dm[i].isNull()) m_slotDyeable[s] = true;   // armour only
     }
+
+    const qint64 tMaps = lap();   // per-part texture/param pushes into the view
 
     // FX/SIM part flags + per-part source piece (for the tree) + apply visibility.
     m_lastMerged = merged;   // needed by rebuildPartList() below
@@ -8171,7 +8554,21 @@ void WardrobeTab2::applyOutfit(const WardrobeBuildCtx& ctx, const WardrobeOutfit
             fxCache.insert(mn, fx);
         }
         if (!simCache.contains(mn)) {
-            sim = hasClothDef(d4dir, mn) || (d4dir.isEmpty() && isSimName(mn));
+            // Three sources, strongest first:
+            //   1. the appearance itself said so — the SOA resolved through snoCloth /
+            //      snoHighQualityClothOverride. Authoritative, needs no d4data, and works for
+            //      encrypted armour, which is why it is now carried through the roster.
+            //   2. a d4data Cloth/<name>.clt.json exists.
+            //   3. the material name reads like cloth.
+            //
+            // (3) used to be gated on `d4dir.isEmpty()`, so with d4data installed — i.e. always —
+            // it never ran, and (2) can only ever fire for material names d4data actually ships.
+            // Together that made SIM permanently false for every encrypted piece: the toggle was
+            // present, the parts tree showed no [SIM] label, and export's FX/SIM re-include found
+            // nothing. The FX branch above already degraded to its name test correctly; this one
+            // did not. False positives here cost a mislabelled toggle, false negatives cost the
+            // feature entirely, so the fallback is no longer conditional.
+            sim = m_clothMatNames.contains(mn) || hasClothDef(d4dir, mn) || isSimName(mn);
             simCache.insert(mn, sim);
         }
         m_partFx  << (fx ? 1 : 0);
@@ -8188,6 +8585,27 @@ void WardrobeTab2::applyOutfit(const WardrobeBuildCtx& ctx, const WardrobeOutfit
             m_partSourceSno << sno;                  // lets the context menu export the SOURCE item
         }
     }
+
+    // HED covers the WHOLE head appearance, not only materials named for one. Any creator piece
+    // (past the base body) with at least one head-ish material has ALL of its primitives flagged —
+    // that is what catches teeth, tongue and lashes, whose material names say nothing about a head.
+    // Placed here, not next to m_partHed above, because m_partSource is only rebuilt on the lines
+    // immediately preceding this; running it earlier read the previous outfit's piece names.
+    // The base body is deliberately outside the expansion: one head-ish submesh inside base00 would
+    // otherwise flag the entire body and HED would hide the whole character.
+    {
+        QSet<QString> headPieces;
+        for (int i = baseOutfitCount; i < m_partSource.size() && i < m_partHed.size(); ++i)
+            if (m_partHed[i]) headPieces.insert(m_partSource[i]);
+        if (!headPieces.isEmpty())
+            for (int i = baseOutfitCount; i < m_partSource.size() && i < m_partHed.size(); ++i)
+                if (headPieces.contains(m_partSource[i])) m_partHed[i] = 1;
+    }
+    // Prime suspect. shaderMapOf() and hasClothDef() both hit d4data on disk, and fxCache/simCache
+    // are LOCAL to this function — so they start empty on every call, and the first call of a
+    // session pays cold reads against ~460 000 small NTFS-compressed files.
+    const qint64 tClassify = lap();
+
     m_view->setPartFx(m_partFx);   // exclude FX submeshes from the cloth sim
     loadClothTuning();             // read the equipped pieces' real cloth params
     // The outfit just changed: new rig, new cloth build. Re-push EVERY overlay (this also calls
@@ -8207,9 +8625,12 @@ void WardrobeTab2::applyOutfit(const WardrobeBuildCtx& ctx, const WardrobeOutfit
         loadLog += QStringLiteral("\nbase00 regions:%1 | armour covers:%2 | hidden=%3")
                        .arg(baseHashes).arg(coverDbg.isEmpty() ? QStringLiteral(" (none)") : coverDbg).arg(nCov);
     }
+    const qint64 tCloth = lap();   // loadClothTuning + reapplyOverlays (rebuilds the cloth sim)
+
     rebuildPartList();
     recomputePartVisibility();
     populateMaterials();
+    const qint64 tLists = lap();   // parts tree + materials panel repopulation
 
     // Cache export materials (indexed by materialIndex) for the Export button — reuses
     // the exact base/normal/orm images already decoded for the preview.
@@ -8230,6 +8651,8 @@ void WardrobeTab2::applyOutfit(const WardrobeBuildCtx& ctx, const WardrobeOutfit
         em.doubleSided = hair.value(pi, 0) != 0;
         m_exportMats[mi] = em;
     }
+
+    const qint64 tExportMats = lap();   // export-material cache
 
     // Re-apply the user's preview-settings shading features (defaults on for the
     // creator-friendly look: hair sheen, subsurface, IBL, tonemap, detail maps).
@@ -8259,13 +8682,21 @@ void WardrobeTab2::applyOutfit(const WardrobeBuildCtx& ctx, const WardrobeOutfit
         m_view->setFxWobble     (vpi(QStringLiteral("fxWobble"),    20) * 0.05f);
     }
 
+    const qint64 tSettings = lap();   // QSettings re-read of every viewport feature
+
+    // Split four ways: measured cold, this bucket is 1964 ms of a 1996 ms applyOutfit — 98% — and
+    // 7 ms on the very next call. Whatever the first-build cost is, it is in here, so a single
+    // number for the group is no longer good enough.
     applyDye();   // apply per-slot pigments (and the global dye fallback, if any)
     if (m_env) m_view->setEnvironment(m_env->currentIndex());
+    const qint64 tDye = lap();
     populateAnims();   // refresh the animation list for the current body rig
+    const qint64 tPopAnims = lap();
 
     // The attachment (and therefore its clip list) is only settled once the rebuild has run, so
     // refresh the ATTACHED panel here — BEFORE replaying the clip, which reads its selection.
     fillAnimList();
+    const qint64 tFillAnims = lap();
     // Re-apply the animation that was running before this rebuild (setGeometry cleared
     // it), restoring the frame + play/pause state so equipping/creator changes don't
     // interrupt playback.
@@ -8280,6 +8711,8 @@ void WardrobeTab2::applyOutfit(const WardrobeBuildCtx& ctx, const WardrobeOutfit
         }
     }
 
+    const qint64 tClip = lap();   // playAnimByName + slider/transport restore
+
     // Clean human summary on the visible line ("Warlock · 6 items"); the technical counts + full
     // per-piece debug go to the tooltip (hover) so the default view isn't engineer-facing.
     const QString cls = m_class ? m_class->currentText() : QString();
@@ -8293,6 +8726,17 @@ void WardrobeTab2::applyOutfit(const WardrobeBuildCtx& ctx, const WardrobeOutfit
     // Camera Snap: re-fit on the active slot after an equip — keeps the angle, adjusts for
     // size changes (e.g. a helmet with big horns vs. one without).
     if (m_d4View) frameSlot(m_activeSlot, /*animate=*/true, /*keepRotation=*/true);
+    const qint64 tFinish = lap();
+
+    // One line, every stage, always — not gated behind a debug flag. The cost of printing this is
+    // nothing next to the thing it measures, and the failure it exists to catch is intermittent:
+    // the same launch sequence produced 86 000 ms once and 2 217 ms the next time, so it has to be
+    // recorded whenever it happens rather than when someone remembers to switch instrumentation on.
+    qInfo("wardrobe: applyOutfit %lld ms — gpu %lld · maps %lld · classify %lld · cloth %lld · "
+          "lists %lld · exportMats %lld · settings %lld · dye %lld · popAnims %lld · "
+          "fillAnims %lld · clip %lld · finish %lld (%d prims)",
+          applyT.elapsed(), tGpu, tMaps, tClassify, tCloth, tLists, tExportMats, tSettings,
+          tDye, tPopAnims, tFillAnims, tClip, tFinish, int(merged.primitives.size()));
 }
 
 // ── Preview-settings popup (shading features + exposure + background) ──────────
@@ -8391,9 +8835,14 @@ bool WardrobeTab2::exportOutfitGlb(const QString& path, const QVector<int>& keep
     // src[i] maps exported primitive i back to its ORIGINAL merged index, which is what the
     // per-part texture/dye/detail arrays (m_exp*, m_partSlot) are indexed by.
     QVector<int> src;
+    // Parallel to src: this primitive takes the marking-or-black skin material instead of its
+    // real textures. Kept as its own vector rather than encoded into src, because src is also
+    // the index into every per-part array and overloading it with sentinels is how the earlier
+    // -1 version ended up needing a bounds guard on every lookup.
+    QVector<bool> forceSkinBase;
     for (int k = 0; k < (keep.isEmpty() ? geo.primitives.size() : keep.size()); ++k) {
         const int si = keep.isEmpty() ? k : keep[k];
-        if (si >= 0 && si < geo.primitives.size()) src << si;
+        if (si >= 0 && si < geo.primitives.size()) { src << si; forceSkinBase << false; }
     }
     if (src.isEmpty()) {
         // Returned false BEFORE the "Export failed" status at the end of this function, and two of
@@ -8410,6 +8859,45 @@ bool WardrobeTab2::exportOutfitGlb(const QString& path, const QVector<int>& keep
         for (int si : src) sub << m_lastMerged.primitives[si];
         geo.primitives = sub;
     }
+
+    // Scope 2 — "Items + untextured base character": re-attach the base body as a plain grey fit
+    // reference, so proportions and clipping can be checked in Blender without the body competing
+    // with the items visually.
+    //
+    // Note this does NOT reuse the Models tab's appendFitReferenceBody(): that one re-parses the
+    // body appearance from CASC and remaps its joints onto the piece's skeleton by bone-name hash,
+    // because there the body is a separate model. Here the base body is already sitting in
+    // m_lastMerged, merged onto this very skeleton — so it is a copy-and-relabel, and re-parsing
+    // would be slower and could disagree with what is on screen.
+    //
+    // src[] gets -1 for these: the per-part texture arrays have no entry for a synthetic primitive,
+    // and -1 is what the material loop below tests to emit a bare material.
+    if (QSettings().value(QStringLiteral("export/wardrobeScope"), 0).toInt() == 2) {
+        const int n = m_lastMerged.primitives.size();
+        for (int i = 0; i < n; ++i) {
+            // NOT everything the scope filter removed: the BODY and the HEAD MESH only.
+            //
+            // m_partHeadCore, not m_partHed — the head GROUP also carries teeth, tongue, eyeballs,
+            // eyelashes, eyeshadow, facial hair and the appearance's own _BOD copy. Those are
+            // invisible in-game behind the face but very much in the way on an untextured
+            // reference, so only the "_HED" mesh comes across. Hair, jewelry and the remaining
+            // creator appearances stay out for the same reason.
+            const bool isBody = (i < m_baseOutfitCount);
+            const bool isHead = (i < m_partHeadCore.size() && m_partHeadCore[i]);
+            if (!isBody && !isHead) continue;
+            MeshPrimitive p = m_lastMerged.primitives[i];
+            p.materialName = QStringLiteral("__fitReference");
+            forceSkinBase.append(true);
+            // No materialIndex set here: the loop further down assigns every primitive its own
+            // index into `mats`, and these get one too (a bare, map-less material). The Models
+            // tab's version sets -1 because it hands geometry to a different path.
+            geo.primitives.append(p);
+            // The REAL index, not -1: the white-skin variant is looked up per part, and these are
+            // the body/head parts whose markings have to survive. The forceSkinBase flag above is what
+            // stops the ordinary texture path from running for them.
+            src.append(i);
+        }
+    }
     QVector<ModelExporter::ExportMaterial> mats;
     mats.reserve(geo.primitives.size());
     for (int i = 0; i < geo.primitives.size(); ++i) {
@@ -8417,6 +8905,40 @@ bool WardrobeTab2::exportOutfitGlb(const QString& path, const QVector<int>& keep
         ModelExporter::ExportMaterial em;
         em.name = geo.primitives[i].materialName;
         em.doubleSided = geo.primitives[i].doubleSided;
+        // Untextured character: the re-attached head/body AND the items' own skin submeshes export
+        // with the MARKING as their base colour, or flat black when nothing is equipped. Nothing
+        // else — no normal, ORM, detail, dye or emissive maps.
+        const bool scope2 = QSettings().value(QStringLiteral("export/wardrobeScope"), 0).toInt() == 2;
+        const bool skinLike = scope2 && ((si < m_partSkin.size() && m_partSkin[si])
+                                         || (si < m_partHeadCore.size() && m_partHeadCore[si]));
+        if (forceSkinBase.value(i, false) || skinLike) {
+            const QImage mk = m_expSkinBase.value(si);
+            if (!mk.isNull()) {
+                em.baseColor = mk;
+            } else {
+                static const QImage kBlack = [] {    // no marking decoded for this part
+                    QImage f(4, 4, QImage::Format_RGBA8888);
+                    f.fill(QColor(0, 0, 0));
+                    return f;
+                }();
+                em.baseColor = kBlack;
+            }
+            // Rename the material too. It was inheriting the armour piece's name — an exported skin
+            // submesh showing up as "barF_stor158_TRS_mat" reads as the armour's material and makes
+            // the file look like the setting did nothing.
+            em.name = QStringLiteral("__untexturedSkin");
+            geo.primitives[i].materialName = em.name;
+            em.hasMetal = true;  em.metal = 0.0f;    // plain matte: no sheen on a reference surface
+            em.hasRough = true;  em.rough = 1.0f;
+            // MUST mirror the tail of this loop. The `continue` skips the shared
+            // "materialIndex = i; mats.push_back(em);" at the bottom, so doing only the append left
+            // these primitives pointing at whatever index they had before — inheriting the armour's
+            // material, while __untexturedSkin sat in the file unreferenced. That is exactly what
+            // showed up in Blender.
+            geo.primitives[i].materialIndex = i;
+            mats.push_back(em);
+            continue;
+        }
         if (wantTex) {
             if (si < m_expBase.size() && !m_expBase[si].isNull()) {
                 em.baseColor = m_expBase[si];
@@ -8494,8 +9016,9 @@ bool WardrobeTab2::exportOutfitGlb(const QString& path, const QVector<int>& keep
     const bool ok = ModelExporter::exportGlb(geo, path, mats, anims, names, opt);
     if (ok)
         ExportNotifier::instance().notify(
-            QStringLiteral("Exported %1%2").arg(QFileInfo(path).fileName(),
-                wantAnim ? QStringLiteral(" (with animation)") : QString()),
+            QStringLiteral("Exported %1%2%3").arg(QFileInfo(path).fileName(),
+                wantAnim ? QStringLiteral(" (with animation)") : QString(),
+                ExportNotifier::glbOptionsLine(opt)),
             QFileInfo(path).absolutePath());
     else if (m_status)
         m_status->setText(QStringLiteral("Export failed: %1").arg(QFileInfo(path).fileName()));
@@ -8518,36 +9041,265 @@ QVector<int> WardrobeTab2::visibleParts() const
     return out;
 }
 
+// The part list an EXPORT should use, applying Settings ▸ Export ▸ Model export ▸ Wardrobe outfits.
+// Separate from visibleParts() on purpose: the viewport's own visibility is still the baseline —
+// hiding a part in the parts tree must still exclude it — and these options only widen or narrow
+// that, so "what you see is what you get" survives unless a setting deliberately overrides it.
+QVector<int> WardrobeTab2::exportParts(QString* whatChanged) const
+{
+    const int scope = QSettings().value(QStringLiteral("export/wardrobeScope"), 0).toInt();
+    const bool wantFx = QSettings().value(QStringLiteral("export/exportFxSim"), false).toBool();
+    const int n = m_lastMerged.primitives.size();
+
+    QVector<int> out;
+    int droppedBase = 0, addedFx = 0, droppedSkin = 0;
+    for (int i = 0; i < n; ++i) {
+        bool take = m_view ? m_view->partVisible(i) : true;
+        // FX/SIM/FORM are hidden by their toggles, not by the user picking parts, so re-including
+        // them means overriding that specific reason for hiding — nothing else.
+        if (!take && wantFx) {
+            const bool isFx   = m_partFx.value(i, 0)   != 0;
+            const bool isSim  = m_partSim.value(i, 0)  != 0;
+            const bool isForm = m_partForm.value(i, 0) != 0;
+            if (isFx || isSim || isForm) { take = true; ++addedFx; }
+        }
+        // Both non-default scopes drop the character mesh; scope 2 puts part of it back, untextured,
+        // in exportOutfitGlb. "Character" is the slot tag (< 0), which covers the base body AND the
+        // creator appearances — head, hair, eyes, teeth — that merge in after it.
+        const bool isChar = (i < m_baseOutfitCount)
+                            || (i < m_partCharacter.size() && m_partCharacter[i]);
+        if (take && scope != 0 && isChar) { take = false; ++droppedBase; }
+
+        // "Items only" additionally strips skin submeshes CARRIED BY the armour itself —
+        // armor_skin_mat and friends are exposed flesh authored onto the equipment, so they belong
+        // to the character even though their slot tag says armour. Scope 2 keeps them: there the
+        // body is present, so the seams they cover need to stay.
+        if (take && scope == 1 && i < m_partSkin.size() && m_partSkin[i]) {
+            take = false;
+            ++droppedSkin;
+        }
+        if (take) out << i;
+    }
+    if (whatChanged) {
+        QStringList notes;
+        if (droppedBase > 0) notes << QStringLiteral("character excluded — body, head, hair and eyes "
+                                                     "(%1 part(s))").arg(droppedBase);
+        if (droppedSkin > 0) notes << QStringLiteral("skin submeshes stripped from the items "
+                                                     "(%1 part(s))").arg(droppedSkin);
+        if (addedFx > 0)     notes << QStringLiteral("FX/SIM/FORM included (%1 part(s))").arg(addedFx);
+        if (scope == 2) {
+            // Count what will actually be re-attached — body + head — rather than the base count,
+            // so the number in the status line matches the parts in the file.
+            int n = 0;
+            for (int i = 0; i < m_lastMerged.primitives.size(); ++i)
+                if (i < m_baseOutfitCount || (i < m_partHeadCore.size() && m_partHeadCore[i])) ++n;
+            notes << (n > 0
+                ? QStringLiteral("untextured head + body attached as a fit reference (%1 part(s))").arg(n)
+                : QStringLiteral("no character mesh in this outfit to attach"));
+        }
+        *whatChanged = notes.join(QStringLiteral(", "));
+    }
+    return out;
+}
+
+QString WardrobeTab2::exportNameStem() const
+{
+    QSettings s;
+    const QString tmpl = s.value(QStringLiteral("export/wardrobeNameTemplate"),
+                                 QStringLiteral("{{Class}}_{{Gender}}_outfit")).toString().trimmed();
+    AppearanceMeta& am = AppearanceMeta::instance();
+
+    // Slot index → placeholder. Weapons and the trophy are included because an outfit is often
+    // identified by its weapon rather than its armour.
+    struct Ph { const char* key; int slot; };
+    static const Ph kPh[] = {
+        {"Helm", 0}, {"Torso", 1}, {"Gloves", 2}, {"Legs", 3}, {"Boots", 4},
+        {"Main", 5}, {"Off", 6}, {"Trophy", 9},
+    };
+    // Raw asset name ("necF_stor193_TRS") for the per-slot placeholders and {{FileName}}; the
+    // in-game display name is exposed separately as {{Name}}. Two placeholders rather than a
+    // toggle: a toggle meant the same template produced different names depending on a checkbox
+    // somewhere else, which is exactly the kind of hidden state that makes a filename surprising.
+    auto slotName = [&](int slot) -> QString {
+        const QComboBox* cb = (slot == 9) ? m_backTrophy : (slot >= 0 && slot < kSlotCount ? m_slot[slot] : nullptr);
+        if (!cb || cb->currentIndex() <= 0) return QString();
+        return cb->currentText();
+    };
+    auto slotTitle = [&](int slot) -> QString {   // display name, falling back to the raw one
+        const QComboBox* cb = (slot == 9) ? m_backTrophy : (slot >= 0 && slot < kSlotCount ? m_slot[slot] : nullptr);
+        if (!cb || cb->currentIndex() <= 0) return QString();
+        const QString t = am.titleFor(cb->currentData().toInt());
+        return t.isEmpty() ? cb->currentText() : t;
+    };
+
+    // Collection: the torso's, else the first equipped slot that has one.
+    QString coll;
+    {
+        static const int order[] = {1, 0, 3, 4, 2};   // torso first, then the rest
+        for (int i = 0; i < 5 && coll.isEmpty(); ++i) {
+            const int slot = order[i];
+            if (!m_slot[slot] || m_slot[slot]->currentIndex() <= 0) continue;
+            coll = am.collectionFor(m_slot[slot]->currentData().toInt());
+        }
+    }
+
+    // Case-insensitive: {{class}}, {{Class}} and {{CLASS}} all resolve. Built as a value table and
+    // substituted with one regex pass rather than a chain of replace() calls, because a chain would
+    // need three spellings of every key and would still miss {{ClAsS}}.
+    QHash<QString, QString> vals;   // lower-cased key → value
+    vals.insert(QStringLiteral("class"),  m_class ? m_class->currentText() : QString());
+    vals.insert(QStringLiteral("gender"),
+                (m_gender && m_gender->currentData().toString() == QLatin1String("m"))
+                    ? QStringLiteral("M") : QStringLiteral("F"));
+    vals.insert(QStringLiteral("date"), QDate::currentDate().toString(QStringLiteral("yyyy-MM-dd")));
+    vals.insert(QStringLiteral("collection"), coll);
+    vals.insert(QStringLiteral("filename"), slotName(1));    // torso's raw asset name
+    vals.insert(QStringLiteral("name"),     slotTitle(1));   // torso's in-game display name
+    for (const Ph& p : kPh) vals.insert(QString::fromLatin1(p.key).toLower(), slotName(p.slot));
+
+    static const QRegularExpression rxPh(QStringLiteral("\\{\\{\\s*([A-Za-z]+)\\s*\\}\\}"));
+    QString out;
+    out.reserve(tmpl.size());
+    int last = 0;
+    auto it = rxPh.globalMatch(tmpl);
+    while (it.hasNext()) {
+        const auto m = it.next();
+        out += tmpl.mid(last, m.capturedStart() - last);
+        out += vals.value(m.captured(1).toLower());   // unknown placeholder → empty, then tidied below
+        last = m.capturedEnd();
+    }
+    out += tmpl.mid(last);
+
+    // Tidy up after empty placeholders rather than leaving "__" or a leading/trailing separator —
+    // an unequipped slot should vanish from the name, not leave a scar in it.
+    static const QRegularExpression rxUnknown(QStringLiteral("\\{\\{[^}]*\\}\\}"));
+    out.remove(rxUnknown);                        // malformed braces the placeholder regex skipped
+    static const QRegularExpression rxIllegal(QStringLiteral("[\\\\/:*?\"<>|]"));
+    out.remove(rxIllegal);                                           // not valid in a filename
+    static const QRegularExpression rxRuns(QStringLiteral("[ _\\-]{2,}"));
+    out.replace(rxRuns, QStringLiteral("_"));
+    static const QRegularExpression rxEdges(QStringLiteral("^[ _\\-]+|[ _\\-]+$"));
+    out.remove(rxEdges);
+    out = out.simplified().replace(QLatin1Char(' '), QLatin1Char('_'));
+
+    if (out.isEmpty()) out = classPrefix() + QStringLiteral("_outfit");
+    return out;
+}
+
 void WardrobeTab2::exportSelection()
 {
     if (!hasExportSelection()) return;
-    const QVector<int> vis = visibleParts();
+    QString scopeNote;
+    const QVector<int> vis = exportParts(&scopeNote);
     if (vis.isEmpty()) {
         QMessageBox::information(this, QStringLiteral("Export"),
-            QStringLiteral("Every part is hidden — nothing to export."));
+            QStringLiteral("Nothing to export — every part is hidden, or the export scope excluded them all."));
         return;
     }
     const QString dir = QSettings().value(QStringLiteral("wardrobe2/lastExportDir"),
         QStandardPaths::writableLocation(QStandardPaths::DocumentsLocation)).toString();
-    const QString suggest = QDir(dir).filePath(classPrefix() + QStringLiteral("_outfit.glb"));
+    const QString suggest = QDir(dir).filePath(exportNameStem() + QStringLiteral(".glb"));
     const QString path = QFileDialog::getSaveFileName(this, QStringLiteral("Export outfit .glb"),
                                                       suggest, QStringLiteral("glTF binary (*.glb)"));
     if (path.isEmpty()) return;
-    if (exportOutfitGlb(path, vis))
-        QSettings().setValue(QStringLiteral("wardrobe2/lastExportDir"), QFileInfo(path).absolutePath());
+    if (!exportOutfitGlb(path, vis)) return;
+    QSettings().setValue(QStringLiteral("wardrobe2/lastExportDir"), QFileInfo(path).absolutePath());
+    if (QSettings().value(QStringLiteral("export/bothGenders"), false).toBool())
+        exportOppositeGender(path, scopeNote);
+    // Say what the scope settings did. An export that silently omits the body (or silently
+    // includes hidden FX) is the kind of surprise that gets blamed on the exporter.
+    else if (m_status && !scopeNote.isEmpty())
+        m_status->setText(QStringLiteral("Exported — %1").arg(scopeNote));
+}
+
+// Second pass for "Export both genders": rename the file just written to _<G>, flip the gender,
+// and export again as _<other>.
+//
+// Deliberately re-runs the WHOLE export rather than transforming the first one. exportOutfitGlb
+// reads every other export setting itself — animations, raw source files, textures, retarget
+// options — so calling it twice means the second file gets all of them for free, and a setting
+// added later needs no changes here. Transforming the first file would have had to reimplement
+// each of them.
+void WardrobeTab2::exportOppositeGender(const QString& firstPath, const QString& scopeNote)
+{
+    if (!m_gender || m_gender->count() < 2) return;
+    const bool wasMale = m_gender->currentData().toString() == QLatin1String("m");
+    const QString curSuffix = wasMale ? QStringLiteral("_M") : QStringLiteral("_F");
+    const QString altSuffix = wasMale ? QStringLiteral("_F") : QStringLiteral("_M");
+
+    // Give the file just written its gender suffix, so the pair is named consistently.
+    const QFileInfo fi(firstPath);
+    const QString stem = fi.completeBaseName();
+    const QString dir  = fi.absolutePath();
+    QString firstFinal = firstPath;
+    if (!stem.endsWith(curSuffix, Qt::CaseInsensitive)) {
+        firstFinal = QDir(dir).filePath(stem + curSuffix + QStringLiteral(".glb"));
+        QFile::remove(firstFinal);          // overwrite rather than fail the rename
+        if (!QFile::rename(firstPath, firstFinal)) firstFinal = firstPath;   // keep what we have
+    }
+
+    // Flip. The combo's own handler retains each slot's opposite-gender twin and rebuilds
+    // synchronously, which is the same path a manual gender switch takes — so this cannot drift
+    // from it.
+    const int otherIdx = m_gender->currentIndex() == 0 ? 1 : 0;
+    qInfo("wardrobe export: both-genders — flipping gender %d -> %d", m_gender->currentIndex(), otherIdx);
+    m_gender->setCurrentIndex(otherIdx);
+    // The gender handler runs remapAnimationForRig(), which re-points the playing clip at the new
+    // rig's equivalent (barf_… → barm_…) when that .ani.json exists, and CLEARS it when it does
+    // not. So the twin's .glb carries the matching clip rather than the original gender's — but
+    // only if the twin clip exists, and a silently animation-less second file would look like the
+    // export ignoring the setting. Log it either way.
+    const bool wantAnim = QSettings().value(QStringLiteral("export/includeAnim"), false).toBool();
+    qInfo("wardrobe export: after flip gender='%s' clip='%s'%s",
+          qPrintable(m_gender->currentData().toString()),
+          m_playingAnim.isEmpty() ? "(none)" : qPrintable(m_playingAnim),
+          (wantAnim && m_playingAnim.isEmpty())
+              ? "  [include-animation is ON but this rig has no equivalent clip]" : "");
+
+    const QVector<int> parts = exportParts();
+    QString secondFinal;
+    if (parts.isEmpty()) {
+        qWarning("wardrobe export: opposite gender produced no exportable parts — skipped");
+    } else {
+        secondFinal = QDir(dir).filePath(stem + altSuffix + QStringLiteral(".glb"));
+        if (!exportOutfitGlb(secondFinal, parts)) secondFinal.clear();
+    }
+
+    // Back to where the user was. They asked to export, not to change their outfit.
+    m_gender->setCurrentIndex(wasMale ? m_gender->findData(QStringLiteral("m"))
+                                      : m_gender->findData(QStringLiteral("f")));
+
+    if (m_status) {
+        QString msg = secondFinal.isEmpty()
+            ? QStringLiteral("Exported %1 — the opposite gender could not be built")
+                  .arg(QFileInfo(firstFinal).fileName())
+            : QStringLiteral("Exported both genders: %1 + %2")
+                  .arg(QFileInfo(firstFinal).fileName(), QFileInfo(secondFinal).fileName());
+        if (!scopeNote.isEmpty()) msg += QStringLiteral(" — %1").arg(scopeNote);
+        m_status->setText(msg);
+    }
 }
 
 void WardrobeTab2::exportSelectionToLast()
 {
     if (!hasExportSelection()) return;
-    if (visibleParts().isEmpty()) {
+    // Same scope rules as the prompted export — otherwise "export to last folder" would quietly
+    // write a different model from the one Ctrl+E produces.
+    const QVector<int> parts = exportParts();
+    if (parts.isEmpty()) {
         QMessageBox::information(this, QStringLiteral("Export"),
-            QStringLiteral("Every part is hidden — nothing to export."));
+            QStringLiteral("Nothing to export — every part is hidden, or the export scope excluded them all."));
         return;
     }
     const QString dir = QSettings().value(QStringLiteral("wardrobe2/lastExportDir")).toString();
     if (dir.isEmpty()) { exportSelection(); return; }   // no remembered folder → prompt
-    exportOutfitGlb(QDir(dir).filePath(classPrefix() + QStringLiteral("_outfit.glb")), visibleParts());
+    const QString path = QDir(dir).filePath(exportNameStem() + QStringLiteral(".glb"));
+    if (!exportOutfitGlb(path, parts)) return;
+    // Both-genders must fire here too. It was wired only into exportSelection(), so "export to
+    // last folder" quietly produced one file — the same export, one keystroke apart, behaving
+    // differently.
+    if (QSettings().value(QStringLiteral("export/bothGenders"), false).toBool())
+        exportOppositeGender(path, QString());
 }
 
 // (exportScreenshot / exportTurntableGif removed — image and turntable capture run through the
@@ -8799,6 +9551,9 @@ void WardrobeTab2::showPartContextMenu(int part, const QPoint& gp, int groupPart
         if (part >= 0 && part < m_lastMerged.primitives.size()) {
             item = itemForPart(part);
             in.part           = part;
+            // The merge pipeline writes the real material name into each primitive here (unlike
+            // the Models tab, where it stays the parser's "Material_<n>" and the roster has to be
+            // consulted). Kept explicit so the difference is visible rather than assumed.
             in.partName       = m_lastMerged.primitives[part].materialName;
             in.partFileName   = in.partName;
             in.sourceFileName = m_partSource.value(part);     // the outfit piece this part came from
@@ -9169,43 +9924,114 @@ void WardrobeTab2::composeEyeMaps(const QString& d4, const QString& stem, QImage
 void WardrobeTab2::populateAnims()
 {
     if (!m_anims) return;
+    // STAGE TIMING. Caching the 45,549-file scan to disk removed the scan — the log confirms
+    // "Anim folder not scanned" — and yet the first call still costs ~1800 ms against ~12 ms for
+    // every call after. So the scan was never the whole cost, and a second guess is not worth a
+    // build cycle. These four laps cover everything that is left.
+    QElapsedTimer paT; paT.start();
+    qint64 paMark = 0;
+    auto paLap = [&paT, &paMark]() { const qint64 n = paT.elapsed(); const qint64 d = n - paMark; paMark = n; return d; };
+
     m_anims->clear();
+    const qint64 tClear = paLap();
     const QString d4 = Config::d4dataDir();
     if (d4.isEmpty() || !m_index) return;
     // The body rig carrier is <pref>_base00; its appearance SNO owns the clips.
     const QString pref = classPrefix();
-    // Scan the Anim folder for all clips owned by a given class/gender prefix (matched by name
+    const QString animDir = d4 + QStringLiteral("/json/base/meta/Anim");
+
+    // ── Disk cache ──────────────────────────────────────────────────────────────────────────────
+    // The scan below walks 45,549 files. m_animCache made that once per SESSION; this makes it once
+    // per d4data snapshot. Rows are short strings ("name  ·  N frames"), so all sixteen class/gender
+    // prefixes together are a couple of hundred KB — negligible beside the 100 MB of index caches,
+    // and it removes the single largest stall in the tool.
+    //
+    // Signature deliberately avoids counting the directory: counting IS the expensive operation, so
+    // a count-based signature would pay the cost it exists to avoid. The d4data build stamp plus the
+    // Anim directory's own mtime both change when the snapshot updates (git rewrites the tree), and
+    // both are a single stat.
+    const QString animCachePath = AppPaths::file(QStringLiteral("wardrobe_anims_v1.json"));
+    QString animSig;
+    {
+        QString bv;
+        QFile bf(d4 + QStringLiteral("/buildVersion.txt"));
+        if (bf.open(QIODevice::ReadOnly | QIODevice::Text)) bv = QString::fromUtf8(bf.readAll()).trimmed();
+        animSig = QStringLiteral("%1|%2").arg(bv).arg(
+            QFileInfo(animDir).lastModified().toMSecsSinceEpoch());
+    }
+    const qint64 tSig = paLap();   // buildVersion.txt read + the Anim directory's mtime stat
+    if (!m_animDiskLoaded) {
+        m_animDiskLoaded = true;
+        QFile cf(animCachePath);
+        if (cf.open(QIODevice::ReadOnly)) {
+            const QJsonObject root = QJsonDocument::fromJson(cf.readAll()).object();
+            if (root.value(QStringLiteral("sig")).toString() == animSig) {
+                const QJsonObject pfx = root.value(QStringLiteral("prefixes")).toObject();
+                for (auto it = pfx.constBegin(); it != pfx.constEnd(); ++it) {
+                    QStringList rows;
+                    for (const QJsonValue& v : it.value().toArray()) rows << v.toString();
+                    m_animCache.insert(it.key(), rows);
+                }
+                qInfo("wardrobe anims: %d prefix(es) from disk cache — Anim folder not scanned",
+                      int(m_animCache.size()));
+            }
+        }
+    }
+
+    // Scan the Anim folder for all clips owned by the given class/gender prefixes (matched by name
     // prefix AND, when the body appearance exists, by the clip's snoAppearance).
-    auto scanFor = [&](const QString& p) -> QStringList {
-        int bodySno = 0;
-        const QString want = p + QStringLiteral("_base00");
-        for (const SnoEntry& e : m_index->entries(kGroupAppearance))
-            if (e.name.compare(want, Qt::CaseInsensitive) == 0) { bodySno = e.snoId; break; }
+    //
+    // Takes a LIST and buckets in one pass. It used to take one prefix and be called twice — once
+    // for this gender and once for the other, to decide whether to merge — which walked all 45,549
+    // files twice for a result that needed one walk.
+    auto scanFor = [&](const QStringList& prefs) -> QHash<QString, QStringList> {
+        QHash<QString, int> bodySno;
+        for (const QString& p : prefs) {
+            const QString want = p + QStringLiteral("_base00");
+            for (const SnoEntry& e : m_index->entries(kGroupAppearance))
+                if (e.name.compare(want, Qt::CaseInsensitive) == 0) { bodySno.insert(p, e.snoId); break; }
+        }
         static const QRegularExpression rxApp(
             QStringLiteral("\"snoAppearance\":\\s*\\{[^{}]*?\"__raw__\":\\s*(\\d+)"));
         static const QRegularExpression rxFrames(QStringLiteral("\"nKeyframeCount\":\\s*(\\d+)"));
-        QStringList r;
-        QDirIterator it(d4 + QStringLiteral("/json/base/meta/Anim"),
-                        QStringList{QStringLiteral("*.ani.json")}, QDir::Files);
+        QHash<QString, QStringList> out;
+        QDirIterator it(animDir, QStringList{QStringLiteral("*.ani.json")}, QDir::Files);
         while (it.hasNext()) {
             const QString fp = it.next();
             const QString base = it.fileName();
-            if (!base.toLower().startsWith(p)) continue;   // this class/gender's clips
+            const QString lower = base.toLower();
+            QString hit;
+            for (const QString& p : prefs) if (lower.startsWith(p)) { hit = p; break; }
+            if (hit.isEmpty()) continue;   // belongs to no prefix we were asked about
             QFile jf(fp);
             if (!jf.open(QIODevice::ReadOnly)) continue;
             const QString raw = QString::fromUtf8(jf.readAll());
             const auto m = rxApp.match(raw);
-            if (bodySno > 0 && (!m.hasMatch() || m.captured(1).toInt() != bodySno)) continue;
+            const int want = bodySno.value(hit, 0);
+            if (want > 0 && (!m.hasMatch() || m.captured(1).toInt() != want)) continue;
             const QString nm = base.left(base.size() - 9);   // strip ".ani.json"
             const auto fm = rxFrames.match(raw);
-            r << (fm.hasMatch() ? QStringLiteral("%1  ·  %2 frames").arg(nm, fm.captured(1)) : nm);
+            out[hit] << (fm.hasMatch() ? QStringLiteral("%1  ·  %2 frames").arg(nm, fm.captured(1)) : nm);
         }
-        r.sort();
-        return r;
+        for (auto it2 = out.begin(); it2 != out.end(); ++it2) it2.value().sort();
+        return out;
     };
+    const qint64 tCache = paLap();   // reading + parsing wardrobe_anims_v1.json (first call only)
+
     QStringList rows = m_animCache.value(pref);
     if (!m_animCache.contains(pref)) {
-        rows = scanFor(pref);
+        // Both prefixes up front, so the merge check below costs no extra directory walk.
+        QStringList wanted{pref};
+        QString otherPref;
+        if (pref.size() == 4 && (pref.endsWith(QLatin1Char('f')) || pref.endsWith(QLatin1Char('m')))) {
+            otherPref = pref.left(3) + (pref.endsWith(QLatin1Char('f')) ? QLatin1Char('m') : QLatin1Char('f'));
+            wanted << otherPref;
+        }
+        QElapsedTimer scanT; scanT.start();
+        const QHash<QString, QStringList> scanned = scanFor(wanted);
+        rows = scanned.value(pref);
+        qInfo("wardrobe anims: scanned Anim for [%s] in %lld ms (cold — cached to disk now)",
+              qPrintable(wanted.join(QLatin1Char(','))), scanT.elapsed());
         // A gender may ship no animation set of its own; borrow the class's other-gender clips,
         // which play fine because the skeletons match by bone-name hash.
         //
@@ -9220,21 +10046,44 @@ void WardrobeTab2::populateAnims()
         // double" separates those from the thirteen healthy pairs by a wide margin — the healthy
         // ones sit within ~12% of each other (barF 325 / barM 364, rogM / rogF closer still), so
         // nothing is near the line. Merged rather than replaced, so a gender's own few clips stay.
-        if (pref.size() == 4 && (pref.endsWith(QLatin1Char('f')) || pref.endsWith(QLatin1Char('m')))) {
-            const QChar other = pref.endsWith(QLatin1Char('f')) ? QLatin1Char('m') : QLatin1Char('f');
-            const QStringList alt = scanFor(pref.left(3) + other);
+        if (!otherPref.isEmpty()) {
+            const QStringList alt = scanned.value(otherPref);
             if (alt.size() > rows.size() * 2) {
                 qInfo("wardrobe anims: %s ships %d clip(s); merging %s's %d — this rig has no set "
                       "of its own", qPrintable(pref), int(rows.size()),
-                      qPrintable(pref.left(3) + other), int(alt.size()));
+                      qPrintable(otherPref), int(alt.size()));
                 QSet<QString> seen(rows.cbegin(), rows.cend());
                 for (const QString& a2 : alt) if (!seen.contains(a2)) { rows << a2; seen.insert(a2); }
                 rows.sort();
             }
         }
         m_animCache.insert(pref, rows);
+
+        // Persist. Written after each new prefix rather than at shutdown: the whole point is that a
+        // crash or a kill mid-session must not cost the scan again, and the file is small enough
+        // that rewriting it a handful of times per session is free.
+        QJsonObject pfx;
+        for (auto it2 = m_animCache.constBegin(); it2 != m_animCache.constEnd(); ++it2) {
+            QJsonArray a;
+            for (const QString& r : it2.value()) a.append(r);
+            pfx.insert(it2.key(), a);
+        }
+        QJsonObject root;
+        root.insert(QStringLiteral("sig"), animSig);
+        root.insert(QStringLiteral("prefixes"), pfx);
+        QFile wf(animCachePath);
+        if (wf.open(QIODevice::WriteOnly | QIODevice::Truncate))
+            wf.write(QJsonDocument(root).toJson(QJsonDocument::Compact));
     }
+    const qint64 tScan = paLap();   // 0 on a cache hit; the directory walk otherwise
     fillAnimList();   // build the list applying the current filter + sort + search
+    // Sequenced deliberately: paLap() mutates the lap marker, and C++ leaves the evaluation order
+    // of function ARGUMENTS unspecified, so it must not share an argument list with paT.elapsed().
+    const qint64 tFill  = paLap();
+    const qint64 tTotal = paT.elapsed();
+    qInfo("wardrobe anims: populateAnims %lld ms — clear %lld · sig %lld · cacheLoad %lld · "
+          "scan %lld · fillList %lld (%d rows)",
+          tTotal, tClear, tSig, tCache, tScan, tFill, int(rows.size()));
 }
 
 // Build the animation list from the cached rows, applying the category filter, sort order,
@@ -9434,7 +10283,10 @@ QString WardrobeTab2::exportMenuSuffix(int sno, const QString& appr)
     QSettings s;
     QStringList parts; parts << QStringLiteral("1 model");
     if (s.value(QStringLiteral("export/includeAnim"), false).toBool()) {
-        if (s.value(QStringLiteral("export/animScope"), 0).toInt() == 1) {
+        // The Wardrobe composes a whole OUTFIT on a base body, so "the model's own clips" and
+        // "the base rig's clips" are the same rig here — any of the three means the listed clips.
+        const AnimExportScope asc = AnimExportScope::load();
+        if (asc.original || asc.sets || asc.base) {
             const int n = m_anims ? m_anims->count() : 0;
             parts << QStringLiteral("%1 animation%2").arg(n).arg(n == 1 ? QString() : QStringLiteral("s"));
         } else {
@@ -9494,8 +10346,10 @@ void WardrobeTab2::collectExportAnims(QVector<AnimParser::DecodedAnim>& anims, Q
         if (!anims.isEmpty()) return;
     }
     const QVector<QListWidgetItem*> all = bodyRows();
-    bool wantAll = QSettings().value(QStringLiteral("export/animScope"), 0).toInt() == 1
-                   && !all.isEmpty();
+    // As above: the outfit rides one base body, so `original` and `base` both resolve to the rows
+    // the ANIMATIONS panel is showing for that body.
+    const AnimExportScope asc = AnimExportScope::load();
+    bool wantAll = (asc.original || asc.sets || asc.base) && !all.isEmpty();
     if (wantAll && all.size() > 25) {
         const auto r = QMessageBox::question(this, QStringLiteral("Embed animations"),
             QStringLiteral("Embed all %1 clips currently listed in the ANIMATIONS panel?\n"

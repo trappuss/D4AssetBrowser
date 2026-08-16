@@ -35,13 +35,19 @@ echo [2/3] Configuring + building d4cloth...
 powershell -NoProfile -ExecutionPolicy Bypass -Command ^
   "cmake -S tools/d4cloth -B tools/d4cloth/build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_TOOLCHAIN_FILE='%VCPKG_ROOT%/scripts/buildsystems/vcpkg.cmake' -DVCPKG_TARGET_TRIPLET=x64-windows '-DVCPKG_INSTALL_OPTIONS=--x-buildtrees-root=C:/Users/notso/vbt' 2>&1 | Tee-Object -FilePath '%~dp0d4cloth_build_log.txt'; exit $LASTEXITCODE"
 if not "%errorlevel%"=="0" (
-    findstr /i /c:"CMake Error" /c:"error" /c:"FAILED" "%~dp0d4cloth_build_log.txt" > "%~dp0d4cloth_build_errors.txt"
+    REM Select-String, not findstr: Tee-Object writes the log as UTF-16, which findstr
+    REM cannot read - it warns and produces an EMPTY error file, so a failed build
+    REM appears to report no errors at all.
+    powershell -NoProfile -ExecutionPolicy Bypass -Command "$e = Select-String -Path '%~dp0d4cloth_build_log.txt' -Pattern 'CMake Error','error','FAILED' | ForEach-Object { $_.Line } | Select-Object -First 40 ; $e; $e | Out-File -FilePath '%~dp0d4cloth_build_errors.txt' -Encoding utf8"
     echo   CONFIGURE FAILED ^(see d4cloth_build_errors.txt^). & pause & exit /b 1
 )
 powershell -NoProfile -ExecutionPolicy Bypass -Command ^
   "cmake --build tools/d4cloth/build 2>&1 | Tee-Object -Append -FilePath '%~dp0d4cloth_build_log.txt'; exit $LASTEXITCODE"
 if not "%errorlevel%"=="0" (
-    findstr /i /c:"error C" /c:": error" /c:"error LNK" /c:"fatal error" /c:"FAILED" "%~dp0d4cloth_build_log.txt" > "%~dp0d4cloth_build_errors.txt"
+    REM Select-String, not findstr: Tee-Object writes the log as UTF-16, which findstr
+    REM cannot read - it warns and produces an EMPTY error file, so a failed build
+    REM appears to report no errors at all.
+    powershell -NoProfile -ExecutionPolicy Bypass -Command "$e = Select-String -Path '%~dp0d4cloth_build_log.txt' -Pattern 'error C',': error','error LNK','fatal error','FAILED' | ForEach-Object { $_.Line } | Select-Object -First 40 ; $e; $e | Out-File -FilePath '%~dp0d4cloth_build_errors.txt' -Encoding utf8"
     echo   BUILD FAILED ^(see d4cloth_build_errors.txt^). & pause & exit /b 1
 )
 

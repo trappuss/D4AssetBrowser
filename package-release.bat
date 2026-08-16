@@ -16,6 +16,49 @@ cd /d "%~dp0"
 
 taskkill /im D4AssetBrowser.exe /f >nul 2>&1
 
+:: ---------------------------------------------------------------------------
+:: 0. SOURCE CHECKS - BLOCKING HERE, unlike rebuild.bat.
+::
+::    rebuild.bat runs verify-src.py and continues regardless, which is right for
+::    an inner-loop build: a checker false positive must never stop you working.
+::    A RELEASE is the opposite case. The zip is what people download, and the
+::    checks that run here are exactly the ones whose failures are invisible at
+::    runtime until someone hits them:
+::      * truncation  - a source file silently emptied to 0 bytes. This has
+::                      happened, and every other check passed on the wreckage
+::                      ("131 file(s) clean") because an empty file balances its
+::                      delimiters, declares no bad formats and collides with no
+::                      macros. It is checked FIRST and alone for that reason.
+::      * format/arg  - a qInfo with more %d than arguments prints garbage or
+::                      crashes, and only on the line that fires.
+::      * missing #include for the header-only helpers - builds here, fails on a
+::                      clean checkout.
+::
+::    So: if the checker finds something, this stops. Ship deliberately.
+:: ---------------------------------------------------------------------------
+set "PYEXE="
+py -3 -c "import sys" >nul 2>&1 && set "PYEXE=py -3"
+if not defined PYEXE python -c "import sys" >nul 2>&1 && set "PYEXE=python"
+if not defined PYEXE python3 -c "import sys" >nul 2>&1 && set "PYEXE=python3"
+if not defined PYEXE (
+    echo   WARNING: no Python interpreter found - source checks SKIPPED for this release.
+    echo            Install Python, or accept that verify-src did not run on this zip.
+    echo.
+) else (
+    echo [0/5] Source checks ^(verify-src.py^)...
+    %PYEXE% "%~dp0verify-src.py"
+    if errorlevel 1 (
+        echo.
+        echo   ERROR: verify-src found problems ^(listed above^). Not packaging a release
+        echo          from source that does not pass its own checks. Fix them, or run
+        echo          package-release.bat again after deciding they are false positives.
+        echo.
+        pause & exit /b 1
+    )
+    echo   [OK] source checks passed.
+    echo.
+)
+
 :: 1. MSVC on PATH (else init vcvars64).
 where cl >nul 2>&1
 if errorlevel 1 (
@@ -42,7 +85,11 @@ echo.
 powershell -NoProfile -ExecutionPolicy Bypass -Command "cmake --preset windows-msvc-release 2>&1 | Tee-Object -FilePath '%~dp0build_log.txt'; exit $LASTEXITCODE"
 set "RC=%errorlevel%"
 if not "%RC%"=="0" (
-    findstr /i /c:"CMake Error" /c:"error" /c:"Failed to find" /c:"FAILED" "%~dp0build_log.txt" > "%~dp0build_errors.txt"
+    REM Select-String, NOT findstr. Tee-Object above writes UTF-16; findstr cannot read it and
+    REM produces an EMPTY build_errors.txt, so a failed configure reported no errors at all. That
+    REM cost a debugging round trip on a real failure. rebuild.bat and the smoke test already do
+    REM this correctly - this path was missed.
+    powershell -NoProfile -ExecutionPolicy Bypass -Command "$e = Select-String -Path '%~dp0build_log.txt' -Pattern 'CMake Error','Failed to find','FAILED',': error' | ForEach-Object { $_.Line } | Select-Object -First 40 ; $e; $e | Out-File -FilePath '%~dp0build_errors.txt' -Encoding utf8"
     echo   CONFIGURE FAILED ^(see build_errors.txt^). & pause & exit /b 1
 )
 
@@ -51,7 +98,8 @@ echo [3/5] Building (LIVE output; the two big files can take a few minutes each)
 echo.
 powershell -NoProfile -ExecutionPolicy Bypass -Command "cmake --build --preset release 2>&1 | Tee-Object -FilePath '%~dp0build_log.txt'; exit $LASTEXITCODE"
 set "RC=%errorlevel%"
-findstr /i /c:"error C" /c:": error" /c:"error LNK" /c:"fatal error" /c:"FAILED" /c:"ninja: build stopped" "%~dp0build_log.txt" > "%~dp0build_errors.txt"
+REM Same UTF-16 trap as the configure step above — findstr silently produced an empty file.
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$e = Select-String -Path '%~dp0build_log.txt' -Pattern 'error C','error LNK','fatal error',': error','ninja: build stopped' | ForEach-Object { $_.Line } | Select-Object -First 40 ; $e; $e | Out-File -FilePath '%~dp0build_errors.txt' -Encoding utf8"
 if not "%RC%"=="0" ( echo   BUILD FAILED ^(see build_errors.txt^). & pause & exit /b 1 )
 
 :: 5. Install into the dist folder. The CMake install copies the Qt6 DLLs + the plugin

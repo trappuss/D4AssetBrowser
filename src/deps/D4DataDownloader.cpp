@@ -3,6 +3,7 @@
 #include "app/AppPaths.h"
 #include <QDir>
 #include <QProcess>
+#include "util/ProcQuiet.h"   // git/compact are console tools — suppress their console window
 #include <QRegularExpression>
 #include <QStandardPaths>
 
@@ -122,6 +123,7 @@ void D4DataDownloader::enableNtfsCompression(const QString& dir)
 {
 #ifdef Q_OS_WIN
     QProcess p;
+    quietProcess(p);   // compact.exe is a console tool — no black flash
     // /c compress · /s recurse (so subdirs created later inherit) · /i ignore errors · /q quiet
     p.start(QStringLiteral("compact"),
             {QStringLiteral("/c"), QStringLiteral("/s:") + QDir::toNativeSeparators(dir),
@@ -196,6 +198,7 @@ void D4DataDownloader::runNext()
     if (args.contains(QStringLiteral("sparse-checkout")) || label.startsWith(QStringLiteral("Applying")))
         startExtractWatch(m_dest);
     m_proc = new QProcess(this);
+    quietProcess(*m_proc);   // git clone/fetch — progress is streamed into our own console widget
     m_proc->setProgram(gitPath());
     m_proc->setArguments(args);
     m_proc->setProcessChannelMode(QProcess::SeparateChannels);

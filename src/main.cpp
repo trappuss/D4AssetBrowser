@@ -19,13 +19,19 @@
 #include <QSurfaceFormat>
 #include <QTextStream>
 
+#include "app/AppLog.h"
 #include "app/AppPaths.h"
+#include "util/QueryTerm.h"   // startup self-test for the shared name-query matcher
 #include "app/LogConsole.h"
 #include "app/MainWindow.h"
 #include "app/SehGuard.h"
 
 namespace {
 QFile g_logFile;
+// Guards g_logFile. The message handler runs on EVERY thread, so opening or closing the file from
+// the Settings dialog while a worker is mid-write would tear the QFile out from under it. Both the
+// handler and AppLog::setFileLogging take this.
+QMutex g_logMutex;
 
 // Replace the platform's filled "blue box" checked indicator with a real
 // checkmark everywhere (checkboxes, menu toggles, tree/table checks). We draw
@@ -89,8 +95,11 @@ void logHandler(QtMsgType type, const QMessageLogContext&, const QString& msg)
     // lock, concurrent logging from a worker thread + the GUI thread tears the
     // shared g_logFile / QTextStream writes apart (garbled output) and crashes on
     // the non-reentrant QFile. Serialize the whole handler.
-    static QMutex s_logMutex;
-    QMutexLocker s_lock(&s_logMutex);
+    //
+    // The mutex is now a file-scope one shared with AppLog::setFileLogging, not a local static:
+    // toggling the setting closes this QFile, and doing that while a worker thread is inside the
+    // write below is the same tear this lock exists to prevent.
+    QMutexLocker s_lock(&g_logMutex);
 
     const char* lvl = "INFO";
     switch (type) {
@@ -110,6 +119,34 @@ void logHandler(QtMsgType type, const QMessageLogContext&, const QString& msg)
     fprintf(stderr, "%s\n", line.toLocal8Bit().constData());
     LogBuffer::instance().append(line);   // mirror to the in-app console window
 }
+}   // namespace
+
+// Defined at file scope, NOT inside the anonymous namespace above: a qualified name from another
+// namespace may not be DEFINED inside an unnamed one (C2888), which this codebase has hit before.
+QString AppLog::filePath()
+{
+    return AppPaths::file(QStringLiteral("D4AssetBrowser.log"));
+}
+
+bool AppLog::fileLogging()
+{
+    QMutexLocker lock(&g_logMutex);
+    return g_logFile.isOpen();
+}
+
+void AppLog::setFileLogging(bool on)
+{
+    QSettings().setValue(QStringLiteral("log/autoFile"), on);
+    QMutexLocker lock(&g_logMutex);
+    if (on) {
+        if (g_logFile.isOpen()) return;
+        g_logFile.setFileName(AppPaths::file(QStringLiteral("D4AssetBrowser.log")));
+        // Truncate: ONE file that is always the current session, never an ever-growing history.
+        // That is the whole point of it — a fixed path someone can be pointed at.
+        g_logFile.open(QIODevice::WriteOnly | QIODevice::Truncate | QIODevice::Text);
+    } else if (g_logFile.isOpen()) {
+        g_logFile.close();
+    }
 }
 
 int main(int argc, char** argv)
@@ -141,7 +178,7 @@ int main(int argc, char** argv)
     LogBuffer::instance();   // construct on the GUI thread (queued log delivery)
     QApplication::setOrganizationName("D4AssetBrowser");
     QApplication::setApplicationName("D4AssetBrowser");
-    QApplication::setApplicationVersion("2.2.0");
+    QApplication::setApplicationVersion("2.2.8");
 
     // Portable: every QSettings() default-ctor writes to an INI in the beside-exe data/ folder
     // (no Windows registry). Must run before any QSettings use. Combined with AppPaths, the whole
@@ -167,16 +204,55 @@ int main(int argc, char** argv)
         }
     }
 
+    // ── Renamed setting keys ────────────────────────────────────────────────────────────────────
+    // Renaming a key silently RESETS it: the new name has never been written, so its default wins
+    // and the user's choice vanishes with no error and nothing in the log. That is exactly what
+    // happened when the Wardrobe-only export options moved to Model export and lost their
+    // "wardrobe" prefix — "it used to work" was correct, and the rename was the regression.
+    // Carry each old value across once, then leave the old key alone (harmless, and it keeps a
+    // downgrade working).
+    {
+        QSettings s;
+        static const struct { const char* from; const char* to; } kRenamed[] = {
+            {"export/wardrobeBothGenders", "export/bothGenders"},
+            {"export/wardrobeFxSim",       "export/exportFxSim"},
+        };
+        for (const auto& r : kRenamed) {
+            const QString from = QLatin1String(r.from), to = QLatin1String(r.to);
+            if (s.contains(from) && !s.contains(to)) {
+                s.setValue(to, s.value(from));
+                qInfo("settings: carried %s -> %s", r.from, r.to);
+            }
+        }
+    }
+
+    // The shared name-query matcher, used by three filters that must agree. Microseconds; a
+    // failure means Bulk Extract and the Models list would disagree, so say so loudly rather
+    // than shipping a silent divergence.
+    if (const QString qtErr = QueryTerm::selfTest(); !qtErr.isEmpty())
+        qWarning().noquote() << "SELF-TEST FAILED —" << qtErr;
+
     // Superseded cache versions accumulate otherwise — back_trophy_v1..v4 were all still present,
     // and appearance_meta/icon_index are 2-3 MB each per version. Keep the numbers in step with the
     // kCacheVersion constants they mirror; a stale number here only under-prunes, never deletes a
     // live cache, because pruneOldCaches removes strictly LOWER versions.
     AppPaths::pruneOldCaches(QStringLiteral("back_trophy_v"),    4,  QStringLiteral(".json"));
-    AppPaths::pruneOldCaches(QStringLiteral("appearance_meta_v"), 21, QStringLiteral(".json"));
-    AppPaths::pruneOldCaches(QStringLiteral("icon_index_v"),      3,  QStringLiteral(".json"));
+    AppPaths::pruneOldCaches(QStringLiteral("appearance_meta_v"), 23, QStringLiteral(".json"));
+    AppPaths::pruneOldCaches(QStringLiteral("icon_index_v"),      4,  QStringLiteral(".json"));
     AppPaths::pruneOldCaches(QStringLiteral("stable_index_v"),    6,  QStringLiteral(".bin"));
     AppPaths::pruneOldCaches(QStringLiteral("asset_links_v"),     1,  QStringLiteral(".bin"));
-    AppPaths::pruneOldCaches(QStringLiteral("coretoc_v"),         2,  QStringLiteral(".bin"));
+    AppPaths::pruneOldCaches(QStringLiteral("coretoc_v"),         3,  QStringLiteral(".bin"));
+    AppPaths::pruneOldCaches(QStringLiteral("tex_info_v"),        2,  QStringLiteral(".bin"));
+    AppPaths::pruneOldCaches(QStringLiteral("store_products_v"), 4,  QStringLiteral(".json"));
+    AppPaths::pruneOldCaches(QStringLiteral("item_hover_v"),      2,  QStringLiteral(".json"));
+    // The remaining five. All are at v1 today so these are no-ops — which is the point: the first
+    // bump of any of them would otherwise orphan the old file forever, and tvfs_paths alone is
+    // ~50 MB. Cheaper to add the line now than to remember at bump time.
+    AppPaths::pruneOldCaches(QStringLiteral("wardrobe_anims_v"),  1,  QStringLiteral(".json"));
+    AppPaths::pruneOldCaches(QStringLiteral("latest_v"),          2,  QStringLiteral(".bin"));
+    AppPaths::pruneOldCaches(QStringLiteral("build_history_v"),   1,  QStringLiteral(".bin"));
+    AppPaths::pruneOldCaches(QStringLiteral("casc_index_v"),      1,  QStringLiteral(".bin"));
+    AppPaths::pruneOldCaches(QStringLiteral("tvfs_paths_v"),      1,  QStringLiteral(".bin"));
 
     // Runtime log inside data/ (truncated each launch) for diagnostics.
     //
@@ -189,9 +265,11 @@ int main(int argc, char** argv)
     //
     // dataDir() is safe here: QApplication is constructed, and QSettings::setPath above has already
     // forced its one-time mkpath.
-    g_logFile.setFileName(AppPaths::file(QStringLiteral("D4AssetBrowser.log")));
-    g_logFile.open(QIODevice::WriteOnly | QIODevice::Truncate | QIODevice::Text);
+    // Gated by Settings -> General -> "Write a log file automatically", default ON. Default ON is
+    // deliberate: the file costs nothing until something goes wrong, and the one time it matters is
+    // the run nobody thought to enable it for.
     qInstallMessageHandler(logHandler);
+    AppLog::setFileLogging(QSettings().value(QStringLiteral("log/autoFile"), true).toBool());
     qInfo("D4AssetBrowser v%s starting",
           QApplication::applicationVersion().toLatin1().constData());
 

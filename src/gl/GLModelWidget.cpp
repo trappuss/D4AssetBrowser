@@ -332,6 +332,11 @@ uniform int   uDyeMode;        // 0 = custom colour, 1 = real dye gradient
 uniform vec3  uDyeColor[4];    // dye colour per material region (custom mode)
 uniform int   uDyeRegion;      // which dye colour this part uses (0..3)
 uniform int   uIsHair;         // per-part: anisotropic specular
+// 1 = the draw target is multisampled, so alpha-to-coverage is doing the cutout anti-aliasing and
+// fractional alpha is the coverage signal. 0 = single-sampled target (the supersampled capture
+// FBO): coverage would collapse to a 1-bit, driver-dithered test — visible as speckled fur — so the
+// cutout becomes a hard discard and alpha stays 1.0, letting the downscale do the anti-aliasing.
+uniform int   uA2C;
 uniform vec3  uHairParams;     // hero_hair MaterialValues: (Hair Roughness, Hair Specular, Highlight Shift)
 uniform int   uIsSkin;         // per-part: subsurface wrap
 uniform int   uIsHead;         // per-part: face skin (warm Fresnel rim); body skin has none (D4 data)
@@ -545,10 +550,22 @@ void main() {
         // lower threshold (thin strand tips survive) + a WIDER fade band so the tips dither out
         // softly over several pixels (flyaways) rather than clipping to a hard card silhouette.
         float thr = (uIsHair==1) ? 0.16 : 0.35;
-        float aa  = max(fwidth(base.a), 1e-4);
-        if (uIsHair==1) aa = max(aa, 0.10);      // broaden the soft tip band for wispy hair
-        cutCov = clamp((base.a - thr) / aa + 0.5, 0.0, 1.0);
-        if (cutCov <= 0.0) discard;
+        if (uA2C==0) {
+            // Single-sampled target: a plain binary test. Fragments that survive are fully opaque,
+            // so a saved PNG gets solid hair/fur instead of a half-transparent ghost of it.
+            //
+            // Cut at the MIDPOINT of the band the coverage path would have used, not at thr. Hair
+            // floors that band at 0.10 (below) to keep wispy flyaways, so a fragment survives there
+            // whenever base.a > thr - 0.05. Cutting at thr instead would shave every wisp off and
+            // the capture would show visibly thinner hair than the viewport. Solid geometry has no
+            // band worth speaking of (aa = fwidth), so it keeps thr.
+            if (base.a < (uIsHair==1 ? thr - 0.05 : thr)) discard;
+        } else {
+            float aa  = max(fwidth(base.a), 1e-4);
+            if (uIsHair==1) aa = max(aa, 0.10);      // broaden the soft tip band for wispy hair
+            cutCov = clamp((base.a - thr) / aa + 0.5, 0.0, 1.0);
+            if (cutCov <= 0.0) discard;
+        }
     }
     // Shell-fur strand test: each strand has a height from the (dual) noise; on shell layer
     // vFurShell it only exists where the strand is taller than this layer, so outer shells
@@ -564,8 +581,15 @@ void main() {
         // Strand height comes from the noise alone (full 0..1 range) so fur stays DENSE even
         // where the mask is mid-grey — multiplying by the mask made those areas sparse/patchy.
         float strand = n1 * mix(1.0, n2, uFurSecondary);
-        furCover = smoothstep(0.0, 0.14, strand - vFurShell);
-        if (furCover <= 0.0) discard;
+        // Same split as the cutout above: the soft tip band is a coverage signal, and without
+        // multisampling to resolve it the strand tips turn into per-pixel speckle. Hard-cut them
+        // instead and let the supersampled downscale smooth the tips.
+        if (uA2C==0) {
+            if (strand - vFurShell <= 0.0) discard;
+        } else {
+            furCover = smoothstep(0.0, 0.14, strand - vFurShell);
+            if (furCover <= 0.0) discard;
+        }
         furJit = (vec2(n1, n2) * 2.0 - 1.0) * vFurShell;   // more scatter toward the tips
     }
     vec3 N = normalize(vNormal);
@@ -4042,6 +4066,7 @@ void main() { o = vec4(mix(uBot, uTop, clamp(vT, 0.0, 1.0)), uA); })";
     const GLint uFDye = uni(m_prog, "uFDye");        // cached: set per-part in loop
     const GLint uDyeColor = uni(m_prog, "uDyeColor");// cached: set per-part in loop
     const GLint uIsHair = uni(m_prog, "uIsHair");
+    const GLint uA2C    = uni(m_prog, "uA2C");
     const GLint uHairParams = uni(m_prog, "uHairParams");   // set per-hair-part in loop
     const GLint uIsSkin = uni(m_prog, "uIsSkin");
     const GLint uIsHead = uni(m_prog, "uIsHead");
@@ -4250,6 +4275,15 @@ void main() { o = vec4(mix(uBot, uTop, clamp(vT, 0.0, 1.0)), uA); })";
     if (m_backfaceCull) { glEnable(GL_CULL_FACE); glCullFace(GL_BACK); }
     else glDisable(GL_CULL_FACE);
     glBindVertexArray(m_vao);
+    // Which cutout path the shader takes, decided ONCE per frame and before either branch draws.
+    // Alpha-to-coverage only works on a MULTISAMPLED target, and the draw target is not always the
+    // widget's 4x MSAA FBO: grabSupersampled renders into a single-sampled one. There, coverage
+    // collapses to one bit that drivers are free to dither, which is what turned captured fur into
+    // speckle. So ask the target what it is rather than assuming, and tell the shader.
+    GLint fbSamples = 0;
+    glGetIntegerv(GL_SAMPLES, &fbSamples);   // framebuffer state: reports the bound DRAW target
+    const bool msaa = fbSamples > 1;
+    glUniform1i(uA2C, msaa ? 1 : 0);
     if (m_parts.isEmpty()) {
         glUniform1i(uHasTex, 0);
         glUniform1i(uHasNormal, 0);
@@ -4260,10 +4294,19 @@ void main() { o = vec4(mix(uBot, uTop, clamp(vT, 0.0, 1.0)), uA); })";
         setTint(false);
         glDrawElements(GL_TRIANGLES, m_indexCount, GL_UNSIGNED_INT, nullptr);
     } else {
-        // Alpha-to-coverage (needs the 4x MSAA default format) anti-aliases the per-part alpha
-        // cutout — cloth/foliage edges resolve smoothly instead of a hard jagged fringe. Opaque
-        // fragments emit coverage 1.0 (cutCov=1), so solid geometry is unaffected.
-        glEnable(GL_SAMPLE_ALPHA_TO_COVERAGE);
+        // Alpha-to-coverage anti-aliases the per-part alpha cutout — cloth/hair/fur edges resolve
+        // smoothly instead of a hard jagged fringe. Opaque fragments emit coverage 1.0 (cutCov=1),
+        // so solid geometry is unaffected.
+        if (msaa) {
+            glEnable(GL_SAMPLE_ALPHA_TO_COVERAGE);
+            // ALPHA_TO_ONE is what stops a transparent capture double-counting the cutout: without
+            // it the fragment's fractional alpha is used BOTH to pick coverage and as the value
+            // written to every covered sample, so the resolve lands on alpha squared and hair/fur
+            // saved to PNG came out far more see-through than it looks on screen. Forcing the
+            // written alpha to 1 leaves coverage as the only alpha term, which is the correct one.
+            // Invisible on screen — blending is off in this pass and the alpha channel is unused.
+            glEnable(GL_SAMPLE_ALPHA_TO_ONE);
+        }
         for (int i = 0; i < m_parts.size(); ++i) {
             const Part& p = m_parts[i];
             if (!p.visible || p.count == 0) continue;
@@ -4421,6 +4464,7 @@ void main() { o = vec4(mix(uBot, uTop, clamp(vT, 0.0, 1.0)), uA); })";
             }
         }
         glDisable(GL_SAMPLE_ALPHA_TO_COVERAGE);   // end alpha-cutout pass
+        glDisable(GL_SAMPLE_ALPHA_TO_ONE);        // must not leak into the blended FX pass
 
         // ── Selection SILHOUETTE pass ─────────────────────────────────────────────────────
         // Selected parts keep their real material (a flat tint hid the textures you are trying
@@ -4812,7 +4856,12 @@ void GLModelWidget::drawFxParts(bool forceAdditive)
         const Part& p = m_parts[i];
         if (!p.visible || !p.count || i >= m_partFx.size() || !m_partFx[i]) continue;
         const bool add = forceAdditive || (i < m_partFxAdditive.size() && m_partFxAdditive[i]);
-        glBlendFunc(GL_SRC_ALPHA, add ? GL_ONE : GL_ONE_MINUS_SRC_ALPHA);
+        // Separate alpha factors. With one glBlendFunc the alpha channel also gets GL_SRC_ALPHA as
+        // its source factor, so a 0.4-alpha FX card contributes 0.16 of coverage instead of 0.4 —
+        // over a transparent background that is a hole where the effect should be. RGB blending is
+        // unchanged, so nothing on screen moves.
+        if (add) glBlendFuncSeparate(GL_SRC_ALPHA, GL_ONE, GL_ONE, GL_ONE);
+        else     glBlendFuncSeparate(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA, GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
         const float aInt = (i < m_partFxIntensity.size())  ? m_partFxIntensity[i]  : 1.5f;
         const float aWob = (i < m_partFxWobble.size())     ? m_partFxWobble[i]     : 0.0f;
         const float aFre = (i < m_partFxFresnel.size())    ? m_partFxFresnel[i]    : 1.6f;
@@ -5444,6 +5493,7 @@ QImage GLModelWidget::grabThumbnail(int size)
     glUniform1i(uni(m_prog, "uHasNormal"), 0);
     glUniform1i(uni(m_prog, "uPbr"), 0);
     glUniform1i(uni(m_prog, "uViewChannel"), 0);   // thumbnails always shaded
+    glUniform1i(uni(m_prog, "uA2C"), 0);           // this FBO is single-sampled: hard cutout, no dither
     glUniform1i(uni(m_prog, "uHasOrm"), 0);
     glUniform1i(uni(m_prog, "uHasEmissive"), 0);
     glUniform1i(uni(m_prog, "uHasDyeMask"), 0);
@@ -5687,6 +5737,17 @@ GLModelWidget::CamState GLModelWidget::cameraState() const
     s.cx = m_center.x(); s.cy = m_center.y(); s.cz = m_center.z();
     s.ortho = m_ortho; s.valid = true;
     return s;
+}
+
+void GLModelWidget::setOrbitAngles(float yawRad, float pitchRad)
+{
+    if (m_camAnim) m_camAnim->stop();
+    m_followParts.clear();
+    constexpr float lim = 1.553f;   // same ~89 degree gimbal guard as mouseMoveEvent
+    m_yaw   = yawRad;
+    m_pitch = qBound(-lim, pitchRad, lim);
+    m_tgtYaw = m_yaw; m_tgtPitch = m_pitch;   // keep the glide target in step with the hard set
+    update();
 }
 
 void GLModelWidget::setCameraState(const CamState& s)

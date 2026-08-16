@@ -1,3 +1,50 @@
 // Application icon for the Windows executable (Explorer / taskbar / Alt-Tab).
 // The runtime window icon is set independently in main.cpp from res/app_256.png.
 IDI_ICON1 ICON "app.ico"
+
+// Version resource — what Explorer shows under Properties > Details. Without this block the exe
+// reports no version at all, so "which build is this?" could only be answered by launching it and
+// reading Help > About. Worth having on anything people download.
+//
+// KEEP IN STEP with src/main.cpp's setApplicationVersion, CMakeLists.txt and vcpkg.json.
+// "Set Version.bat" rewrites all four, including the two spellings below (comma-separated for the
+// binary fields, dotted for the string) — do not edit one by hand and expect the others to follow.
+// Two spellings of one version. The numeric form is comma-separated because that is what the
+// VERSIONINFO fields require; the trailing 0 is the build field, unused here.
+#define VER_NUM 2,2,8,0
+#define VER_STR "2.2.8"
+
+// Literal 1, not VS_VERSION_INFO. That constant lives in winver.h and this file includes no
+// headers — rc.exe does not error on an unknown identifier in the ID position, it silently makes a
+// NAMED resource instead (which is exactly why the IDI_ICON1 line above works). A version resource
+// named "VS_VERSION_INFO" is not the one Explorer reads, so the whole block would compile, ship,
+// and show nothing under Properties > Details.
+1 VERSIONINFO
+FILEVERSION    VER_NUM
+PRODUCTVERSION VER_NUM
+FILEFLAGSMASK  0x3fL
+FILEFLAGS      0x0L
+FILEOS         0x40004L   // VOS_NT_WINDOWS32
+FILETYPE       0x1L       // VFT_APP
+FILESUBTYPE    0x0L
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904b0"   // US English, Unicode
+        BEGIN
+            VALUE "FileDescription", "D4AssetBrowser — Diablo IV asset browser and wardrobe studio"
+            VALUE "FileVersion",     VER_STR
+            VALUE "InternalName",    "D4AssetBrowser"
+            VALUE "OriginalFilename","D4AssetBrowser.exe"
+            VALUE "ProductName",     "D4AssetBrowser"
+            VALUE "ProductVersion",  VER_STR
+            // Deliberately no CompanyName / LegalCopyright beyond this: the project is MIT and not
+            // affiliated with Blizzard, and claiming a company field would imply otherwise.
+            VALUE "Comments",        "Not affiliated with or endorsed by Blizzard Entertainment."
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 1200
+    END
+END

@@ -4,6 +4,11 @@
 Catches the classes of mistake that have actually broken this build, cheaply, before a
 multi-minute MSVC cycle:
 
+  0. Empty / truncated file         — a botched write that left 0 bytes. Checked FIRST and
+                                      alone, because an empty file passes every other check
+                                      here: it has balanced delimiters, no bad format strings
+                                      and no duplicate lambdas. Two files were blanked and this
+                                      script reported "131 file(s) clean".
   1. Unbalanced {} () []            — truncated or mis-spliced edits.
   2. Missing #include for a         — a header-only helper used as `Ns::Thing` with no
      header-only helper               matching include directive. THIS is the one that broke
@@ -32,8 +37,13 @@ SRC = ROOT / "src"
 # Add a row when a new one lands; the check is only as good as this table.
 HEADER_ONLY = {
     "ViewportPartMenu": "util/ViewportPartMenu.h",
+    # Same header, second namespace: the shared context-menu vocabulary. Guarded separately
+    # because a file can use MenuText:: labels without touching ViewportPartMenu::.
+    "MenuText":         "util/ViewportPartMenu.h",
     "PanelPersist":     "util/PanelPersist.h",
+    "CameraOrbit":      "util/CameraOrbitRow.h",
     "NameTemplate":     "util/NameTemplate.h",
+    "ExportLayout":     "util/ExportLayout.h",
     "HoverInfo":        "util/HoverInfo.h",
     "ExportNotifier":   "app/ExportNotifier.h",
 }
@@ -120,6 +130,10 @@ def check_header_only_includes(path: Path, raw: str, code: str) -> list[str]:
     for ns, header in HEADER_ONLY.items():
         if not re.search(rf"\b{re.escape(ns)}::", code):
             continue                                   # not used here
+        # The DEFINING header cannot include itself. Without this, adding a second namespace from
+        # an existing header to the table immediately fails that header.
+        if path.as_posix().endswith(header):
+            continue
         pat = re.compile(rf'^\s*#\s*include\s+["<]{re.escape(header)}[">]\s*$', re.M)
         if not pat.search(raw):
             problems.append(
@@ -303,15 +317,42 @@ def check_format_args(path: Path, raw: str) -> list[str]:
 
 DECL = re.compile(r"\b(?:auto|int|float|double|bool|QString|QMenu|QAction)\s+(\w+)\s*=")
 
+# The DECL list above is a closed set of types and only matches the `TYPE NAME =` form, so it
+# missed `QHash<QString, LatestSlot> slots;` — templated type, no initialiser — and misses
+# parameters entirely. That cost a full build cycle: `slots` expands to nothing, so the line became
+# `QHash<QString, LatestSlot> ;` and every later `slots.insert(...)` compiled as `.insert(...)`.
+# MSVC then reports "syntax error: '.'" pointing at correct-looking code, several functions away
+# from the actual mistake, which is close to the worst possible diagnostic.
+#
+# Two broader patterns, both keyed on the macro name being USED as an identifier:
+#   USE  — member access. `slots.` / `signals->` / `slots[` cannot be anything but a mistake.
+#   DECL2 — `<type> NAME` followed by ; = , ) — covers locals, members and parameters.
+# Neither fires on the legitimate spellings: `public slots:` and `signals:` are followed by ':',
+# and `emit obj.sig()` captures `obj`, not `emit`.
+QT_MACRO_USE = re.compile(r"\b(emit|signals|slots|foreach)\s*(?:\.|->|\[)")
+QT_MACRO_DECL2 = re.compile(r"[>\w\]]\s*[&*]?\s+(emit|signals|slots|foreach)\s*[;=,)]")
+
 
 def check_qt_macro_names(path: Path, code: str) -> list[str]:
     problems = []
+    seen = set()
+
+    def add(pos: int, name: str, why: str) -> None:
+        line = code[:pos].count("\n") + 1
+        if (line, name) in seen:
+            return
+        seen.add((line, name))
+        problems.append(
+            f"line {line}: `{name}` is a Qt macro that expands to NOTHING — {why}. "
+            f"Rename the identifier.")
+
     for m in DECL.finditer(code):
         if m.group(1) in QT_MACROS:
-            line = code[:m.start()].count("\n") + 1
-            problems.append(
-                f"line {line}: declares `{m.group(1)}` — a Qt macro; it expands to nothing "
-                f"and the declaration silently disappears")
+            add(m.start(), m.group(1), "the declaration silently disappears")
+    for m in QT_MACRO_USE.finditer(code):
+        add(m.start(), m.group(1), "used here as an object, so this line loses its subject")
+    for m in QT_MACRO_DECL2.finditer(code):
+        add(m.start(), m.group(1), "declared here as a variable or parameter")
     return problems
 
 
@@ -352,6 +393,30 @@ def check_duplicate_locals(path: Path, code: str) -> list[str]:
     return problems
 
 
+def check_truncation(path: Path, raw: str) -> list[str]:
+    """Empty or near-empty source file — almost always a botched write, not intent.
+
+    THIS EXISTS BECAUSE THE OTHER CHECKS CANNOT SEE IT. An editing script that opened a file
+    for writing before reading it truncated main.cpp and CacheVersioning.h to ZERO BYTES, and
+    this script reported "131 file(s) clean" — an empty file has balanced delimiters, no bad
+    format strings and no duplicate lambdas. It passed every test with flying colours because
+    there was nothing left to test.
+
+    A .cpp/.h in this tree is never legitimately empty: even the thinnest header carries
+    `#pragma once` and a comment. The floor is deliberately low (a handful of bytes) so this
+    only ever fires on real damage, never on a small-but-real file.
+    """
+    stripped = raw.strip()
+    if not stripped:
+        return ["FILE IS EMPTY (0 bytes of content) — almost certainly a truncated write. "
+                "Restore it from .Backups/ before doing anything else."]
+    # A file with no directive, no comment and no brace is not plausibly source.
+    if len(stripped) < 24 and not any(t in stripped for t in ("#", "//", "{", ";")):
+        return [f"file is only {len(stripped)} byte(s) and contains no code — "
+                f"looks truncated; check .Backups/ before building"]
+    return []
+
+
 def main() -> int:
     args = [a for a in sys.argv[1:] if not a.startswith("--")]
     quiet = "--quiet" in sys.argv
@@ -372,6 +437,16 @@ def main() -> int:
             total += 1
             continue
         code = strip_code(raw)
+        # Truncation FIRST: on an empty file every other check trivially passes, so reporting
+        # "clean" is worse than useless — it actively certifies the damage.
+        trunc = check_truncation(f, raw)
+        if trunc:
+            total += len(trunc)
+            rel = f.relative_to(ROOT) if ROOT in f.parents or f.is_relative_to(ROOT) else f
+            print(f"\n[FAIL] {rel}")
+            for p in trunc:
+                print(f"       - {p}")
+            continue
         problems = (check_balance(f, code)
                     + check_header_only_includes(f, raw, code)
                     + check_format_args(f, raw)
@@ -388,7 +463,8 @@ def main() -> int:
     if total == 0:
         if not quiet:
             print(f"verify-src: OK — {len(files)} file(s) clean "
-                  f"(balance, header-only includes, format args, Qt macro names, duplicate lambdas)")
+                  f"(non-empty, balance, header-only includes, format args, Qt macro names, "
+                  f"duplicate lambdas)")
         return 0
     print(f"\nverify-src: {total} problem(s) in {len(files)} file(s) — fix before building.")
     return 1

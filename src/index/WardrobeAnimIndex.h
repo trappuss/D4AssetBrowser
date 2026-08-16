@@ -44,6 +44,8 @@ public:
     void ensureBuilt(const QString& d4dataDir);   // background; no-op if ready/in-flight
     void reset();
     bool ready() const { return m_ready; }
+    // Exposed so File ▸ Index can say "Building…" instead of only ready/not-ready.
+    bool building() const { return m_building; }
 
     // eWeaponClass for an ItemType stem ("Sword2H", "Axe", …). -1 when the type carries none.
     int weaponClassOf(const QString& itemType) const
@@ -60,6 +62,7 @@ public:
 
 signals:
     void readyChanged();
+    void progress(int pct);   // 0..100 while crawling (this index has no disk cache \u2014 always)
 
 private:
     explicit WardrobeAnimIndex(QObject* parent = nullptr) : QObject(parent) {}

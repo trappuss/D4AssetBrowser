@@ -8,18 +8,26 @@
 #include <QFile>
 #include <QFileInfo>
 #include <QHash>
+#include <QMutex>
 #include <QRegularExpression>
 #include <QString>
+
+#include <atomic>
 
 class AnimActionIndex {
 public:
     static AnimActionIndex& instance() { static AnimActionIndex i; return i; }
 
-    // Build from a d4data root if not already built. Safe to call repeatedly.
+    // Build from a d4data root if not already built. Safe to call repeatedly AND from more than
+    // one thread: the first caller builds, any other blocks until it is done. Measured at ~1700 ms
+    // over the AnimSet/Emote/StringList trees, which is why it must not run on the GUI thread —
+    // prewarm it from a worker (MainWindow's reload thread does) before the Wardrobe needs it.
     void ensure(const QString& d4)
     {
-        if (m_built || d4.isEmpty()) return;
-        m_built = true;
+        if (m_built.load(std::memory_order_acquire) || d4.isEmpty()) return;
+        QMutexLocker lock(&m_mutex);
+        if (m_built.load(std::memory_order_relaxed)) return;   // another thread built it while we waited
+        // NB: the flag is set at the END of this function, not here.
         const QString dir = d4 + QStringLiteral("/json/base/meta/AnimSet");
         // Pair the entry's Power (the action) with its clip; the "(?!snoPower)" guard stops a null
         // power from grabbing the next entry's clip. group1 = power name, group2 = clip name.
@@ -100,9 +108,31 @@ public:
                 if (!clip.isEmpty() && !m_set.contains(clip)) m_set.insert(clip, setName);
             }
         }
+        // LAST, with release ordering: everything written above must be visible to any thread that
+        // subsequently sees this flag without taking the mutex (the fast path at the top).
+        m_built.store(true, std::memory_order_release);
     }
 
-    bool built() const { return m_built; }
+    bool built() const { return m_built.load(std::memory_order_acquire); }
+
+    // Drop everything so the next ensure() re-reads the snapshot.
+    //
+    // This index is memory-only and was built once per process with no way back, so switching the
+    // d4data folder — or pulling a newer snapshot — left every clip still labelled from the OLD
+    // one until the app was restarted. Nothing said so; the labels simply stayed wrong. Wired into
+    // MainWindow's fingerprint guard alongside the other indexes.
+    //
+    // Takes the same mutex ensure() holds, so a reset landing while a build is in flight waits for
+    // it rather than tearing the maps out from under it. The build then finishes and marks itself
+    // built; the following ensure() sees a cleared, unbuilt index and redoes it.
+    void reset()
+    {
+        QMutexLocker lock(&m_mutex);
+        m_built.store(false, std::memory_order_release);
+        m_power.clear();
+        m_set.clear();
+        m_emote.clear();
+    }
     // Readable action for a clip (e.g. "Walk", "Get Hit"), or empty if unknown.
     QString action(const QString& clipNameLower) const
     {
@@ -162,7 +192,13 @@ private:
         return pretty(s);
     }
 
-    bool m_built = false;
+    // Atomic + mutex because ensure() is now called from a WORKER thread at startup as well as
+    // from the GUI thread on first use. The old `bool m_built = true;` set at the TOP of the build
+    // was a race waiting to happen: a second caller saw "built" and read a half-filled map while
+    // the first was still writing it. The flag is now set at the END, and a caller that arrives
+    // mid-build waits rather than reading torn state.
+    std::atomic<bool> m_built{false};
+    QMutex m_mutex;
     QHash<QString, QString> m_power;   // clip (lower) → raw power name
     QHash<QString, QString> m_set;     // clip (lower) → AnimSet name
     QHash<QString, QString> m_emote;   // power (lower) → Emote definition name

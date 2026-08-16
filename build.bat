@@ -68,7 +68,10 @@ echo.
 powershell -NoProfile -ExecutionPolicy Bypass -Command "cmake --preset windows-msvc-release 2>&1 | Tee-Object -FilePath '%~dp0build_log.txt'; exit $LASTEXITCODE"
 set "RC=%errorlevel%"
 if not "%RC%"=="0" (
-    findstr /i /c:"CMake Error" /c:"error" /c:"Failed to find" /c:"FAILED" "%~dp0build_log.txt" > "%~dp0build_errors.txt"
+    REM Select-String, not findstr: Tee-Object writes the log as UTF-16, which findstr
+    REM cannot read - it warns and produces an EMPTY error file, so a failed build
+    REM appears to report no errors at all.
+    powershell -NoProfile -ExecutionPolicy Bypass -Command "$e = Select-String -Path '%~dp0build_log.txt' -Pattern 'CMake Error','error','Failed to find','FAILED' | ForEach-Object { $_.Line } | Select-Object -First 40 ; $e; $e | Out-File -FilePath '%~dp0build_errors.txt' -Encoding utf8"
     echo   CONFIGURE FAILED ^(see build_errors.txt^). & pause & exit /b 1
 )
 
@@ -76,7 +79,10 @@ echo [4/4] Building (LIVE output; the two big files can take a few minutes each)
 echo.
 powershell -NoProfile -ExecutionPolicy Bypass -Command "cmake --build --preset release 2>&1 | Tee-Object -FilePath '%~dp0build_log.txt'; exit $LASTEXITCODE"
 set "RC=%errorlevel%"
-findstr /i /c:"error C" /c:": error" /c:"error LNK" /c:"fatal error" /c:"FAILED" /c:"ninja: build stopped" "%~dp0build_log.txt" > "%~dp0build_errors.txt"
+REM Select-String, not findstr: Tee-Object writes the log as UTF-16, which findstr
+REM cannot read - it warns and produces an EMPTY error file, so a failed build
+REM appears to report no errors at all.
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$e = Select-String -Path '%~dp0build_log.txt' -Pattern 'error C',': error','error LNK','fatal error','FAILED','ninja: build stopped' | ForEach-Object { $_.Line } | Select-Object -First 40 ; $e; $e | Out-File -FilePath '%~dp0build_errors.txt' -Encoding utf8"
 if not "%RC%"=="0" ( echo   BUILD FAILED ^(see build_errors.txt^). & pause & exit /b 1 )
 
 echo.

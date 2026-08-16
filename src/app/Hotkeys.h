@@ -20,7 +20,7 @@ inline QVector<Def> defs()
 {
     return {
         { QStringLiteral("hotkeys/exportSelection"),  QStringLiteral("Export selection…"),        QStringLiteral("Ctrl+E") },
-        { QStringLiteral("hotkeys/exportToLast"),     QStringLiteral("Export to last dir"),       QStringLiteral("Ctrl+Shift+E") },
+        { QStringLiteral("hotkeys/exportToLast"),     QStringLiteral("Export to last folder"),    QStringLiteral("Ctrl+Shift+E") },
         { QStringLiteral("hotkeys/exportAnimations"), QStringLiteral("Export animations only…"),  QStringLiteral("Ctrl+Shift+A") },
         { QStringLiteral("hotkeys/saveImage"),        QStringLiteral("Save preview image…"),      QStringLiteral("Ctrl+Shift+I") },
         { QStringLiteral("hotkeys/turntable"),        QStringLiteral("Turntable GIF…"),           QString() },

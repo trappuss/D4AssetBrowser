@@ -1,9 +1,11 @@
 #include "tabs/StableTab2.h"
+#include "util/CameraOrbitRow.h"
 #include "util/LookIcon.h"
 #include "util/ViewportPartMenu.h"
 
 #include "app/ExportNotifier.h"
 #include "util/HoverInfo.h"
+#include "util/AnimExportScope.h"   // which animation sources an export embeds
 #include "util/PanelPersist.h"
 
 #include <QElapsedTimer>
@@ -258,19 +260,19 @@ StableTab2::StableTab2(QWidget* parent) : BrowserTab(parent)
                 const QString exDir = ViewportPartMenu::condensePath(
                     QSettings().value(QStringLiteral("stable2/exportDir")).toString());
                 if (!exDir.isEmpty())
-                    menu.addAction(ViewportPartMenu::withValue(QStringLiteral("Export Model Last dir"), exDir),
+                    menu.addAction(ViewportPartMenu::withValue(MenuText::kExportModelLast, exDir),
                                    this, [this, sno, appr] { exportAppearanceModel(sno, appr, true); });
-                menu.addAction(QStringLiteral("Export Model"), this,
+                menu.addAction(ViewportPartMenu::prompts(MenuText::kExportModel), this,
                                [this, sno, appr] { exportAppearanceModel(sno, appr, false); });
                 menu.addSeparator();
-                menu.addAction(QStringLiteral("Copy SNO id  (%1)").arg(sno), this,
+                menu.addAction(QStringLiteral("%1  (%2)").arg(MenuText::kCopySno).arg(sno), this,
                                [sno, clip] { clip(QString::number(sno)); });
-                menu.addAction(QStringLiteral("Copy file name  (%1)").arg(prev(appr)), this,
+                menu.addAction(QStringLiteral("%1  (%2)").arg(MenuText::kCopyFileName).arg(prev(appr)), this,
                                [appr, clip] { clip(appr); });
-                menu.addAction(QStringLiteral("Copy name  (%1)").arg(prev(disp)), this,
+                menu.addAction(QStringLiteral("%1  (%2)").arg(MenuText::kCopyName).arg(prev(disp)), this,
                                [disp, clip] { clip(disp); });
                 QAction* aColl = menu.addAction(
-                    QStringLiteral("Copy collection name  (%1)").arg(prev(coll.isEmpty() ? QStringLiteral("—") : coll)),
+                    QStringLiteral("%1  (%2)").arg(MenuText::kCopyCollection).arg(prev(coll.isEmpty() ? QStringLiteral("—") : coll)),
                     this, [coll, clip] { clip(coll); });
                 aColl->setEnabled(!coll.isEmpty());
             }
@@ -770,6 +772,7 @@ void StableTab2::buildVpStrip()
     });
     connect(bCam, &QToolButton::clicked, this, [this, bCam] {
         if (!m_camPanel) buildCameraPanel();
+        if (m_camOrbitSync) m_camOrbitSync();   // camera may have been orbited since the last open
         showPopup(m_camPanel, bCam);
     });
     connect(bLight, &QToolButton::clicked, this, [this, bLight] {
@@ -947,7 +950,7 @@ void StableTab2::refresh()
     // (IconIndex); build them if some other tab hasn't already, and repaint when ready.
     const QString d4 = Config::d4dataDir();
     AppearanceMeta::instance().ensureBuilt(d4, m_index, m_reader);
-    IconIndex::instance().ensureBuilt(d4);
+    IconIndex::instance().ensureBuilt(d4, m_reader);
     connect(&IconIndex::instance(), &IconIndex::readyChanged, this,
             [this] { refreshSlotCells(); fillGrid(); });
     connect(&AppearanceMeta::instance(), &AppearanceMeta::readyChanged, this,
@@ -1091,6 +1094,15 @@ void StableTab2::ensurePetIndex()
             if (iv.hasMatch()) { const quint32 h = iv.captured(1).toUInt(); if (h) icons.insert(apprSno, h); }
         };
 
+        // Items dropped because their appearance name would not join to a SNO. Each branch below
+        // ends in a bare `continue`, so the item simply never reaches its picker and the user sees
+        // a shorter list with no way to tell that anything was lost. Counted per item type, because
+        // "9 mounts missing" and "9 trophies missing" point at completely different causes.
+        //
+        // Reported on the COLD build only: the result is cached (stable_index_v6.bin) and the
+        // cache-hit path returns before this loop runs. That is the right time to hear it — the
+        // counts can only change when the index is rebuilt, which is when d4data changed.
+        int dropMount = 0, dropArmor = 0, dropTrophy = 0, dropPet = 0;
         QDir dir(d4 + QStringLiteral("/json/base/meta/Item"));
         for (const QString& fn : dir.entryList(QStringList{ QStringLiteral("*.itm.json") }, QDir::Files)) {
             QFile f(dir.filePath(fn));
@@ -1103,7 +1115,7 @@ void StableTab2::ensurePetIndex()
 
             if (itype == QLatin1String("mountitem")) {
                 const auto mm = rxMount.match(raw);
-                if (!mm.hasMatch()) continue;
+                if (!mm.hasMatch()) { ++dropMount; continue; }   // no snoMount reference at all
                 const QString actor = mm.captured(1);
                 StableEntry e; e.item = base;
                 // The ridable actor carries the appearance + type + colour look — one read,
@@ -1125,10 +1137,10 @@ void StableTab2::ensurePetIndex()
                         if (lm.hasMatch()) e.look = lm.captured(1).toUInt();
                     }
                 }
-                if (apprName.isEmpty()) continue;
+                if (apprName.isEmpty()) { ++dropMount; continue; }
                 e.appr = apprName;
                 e.apprSno = appByName.value(apprName.toLower(), 0);
-                if (e.apprSno <= 0) continue;
+                if (e.apprSno <= 0) { ++dropMount; continue; }
                 readStrings(d4, QStringLiteral("Item_") + base, e.name, e.desc);
                 if (e.name.isEmpty()) {   // base colour variants carry their name on the ACTOR instead
                     QString d2;
@@ -1141,7 +1153,7 @@ void StableTab2::ensurePetIndex()
             } else if (itype == QLatin1String("horsearmor") || itype == QLatin1String("catarmor")) {
                 StableEntry e; e.item = base; e.appr = base;
                 e.apprSno = appByName.value(base.toLower(), 0);
-                if (e.apprSno <= 0) continue;                 // no worn mesh shipped
+                if (e.apprSno <= 0) { ++dropArmor; continue; }   // no worn mesh shipped
                 e.type = itype == QLatin1String("horsearmor") ? 0 : 1;
                 readStrings(d4, QStringLiteral("Item_") + base, e.name, e.desc);
                 if (e.name.isEmpty()) e.name = base;
@@ -1157,7 +1169,7 @@ void StableTab2::ensurePetIndex()
                         e.apprSno = appByName.value(e.appr.toLower(), 0);
                     }
                 }
-                if (e.apprSno <= 0) continue;
+                if (e.apprSno <= 0) { ++dropTrophy; continue; }
                 readStrings(d4, QStringLiteral("Item_") + base, e.name, e.desc);
                 if (e.name.isEmpty()) e.name = base;
                 entryIcon(raw, e.apprSno);
@@ -1169,16 +1181,22 @@ void StableTab2::ensurePetIndex()
                     const auto ma = rxActor.match(raw);
                     if (ma.hasMatch()) actor = ma.captured(1);
                 }
-                if (actor.isEmpty()) continue;
+                if (actor.isEmpty()) { ++dropPet; continue; }
                 StableEntry e; e.item = base; e.appr = actor;
                 e.apprSno = appByName.value(actor.toLower(), 0);
-                if (e.apprSno <= 0) continue;
+                if (e.apprSno <= 0) { ++dropPet; continue; }
                 readStrings(d4, QStringLiteral("Item_") + base, e.name, e.desc);
                 if (e.name.isEmpty()) e.name = actor;
                 entryIcon(raw, e.apprSno);
                 pets.append(e);
             }
         }
+        if (dropMount || dropArmor || dropTrophy || dropPet)
+            qInfo("stable index: %d item(s) skipped — no appearance resolved "
+                  "(mounts %d, barding %d, trophies %d, pets %d); kept %d/%d/%d/%d",
+                  dropMount + dropArmor + dropTrophy + dropPet,
+                  dropMount, dropArmor, dropTrophy, dropPet,
+                  int(mounts.size()), int(armor.size()), int(trophies.size()), int(pets.size()));
         auto byName2 = [](const StableEntry& a, const StableEntry& b) { return a.name.toLower() < b.name.toLower(); };
         std::sort(mounts.begin(), mounts.end(), byName2);
         std::sort(armor.begin(), armor.end(), byName2);
@@ -1573,9 +1591,9 @@ void StableTab2::fillGrid()
                                 ? QString() : QStringLiteral("  —  %1").arg(ex.join(QStringLiteral(" + ")));
                             if (!exDir.isEmpty())
                                 menu.addAction(ViewportPartMenu::withValue(
-                                                   QStringLiteral("Export Model Last dir"), exDir) + extra, this,
+                                                   MenuText::kExportModelLast, exDir) + extra, this,
                                                [this, entry] { exportAppearanceModel(entry.apprSno, entry.appr, true); });
-                            menu.addAction(QStringLiteral("Export Model") + extra, this,
+                            menu.addAction(ViewportPartMenu::prompts(MenuText::kExportModel + extra), this,
                                            [this, entry] { exportAppearanceModel(entry.apprSno, entry.appr, false); });
                         }
                         LookIcon::addActions(menu, this, slotIcon(entry.apprSno), entry.appr);
@@ -1583,13 +1601,13 @@ void StableTab2::fillGrid()
                         auto clip = [](const QString& s) { QGuiApplication::clipboard()->setText(s); };
                         auto prev = [](const QString& s) { return s.size() > 30 ? s.left(29) + QChar(0x2026) : s; };
                         const QString coll = AppearanceMeta::instance().collectionFor(entry.apprSno);
-                        menu.addAction(QStringLiteral("Copy SNO id  (%1)").arg(entry.apprSno), this,
+                        menu.addAction(QStringLiteral("%1  (%2)").arg(MenuText::kCopySno).arg(entry.apprSno), this,
                                        [entry, clip] { clip(QString::number(entry.apprSno)); });
-                        menu.addAction(QStringLiteral("Copy file name  (%1)").arg(prev(entry.appr)), this,
+                        menu.addAction(QStringLiteral("%1  (%2)").arg(MenuText::kCopyFileName).arg(prev(entry.appr)), this,
                                        [entry, clip] { clip(entry.appr); });
-                        menu.addAction(QStringLiteral("Copy name  (%1)").arg(prev(entry.name)), this,
+                        menu.addAction(QStringLiteral("%1  (%2)").arg(MenuText::kCopyName).arg(prev(entry.name)), this,
                                        [entry, clip] { clip(entry.name); });
-                        QAction* aColl = menu.addAction(QStringLiteral("Copy collection name  (%1)").arg(prev(coll.isEmpty() ? QStringLiteral("—") : coll)), this,
+                        QAction* aColl = menu.addAction(QStringLiteral("%1  (%2)").arg(MenuText::kCopyCollection).arg(prev(coll.isEmpty() ? QStringLiteral("—") : coll)), this,
                                        [coll, clip] { clip(coll); });
                         aColl->setEnabled(!coll.isEmpty());
                         menu.exec(b->mapToGlobal(p));
@@ -2504,6 +2522,9 @@ void StableTab2::exportAppearanceModel(int sno, const QString& appr, bool toLast
         if (!rn.isEmpty()) p.materialName = rn;
     }
     // Per-material PBR decode → ExportMaterial list.
+    const bool bakeDetail_ = QSettings().value(QStringLiteral("export/bakeDetail"), false).toBool();
+    // One decode cache for this model's materials, same as the batch paths.
+    MaterialDecode::TextureCacheScope texCache;
     QVector<ModelExporter::ExportMaterial> mats(geo.primitives.size());
     QHash<QString, ModelExporter::ExportMaterial> cache;
     for (int i = 0; i < geo.primitives.size(); ++i) {
@@ -2519,6 +2540,12 @@ void StableTab2::exportAppearanceModel(int sno, const QString& appr, bool toLast
             em.hasMetal = true; em.metal = mt; em.hasRough = true; em.rough = rg;
             const QImage emi = MaterialDecode::byRole(m_reader, d4, m, "EMISSIVE");
             if (!emi.isNull()) { em.emissive = emi; em.hasEmissive = true; em.emisMult = 1.0f; }
+            // The third export path that was ignoring export/bakeDetail. exportMount and the Models
+            // roster builder were both wired up when the bake became shared; this one — right-click
+            // ▸ Export model on a stable item — builds its own materials and was missed, so the
+            // setting was still a lie here alone. Cached with the material, like everything above it.
+            if (bakeDetail_)
+                MaterialDecode::bakeDetailForMaterial(m_reader, d4, m, em.normal, em.orm);
         });
         cache.insert(m, em); mats[i] = em; geo.primitives[i].materialIndex = i;
     }
@@ -2549,7 +2576,10 @@ void StableTab2::exportAppearanceModel(int sno, const QString& appr, bool toLast
         if (carrier > 0 && !m_animCache.contains(carrier)) m_animCache.insert(carrier, discoverClips(carrier, tok));
         QStringList want;
         auto clipOf = [](const QString& r) { return r.section(QStringLiteral("  ·  "), 0, 0); };
-        if (QSettings().value(QStringLiteral("export/animScope"), 0).toInt() == 1) {
+        // Mount/pet clips are discovered off the CARRIER actor, which is the animated rig itself —
+        // so `original`, `sets` and `base` name the same set here \u2014 any of them means "all its clips".
+        const AnimExportScope asc = AnimExportScope::load();
+        if (asc.original || asc.sets || asc.base) {
             for (const QString& r : m_animCache.value(carrier)) want << clipOf(r);
         } else {
             QString c = appr.compare(m_slotName[SlotMount], Qt::CaseInsensitive) == 0 ? m_playingAnim : QString();
@@ -2587,18 +2617,30 @@ void StableTab2::exportAppearanceModel(int sno, const QString& appr, bool toLast
     const bool wrote = ModelExporter::exportGlb(geo, path, mats, anims, animNames, opt);
     QSettings().setValue(QStringLiteral("stable2/exportDir"), QFileInfo(path).absolutePath());
 
-    // Raw source files (.app + distinct .tex) into a "<name>_deps" folder, when enabled.
+    // Raw source files (.app + distinct .tex) into a "deps" folder beside the .glb, when enabled.
+    // Folder name and rule match the Models/Bulk path — export/withDeps is one setting and had
+    // grown two layouts, which is the thing that makes a shared option unpredictable.
     int nRaw = 0;
+    int nUnnamedMat = 0;   // roster slots with no material name — their sources cannot be written
     if (wrote && QSettings().value(QStringLiteral("export/withDeps"), false).toBool()) {
-        const QString depDir = path.left(path.size() - 4) + QStringLiteral("_deps");
+        const QString depDir = QFileInfo(path).dir().filePath(QStringLiteral("deps"));
         QDir().mkpath(depDir);
         QFile af(depDir + QLatin1Char('/') + base + QStringLiteral(".app"));
         if (af.open(QIODevice::WriteOnly)) { af.write(payload); af.close(); ++nRaw; }
         QSet<qint64> doneTex;
         for (const QString& mn : roster) {
+            // An EMPTY roster slot is not a failure — appearanceRoster() pads the table so its
+            // indices line up with materialIndex, and a slot with no ptSOAs legitimately has no
+            // material. Counting those reported "2 materials unresolved" on a complete export.
             if (mn.isEmpty()) continue;
             QFile mf(d4 + QStringLiteral("/json/base/meta/Material/") + mn + QStringLiteral(".mat.json"));
-            if (!mf.open(QIODevice::ReadOnly)) continue;
+            if (!mf.open(QIODevice::ReadOnly)) {
+                // "~unnamed_<sno>" is an ENCRYPTED material: it has a real sno and renders fine, it
+                // just has no name and therefore no .mat.json — by far the common case (d4data ships
+                // ~1079 of them). Only a NAMED material with no readable .mat.json is a real miss.
+                if (!mn.startsWith(QLatin1String("~unnamed_"))) ++nUnnamedMat;
+                continue;
+            }
             for (const MatTexture& mt : parseMaterialJson(mf.readAll())) {
                 if (mt.texSno == 0 || doneTex.contains(mt.texSno)) continue;
                 doneTex.insert(mt.texSno);
@@ -2614,9 +2656,16 @@ void StableTab2::exportAppearanceModel(int sno, const QString& appr, bool toLast
     QString extra;
     if (nAnim) extra += QStringLiteral("  + %1 animation%2").arg(nAnim).arg(nAnim == 1 ? QString() : QStringLiteral("s"));
     if (nRaw)  extra += QStringLiteral("  + %1 raw source file%2").arg(nRaw).arg(nRaw == 1 ? QString() : QStringLiteral("s"));
+    // Materials the roster could not name: their .mat/.tex sources are simply absent from _deps.
+    // Reported for the same reason ModelsTab_Export logs an empty palette — a short deps folder is
+    // otherwise indistinguishable from a complete one.
+    if (nUnnamedMat) extra += QStringLiteral("  ·  %1 material%2 unresolved")
+                                  .arg(nUnnamedMat).arg(nUnnamedMat == 1 ? QString() : QStringLiteral("s"));
     if (wrote)
         ExportNotifier::instance().notify(
-            QStringLiteral("Exported %1%2").arg(QFileInfo(path).fileName(), extra), QFileInfo(path).absolutePath());
+            QStringLiteral("Exported %1%2%3").arg(QFileInfo(path).fileName(), extra,
+                                                  ExportNotifier::glbOptionsLine(opt)),
+            QFileInfo(path).absolutePath());
     else
         QMessageBox::information(this, QStringLiteral("Export"), QStringLiteral("Export failed."));
 }
@@ -2834,7 +2883,9 @@ bool StableTab2::eventFilter(QObject* obj, QEvent* ev)
     if (m_shadeMoreBtn && obj == m_shadeMoreBtn && t == QEvent::Wheel && m_channelCombo) {
         const int dir = static_cast<QWheelEvent*>(ev)->angleDelta().y() > 0 ? -1 : 1;
         const int n = m_channelCombo->count();
-        if (n > 0) m_channelCombo->setCurrentIndex((m_channelCombo->currentIndex() + dir + n) % n);
+        // Clamped, not wrapped — see ModelsTab: scrolling up must stop at "Shaded", not wrap to the
+        // bottom of the list.
+        if (n > 0) m_channelCombo->setCurrentIndex(qBound(0, m_channelCombo->currentIndex() + dir, n - 1));
         return true;
     }
     if (m_view && obj == m_view && (t == QEvent::Resize || t == QEvent::Show)) {
@@ -3279,7 +3330,8 @@ QString StableTab2::exportMenuSuffix(const QString& appr, bool pet)
         }
         if (carrier > 0 && !m_animCache.contains(carrier)) m_animCache.insert(carrier, discoverClips(carrier, tok));
         const QStringList clips = carrier > 0 ? m_animCache.value(carrier) : QStringList();
-        if (s.value(QStringLiteral("export/animScope"), 0).toInt() == 1) {
+        const AnimExportScope asc = AnimExportScope::load();   // as in exportOne: carrier == the rig
+        if (asc.original || asc.sets || asc.base) {
             parts << QStringLiteral("%1 animation%2").arg(clips.size()).arg(clips.size() == 1 ? QString() : QStringLiteral("s"));
         } else {
             QString clip = appr.compare(m_slotName[SlotMount], Qt::CaseInsensitive) == 0 ? m_playingAnim : QString();
@@ -3769,6 +3821,11 @@ void StableTab2::buildCameraPanel()
     pl->addWidget(spinChk);
     pl->addLayout(spinRow);
 
+    // Numeric orbit control. Placed AFTER the turntable so it can be handed that checkbox —
+    // editing an angle by hand unticks it, since the spin would otherwise overwrite yaw 30x a
+    // second and the control would look dead.
+    m_camOrbitSync = CameraOrbit::addRows(m_camPanel, pl, m_view, spinChk);
+
     // Orthographic projection.
     auto* orthoChk = new QCheckBox(QStringLiteral("Orthographic projection"), m_camPanel);
     orthoChk->setChecked(s.value(QStringLiteral("stable2/ortho"), false).toBool());
@@ -3856,7 +3913,7 @@ void StableTab2::buildGraphicsPanel()
         return gl;
     };
 
-    auto* gLight = addGroup(QStringLiteral("Scene & shadows"));
+    auto* gLight = addGroup(QStringLiteral("Scene && shadows"));
     addChkTo(gLight, QStringLiteral("ibl"), QStringLiteral("Environment lighting (IBL)"), true,
              [this](bool on) { if (m_view) m_view->setFeatureIbl(on); });
     addChkTo(gLight, QStringLiteral("shadow"), QStringLiteral("Self-shadows"), true,
@@ -3876,7 +3933,7 @@ void StableTab2::buildGraphicsPanel()
     addChkTo(gShade, QStringLiteral("specaa"), QStringLiteral("Specular anti-aliasing"), true,
              [this](bool on) { if (m_view) m_view->setFeatureSpecAA(on); });
 
-    auto* gGeom = addGroup(QStringLiteral("Geometry & debug"));
+    auto* gGeom = addGroup(QStringLiteral("Geometry && debug"));
     addChkTo(gGeom, QStringLiteral("mask"), QStringLiteral("Primary mask"), false,
              [this](bool on) { if (m_view) m_view->setFeatureMask(on); });
 
@@ -4490,6 +4547,7 @@ void StableTab2::showPartContextMenu(int part, const QPoint& gp, int groupPart)
         if (part >= 0 && part < m_lastGeo.primitives.size()) {
             item = itemForPart(part);
             in.part         = part;
+            // As in the Wardrobe: the merge pipeline puts the real material name on the primitive.
             in.partName     = m_lastGeo.primitives[part].materialName;
             in.partFileName = in.partName;
             in.sourceFileName = m_partSource.value(part);   // the equipped piece this part came from
@@ -4683,6 +4741,31 @@ void StableTab2::exportMount(const QVector<int>& keep, const QString& label, boo
         geoCopy.primitives = sub;
         mats = subMats;
     }
+    // Bake the tiled/zone-routed detail grain into the exported normal + ORM (opt-in), so barding
+    // exports with its leather/metal surface texture instead of a smooth base normal. Same setting
+    // and same guards the Wardrobe export uses; until now `export/bakeDetail` was read by Wardrobe
+    // alone and this path silently ignored it.
+    //
+    // Here and not in the rebuild's decode pass, deliberately: the setting is read at EXPORT time,
+    // so toggling it takes effect on the next export rather than the next mount load — and a mount
+    // browsed with the option off costs nothing. `mats` is a copy; m_exportMats (which the parts
+    // panel reads) is never touched.
+    //
+    // Cached by material NAME, which is safe here because every ExportMaterial with a given name
+    // took its normal/ORM from the same per-material cache above — so one decode+bake per distinct
+    // material, not one per primitive.
+    if (QSettings().value(QStringLiteral("export/bakeDetail"), false).toBool()) {
+        const QString d4 = Config::d4dataDir();
+        QHash<QString, QImage> bakedN, bakedO;   // two hashes rather than QPair: <QPair> is not included here
+        for (ModelExporter::ExportMaterial& em : mats) {
+            if (em.normal.isNull() || em.name.isEmpty()) continue;
+            auto it = bakedN.constFind(em.name);
+            if (it != bakedN.constEnd()) { em.normal = it.value(); em.orm = bakedO.value(em.name); continue; }
+            MaterialDecode::bakeDetailForMaterial(m_reader, d4, em.name, em.normal, em.orm);
+            bakedN.insert(em.name, em.normal);
+            bakedO.insert(em.name, em.orm);
+        }
+    }
     Retarget::applyFromSettings(geoCopy);
     if (opt.blenderFriendly)
         GLModelWidget::blenderizeSkeletonNames(geoCopy.skeleton);
@@ -4691,8 +4774,9 @@ void StableTab2::exportMount(const QVector<int>& keep, const QString& label, boo
     QSettings().setValue(QStringLiteral("stable2/exportDir"), folder);
     if (ok)
         ExportNotifier::instance().notify(
-            QStringLiteral("Exported %1%2").arg(QFileInfo(path).fileName(),
-                anims.isEmpty() ? QString() : QStringLiteral("  (with animation: %1)").arg(animNames.first())),
+            QStringLiteral("Exported %1%2%3").arg(QFileInfo(path).fileName(),
+                anims.isEmpty() ? QString() : QStringLiteral("  (with animation: %1)").arg(animNames.first()),
+                ExportNotifier::glbOptionsLine(opt)),
             folder);
     else
         QMessageBox::information(this, QStringLiteral("Export"), QStringLiteral("Export failed."));

@@ -33,16 +33,36 @@
 namespace {
 
 constexpr int kGroupAppearance = 9;
-constexpr int kCacheVersion = 21;  // v21: bind mount/pet/barding/trophy inventory icons (snoMount/
+constexpr int kCacheVersion = 23;  // v23: route 3 (withSelfName) — weapons, mounts, trophies and
+                                   //      off-hands now bind icons in the delta and d4dad passes.
+                                   //      The crawl produces MORE icons than v22 did, and nothing
+                                   //      in the signature could see that: the file counts, the
+                                   //      named count and the build stamp were all unchanged, so a
+                                   //      v22 cache stayed valid and the new bindings never ran.
+                                   //      The icon audit — which is NOT cached — re-ran with the
+                                   //      new rule and duly reported 308 weapons/mounts MISSING,
+                                   //      against a cache built before the rule existed. Classic:
+                                   //      "changing what gets INCLUDED qualifies" (CacheVersioning.h).
+                                   // v22: signature now includes how many appearances are
+                                   //      NAMED — recovering encrypted names does not change
+                                   //      appCount, so the CASC icon join kept running
+                                   //      against stale ~unnamed_ names (1 icon recovered).
+                                   // v21: bind mount/pet/barding/trophy inventory icons (snoMount/
                                    //      snoCompanion appearance + direct-name route + unk_75d565b)
                                    // v20: d4dad pass collects all valid handles per appearance and
                                    //      prefers one with a local atlas sprite (kills blank icons)
 
+// code → display name, derived from ItemDef's canonical table (see ItemDef.h). Adding a class
+// there adds it here, to heroClassPrefixes(), and to every filter built on them.
 const QHash<QString, QString>& classPrefix()
 {
-    static const QHash<QString, QString> m = {
-        {"bar", "Barbarian"}, {"rog", "Rogue"}, {"sor", "Sorcerer"}, {"nec", "Necromancer"},
-        {"dru", "Druid"}, {"spi", "Spiritborn"}, {"pal", "Paladin"}, {"war", "Warlock"}};
+    static const QHash<QString, QString> m = [] {
+        QHash<QString, QString> h;
+        for (int i = 0; i < ItemDef::HeroClassCount; ++i)
+            h.insert(QString::fromLatin1(ItemDef::heroClassCode(i)),
+                     QString::fromLatin1(ItemDef::heroClassName(i)));
+        return h;
+    }();
     return m;
 }
 const QHash<QString, QString>& slot2code()
@@ -51,9 +71,15 @@ const QHash<QString, QString>& slot2code()
         {"helm", "hlm"}, {"chest", "trs"}, {"gloves", "glv"}, {"pants", "leg"}, {"boots", "bts"}};
     return m;
 }
+// The set of slot CODES, derived from slot2code's values — adding a slot there adds it here.
 bool isSlot(const QString& s)
 {
-    static const QSet<QString> k = {"bts", "trs", "glv", "hlm", "leg"};
+    static const QSet<QString> k = [] {
+        QSet<QString> out;
+        const QHash<QString, QString>& m = slot2code();
+        for (auto it = m.constBegin(); it != m.constEnd(); ++it) out.insert(it.value());
+        return out;
+    }();
     return k.contains(s);
 }
 
@@ -559,6 +585,10 @@ BuildResult crawl(const QString& d4, const SnoIndex* index, CascReader* reader,
                     candNames = AppearanceMeta::styleAppearanceNames(
                         actorNames.value(info.snoActor));
             }
+            // Route 3. Without it this phase covered armour only, so a WEAPON added by a patch
+            // newer than the d4data snapshot — exactly the content this phase exists to rescue —
+            // got no icon at all.
+            candNames = AppearanceMeta::withSelfName(candNames, lname);
             for (const QString& nm : candNames) {
                 const int s = name2sno.value(nm, 0);
                 if (!s || R.icons.contains(s))
@@ -592,7 +622,10 @@ BuildResult crawl(const QString& d4, const SnoIndex* index, CascReader* reader,
     // appearance cannot appear in the wardrobe no matter how cleanly its payload decodes.
     //
     // Recovering the name is therefore the whole problem, and it is NOT decidable from d4data: the
-    // Appearance JSON carries no self-name field (checked), and EncryptedNameDict ships 4 entries.
+    // Appearance JSON carries no self-name field (checked), and d4data's EncryptedNameDict.dat.json
+    // ships 4 entries — an artefact of a bug in ITS parser, not a property of the game. The real
+    // dicts inside CASC do carry the names; SnoIndex::applyEncryptedNameDicts reads them, and this
+    // payload scan is now the fallback for keys we do not hold.
     // The only remaining question is whether the DECRYPTED BINARY carries its authored name as a
     // string — ClothData does, in a fixed 32-byte field, which is why cloth tuning has an
     // embedded-name fallback at all. This dump answers that for Appearance/Actor/Item, per group,
@@ -721,10 +754,7 @@ BuildResult crawl(const QString& d4, const SnoIndex* index, CascReader* reader,
     // appearances that (a) exist in the index and (b) have no icon yet — a wrong
     // name-guess can never overwrite a correct icon.
     if (reader && reader->isReady()) {
-        static const QHash<QString, QString> slotWord = {
-            {QStringLiteral("helm"), QStringLiteral("hlm")}, {QStringLiteral("chest"), QStringLiteral("trs")},
-            {QStringLiteral("gloves"), QStringLiteral("glv")}, {QStringLiteral("pants"), QStringLiteral("leg")},
-            {QStringLiteral("boots"), QStringLiteral("bts")}};
+        const QHash<QString, QString>& slotWord = slot2code();   // was a verbatim second copy
         // Recovered categories are those with a granting item whose NAME encodes the
         // transmog appearance: Unique ("Helm_Unique_Barbarian_95" → uniq95) and Cosmetic
         // ("Helm_Cosmetic_Barb_150_stor" → stor150). Set/generic/pvp looks have no such
@@ -831,6 +861,9 @@ BuildResult crawl(const QString& d4, const SnoIndex* index, CascReader* reader,
                 }
                 candNames = AppearanceMeta::styleAppearanceNames(actor, classPrefs);
             }
+            // Route 3 — otherwise the authoritative d4dad handles were only ever applied to
+            // armour, and weapons kept whatever earlier route guessed.
+            candNames = AppearanceMeta::withSelfName(candNames, di.stem.toLower());
             for (const QString& nm : candNames) {
                 const int app = name2sno.value(nm, 0);
                 if (!app) continue;
@@ -912,22 +945,40 @@ void AppearanceMeta::ensureBuilt(const QString& d4dataDir, const SnoIndex* index
     const QString dadSig = dadFi.exists()
         ? QStringLiteral("%1:%2").arg(dadFi.size()).arg(dadFi.lastModified().toSecsSinceEpoch())
         : QStringLiteral("none");
+    // The game build, because part of this crawl comes from CASC and not from d4data: encrypted
+    // appearance names recovered from cloth payloads, and icon handles resolved through the live
+    // reader. appCount alone was the only game-side guard, and it is a COUNT — two builds with the
+    // same number of appearances (retail vs PTR early in a cycle, or a patch that swaps rather than
+    // adds) would have served the previous build's metadata with no way to tell.
+    const QString buildSig = reader ? reader->buildId() : QString();
+
+    // How many appearances actually have a NAME. appCount cannot see a rename, and this crawl
+    // depends on names far more than on counts: the CASC icon phase joins an item to its appearance
+    // by building "druM_stor235_HLM" and looking it up in name2sno. When applyEncryptedNameDicts
+    // recovered 2,426 encrypted names the count did not move by one, so this cache stayed valid and
+    // that join kept running against the OLD ~unnamed_ names — which is why the icon audit recovered
+    // exactly 1 appearance through CASC while thousands were now nameable.
+    int namedCount = 0;
+    for (const SnoEntry& e : index->entries(kGroupAppearance))
+        if (!e.name.startsWith(QLatin1String("~unnamed_"))) ++namedCount;
 
     const SnoIndex* idx = index;
     CascReader* rdr = reader;
     const QString d4 = d4dataDir;
-    const QString cb = cacheBase, cp = cachePath, ds = dadSig;
-    const int ac = appCount;
+    const QString cb = cacheBase, cp = cachePath, ds = dadSig, bs = buildSig;
+    const int ac = appCount, nc = namedCount;
     // EVERYTHING on a detached worker thread — including the disk-cache try. The cache is a
     // multi-megabyte JSON over ~67k appearances; parsing it inline (the old "instant" path)
     // stalled the first tab refresh for the whole parse. Results marshal back queued.
-    std::thread([this, d4, idx, rdr, cb, cp, ac, ds]() {
+    std::thread([this, d4, idx, rdr, cb, cp, ac, nc, ds, bs]() {
         if (QFile::exists(cp)) {
             QFile f(cp);
             if (f.open(QIODevice::ReadOnly)) {
                 const QJsonObject root = QJsonDocument::fromJson(f.readAll()).object();
                 if (root.value("appCount").toInt() == ac
-                    && root.value("dadSig").toString() == ds) {
+                    && root.value("namedCount").toInt() == nc
+                    && root.value("dadSig").toString() == ds
+                    && root.value("buildSig").toString() == bs) {
                     QHash<int, QSet<QString>> tags;
                     QHash<int, QString> titles;
                     const QJsonObject jt = root.value("tags").toObject();
@@ -966,7 +1017,7 @@ void AppearanceMeta::ensureBuilt(const QString& d4dataDir, const SnoIndex* index
                                       Qt::QueuedConnection);
         };
         BuildResult r = crawl(d4, idx, rdr, prog);
-        QMetaObject::invokeMethod(this, [this, r, cb, cp, ac, ds]() {
+        QMetaObject::invokeMethod(this, [this, r, cb, cp, ac, nc, ds, bs]() {
             qInfo("AppearanceMeta: CASC-item phase recovered %d icons missing from d4data", r.cascFilled);
             QDir().mkpath(cb);
             QJsonObject root, jt, jn, jc, ji;
@@ -984,7 +1035,9 @@ void AppearanceMeta::ensureBuilt(const QString& d4dataDir, const SnoIndex* index
             for (auto i = r.iconNames.constBegin(); i != r.iconNames.constEnd(); ++i)
                 jin.insert(QString::number(i.key()), i.value());
             root.insert("appCount", ac);
+            root.insert("namedCount", nc);
             root.insert("dadSig", ds);
+            root.insert("buildSig", bs);
             root.insert("tags", jt);
             root.insert("titles", jn);
             root.insert("collections", jc);
@@ -1000,11 +1053,15 @@ void AppearanceMeta::ensureBuilt(const QString& d4dataDir, const SnoIndex* index
 
 const QStringList& AppearanceMeta::heroClassPrefixes()
 {
-    // eHeroClass order — index into this list == index into tInvImages/fUsableByClass.
-    static const QStringList o{
-        QStringLiteral("sor"), QStringLiteral("dru"), QStringLiteral("bar"),
-        QStringLiteral("rog"), QStringLiteral("nec"), QStringLiteral("spi"),
-        QStringLiteral("pal"), QStringLiteral("war")};
+    // eHeroClass order — index into this list == index into tInvImages/fUsableByClass. Built
+    // from ItemDef's table so the two can never disagree about what index 5 means.
+    static const QStringList o = [] {
+        QStringList l;
+        l.reserve(ItemDef::HeroClassCount);
+        for (int i = 0; i < ItemDef::HeroClassCount; ++i)
+            l << QString::fromLatin1(ItemDef::heroClassCode(i));
+        return l;
+    }();
     return o;
 }
 
@@ -1042,6 +1099,13 @@ QStringList AppearanceMeta::cosmeticAppearanceNames(const QString& itemName)
         for (const QString& g : {QStringLiteral("f"), QStringLiteral("m")})
             out << QStringLiteral("%1%2_%3_%4").arg(pref, g, token, slot);
     return out;
+}
+
+QStringList AppearanceMeta::withSelfName(QStringList candidates, const QString& itemName)
+{
+    if (!itemName.isEmpty() && !candidates.contains(itemName, Qt::CaseInsensitive))
+        candidates << itemName;
+    return candidates;
 }
 
 QStringList AppearanceMeta::styleAppearanceNames(const QString& actorName,

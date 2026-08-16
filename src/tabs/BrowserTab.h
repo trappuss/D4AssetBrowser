@@ -73,7 +73,7 @@ public:
     // / "selected look" — count-aware where the tab knows it.
     virtual QString exportNoun() const { return QStringLiteral("selection"); }
     // Rig-only animation export (no mesh) — Models tab only. The menu item is shown only when
-    // hasAnimExport() is true, labelled by animExportLabel() (singular/plural by selection).
+    // hasAnimExport() is true, labelled by animExportLabel() (carries the planned-scope clip count).
     virtual bool    hasAnimExport() const { return false; }
     virtual QString animExportLabel() const { return QStringLiteral("Export animations only (.glb)…"); }
     virtual void    exportAnimations() {}
@@ -84,6 +84,15 @@ public:
     virtual void    exportFramesSelectedToLast() {}   // re-export the selection to the remembered dir
     virtual void    exportFramesAll() {}
     virtual void    exportFramesAllToLast() {}         // re-export every frame to the remembered dir
+    // "Export everything the current filter matches" — Catalogue only so far. Shown only when
+    // hasExportAllFiltered() is true, labelled by exportAllFilteredLabel() so the tab can put the
+    // live match count in the text ("Export all 74 matching bundles…"). Lives in the Export menu
+    // with every other export rather than as a button in the tab: one place to export from is what
+    // stops the two drifting apart, and the Catalogue has been through that once already.
+    virtual bool    hasExportAllFiltered() const { return false; }
+    virtual QString exportAllFilteredLabel() const { return QStringLiteral("Export all matching"); }
+    virtual void    exportAllFiltered() {}
+    virtual void    exportAllFilteredToLast() {}
 protected:
     CascReader* m_reader = nullptr;
     SnoIndex*   m_index  = nullptr;

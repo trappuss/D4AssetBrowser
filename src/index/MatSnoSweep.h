@@ -49,3 +49,18 @@ QString runChainTest(const QString& d4, SnoIndex* idx, CascReader* rd);
 // This is the durable answer to "what else is missing?" — the six-sample chain test proves the
 // readers work, but only a full pass finds the pieces nobody has looked at yet.
 QString runHealthAudit(const QString& d4, SnoIndex* idx, CascReader* rd, QWidget* parent);
+
+// ── Body-marking model sweep ────────────────────────────────────────────────────────────────────
+// Everything needed to diagnose marking colour/blend in ONE run, because diagnosing it a field at
+// a time costs a rebuild per question:
+//
+//   marking_sweep.txt   every MarkingColor (samples as linear + sRGB + luminance + ramp direction)
+//                       and every MarkingShape (mask size, ink coverage, the G distribution OVER
+//                       INK, B over ink, and the composited ink colour the model produces)
+//   marking_swatch/     PNGs for a representative set — mask R and G channels, the ramp as a
+//                       gradient strip, and the composite over flat skin. Images because the
+//                       question "is the output dark or bright" is answered by looking, not by
+//                       arithmetic — which has already been wrong once here.
+//
+// Returns a one-line summary.
+QString runMarkingSweep(const QString& d4, SnoIndex* idx, CascReader* rd, QWidget* parent);

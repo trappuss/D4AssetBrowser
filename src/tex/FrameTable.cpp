@@ -17,6 +17,10 @@ FrameTable& FrameTable::instance()
 
 bool FrameTable::ensureLoaded(CascReader* reader)
 {
+    // Held for the whole load: a second thread arriving mid-parse must wait and then see the
+    // finished tables, not a half-filled one. parse() is called with the lock held, so it must not
+    // re-enter any public method here.
+    QMutexLocker lock(&m_mutex);
     if (m_loaded)
         return true;
 
@@ -57,8 +61,8 @@ bool FrameTable::ensureLoaded(CascReader* reader)
     if (!parse(data))
         return false;
 
-    m_loaded = true;
     m_source = src;
+    m_loaded.store(true, std::memory_order_release);   // last: publishes the parsed tables
     return true;
 }
 
@@ -98,8 +102,27 @@ bool FrameTable::parse(const QByteArray& data)
     return !m_byAtlas.isEmpty();
 }
 
+QString FrameTable::source() const
+{
+    QMutexLocker lock(&m_mutex);
+    return m_source;
+}
+
+bool FrameTable::contains(quint32 atlasSno) const
+{
+    QMutexLocker lock(&m_mutex);
+    return m_byAtlas.contains(atlasSno);
+}
+
+QList<quint32> FrameTable::atlases() const
+{
+    QMutexLocker lock(&m_mutex);
+    return m_byAtlas.keys();
+}
+
 bool FrameTable::locate(quint32 handle, quint32& atlasSno, int& frameIndex) const
 {
+    QMutexLocker lock(&m_mutex);
     const auto it = m_byHandle.constFind(handle);
     if (it == m_byHandle.constEnd())
         return false;
@@ -110,11 +133,13 @@ bool FrameTable::locate(quint32 handle, quint32& atlasSno, int& frameIndex) cons
 
 int FrameTable::frameCount(quint32 atlasSno) const
 {
+    QMutexLocker lock(&m_mutex);
     const auto it = m_byAtlas.constFind(atlasSno);
     return it == m_byAtlas.constEnd() ? 0 : it.value().size();
 }
 
 QVector<quint32> FrameTable::handles(quint32 atlasSno) const
 {
+    QMutexLocker lock(&m_mutex);
     return m_byAtlas.value(atlasSno);
 }

@@ -45,6 +45,9 @@ No Python. No `pip`. No d4extract.
 **Requirements:** Windows 10/11 x64 · a Diablo IV install (Battle.net or Steam) ·
 GPU with OpenGL 4.5 · internet on first run.
 
+**False Positive:** I guess because it's an .exe file it gets flagged at a virus, it's not.
+<img width="522" height="440" alt="ApplicationFrameHost_pqj4REMhxN" src="https://github.com/user-attachments/assets/85705de9-b710-4896-beee-02c69ef684b4" />
+
 ---
 
 ## Tabs
@@ -55,6 +58,7 @@ GPU with OpenGL 4.5 · internet on first run.
 | **Wardrobe** | Dress a character — armour, weapons, dyes, hair, markings, animations. |
 | **Stable** | The same for mounts and pets. |
 | **Textures** | Browse and decode every texture in the game. |
+| **Catalogue** | The Cosmetics Shop — every bundle the game has, what was in it, and export the lot. |
 | **Bulk Extract** | Filter the index and export in one run. |
 
 Each is covered in detail below.
@@ -150,18 +154,67 @@ each export to its tight bounds. **ASSOCIATED MODELS** walks texture → materia
 lets you jump straight to the model in the Models tab. Images can be dragged out of the preview
 straight into another application.
 
+### Catalogue
+
+The Cosmetics Shop, browsable. Every bundle it has sold — hero art, card, lore text — with each
+item inside resolved to the appearance or texture it actually is. Search matches the shop title,
+the SNO name and the lore.
+
+**Filters** live behind the same funnel the other tabs use: contents kind, patch, season, and
+**Latest** (new in this game update), plus a sort by name, season or patch. Active filters show as
+removable chips and tint the funnel.
+
+**Two views of the contents.** The shop's own *INCLUDES 8 ITEMS* strip, showing each piece's real
+inventory icon — one row per gender, because armour resolves to a female and a male appearance and
+both are openable — and a tree beneath it carrying SNOs, the **SLOT** each piece occupies (read
+from the item → gear reference graph, not guessed from the name), and a plain *no appearance found*
+wherever a product could not be resolved. Selection is mirrored between the two panes. The bundle's
+own shop art is listed as its own branch.
+
+**Double-click** any item to open it in Models — textured, with its parts tree and animations.
+Bundle art opens in Textures.
+
+**Provenance.** Supported classes, whether it shipped with VFX, its associated season, and the
+shop's own *requires* / *add-on to* / *excludes* relationships — which is how you discover a mount
+trophy was never sold at all, but was a Season 3 premium pass reward.
+
+**Bundles the metadata snapshot has never heard of are read from the game itself.** d4data
+describes about 7,500 shop products; the game has 9,300. The ~1,800 in the gap are the encrypted
+and newly-patched ones — the Doom collab armour was missing for every class except Druid and Rogue
+purely because only those two shipped a description file. Those records are now parsed straight
+from the game's binary, so their contents, artwork and models are all present and export normally.
+What the game files do *not* carry is the shop's display text, so such a bundle shows its asset
+name instead of a title and says so plainly: *"read from game files — no shop text in this
+snapshot"*. Re-running **File → Dependencies…** once d4data catches up fills the text back in.
+
 ### Bulk Extract
 
 Filter the whole index, watch the match count update live, then export everything at once.
 Same funnel filters as the Models tab. **Pick items manually** moves matches into a persistent
 **Queue** that survives filter changes, mode switches and restarts.
 
-Options: include textures · all animations · pulled animations · raw sources · raw buffers ·
-loose textures · a CSV report. **Parallel** workers (auto = core count). Output can be flat or
-organised into subfolders by class or type. **Only new** skips anything already exported —
-tracked in a `_bulk_manifest.json` ledger — or **Overwrite**. Live console with a working
-Cancel (or `Esc`) and Pause/Resume that excludes paused time from the ETA. Failures are
-written to `_bulk_failed.txt` with a reason each, and one bad model can't take the run down.
+Options: include textures · all animations · pulled animations · raw sources. **Parallel**
+workers (auto = core count). **Only new** skips anything already exported — tracked in a
+`_bulk_manifest.json` ledger — or **Overwrite**. Live console with a working Cancel (or `Esc`)
+and Pause/Resume that excludes paused time from the ETA. Failures are written to
+`_bulk_failed.txt` with a reason each, and one bad model can't take the run down.
+
+Everything else this tab used to keep its own copy of — raw buffers, loose textures, the CSV
+report — now lives in *Settings ▸ Export* alongside the rest, so each setting has one home and
+one value regardless of which tab starts the run.
+
+**Output layout** is one choice — **Flat**, or a subfolder per **class**, per **type**, or per
+**model** — and it is a property of exporting models rather than of this tab. Every batch path
+obeys it: Bulk Extract, a multi-selection from the Models tab, the context-menu batch, *export
+all*. Single-model exports deliberately don't, because `Ctrl+E` quietly becoming
+`Barbarian\foo.glb` is a surprise the caller can't undo. Inside a group the shape is identical
+in every mode — the models, plus `deps\`, `textures\` and `buffers\` for whichever options are
+on — which is what makes Flat simply *one group, at the root* rather than a special case.
+
+**Repeated textures decode once per run.** A set of appearances typically shares the same
+detail and dye maps; a run-scoped cache means the second and later uses are a memory hit rather
+than a fresh BC decode. It is bounded, lives only for the duration of the run, and writes
+nothing to disk.
 
 ---
 
@@ -222,7 +275,16 @@ Delete custom pigment.
 **Models** — rigged, animated `.glb`. Exports exactly what's visible: hidden parts stay out
 unless you explicitly picked them. Batch-export a multi-selection, or **drag models straight
 out of the list** into Blender or Explorer. Wardrobe exports the assembled outfit; Stable
-exports the mount.
+exports the mount. Batch exports follow the output layout described under
+[Bulk Extract](#bulk-extract).
+
+**Detail maps are baked in** *(Settings ▸ Export ▸ Models)*. Diablo IV layers a tiling detail
+normal and roughness over the base maps per dye zone — that's where fabric weave, leather grain
+and scale texture actually come from, and a plain material dump leaves it all behind, which is
+why an exported piece can look flat next to the same piece in the viewport. With this on, the
+detail layers are composited into the exported normal and ORM maps, zone by zone, exactly as
+the viewport composites them. It applies on every path that writes a model — Models, Wardrobe,
+Stable, Catalogue and Bulk Extract — rather than only in the wardrobe preview.
 
 **Animation libraries** — skeleton plus selected clips, no mesh, for retargeting in Blender.
 
@@ -242,6 +304,14 @@ the first captured frame. A turntable follows the animation only if it's actuall
 to non-transparent bounds. Filenames follow templates using `{{FileName}}`, `{{SNO}}`,
 `{{FrameIdx}}` and `{{FrameName}}`.
 
+**Catalogue** — a whole bundle into its own folder (`models\`, `art\`, `icons\` and a
+`manifest.json` naming everything that resolved *and* everything that did not), several bundles in
+one run with **Multi select**, or just the rows you highlighted in the includes strip or the
+contents list. The Export menu names what it will act on before you commit — *Export 2 models…*,
+*Export 1 image…*, *Export 3 bundles…*. Everything routes through the Models and Textures
+pipelines, so every option here applies. *Settings ▸ Export ▸ Catalogue export* adds every frame of
+each shop atlas as its own PNG.
+
 **Modding / retarget options** *(Settings ▸ Export ▸ Advanced)* — engine presets for Blender,
 Unreal/Skyrim and Unity (unit scale and normal-map convention), rebuild normal-map blue
 channel, readable bone names, hardpoints as empties, Blender-friendly `.L`/`.R` rig names,
@@ -252,18 +322,91 @@ base body as a fit reference, and batch the whole armour set with a `manifest.js
 `Ctrl+Shift+A` animations only · `Ctrl+Shift+I` save preview image. All rebindable in
 *Settings ▸ Hotkeys*, along with unbound slots for the two GIF exports.
 
+**Which option do I actually want?** *Settings ▸ Information* answers that in the tool itself,
+in sub-tabs — including a side-by-side of the two ways to get loose texture files, which look
+interchangeable and are not: one copies the maps a model already decoded, the other decodes
+every map in the material whether the model uses it or not.
+
 ---
 
 ## Building from source
 
+**You need:** Windows 10/11 x64 · Visual Studio 2022 with the *Desktop development with C++*
+workload · [vcpkg](https://github.com/microsoft/vcpkg) with `VCPKG_ROOT` set · CMake 3.21+ and
+Ninja (both ship with the VS workload) · Python 3 (for the pre-build source checks).
+
 ```bat
-build.bat          :: first build — vcpkg fetches Qt6, slow (~30-60 min)
-rebuild.bat        :: incremental, then launch
+build.bat          :: first build. Finds vcvars64 itself, then lets vcpkg fetch every
+                   :: dependency. Qt6 is built FROM SOURCE here, so budget 30-60 min.
+rebuild.bat        :: incremental build, then launch. The one you use day to day.
+clean-rebuild.bat  :: wipes build\ and configures again, without touching vcpkg.
 Diagnostics.bat    :: menu of audits and self-tests
 ```
 
-Visual Studio 2022 with "Desktop development with C++". Qt6, fastgltf, lz4 and zlib come
-from vcpkg automatically.
+Or drive CMake directly — `CMakePresets.json` carries three configurations:
+
+```bat
+cmake --preset windows-msvc-release   &&  cmake --build --preset release   :: build\release
+cmake --preset windows-msvc-debug     &&  cmake --build --preset debug     :: build\debug
+cmake --preset windows-static-release &&  cmake --build --preset static    :: one static exe
+```
+
+Dependencies come from the `vcpkg.json` manifest, pinned to a baseline commit so a build today
+resolves the same versions as a build six months from now: **qtbase** (widgets, opengl, gui,
+png, jpeg) · **qtsvg** · **fastgltf** · **tinygltf** · **zlib** · **lz4**.
+
+**`verify-src.py`** runs before the compiler and catches the mistakes that have actually broken
+this build, in seconds rather than after a multi-minute MSVC cycle: zero-byte files from a
+botched write, unbalanced `{}` `()` `[]`, a header-only helper used without its `#include`,
+printf-style format/argument mismatches, and locals named `emit` / `signals` / `slots` that Qt's
+macros silently delete.
+
+```bat
+python verify-src.py            :: check src\
+python verify-src.py --quiet    :: only print problems
+```
+
+### Continuous integration
+
+`.github/workflows/release.yml` builds the portable Windows folder on GitHub's runners. Push a
+tag matching `v*` and it compiles, runs `windeployqt`, zips the result and publishes it as a
+GitHub Release; run it by hand from **Actions ▸ Release ▸ Run workflow** to get the same zip as
+a plain artifact without cutting a release.
+
+The CI build installs a **prebuilt Qt 6.7.3** rather than letting vcpkg compile Qt, and uses
+vcpkg only for the four small dependencies. That is the single reason a cold CI build takes
+minutes while a cold local `build.bat` takes closer to an hour — it is the same source and the
+same compiler either way.
+
+---
+
+## Repository layout
+
+| | |
+|---|---|
+| `src\` | all C++ — see the table below |
+| `res\` | application icon and Qt resource script |
+| `tools\d4cloth\` | standalone cloth-format probe used to derive the physics parsing |
+| `docs\` | format notes and investigation write-ups |
+| `.github\workflows\` | the release build |
+| `*.bat` · `*.ps1` · `verify-src.py` | build, audit, dump and test entry points — all double-clickable |
+
+`src\` is split by what the code talks to, not by Qt class:
+
+| | |
+|---|---|
+| `casc\` | Blizzard's CASC storage — archives, indices, BLTE frames, TACT decryption |
+| `index\` | the asset index and everything derived from it: appearance metadata, tags, icons, shop products |
+| `model\` | geometry, skeletons, animation, materials, cloth physics, glTF export |
+| `tex\` | texture definitions and BC1/3/4/5/7 decode |
+| `gl\` | the OpenGL 4.5 renderer — PBR, IBL, shadows, SSAO |
+| `tabs\` | the six tabs and their panels |
+| `app\` | main window, settings, dialogs |
+| `util\` · `text\` · `deps\` | shared helpers, string handling, the dependency downloader |
+
+**Not in the repository, by design:** no game assets, no TACT decryption keys, no d4data
+snapshot. All three are fetched or read at runtime from a copy of the game you own — see
+[Data and keys](#data-and-keys). `build\`, `dist\` and the local backup tree are gitignored.
 
 ---
 
@@ -300,6 +443,8 @@ encrypted"*. This version resolves encrypted assets end to end from CASC:
   from the **binary**, so assets missing from the d4data snapshot still render fully.
 - Texture definitions read from CASC's bulk tables (`texture-base-global.dat` plus per-key
   overlays) — textures have no per-sno meta entry, which is why this was the last gap.
+- **Shop products read from the binary** when the metadata snapshot has no record of them —
+  ~1,800 of 9,300, which is where every collab and seasonal bundle lands until d4data catches up.
 - **"Only encrypted (TACT)"** filter to browse exactly that content.
 
 **A multi-frame BLTE decode bug is fixed.** Any encrypted asset stored in more than one
@@ -325,6 +470,16 @@ cannot be shown (OK / no-textures / no-materials / no-geometry / locked / no-dat
 **diffs against the previous run** — so a game patch or a new TACT key reports "newly
 working / newly broken" rather than being discovered months later.
 `Test Encrypted Chain.bat` verifies the appearance → material → texture chain in seconds.
+The health audit also reports **iconless but renderable** assets — pieces that decode perfectly and
+show as a blank row because no inventory icon binds to them — so a name-rule regression that costs
+a whole category its icons shows up as a number rather than as a bug report months later.
+
+**Help → Health check** adds a *snapshot coverage* row: how many shop products and items the game
+has versus how many the metadata snapshot describes. That gap is the honest answer to "why is this
+bundle missing", and it is the first thing to read after a patch.
+
+`Dump StoreProduct Layout.bat` and `Dump Marking Model.bat` each build, run, write a report and
+exit on their own — one double-click, no babysitting.
 
 ### Honest limitations
 
@@ -347,7 +502,7 @@ No registry keys, no `%APPDATA%`, no user-profile files. Everything the tool wri
 |---|---|
 | `D4AssetBrowser\*.ini` | settings (INI, not the registry) |
 | `coretoc_v2.bin` · `casc_index_v1.bin` | asset index caches, keyed to the game build |
-| `appearance_meta_v21.json` · `icon_index_v3.json` | metadata and icon caches |
+| `appearance_meta_v22.json` · `icon_index_v3.json` | metadata and icon caches |
 | `model_thumbs\` · `stable_thumbs\` · `icon_overrides\` | rendered thumbnails |
 | `ensembles\` | saved wardrobe outfits |
 | `d4data\` | the metadata checkout |
@@ -376,13 +531,21 @@ distribute them.
 
 Roadmap, what's in progress and what's planned live on the project board:
 
-### **[D4AssetBrowser project board](https://github.com/users/trappuss/projects/3/views/1)**
+### **[D4AssetBrowser project board](https://github.com/users/trappuss/projects/3)**
 
-- **[Issues](https://github.com/trappuss/Diablo4AssetBrowser/issues)** — bugs and requests.
+- **[Issues](https://github.com/trappuss/D4AssetBrowser/issues)** — bugs and requests.
   A missing or broken model is worth reporting: attach `data\D4AssetBrowser.log`, which names
   the exact asset and, where relevant, the TACT key it needs.
-- **[Releases](https://github.com/trappuss/Diablo4AssetBrowser/releases)** — watch the repo to
-  be told about new builds.
+- **[Releases](https://github.com/trappuss/D4AssetBrowser/releases)** — watch the repo to
+  be told about new builds. Each one is the portable zip, built by
+  [the release workflow](https://github.com/trappuss/D4AssetBrowser/actions) from the tagged
+  commit, so what you download is what the source at that tag produces.
+
+**Pull requests are welcome.** Run `python verify-src.py` and make sure `rebuild.bat` completes
+before opening one — between them they catch most of what a review would otherwise be spent on.
+If a change touches parsing, say which assets you tested it against; a format derivation that
+works on the ten models you tried and fails on the eleventh is the usual failure here, and
+`Audit Asset Health.bat` diffs the whole index against your previous run for exactly that reason.
 
 **After a game patch:** run **File → Update TACT Keys**, then re-run **File → Dependencies…**
 to refresh d4data. New seasonal and collab content usually needs both. If something still

@@ -46,6 +46,23 @@ ItemInfo parseItem(const QByteArray& meta);
 
 // Parse an ActorDefinition meta blob → snoAppearance (0 if unavailable).
 
+// ── The hero-class table: ONE definition, four former copies ────────────────────────────────
+// eHeroClass is the index into tInvImages and fUsableByClass, and it is also the class index
+// StoreProduct records use. That one ordering used to be written out four times — here as an
+// enum, as a code list in AppearanceMeta, as a {name, code, fubc} struct in WardrobeTab2, and
+// as a switch in StoreProductIndex — and the copies had already drifted: the switch had no
+// case for 7, so Warlock store products showed a blank class.
+//
+// Everything now derives from kHeroClasses below. To add a class, add one row.
+struct HeroClassDef {
+    const char* code;   // 3-letter appearance-name prefix, lower case ("bar")
+    const char* name;   // display name ("Barbarian")
+};
+// Indexed BY the HeroClass enum — kHeroClasses[Barbarian].code == "bar".
+const HeroClassDef* heroClasses();          // HeroClassCount entries
+const char* heroClassCode(int idx);         // "" when out of range
+const char* heroClassName(int idx);         // "" when out of range
+
 // Map a hero-class 3-letter prefix (from an appearance name, e.g. "bar", "sor")
 // to its eHeroClass index, or -1 if unknown.
 int heroClassIndex(const QString& prefix);

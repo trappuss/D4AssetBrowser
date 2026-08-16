@@ -60,7 +60,10 @@ powershell -NoProfile -ExecutionPolicy Bypass -Command "cmake --build --preset r
 set "RC=%errorlevel%"
 
 :: Distill just the error lines into a SMALL file so the exact compiler error stays readable.
-findstr /i /c:"error C" /c:": error" /c:"error LNK" /c:"fatal error" /c:"FAILED" /c:"ninja: build stopped" /c:"BUILD FAILED" "%~dp0build_log.txt" > "%~dp0build_errors.txt"
+REM Select-String, not findstr: Tee-Object writes the log as UTF-16, which findstr
+REM cannot read - it warns and produces an EMPTY error file, so a failed build
+REM appears to report no errors at all.
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$e = Select-String -Path '%~dp0build_log.txt' -Pattern 'error C',': error','error LNK','fatal error','FAILED','ninja: build stopped','BUILD FAILED' | ForEach-Object { $_.Line } | Select-Object -First 40 ; $e; $e | Out-File -FilePath '%~dp0build_errors.txt' -Encoding utf8"
 if not "%RC%"=="0" (
     echo.
     echo BUILD FAILED - full output is above and in build_log.txt ^(errors in build_errors.txt^)

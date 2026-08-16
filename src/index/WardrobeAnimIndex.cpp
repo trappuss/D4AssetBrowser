@@ -88,9 +88,25 @@ void WardrobeAnimIndex::ensureBuilt(const QString& d4dataDir)
         QHash<QString, Entry> sets;
         QSet<QString>         prefixes;
 
+        // Three sequential passes over three directories, so progress is reported per stage rather
+        // than as one count: 0-30 ItemType, 30-60 PlayerClass, 60-100 AnimSet. The split is by
+        // measured share of the build, not by file count — the AnimSet pass opens the largest files.
+        int lastPct = -1;
+        auto report = [this, &lastPct](int base, int span, int i, int n) {
+            if (n <= 0) return;
+            const int pct = base + int(qint64(i) * span / n);
+            if (pct == lastPct) return;             // whole-percent throttle
+            lastPct = pct;
+            QMetaObject::invokeMethod(this, [this, pct]() { emit progress(pct); },
+                                      Qt::QueuedConnection);
+        };
+
         // ── ItemType -> eWeaponClass ──
         const QString itDir = QDir(root).filePath(QStringLiteral("json/base/meta/ItemType"));
-        for (const QFileInfo& fi : QDir(itDir).entryInfoList({QStringLiteral("*.itt.json")}, QDir::Files)) {
+        const QFileInfoList itFiles = QDir(itDir).entryInfoList({QStringLiteral("*.itt.json")}, QDir::Files);
+        int itDone = 0;
+        for (const QFileInfo& fi : itFiles) {
+            report(0, 30, ++itDone, itFiles.size());
             const QJsonObject o = readJson(fi.absoluteFilePath());
             if (o.isEmpty()) continue;
             const QJsonValue wc = o.value(QStringLiteral("eWeaponClass"));
@@ -113,7 +129,10 @@ void WardrobeAnimIndex::ensureBuilt(const QString& d4dataDir)
         const QString pcDir = QDir(root).filePath(QStringLiteral("json/base/meta/PlayerClass"));
         const QString acDir = QDir(root).filePath(QStringLiteral("json/base/meta/Actor"));
         QSet<QString> wardrobeSets;   // set stems this game's characters actually reference
-        for (const QFileInfo& pf : QDir(pcDir).entryInfoList({QStringLiteral("*.pcl.json")}, QDir::Files)) {
+        const QFileInfoList pcFiles = QDir(pcDir).entryInfoList({QStringLiteral("*.pcl.json")}, QDir::Files);
+        int pcDone = 0;
+        for (const QFileInfo& pf : pcFiles) {
+            report(30, 30, ++pcDone, pcFiles.size());
             const QJsonObject pc = readJson(pf.absoluteFilePath());
             if (pc.isEmpty()) continue;
             for (const char* k : {"snoActorMale", "snoActorFemale"}) {
@@ -127,8 +146,11 @@ void WardrobeAnimIndex::ensureBuilt(const QString& d4dataDir)
             }
         }
 
-        for (const QFileInfo& fi : QDir(asDir).entryInfoList({QStringLiteral("*_ui_wardrobe.ans.json")},
-                                                             QDir::Files)) {
+        const QFileInfoList asFiles = QDir(asDir).entryInfoList({QStringLiteral("*_ui_wardrobe.ans.json")},
+                                                                QDir::Files);
+        int asDone = 0;
+        for (const QFileInfo& fi : asFiles) {
+            report(60, 40, ++asDone, asFiles.size());
             {   // only the sets a real character references
                 QString setStem = fi.fileName();
                 setStem.chop(9);   // ".ans.json"
@@ -178,7 +200,10 @@ void WardrobeAnimIndex::ensureBuilt(const QString& d4dataDir)
 
         QMetaObject::invokeMethod(this, [this, gen, byType = std::move(byType),
                                          sets = std::move(sets), prefixes = std::move(prefixes)]() mutable {
-            if (gen != m_generation) { m_building = false; return; }   // d4data changed mid-build
+            // No m_building = false here: reset() already cleared it AND bumped the generation, so a
+            // rebuild may already be in flight — clearing the flag would clobber ITS state and leave
+            // the row reading "not started" while it runs. Reachable from Re-index everything.
+            if (gen != m_generation) return;   // d4data changed mid-build
             qInfo("wardrobe anims: %d item type(s) with a weapon class, %d (class,weapon) wardrobe "
                   "set(s) over %d character class(es)",
                   int(byType.size()), int(sets.size()), int(prefixes.size()));

@@ -29,6 +29,7 @@ TextureDefTable& TextureDefTable::instance()
 
 void TextureDefTable::reset()
 {
+    QMutexLocker lock(&m_mutex);
     m_defs.clear();
     m_ready = false;
 }
@@ -72,8 +73,25 @@ void TextureDefTable::parseTable(const QByteArray& b, const QString& label, int*
     qInfo("texture-defs: %s — %d of %d record(s) parsed", qPrintable(label), local, count);
 }
 
+int TextureDefTable::count() const
+{
+    QMutexLocker lock(&m_mutex);
+    return m_defs.size();
+}
+
+TextureDefTable::Def TextureDefTable::lookup(int sno) const
+{
+    QMutexLocker lock(&m_mutex);
+    return m_defs.value(sno);
+}
+
 void TextureDefTable::ensureBuilt(CascReader* rd)
 {
+    // Reached from several worker threads at once (the icon-index build, texture-grid thumbnails,
+    // the wardrobe piece loader). The m_ready flag alone was not enough: it is set BEFORE the 34 MB
+    // parse, so a second thread would sail past it and read m_defs while the first was still
+    // filling it. Held across the whole build; parseTable is called with the lock held.
+    QMutexLocker lock(&m_mutex);
     if (m_ready || !rd || !rd->isReady()) return;
     m_ready = true;   // one attempt; a failure must not retry on every texture load
 
@@ -92,5 +110,5 @@ void TextureDefTable::ensureBuilt(CascReader* rd)
         parseTable(blob, p.section(QLatin1Char('-'), -1), &added);
     }
     qInfo("texture-defs: %d definition(s) from the global table + %d readable overlay(s)",
-          m_defs.size(), overlays);
+          int(m_defs.size()), overlays);
 }

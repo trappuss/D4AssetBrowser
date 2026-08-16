@@ -1,4 +1,4 @@
-# Cloth Physics — Audit & State
+﻿# Cloth Physics — Audit & State
 
 _2026-07-24. Backup of the tree at audit time: `.Backups/src_PHYSICS_FINAL_AUDIT_20260724_233754`_
 
@@ -123,7 +123,7 @@ at x = -0.55, -0.75, -0.57). May be the same root cause; unconfirmed.
 
 ## Diagnostics
 
-`Debug Cloth Overlay.bat` sets `D4_DUMP_CLOTH=1`, runs the tool, and extracts the report.
+`Dev - Debug Cloth Overlay.bat` sets `D4_DUMP_CLOTH=1`, runs the tool, and extracts the report.
 All logging is env-gated and costs nothing in normal use.
 
 | Line | Reports |

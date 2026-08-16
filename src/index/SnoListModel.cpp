@@ -1,4 +1,5 @@
 #include "index/SnoListModel.h"
+#include "util/QueryTerm.h"   // '|' OR-alternatives — shared with ModelsTab/BulkExtractorTab
 
 #include "index/AppearanceMeta.h"
 #include "tabs/IconBadge.h"
@@ -125,15 +126,15 @@ void SnoListModel::rebuild()
             const QString hay  = m_searchBlob ? (e.name + QLatin1Char(' ') + meta) : e.name;
             bool ok = true;
             for (const QString& inc : m_incTerms)
-                if (!hay.contains(inc, Qt::CaseInsensitive)) { ok = false; break; }
+                if (!QueryTerm::matches(hay, inc)) { ok = false; break; }
             if (ok) for (const QString& exc : m_excTerms)
-                if (hay.contains(exc, Qt::CaseInsensitive)) { ok = false; break; }
+                if (QueryTerm::matches(hay, exc)) { ok = false; break; }
             // Without a blob provider there is no metadata to test, so a '#' term cannot be
             // satisfied — reject rather than silently matching everything.
             if (ok) for (const QString& inc : m_incTags)
-                if (!meta.contains(inc, Qt::CaseInsensitive)) { ok = false; break; }
+                if (!QueryTerm::matches(meta, inc)) { ok = false; break; }
             if (ok) for (const QString& exc : m_excTags)
-                if (meta.contains(exc, Qt::CaseInsensitive)) { ok = false; break; }
+                if (QueryTerm::matches(meta, exc)) { ok = false; break; }
             if (!ok) continue;
         }
         if (!m_snoFilter.isEmpty() && !QString::number(e.snoId).contains(m_snoFilter))

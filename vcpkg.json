@@ -1,9 +1,9 @@
 {
   "$schema": "https://raw.githubusercontent.com/microsoft/vcpkg/master/scripts/vcpkg.schema.json",
-  "name": "diablo4assetbrowsernative",
-  "version": "2.1.0",
-  "description": "Native C++/Qt6 Diablo IV asset browser — a rewrite in d4analyzer's exact code stack (C++17, Qt6 Widgets, OpenGL, CascLib, fastgltf, tinygltf, Draco).",
-  "homepage": "https://github.com/DiabloTools/Diablo4Tools-Releases",
+  "name": "d4assetbrowser",
+  "version": "2.2.8",
+  "description": "Native C++/Qt6 Diablo IV asset browser and 3D wardrobe studio — reads the installed game's CASC storage directly.",
+  "homepage": "https://github.com/trappuss/D4AssetBrowser",
   "dependencies": [
     {
       "name": "qtbase",
@@ -22,5 +22,5 @@
     "zlib",
     "lz4"
   ],
-  "builtin-baseline": "f89a4a1da4e3176a8d1a14c1825b9b2f98e48843"
+  "builtin-baseline": "ea1a7396b05637a53bf23c078647ecc0edee4b80"
 }

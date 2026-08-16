@@ -10,6 +10,7 @@
 #include <QMutex>
 #include <QPair>
 #include <QPoint>
+#include <QSet>
 #include <QString>
 #include <QVector>
 #include <QVector3D>
@@ -53,6 +54,17 @@ struct WardrobeOutfitMaps {
     QVector<int>    dMetalLayerV;
     QVector<QVector4D> dBandsV, dZoneMapV;
     QVector<int>    hair, skin, cloth, region, fur, fxAdd, eye, head;
+    // `head` above is narrowed to face SKIN (it drives a shader rim). `hed` is the raw
+    // "this material is part of the head" test — head/face/_HED — which is what the HED visibility
+    // toggle and the items-only export scope need: they must take the whole head, hair and eyes
+    // included, not just the face skin.
+    QVector<int>    hed;
+    // The head mesh ALONE (material carries "_HED"), without the teeth/eyes/lashes/facial-hair
+    // submeshes that `hed` groups in. Used by the untextured-character export.
+    QVector<int>    headCore;
+    // Per-part base colour for the "items and untextured character" export: the equipped
+    // MARKING image when there is one, otherwise flat black. Null for non-skin parts.
+    QVector<QImage> skinExportBase;
     QVector<float>  hairParams;   // per part ×3: hero_hair (Hair Roughness, Hair Specular, Highlight Shift)
     QVector<float>  fxIntensity, fxWobble, fxFresnel, fxAlpha, fxSat;
     QVector<QString> matKey;      // per-part VRAM-pool key (material + colour epoch)
@@ -239,7 +251,15 @@ private:
     QComboBox*   m_lookCollFilter = nullptr;
     QString      m_lookFilter;               // lowercased search text
     int          m_lookCollSlot = -1;        // slot the collection dropdown was last built for
-    QVector<int> m_lookItems;                // filtered combo indices to display (in order)
+    // Filtered combo indices to display, in order. MAY CONTAIN REPEATS: with a theme active its
+    // matching pieces are prepended as copies and also stay in their normal positions, so anything
+    // counting entries has to subtract m_lookThemeCount (updateLookHeader does).
+    QVector<int> m_lookItems;
+    // How many theme cards are pinned at the FRONT of m_lookItems (0 = none). Was a single combo
+    // index, which capped the pin at one card per grid — see fillLookGrid: a theme with two
+    // weapons then pinned the same one into all four weapon slots and the other into none.
+    int          m_lookThemeCount = 0;
+    QString      m_lookThemeLabel;           // header text above them (collection name)
     int          m_lookBuildPos = 0;         // next index into m_lookItems still to build
     int          m_lookBuildRow = 0, m_lookBuildCol = 0;
     QString      m_lookBuildGroup;           // current weapon-type divider group while building
@@ -304,8 +324,34 @@ private:
     QComboBox* m_env    = nullptr;
     QSlider*   m_fovSlider = nullptr;  // camera field-of-view
     QVector<int> m_partFx, m_partSim, m_partForm;  // per merged-part FX/SIM/FORM flags (for visibility)
+    // Material names the APPEARANCE ITSELF declared as cloth (its SOA resolved through snoCloth or
+    // snoHighQualityClothOverride), gathered per piece as the outfit loads. Keyed by name, not by
+    // materialIndex, because that index is per-piece and collides once the pieces are merged.
+    // This is the authoritative SIM input; the d4data .clt.json probe and the name tokens are
+    // fallbacks behind it. Cleared at the top of rebuildOutfitImpl.
+    QSet<QString> m_clothMatNames;
+    QVector<int> m_partHed;        // per merged-part head flag (incl. teeth/eyes) — HED toggle
+    QVector<int> m_partHeadCore; // head mesh only — the untextured-character export attaches this
+    QVector<int> m_partSkin;       // per merged-part skin-material flag — "Items only" strips these
+    QVector<QImage> m_expSkinBase;// marking-or-black skin base, for the untextured-character export
+    QVector<int> m_partCharacter;  // per merged-part "is the character, not equipment" — export scope
     QVector<int> m_partCovered;        // per merged-part: base-body region hidden by equipped armour
     QVector<int> m_partEye;            // per merged-part: 1 = eyeball (Hero_Eye shader / eyeball mat)
+    // How many leading merged primitives are the BASE BODY (they lead `merged.primitives`). Kept
+    // after the build because the export scope options need to separate body from equipped items,
+    // and it previously lived only inside the build context.
+    int m_baseOutfitCount = 0;
+    // Parts an export should write, after applying the Wardrobe export-scope settings on top of
+    // the viewport's own visibility. `whatChanged` (optional) receives a human summary for the
+    // status line, so a surprising export result is explained rather than silent.
+    QVector<int> exportParts(QString* whatChanged = nullptr) const;
+    // Resolve export/wardrobeNameTemplate against the current outfit into a filename STEM (no
+    // extension, no directory). Never returns empty — a template that resolves to nothing falls
+    // back to the class/gender pair, because an empty filename is worse than a dull one.
+    QString exportNameStem() const;
+    // "Export both genders": suffix the file just written with _M/_F, flip the gender, export the
+    // twin, then restore. Re-runs the full export so every other export setting applies to both.
+    void exportOppositeGender(const QString& firstPath, const QString& scopeNote);
     QStringList m_partSource;          // per merged-part source piece name (for grouping)
     QVector<int> m_partSourceSno;      // per merged-part source appearance SNO (context-menu export)
     // One attached model that kept its own rig and can therefore be animated. Several are live at
@@ -418,6 +464,8 @@ private:
     // ── Camera popup (snap/follow/FOV/presets/turntable — next to Preview Settings) ──
     QToolButton* m_camBtn   = nullptr;      // "Camera" popup trigger
     QFrame*      m_camPanel  = nullptr;
+    // Re-reads the viewport into the Camera panel's Yaw/Pitch controls. Built with the panel.
+    std::function<void()> m_camOrbitSync;
     void toggleCameraPanel();
     void buildCameraPanel();
 
@@ -534,6 +582,11 @@ private:
     bool      m_animJustSelected = false;   // selection changed on this click → don't let the
                                             // release's itemClicked toggle it back off
     QHash<QString, QStringList> m_animCache;   // class prefix → anim rows
+    // m_animCache is per-session, so every launch re-scanned json/base/meta/Anim — 45,549 files,
+    // opened and regex-matched, ON THE GUI THREAD. Measured at 2 210 ms of a 2 235 ms applyOutfit
+    // (99%), and it is the stage the intermittent ~86 s wardrobe freeze lives in. Backed by a small
+    // disk cache so it is paid once per d4data snapshot instead of once per launch.
+    bool m_animDiskLoaded = false;   // disk cache consulted this session (hit or miss)
     void populateAnims();                  // list animations for the current body rig
     void fillAnimList();                   // (re)build the list applying filter + sort + search
     void playAnimByName(const QString& animName);

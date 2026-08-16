@@ -63,6 +63,25 @@ public:
     // classPrefixes empty = expand all 8 classes.
     static QStringList styleAppearanceNames(const QString& actorName,
                                             const QStringList& classPrefixes = {});
+    // Route 3 — the item's OWN name, appended as the LAST candidate.
+    //
+    // Routes 1 and 2 only ever describe ARMOUR: route 1 matches `helm|chest|gloves|pants|boots`
+    // and route 2 matches the same five slot codes. Everything else in the shop — weapons, mounts,
+    // mount trophies, companions, headstones — names its appearance exactly as the item is named
+    // (item twoHandPolearm_stor059 → appearance twoHandPolearm_stor059; 493 weapon appearances in
+    // the snapshot follow this). Sites that forgot this rule silently dropped every non-armour
+    // cosmetic: no icon, no hover info, no export, and an audit blind to them.
+    //
+    // Appended LAST on purpose: at a fill-if-empty site a lower-precedence candidate can only ADD
+    // a resolution, never change one routes 1-2 already made.
+    //
+    // That does NOT hold at a site which OVERWRITES — the d4dad pass picks cands.first() and
+    // assigns unconditionally, so a new candidate arriving first can change an existing pick.
+    // Check which kind of site you are in before adding a call.
+    //
+    // Pass a LOWERCASED name wherever the map being searched is lower-keyed (all of them today).
+    // A mixed-case key inserts an entry that exists, caches, and can never be looked up.
+    static QStringList withSelfName(QStringList candidates, const QString& itemName);
 
 signals:
     void readyChanged();

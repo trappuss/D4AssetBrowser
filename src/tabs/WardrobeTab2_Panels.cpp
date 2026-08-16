@@ -23,6 +23,7 @@
 #include "model/MaterialDecode.h"
 #include "tex/TexMeta.h"
 #include "model/ModelParser.h"
+#include "util/CameraOrbitRow.h"
 #include "util/DyeColorWheel.h"
 
 #include <QAction>
@@ -123,6 +124,7 @@ void WardrobeTab2::toggleCameraPanel()
     if (m_vpPanel) m_vpPanel->hide();          // one preview popup open at a time
     if (m_lightPanel) m_lightPanel->hide();
     if (!m_camPanel) buildCameraPanel();
+    if (m_camOrbitSync) m_camOrbitSync();   // the camera may have been orbited since the last open
     m_camPanel->adjustSize();
     m_camPanel->move(panelPosLeftOf(m_camBtn, m_camPanel->sizeHint()));
     m_camPanel->show();
@@ -256,6 +258,7 @@ void WardrobeTab2::buildCameraPanel()
     });
     pl->addWidget(fullBtn);
 
+
     // Auto-rotate turntable: slowly spin the model, with an adjustable speed.
     auto* spinChk = new QCheckBox(QStringLiteral("Auto-rotate (turntable)"), m_camPanel);
     spinChk->setChecked(s.value(QStringLiteral("wardrobe2/turntable"), false).toBool());
@@ -279,6 +282,11 @@ void WardrobeTab2::buildCameraPanel()
     });
     pl->addWidget(spinChk);
     pl->addLayout(spinRow);
+
+    // Numeric orbit control. Placed AFTER the turntable so it can be handed that checkbox —
+    // editing an angle by hand unticks it, since the spin would otherwise overwrite yaw 30x a
+    // second and the control would look dead.
+    m_camOrbitSync = CameraOrbit::addRows(m_camPanel, pl, m_view, spinChk);
 
     // Orthographic vs perspective projection.
     auto* orthoChk = new QCheckBox(QStringLiteral("Orthographic projection"), m_camPanel);
@@ -411,7 +419,7 @@ void WardrobeTab2::buildPreviewPanel()
         return gl;
     };
 
-    auto* gLight = addGroup(QStringLiteral("Scene & shadows"));   // env light/shadows/AO/tonemap (the artistic light rig lives in the separate Lighting panel)
+    auto* gLight = addGroup(QStringLiteral("Scene && shadows"));   // env light/shadows/AO/tonemap (the artistic light rig lives in the separate Lighting panel)
     addChkTo(gLight, QStringLiteral("ibl"), QStringLiteral("Environment lighting (IBL)"), true,
              [this](bool on) { if (m_view) m_view->setFeatureIbl(on); });
     addChkTo(gLight, QStringLiteral("shadow"), QStringLiteral("Self-shadows"), true,
@@ -431,7 +439,7 @@ void WardrobeTab2::buildPreviewPanel()
     addChkTo(gShade, QStringLiteral("specaa"), QStringLiteral("Specular anti-aliasing"), true,
              [this](bool on) { if (m_view) m_view->setFeatureSpecAA(on); });
 
-    auto* gGeom = addGroup(QStringLiteral("Geometry & debug"));
+    auto* gGeom = addGroup(QStringLiteral("Geometry && debug"));
     addChkTo(gGeom, QStringLiteral("mask"), QStringLiteral("Primary mask"), false,
              [this](bool on) { if (m_view) m_view->setFeatureMask(on); });
     // (Ensembles panel toggle lives in File ▸ Settings ▸ Wardrobe ▸ Toggleable panels, not here.)

@@ -46,6 +46,30 @@ public:
     // (per Settings ▸ Export tex format). onlyNew skips already-present files / _bulk_manifest.json entries.
     void bulkExportTextures(const QVector<QPair<int, QString>>& items, const QString& dir, bool onlyNew,
                             const struct BatchSink* sink = nullptr);
+    // ── The ONLY correct way to get a texture's dimensions/format ──────────────────────────────
+    // (moved to public so the Catalogue tab can crop atlas frames without re-rolling the lookup.)
+    // Reading Texture/<name>.tex.json directly, as nine call sites in this file used to, silently
+    // excludes every ENCRYPTED texture: d4data has no JSON for them, so meta.valid stayed false
+    // and the tab showed nothing. CASC's bulk texture tables carry the same fields and DO cover
+    // encrypted textures — see TextureDefTable. Static so worker lambdas can call it.
+    //
+    // NOTE: the CASC fallback fills width/height/format only. `frames` (ptFrame) is not in those
+    // tables, so an encrypted atlas resolved this way decodes whole and cannot be sliced.
+    static TexMeta texMetaFor(CascReader* rd, const QString& d4, const QString& name, int sno);
+    // ── The ONLY correct way to get an atlas's FRAME RECTANGLES ────────────────────────────────
+    // Three routes, in the order this tab uses them:
+    //   1. ptFrame from the .tex.json (texMetaFor) — absent for anything newer than the snapshot;
+    //   2. the game's own 2D_table.dat for the frame COUNT and handles;
+    //   3. alpha-gutter segmentation of the decoded atlas for the actual rectangles, because
+    //      2D_table does NOT carry UVs.
+    // `decoded` is the whole atlas image; pass a null QImage to get route 1 only.
+    //
+    // Static and public because the Catalogue exports atlas frames too, and its first attempt
+    // reimplemented this as "ask IconIndex for each handle" — which returns nothing for an atlas
+    // IconIndex has not indexed, so seasonal bundles exported zero frames while this tab showed
+    // them correctly. One implementation, two callers.
+    static QVector<TexFrame> atlasFramesFor(CascReader* rd, const QString& d4, const QString& name,
+                                            int sno, const QImage& decoded);
     // Texture category filter, shared with the Bulk Extract tab so its funnel can offer the same
     // texture-appropriate facets the Textures tab uses. `bulkTexCategories()` lists the name-based
     // categories (no "Latest" — that's SNO/isNew-based, handled by the caller); `bulkTexInCategory`
@@ -85,6 +109,8 @@ private:
     void setInfo(const QString& key, const QString& value);
     void updateSelLabel();
     void applyNameFilter();         // unified predicate: name/#tag/SNO + tags + format + orphan
+    void applyListDensity();        // compact text-only rows, matching the Models tab's List mode
+    QFont m_listBaseFont;           // the view's font before compacting — never shrink twice
     void refillTagPanel();          // (re)populate the funnel's tag-group checkboxes
     void updateFunnelTint();        // gold-tint the funnel while any filter is active
     void rebuildFilterChips();      // inline removable active-filter pills
@@ -97,6 +123,18 @@ private:
     void exportTexture(bool toLast);
     void exportSelected(bool frames, bool toLast = false);   // batch textures/frames to a chosen/last dir
     QImage decodeTexture(int sno, const QString& name);
+    // ── The ONLY correct way to get a texture's dimensions/format in this tab ──────────────────
+    // Reading Texture/<name>.tex.json directly, as nine call sites here used to, silently excludes
+    // every ENCRYPTED texture: d4data has no JSON for them, so meta.valid stayed false and the tab
+    // showed nothing — no thumbnail, no preview, no bulk export, and a format filter that could not
+    // see them. That is the entire 2D icon set for collab/store content (2DInventory_Bundle_HArmor_
+    // bar_stor251 and its siblings), which d4analyzer exports without trouble.
+    //
+    // CASC's bulk texture tables carry the same fields and DO cover encrypted textures — see
+    // TextureDefTable, whose per-key overlay is gated by the same TACT key as the pixels. This is
+    // the identical mistake MaterialDecode::texturesFor was written to end for materials; the
+    // texture tab simply never got the same treatment. Static so worker lambdas can call it.
+
     void onFrameSelected();
     void exportSelectedFrames(bool all = false, bool toLast = false);   // all→every frame; toLast→remembered dir
     QImage croppedFrame(int row, bool trim);
@@ -121,6 +159,7 @@ private:
     QComboBox*    m_sortCombo  = nullptr;   // Name / SNO / Size / Dimensions
     QCheckBox*    m_orphanCheck = nullptr;  // only textures with no material/model
     QCheckBox*    m_onlyDecrypted = nullptr;
+    QCheckBox*    m_onlyEncrypted = nullptr;  // the inverse: only TACT-gated textures
     QCheckBox*    m_rememberFilters = nullptr;   // persist + restore the whole filter state
     void saveTexFilterState();
     void restoreTexFilterState();

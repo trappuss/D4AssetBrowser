@@ -56,6 +56,8 @@ public:
     void ensureBuilt(const QString& d4dataDir);   // background; no-op if ready/in-flight
     void reset();                                 // drop memory + disk cache
     bool ready() const { return m_ready; }
+    // Exposed so File ▸ Index can say "Building…" instead of only ready/not-ready.
+    bool building() const { return m_building; }
     // Sorted by display name. Empty until ready() — callers keep their previous list until then.
     const QVector<Entry>& entries() const { return m_entries; }
 
@@ -68,6 +70,7 @@ public:
 
 signals:
     void readyChanged();
+    void progress(int pct);   // 0..100 while crawling (cache miss only)
 
 private:
     explicit BackTrophyIndex(QObject* parent = nullptr) : QObject(parent) {}

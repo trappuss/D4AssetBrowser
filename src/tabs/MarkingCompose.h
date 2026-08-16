@@ -12,8 +12,9 @@
 //   albedo    = lerp(skin, rampLerp(ramp, G), R);  metalness = flPaintMetalness * G at coverage R;
 //   emissive gated by G; no normal emboss. Grayscale (BC4) masks have R==G so they still work.
 
-// MarkingShape face/body mask texture names + default MarkingColor stem + flEmissiveStrength (glow).
-struct MarkingDef { QString faceTex, bodyTex, colorStem; float emissive = 0.0f; };
+// MarkingShape face/body mask texture names + default MarkingColor stem + flEmissiveStrength (glow)
+// + the shape's own hIconImage (the swatch the shop and the creator show for it).
+struct MarkingDef { QString faceTex, bodyTex, colorStem; float emissive = 0.0f; quint32 icon = 0; };
 
 // MarkingColor: 3-point ramp (shadow/mid/highlight, sRGB-encoded) + authored surface properties.
 struct MarkingPaint {

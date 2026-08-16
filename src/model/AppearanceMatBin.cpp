@@ -22,17 +22,27 @@ inline quint32 u32(const QByteArray& b, int off)
 
 }  // namespace
 
-QVector<AppearanceMatBin::Entry> AppearanceMatBin::read(const QByteArray& meta)
+QVector<AppearanceMatBin::Entry> AppearanceMatBin::read(const QByteArray& meta, QString* why)
 {
     QVector<Entry> out;
-    if (meta.size() < kDescOff + 8) return out;
+    auto bail = [&](const QString& reason) { if (why) *why = reason; return out; };
+    if (meta.size() < kDescOff + 8)
+        return bail(QStringLiteral("meta too small (%1 bytes)").arg(meta.size()));
     const int dataOff = int(u32(meta, kDescOff));
     const int bytes   = int(u32(meta, kDescOff + 4));
-    if (dataOff <= 0 || bytes <= 0 || bytes % kRecSize != 0) return out;
+    const QString hdr = QStringLiteral("meta=%1 desc@0xC8 dataOff=%2 bytes=%3")
+                            .arg(meta.size()).arg(dataOff).arg(bytes);
+    if (dataOff <= 0 || bytes <= 0)
+        return bail(hdr + QStringLiteral(" -> empty/absent material array"));
+    if (bytes % kRecSize != 0)
+        return bail(hdr + QStringLiteral(" -> byteSize not a multiple of %1").arg(kRecSize));
     const int n = bytes / kRecSize;
-    if (n > kMaxRecords) return out;
+    if (n > kMaxRecords)
+        return bail(hdr + QStringLiteral(" -> %1 records exceeds the %2 ceiling").arg(n).arg(kMaxRecords));
     const int base = dataOff + kRecBias;
-    if (base + n * kRecSize > meta.size()) return out;
+    if (base + n * kRecSize > meta.size())
+        return bail(hdr + QStringLiteral(" -> records run past EOF (base=%1 n=%2)").arg(base).arg(n));
+    if (why) *why = hdr + QStringLiteral(" -> %1 record(s)").arg(n);
 
     out.reserve(n);
     for (int i = 0; i < n; ++i) {
@@ -44,16 +54,20 @@ QVector<AppearanceMatBin::Entry> AppearanceMatBin::read(const QByteArray& meta)
         // a failure — fall through the same order the JSON route prefers.
         for (int f : {kSoaOverride, kSoaMaterial, kSoaCloth, kSoaHqCloth}) {
             const quint32 v = u32(meta, soa + f);
-            if (v != 0 && v != kNil) { e.sno = int(v); break; }
+            if (v != 0 && v != kNil) {
+                e.sno = int(v);
+                e.cloth = (f == kSoaCloth || f == kSoaHqCloth);
+                break;
+            }
         }
         out.push_back(e);
     }
     return out;
 }
 
-QVector<int> AppearanceMatBin::snos(const QByteArray& meta)
+QVector<int> AppearanceMatBin::snos(const QByteArray& meta, QString* why)
 {
-    const QVector<Entry> e = read(meta);
+    const QVector<Entry> e = read(meta, why);
     QVector<int> out;
     out.reserve(e.size());
     for (const Entry& x : e) out.push_back(x.sno);

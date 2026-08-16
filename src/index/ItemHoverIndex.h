@@ -34,6 +34,8 @@ public:
     void ensureBuilt(const QString& d4dataDir);   // background; no-op if ready/in-flight
     void reset();                                  // drop memory + disk cache (build change)
     bool ready() const { return m_ready; }
+    // Exposed so File ▸ Index can say "Building…" instead of only ready/not-ready.
+    bool building() const { return m_building; }
     // Lookup by appearance name (any case). Returns a default Info when unknown.
     Info infoFor(const QString& appearanceName) const
     {
@@ -46,6 +48,7 @@ public:
 
 signals:
     void readyChanged();
+    void progress(int pct);   // 0..100 while crawling (cache miss only)
 
 private:
     explicit ItemHoverIndex(QObject* parent = nullptr) : QObject(parent) {}

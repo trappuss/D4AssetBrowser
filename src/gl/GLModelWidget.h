@@ -346,6 +346,11 @@ public:
     CamState cameraState() const;
     void     setCameraState(const CamState& s);
     void     setOrbitYaw(float y) { m_yaw = y; update(); }   // drive turntable-GIF frames
+    // Set both orbit angles directly (radians), leaving distance, centre, FOV and projection alone.
+    // For the Camera panel's numeric yaw/pitch controls. Pitch is clamped to the same ~89 degree
+    // limit mouse orbit uses, and an in-flight camera glide or part-follow is cancelled — either
+    // would overwrite the value on the very next frame and the control would appear not to work.
+    void     setOrbitAngles(float yawRad, float pitchRad);
     // Export capture: guarantee ONE deterministic cloth step per captured frame. Stops the idle
     // settle timer (the capture loop pumps events, so it would otherwise slip in extra steps at
     // wall-clock intervals) and stops treating programmatic yaw changes as user rotation. Both

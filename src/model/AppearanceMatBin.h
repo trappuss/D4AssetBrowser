@@ -1,5 +1,6 @@
 #pragma once
 #include <QByteArray>
+#include <QString>
 #include <QVector>
 
 // ── ptAppearanceMaterials, read from the CASC meta binary ───────────────────────────────────────
@@ -38,13 +39,24 @@ namespace AppearanceMatBin {
 struct Entry {
     quint32 hash = 0;   // per-entry hash; two entries may share one material sno
     int     sno  = 0;   // override / material / cloth / HQ cloth, first non-empty
+    // WHICH of those four fields answered. The reader always knew — it walks them in preference
+    // order — and used to discard it, which cost the Wardrobe its SIM classification: with no way
+    // to tell "this entry resolved through snoCloth" from "…through snoMaterial", the SIM toggle
+    // fell back to guessing from the material NAME, and encrypted pieces have no name tokens to
+    // guess from. Keeping one bool makes the binary route authoritative where the JSON route only
+    // ever inferred.
+    bool    cloth = false;   // the sno came from snoCloth or snoHighQualityClothOverride
 };
 
 // Empty when the blob carries no material array (or is not an appearance meta). Index i corresponds
 // to MeshPrimitive::materialIndex == i — the same ordinal ModelParser reads at meta.i32(so + 0x60).
-QVector<Entry> read(const QByteArray& meta);
+//
+// `why` (optional) receives the header numbers this read actually saw and, on failure, which check
+// rejected them. An empty return with no explanation is what made the last round of this cost a
+// build: the caller could not tell "no material array" from "layout not recognised".
+QVector<Entry> read(const QByteArray& meta, QString* why = nullptr);
 
 // Just the snos, positionally aligned with materialIndex. Convenience for the roster path.
-QVector<int> snos(const QByteArray& meta);
+QVector<int> snos(const QByteArray& meta, QString* why = nullptr);
 
 }  // namespace AppearanceMatBin

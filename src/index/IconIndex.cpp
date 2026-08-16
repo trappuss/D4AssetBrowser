@@ -4,7 +4,9 @@
 
 #include "casc/CascReader.h"
 #include "tex/BcDecode.h"
+#include "tex/FrameTable.h"
 #include "tex/TexMeta.h"
+#include "tex/TextureDefTable.h"
 
 #include <QSet>
 #include <QDir>
@@ -21,7 +23,10 @@
 #include <thread>
 
 namespace {
-constexpr int kCacheVersion = 3;   // bumped: frame index stored + atlas dims corrected
+// v4: the index now also carries handles recovered from CASC (2D_table.dat + the texture-def
+// tables) for atlases d4data has no JSON for. A v3 file loads perfectly and satisfies the
+// signature check, which would skip the new pass and leave those icons blank with no symptom.
+constexpr int kCacheVersion = 4;
 }
 
 IconIndex& IconIndex::instance()
@@ -47,15 +52,22 @@ void IconIndex::reset()
     const QString cachePath = AppPaths::dataDir()
                               + QStringLiteral("/icon_index_v%1.json").arg(kCacheVersion);
     QFile::remove(cachePath);
+    // Superseded versions are pruned at startup by AppPaths::pruneOldCaches — see main.cpp, whose
+    // version numbers must be kept in step with kCacheVersion above.
     emit readyChanged();
 }
 
-void IconIndex::ensureBuilt(const QString& d4dataDir)
+void IconIndex::ensureBuilt(const QString& d4dataDir, CascReader* reader)
 {
-    if (m_ready || m_building || d4dataDir.isEmpty())
+    if (m_ready || m_building)
         return;
-    const QString texDir = d4dataDir + QStringLiteral("/json/base/meta/Texture");
-    if (!QDir(texDir).exists())
+    const QString texDir = d4dataDir.isEmpty()
+                               ? QString()
+                               : d4dataDir + QStringLiteral("/json/base/meta/Texture");
+    const bool haveJson = !texDir.isEmpty() && QDir(texDir).exists();
+    // Used to return here outright, which meant no d4data ⇒ no icons, ever. The CASC pass alone is
+    // a complete (if coarser) index, so a missing snapshot is no longer fatal.
+    if (!haveJson && !reader)
         return;
     m_building = true;
 
@@ -65,13 +77,23 @@ void IconIndex::ensureBuilt(const QString& d4dataDir)
     // Everything on the worker — the atlas-count signature is a directory scan over thousands
     // of files and the cache is a sizeable JSON; neither belongs on the GUI thread.
     const QString td = texDir, cb = cacheBase, cp = cachePath;
-    std::thread([this, td, cb, cp]() {
-        // Signature = number of 2D*.tex.json atlases (cheap staleness check).
-        int s = 0;
-        {
+    CascReader* const rd = reader;
+    std::thread([this, td, cb, cp, rd]() {
+        // Two DISTINCT numbers, deliberately not folded into one.
+        //   nJson  — how many 2D*.tex.json files the scan will visit. The progress denominator.
+        //   s      — the cache signature: nJson mixed with the game's own atlas count, so a patch
+        //            that adds atlases without touching the d4data snapshot still invalidates.
+        // A first cut added `atlases * 1000000` straight into `s` and reused it as the denominator.
+        // That pinned the progress bar at 0% (the quotient is always zero once s is ~1e9) and
+        // overflowed int past ~2,147 atlases — and FrameTable reserves for 8,192.
+        int nJson = 0;
+        if (!td.isEmpty()) {
             QDirIterator c(td, QStringList{"2D*.tex.json"}, QDir::Files);
-            while (c.hasNext()) { c.next(); ++s; }
+            while (c.hasNext()) { c.next(); ++nJson; }
         }
+        const qint64 atlasN = (rd && FrameTable::instance().ensureLoaded(rd))
+                                  ? qint64(FrameTable::instance().atlases().size()) : 0;
+        const int s = int(quint32(nJson) ^ (quint32(atlasN) * 2654435761u));
         if (QFile::exists(cp)) {
             QFile f(cp);
             if (f.open(QIODevice::ReadOnly)) {
@@ -98,10 +120,11 @@ void IconIndex::ensureBuilt(const QString& d4dataDir)
             }
         }
         QHash<quint32, Frame> frames;
-        const int total = qMax(1, s);
+        const int total = qMax(1, nJson);
         int seen = 0;
-        QDirIterator it(td, QStringList{"2D*.tex.json"}, QDir::Files);
-        while (it.hasNext()) {
+        QDirIterator it(td.isEmpty() ? QDir::tempPath() : td,
+                        QStringList{"2D*.tex.json"}, QDir::Files);
+        while (!td.isEmpty() && it.hasNext()) {
             if ((++seen % 128) == 0) {
                 const int pct = seen * 100 / total;
                 QMetaObject::invokeMethod(this, [this, pct]() { emit progress(pct); },
@@ -139,6 +162,42 @@ void IconIndex::ensureBuilt(const QString& d4dataDir)
                 frames.insert(hh, fr);
             }
         }
+
+        // ── CASC pass: atlases d4data has no .tex.json for ───────────────────────────────────────
+        // 2D_table.dat gives handle → atlas + frame ORDINAL, and the texture-def tables give the
+        // atlas's dimensions and format. What neither carries is the per-frame UV RECTANGLE.
+        //
+        // So this deliberately only claims the atlases where the rectangle is not in doubt: a
+        // single-frame atlas is its own icon, UV 0..1. That is exactly the shape of the bundle art
+        // (2DInventory_Bundle_HArmor_bar_stor251 and siblings) this exists to recover.
+        //
+        // Multi-frame atlases are COUNTED AND SKIPPED, not guessed. The Textures tab recovers their
+        // rectangles by alpha-gutter segmentation, but its own comment records that pairing those
+        // rectangles back to handles is approximate because 2D_table's authored order is not the
+        // atlas's spatial order — and an icon silently showing the WRONG item is worse than one
+        // showing nothing. Those stay served by data/icon_overrides.
+        int fromCasc = 0, multiSkipped = 0, noDef = 0;
+        if (rd && FrameTable::instance().isLoaded()) {
+            TextureDefTable::instance().ensureBuilt(rd);
+            for (const quint32 atlas : FrameTable::instance().atlases()) {
+                const QVector<quint32> hs = FrameTable::instance().handles(atlas);
+                if (hs.size() != 1) { if (hs.size() > 1) ++multiSkipped; continue; }
+                const quint32 h = hs.at(0);
+                if (!h || frames.contains(h)) continue;   // d4data already answered for this one
+                const TextureDefTable::Def d = TextureDefTable::instance().lookup(int(atlas));
+                if (!d.valid()) { ++noDef; continue; }
+                Frame fr;
+                fr.atlasSno = int(atlas); fr.fmt = d.format; fr.w = d.width; fr.h = d.height;
+                fr.frameIdx = 0;
+                fr.u0 = 0.0f; fr.v0 = 0.0f; fr.u1 = 1.0f; fr.v1 = 1.0f;
+                frames.insert(h, fr);
+                ++fromCasc;
+            }
+            qInfo("icon-index: CASC pass — %d single-frame atlas icon(s) added, %d multi-frame "
+                  "atlas(es) skipped (no per-frame UVs; use icon_overrides), %d with no texture "
+                  "definition", fromCasc, multiSkipped, noDef);
+        }
+
         QMetaObject::invokeMethod(this, [this, frames, cb, cp, s]() {
             QDir().mkpath(cb);
             QJsonObject root, jf;

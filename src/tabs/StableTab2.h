@@ -224,6 +224,8 @@ private:
 
     QFrame*       m_lightPanel = nullptr;
     QFrame*       m_camPanel = nullptr;
+    // Re-reads the viewport into the Camera panel's Yaw/Pitch controls. Built with the panel.
+    std::function<void()> m_camOrbitSync;
     QFrame*       m_gfxPanel = nullptr;
     QFrame*       m_shaderPanel = nullptr;
     QFrame*       m_detailPanel = nullptr;

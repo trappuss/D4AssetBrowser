@@ -14,7 +14,11 @@
 #include <thread>
 
 namespace {
-constexpr int kCacheVersion = 1;
+// v2: route 3 — weapons, mounts, trophies and headstones now get hover entries, so a v1 file is
+// missing whole categories rather than merely being older. The 3→4 field signature change would
+// have forced a rebuild anyway, but "it happens to invalidate" is not the rule; the rule is that
+// a change in WHAT IS INCLUDED bumps the filename.
+constexpr int kCacheVersion = 2;
 
 // Basename (no path, no extension) of a d4data sno reference's "__targetFileName__" —
 // e.g. {"__targetFileName__": "base/meta/Season/Season 1.sea"} → "Season 1". Tolerates a
@@ -106,21 +110,34 @@ void ItemHoverIndex::ensureBuilt(const QString& d4dataDir)
 
     const QString stlDir  = d4dataDir + QStringLiteral("/json/enUS_Text/meta/StringList");
     const QString prdDir  = d4dataDir + QStringLiteral("/json/base/meta/StoreProduct");
+    // Read by the route-3 existence test below, so it is an INPUT to this index and therefore
+    // belongs in the signature — see the note there.
+    const QString apprDir = d4dataDir + QStringLiteral("/json/base/meta/Appearance");
     const QString cachePath = AppPaths::dataDir()
                               + QStringLiteral("/item_hover_v%1.json").arg(kCacheVersion);
 
-    std::thread([this, itemDir, stlDir, prdDir, cachePath, d4dataDir]() {
-        // Signature: Item + StringList counts + the snapshot's build stamp. Any patch / d4data
-        // commit changes at least one of these → automatic rebuild, never stale.
+    std::thread([this, itemDir, stlDir, prdDir, apprDir, cachePath, d4dataDir]() {
+        // Signature: the file count of EVERY directory this build reads, plus the snapshot's build
+        // stamp. Any patch / d4data commit changes at least one of these → automatic rebuild.
+        //
+        // The rule that matters is "every directory this build reads": twice now an index has
+        // shipped a signature that could not see one of its own inputs, and a stale cache then
+        // survived a change it should have been invalidated by. When you add a directory to this
+        // build, add it here in the same edit.
+        // nItm is hoisted out of the signature block because pass 1 walks exactly that file set —
+        // so the count the signature already pays for doubles as the progress denominator, with
+        // no second directory walk.
+        int nItm = 0;
         QString sig;
         {
-            int nItm = 0, nStl = 0;
+            int nStl = 0, nApp = 0;
             { QDirIterator c(itemDir, {QStringLiteral("*.itm.json")}, QDir::Files); while (c.hasNext()) { c.next(); ++nItm; } }
             { QDirIterator c(stlDir,  {QStringLiteral("*.stl.json")}, QDir::Files); while (c.hasNext()) { c.next(); ++nStl; } }
+            { QDirIterator c(apprDir, {QStringLiteral("*.app.json")}, QDir::Files); while (c.hasNext()) { c.next(); ++nApp; } }
             QString bv;
             QFile f(d4dataDir + QStringLiteral("/buildVersion.txt"));
             if (f.open(QIODevice::ReadOnly | QIODevice::Text)) bv = QString::fromUtf8(f.readAll()).trimmed();
-            sig = QStringLiteral("%1|%2|%3").arg(nItm).arg(nStl).arg(bv);
+            sig = QStringLiteral("%1|%2|%3|%4").arg(nItm).arg(nStl).arg(nApp).arg(bv);
         }
 
         // Cache hit?
@@ -157,10 +174,36 @@ void ItemHoverIndex::ensureBuilt(const QString& d4dataDir)
         QHash<QString, Info> map;                    // lower appearance → info
         QHash<QString, QStringList> itemToAppear;    // lower item stem → its appearance names
         QDirIterator it(itemDir, {QStringLiteral("*.itm.json")}, QDir::Files);
+        int seen = 0, lastPct = -1;
         while (it.hasNext()) {
             const QString path = it.next();
+            // Throttled to whole-percent changes: this loop runs tens of thousands of times and a
+            // queued emit per iteration would cost more than the work being measured.
+            if (nItm > 0) {
+                const int pct = int(qint64(++seen) * 100 / nItm);
+                if (pct != lastPct) {
+                    lastPct = pct;
+                    QMetaObject::invokeMethod(this, [this, pct]() { emit progress(pct); },
+                                              Qt::QueuedConnection);
+                }
+            }
             const QString stem = QFileInfo(path).fileName().section(QStringLiteral(".itm.json"), 0, 0);
-            const QStringList apps = AppearanceMeta::cosmeticAppearanceNames(stem);
+            QStringList apps = AppearanceMeta::cosmeticAppearanceNames(stem);
+            // Route 3 — but TESTED, not assumed. Appending the item's own name unconditionally
+            // would defeat the pre-filter this loop depends on and open every item file in the
+            // snapshot instead of only the cosmetic ones. A stat is orders of magnitude cheaper
+            // than the parse it avoids, and it is exact rather than a name heuristic.
+            //
+            // Without this, weapons had no hover entry anywhere in the tool, and pass 2 below —
+            // which joins store products through itemToAppear — could not attach a collection or
+            // an "introduced in" line to a single weapon either.
+            // LOWERCASED. m_byAppearance is looked up as appearanceName.toLower() (see the header),
+            // and cosmeticAppearanceNames already returns lowercase, so passing the raw file stem
+            // here would insert a mixed-case key — twoHandPolearm_stor059 — that infoFor() can
+            // never match. The entry would exist, look correct in the cache file, and be dead.
+            if (apps.isEmpty()
+                && QFile::exists(apprDir + QLatin1Char('/') + stem + QStringLiteral(".app.json")))
+                apps = AppearanceMeta::withSelfName(apps, stem.toLower());
             if (apps.isEmpty()) continue;
 
             Info inf;

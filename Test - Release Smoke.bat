@@ -110,6 +110,12 @@ if not exist "%APP%\D4AssetBrowser.exe" (
 >>"%LOG%" echo [OK] tree extracted to %APP%
 echo  [OK] tree extracted
 
+REM Snapshot the exe's own folder so step 4 can tell which files the app ADDED beside
+REM it. Checking only that data\ exists misses the opposite failure - something written
+REM NEXT TO the exe instead of inside data\ - which is how the log file and the icon
+REM audit report both escaped notice.
+dir /b /a-d "%APP%" > "%TEMP%\D4ABSmoke_before.txt" 2>nul
+
 REM Every plugin family the app loads. Missing platforms\qwindows.dll kills it at
 REM startup on every machine; missing styles or imageformats is subtler and would
 REM only show up as an ugly window or blank icons for whoever downloaded it.
@@ -161,9 +167,19 @@ echo  ============================================================
 echo   STEP 3/4 - launch it. LET IT LOAD, THEN CLOSE IT.
 echo  ============================================================
 echo.
-echo   It is unconfigured, so expect the first-run prompts. You do not need to
-echo   download d4data - just reach the main window, open Settings once so it has
-echo   a reason to write an ini, then close the app.
+echo   It is unconfigured, so expect the first-run prompts. Reach the main window,
+echo   open Settings once so it has a reason to write an ini, then:
+echo.
+echo     WAIT FOR BACKGROUND INDEXING TO FINISH before closing.
+echo.
+echo   Watch the indexing indicator in the status bar and let it go quiet. This
+echo   matters: some files are only written AFTER indexing completes - the icon
+echo   audit report is one - so closing early makes this test pass on a portable
+echo   claim it never actually checked. That is exactly how data\icon_audit.txt
+echo   being written beside the exe survived a passing run.
+echo.
+echo   If you have not pointed it at a game folder there is nothing to index, and
+echo   this step is instant. To exercise it properly, set the game folder first.
 echo.
 if "%APPDATA_BEFORE%"=="1" (
     echo   NOTE: AppData already has a D4AssetBrowser folder from an earlier
@@ -192,6 +208,22 @@ if exist "%APP%\data" (
     echo  [X]  no data\ was created
     set "FAIL=1"
 )
+REM Anything that appeared BESIDE the exe rather than inside data\. The portable claim is
+REM not "data\ exists", it is "nothing is written outside data\", and only this direction
+REM catches a stray report or log.
+dir /b /a-d "%APP%" > "%TEMP%\D4ABSmoke_after.txt" 2>nul
+set "STRAY=0"
+for /f "delims=" %%N in ('powershell -NoProfile -Command "Compare-Object (Get-Content '%TEMP%\D4ABSmoke_before.txt') (Get-Content '%TEMP%\D4ABSmoke_after.txt') ^| Where-Object { $_.SideIndicator -eq '=^>' } ^| ForEach-Object { $_.InputObject }" 2^>nul') do (
+    >>"%LOG%" echo [X]  written BESIDE the exe, not in data\: %%N
+    echo  [X]  written beside the exe: %%N
+    set "STRAY=1"
+    set "FAIL=1"
+)
+if "%STRAY%"=="0" (
+    >>"%LOG%" echo [OK] nothing new written beside the exe - all writes went into data\
+    echo  [OK] nothing written beside the exe
+)
+
 if exist "%APP%\data\D4AssetBrowser\*.ini" (
     >>"%LOG%" echo [OK] settings written as INI under data\D4AssetBrowser\
     echo  [OK] settings written as INI

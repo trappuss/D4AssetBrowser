@@ -1,0 +1,109 @@
+ ...ild d4cloth + Extract Corpus.bat - Shortcut.lnk |  Bin [31m1682[m -> [32m0[m bytes
+ .bat shortcuts/Cloth Audit.bat - Shortcut.lnk      |  Bin [31m1511[m -> [32m0[m bytes
+ .../Debug Cloth Overlay.bat - Shortcut.lnk         |  Bin [31m1583[m -> [32m0[m bytes
+ .bat shortcuts/backup-src.bat - Shortcut.lnk       |  Bin [31m1502[m -> [32m0[m bytes
+ .bat shortcuts/build.bat - Shortcut.lnk            |  Bin [31m1453[m -> [32m0[m bytes
+ .bat shortcuts/clean-rebuild.bat - Shortcut.lnk    |  Bin [31m1529[m -> [32m0[m bytes
+ .bat shortcuts/make_portable.bat - Shortcut.lnk    |  Bin [31m1529[m -> [32m0[m bytes
+ .bat shortcuts/package-release.bat - Shortcut.lnk  |  Bin [31m1547[m -> [32m0[m bytes
+ .bat shortcuts/rebuild.bat - Shortcut.lnk          |  Bin [31m1473[m -> [32m0[m bytes
+ .bat shortcuts/run.bat - Shortcut.lnk              |  Bin [31m1433[m -> [32m0[m bytes
+ .bat shortcuts/setup.bat - Shortcut.lnk            |  Bin [31m1453[m -> [32m0[m bytes
+ .gitignore                                         |    6 [32m+[m
+ Audit Asset Health.bat => Audit - Asset Health.bat |    6 [32m+[m[31m-[m
+ Cloth Audit.bat => Audit - Cloth.bat               |    0
+ ...pted Render.bat => Audit - Encrypted Render.bat |    0
+ CMakeLists.txt                                     |    5 [32m+[m[31m-[m
+ ...bat => Dev - Build d4cloth + Extract Corpus.bat |   10 [32m+[m[31m-[m
+ ...th Overlay.bat => Dev - Debug Cloth Overlay.bat |    0
+ ...Encrypted SNOs.bat => Dump - Encrypted SNOs.bat |    0
+ Dump - Marking Model.bat                           |  117 [32m+[m
+ ... SNO Table.bat => Dump - Material SNO Table.bat |    2 [32m+[m[31m-[m
+ Dump - StoreProduct Layout.bat                     |  111 [32m+[m
+ Dump - Texture Chain.bat                           |   23 [32m+[m
+ Organize Folder.bat                                |   22 [32m+[m
+ README.md                                          |   65 [32m+[m[31m-[m
+ make_portable.bat => Release - Make Portable.bat   |    0
+ Release - Set Version.bat                          |   33 [32m+[m
+ Test Capsules Full.bat => Test - Capsules Full.bat |    0
+ ...crypted Chain.bat => Test - Encrypted Chain.bat |    0
+ Test - Export Cache.bat                            |  142 [32m++[m
+ Release Smoke Test.bat => Test - Release Smoke.bat |   38 [32m+[m[31m-[m
+ Test - Verify TACT Keys.bat                        |   53 [32m+[m
+ _to_delete/git_index.lock.removed                  |    0
+ build.bat                                          |   10 [32m+[m[31m-[m
+ clean-rebuild.bat                                  |    5 [32m+[m[31m-[m
+ docs/DD2_ADDON_CONTEXT.md                          |  222 [32m++[m
+ docs/NEXT_SESSION_BUILD_VERIFY.md                  |  155 [32m++[m
+ docs/NEXT_SESSION_DETAIL_BAKE.md                   |  158 [32m++[m
+ docs/notes/BUNDLES-TAB-RESEARCH.md                 |  188 [32m++[m
+ .../notes/ENCRYPTED-CONTENT-HANDOFF.md             |   44 [32m+[m[31m-[m
+ PHYSICS_AUDIT.md => docs/notes/PHYSICS_AUDIT.md    |    4 [32m+[m[31m-[m
+ .../notes/PHYSICS_HARNESS_PROMPT.md                |    0
+ STATUS.md => docs/notes/STATUS.md                  |    0
+ github.bat                                         |  549 [32m+++++[m
+ organize-folder.ps1                                |  179 [32m++[m
+ package-release.bat                                |   52 [32m+[m[31m-[m
+ pick                                               |    1 [32m+[m
+ rebuild.bat                                        |    5 [32m+[m[31m-[m
+ res/app.rc                                         |   47 [32m+[m
+ set-version.ps1                                    |  202 [32m++[m
+ src/app/AppLog.h                                   |   22 [32m+[m
+ src/app/ExportNotifier.h                           |   32 [32m+[m
+ src/app/Hotkeys.h                                  |    2 [32m+[m[31m-[m
+ src/app/MainWindow.cpp                             | 1480 [32m+++++++++++[m[31m-[m
+ src/app/MainWindow.h                               |   65 [32m+[m[31m-[m
+ src/app/SettingsDialog.cpp                         | 1333 [32m+++++++++[m[31m--[m
+ src/app/SettingsDialog.h                           |   10 [32m+[m
+ src/casc/CascReader.cpp                            |  455 [32m+++[m[31m-[m
+ src/casc/CascReader.h                              |  112 [32m+[m[31m-[m
+ src/deps/D4DataDownloader.cpp                      |    3 [32m+[m
+ src/deps/UpdateCheck.cpp                           |    8 [32m+[m
+ src/gl/GLModelWidget.cpp                           |   83 [32m+[m[31m-[m
+ src/gl/GLModelWidget.h                             |    5 [32m+[m
+ src/index/AnimActionIndex.h                        |   46 [32m+[m[31m-[m
+ src/index/AppearanceMeta.cpp                       |  104 [32m+[m[31m-[m
+ src/index/AppearanceMeta.h                         |   19 [32m+[m
+ src/index/BackTrophyIndex.cpp                      |   15 [32m+[m[31m-[m
+ src/index/BackTrophyIndex.h                        |    3 [32m+[m
+ src/index/IconAudit.cpp                            |   15 [32m+[m[31m-[m
+ src/index/IconAudit.h                              |   17 [32m+[m[31m-[m
+ src/index/IconIndex.cpp                            |   85 [32m+[m[31m-[m
+ src/index/IconIndex.h                              |    9 [32m+[m[31m-[m
+ src/index/ItemDef.cpp                              |   39 [32m+[m[31m-[m
+ src/index/ItemDef.h                                |   17 [32m+[m
+ src/index/ItemHoverIndex.cpp                       |   57 [32m+[m[31m-[m
+ src/index/ItemHoverIndex.h                         |    3 [32m+[m
+ src/index/MatSnoSweep.cpp                          |  233 [32m+[m[31m-[m
+ src/index/MatSnoSweep.h                            |   15 [32m+[m
+ src/index/SnoIndex.cpp                             |  443 [32m+++[m[31m-[m
+ src/index/SnoIndex.h                               |  107 [32m+[m[31m-[m
+ src/index/SnoListModel.cpp                         |    9 [32m+[m[31m-[m
+ src/index/StoreProductIndex.cpp                    |  683 [32m++++++[m
+ src/index/StoreProductIndex.h                      |  145 [32m++[m
+ src/index/WardrobeAnimIndex.cpp                    |   35 [32m+[m[31m-[m
+ src/index/WardrobeAnimIndex.h                      |    3 [32m+[m
+ src/main.cpp                                       |   94 [32m+[m[31m-[m
+ src/model/AppearanceMatBin.cpp                     |   30 [32m+[m[31m-[m
+ src/model/AppearanceMatBin.h                       |   16 [32m+[m[31m-[m
+ src/model/MaterialDecode.cpp                       |  560 [32m++++[m[31m-[m
+ src/model/MaterialDecode.h                         |  146 [32m+[m[31m-[m
+ src/model/ModelExporter.cpp                        |   12 [32m+[m
+ src/tabs/BrowserTab.h                              |   11 [32m+[m[31m-[m
+ src/tabs/BulkExtractorTab.cpp                      |  647 [32m+++[m[31m--[m
+ src/tabs/BulkExtractorTab.h                        |   47 [32m+[m[31m-[m
+ src/tabs/CatalogueTab.cpp                          | 2499 [32m++++++++++++++++++++[m
+ src/tabs/CatalogueTab.h                            |  282 [32m+++[m
+ src/tabs/MarkingCompose.cpp                        |   13 [32m+[m
+ src/tabs/MarkingCompose.h                          |    5 [32m+[m[31m-[m
+ src/tabs/ModelsTab.cpp                             | 1253 [32m++++++++[m[31m--[m
+ src/tabs/ModelsTab.h                               |   48 [32m+[m[31m-[m
+ src/tabs/ModelsTab_Export.cpp                      |  689 [32m+++++[m[31m-[m
+ src/tabs/ModelsTab_Panels.cpp                      |    7 [32m+[m
+ src/tabs/StableTab2.cpp                            |  146 [32m+[m[31m-[m
+ src/tabs/StableTab2.h                              |    2 [32m+[m
+ src/tabs/TexturesTab.cpp                           |  299 [32m++[m[31m-[m
+ src/tabs/TexturesTab.h                             |   39 [32m+[m
+ src/tabs/WardrobeTab2.cpp                          | 1280 [32m++++++++[m[31m--[m
+ src/tabs/WardrobeTab2.h                            |   55 [32m+[m[31m-[m
+ src/tabs/WardrobeTab2_Panels.cpp                   |   12 [32m+[m

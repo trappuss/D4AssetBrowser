@@ -130,9 +130,12 @@ void BackTrophyIndex::ensureBuilt(const QString& d4dataDir)
     std::thread([this, gen, itemDir, actorDir, animDir, stlDir, cachePath, d4dataDir]() {
         // Signature: the counts of BOTH directories this index reads, plus the snapshot's build
         // stamp. Any patch / d4data commit changes at least one → automatic rebuild, never stale.
+        // nItm is hoisted out: the main pass below walks exactly this file set, so the count the
+        // signature already pays for doubles as the progress denominator (no second walk).
+        int nItm = 0;
         QString sig;
         {
-            int nItm = 0, nAcr = 0, nAni = 0;
+            int nAcr = 0, nAni = 0;
             { QDirIterator c(itemDir, {QStringLiteral("*.itm.json")}, QDir::Files); while (c.hasNext()) { c.next(); ++nItm; } }
             // Actor counts too: the appearance comes from Actor/*.acr.json, so a snoAppearance
             // retarget with an unchanged item count would otherwise serve a stale mapping.
@@ -196,8 +199,18 @@ void BackTrophyIndex::ensureBuilt(const QString& d4dataDir)
         // back ItemType are actually parsed. Deliberately not pre-filtered on the item's filename:
         // that is exactly the assumption that made the old "back_" scan miss every real trophy.
         QDirIterator it(itemDir, {QStringLiteral("*.itm.json")}, QDir::Files);
+        int seen = 0, lastPct = -1;
         while (it.hasNext()) {
             const QString path = it.next();
+            // Whole-percent throttle — a queued emit per file would cost more than the parse.
+            if (nItm > 0) {
+                const int pct = int(qint64(++seen) * 100 / nItm);
+                if (pct != lastPct) {
+                    lastPct = pct;
+                    QMetaObject::invokeMethod(this, [this, pct]() { emit progress(pct); },
+                                              Qt::QueuedConnection);
+                }
+            }
             QFile f(path);
             if (!f.open(QIODevice::ReadOnly)) continue;
             const QByteArray raw = f.readAll();

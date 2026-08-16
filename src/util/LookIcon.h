@@ -13,6 +13,9 @@
 #include "casc/CascReader.h"
 #include "index/AppearanceMeta.h"
 #include "index/IconIndex.h"
+// MenuText — the shared context-menu vocabulary. Comment above, not trailing: verify-src matches
+// the include directive to end-of-line.
+#include "util/ViewportPartMenu.h"
 
 // The inventory icon for an appearance sno, and the two context-menu actions that go with it.
 //
@@ -46,10 +49,10 @@ inline QImage image(int sno, CascReader* reader)
 inline void addActions(QMenu& menu, QWidget* parent, const QImage& icon, const QString& fullName)
 {
     menu.addSeparator();
-    QAction* aCopy = menu.addAction(QObject::tr("Copy image"), parent,
+    QAction* aCopy = menu.addAction(MenuText::kCopyImage, parent,
                                     [icon] { QGuiApplication::clipboard()->setImage(icon); });
     aCopy->setEnabled(!icon.isNull());
-    QAction* aSave = menu.addAction(QObject::tr("Save image…"), parent, [parent, icon, fullName] {
+    QAction* aSave = menu.addAction(MenuText::kSaveImage, parent, [parent, icon, fullName] {
         QSettings st;
         QString dir = st.value(QStringLiteral("export/captureDir")).toString();
         if (dir.isEmpty()) dir = QStandardPaths::writableLocation(QStandardPaths::PicturesLocation);

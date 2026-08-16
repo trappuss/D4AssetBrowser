@@ -31,13 +31,23 @@ signals:
     // so the host can re-sync tabs (e.g. the Models tab's mirrored Tex/Anim checkboxes).
     void settingsChanged();
 
+protected:
+    // Clamp to the SCREEN's work area on first show. Without it the dialog opens at whatever the
+    // tallest tab wants, which on a short monitor put OK/Cancel below the bottom edge — and since
+    // those live under the tabs, the dialog could not be dismissed with the mouse at all.
+    void showEvent(QShowEvent* e) override;
+
 private:
+    bool m_sized = false;            // guard: clamp once, then respect the user's own resizing
     void accept() override;          // persist to Config (paths/product/view), then close
     void reject() override;          // restore the open-time snapshot of live settings, then close
     void snapshotLiveSettings();     // capture live-persisted keys so Cancel can revert them
     void updateChecks();             // refresh the ✓/✗ indicators
     void updateVersion();            // read d4data/buildVersion.txt
     void downloadTactKeys();
+    // CascLib's KeyService.cs — a SECOND key source, saved beside the first so folder mode merges
+    // them. Failure here is non-fatal and reported inline: the primary list is the important one.
+    void downloadSecondaryKeys(const QString& dir, const QString& primaryMsg);
     void downloadD4Data();
     void runUpdateCheck();           // notify-only probe: is newer d4data / TACT-keys data available?
 

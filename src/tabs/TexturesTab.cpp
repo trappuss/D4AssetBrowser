@@ -37,6 +37,7 @@
 #include "tex/FrameTable.h"
 #include "tex/TexFormat.h"
 #include "tex/TexMeta.h"
+#include "tex/TextureDefTable.h"
 #include "util/CsvCopy.h"
 #include "util/HoverInfo.h"
 #include "util/NameTemplate.h"
@@ -461,7 +462,34 @@ QWidget* TexturesTab::buildLeft()
     // Models tab's layout. The search box does name/#tag; a pure-digit query filters by SNO. ──
     m_onlyDecrypted = new QCheckBox(QStringLiteral("Only decrypted"));
     m_onlyDecrypted->setToolTip(QStringLiteral("Hide textures with no CASC payload."));
-    connect(m_onlyDecrypted, &QCheckBox::toggled, this, [this] { loadList(); applyNameFilter(); });
+    // Clearing the opposite box happens INSIDE this handler, before loadList — a second connect
+    // would run after it, so the list would first be rebuilt with both filters on, paying for the
+    // encrypted frame-header scan that the click was cancelling. m_onlyEncrypted does not exist yet
+    // at this line; the lambda reads the member when it fires, by which point it does.
+    connect(m_onlyDecrypted, &QCheckBox::toggled, this, [this](bool on) {
+        if (on && m_onlyEncrypted && m_onlyEncrypted->isChecked()) m_onlyEncrypted->setChecked(false);
+        loadList();
+        applyNameFilter();
+    });
+
+    // The inverse: show ONLY textures whose payload ships TACT-encrypted. That is where collab and
+    // seasonal art arrives, and it has no usable name (D4 withholds it), so it is unreachable by
+    // searching — ~unnamed_2334281 is not something anyone types. Parity with the Models tab.
+    m_onlyEncrypted = new QCheckBox(QStringLiteral("Only encrypted (TACT)"));
+    m_onlyEncrypted->setToolTip(QStringLiteral(
+        "Show only textures whose payload is TACT-encrypted — where new collab and seasonal art\n"
+        "arrives. Decided from the BLTE frame header, not from the name: a few encrypted textures\n"
+        "do recover a real name via EncryptedNameDict, and a name test would miss exactly those.\n\n"
+        "Includes assets whose key we do NOT hold — they are listed but cannot be decoded."));
+    // Mutually exclusive with "Only decrypted" — the two labels read as opposites, and the Models
+    // tab already pairs them this way. Signals are deliberately NOT blocked when clearing the other
+    // box: its handler needs to run, and it cannot recurse because the box is already false by the
+    // time it looks.
+    connect(m_onlyEncrypted, &QCheckBox::toggled, this, [this](bool on) {
+        if (on && m_onlyDecrypted && m_onlyDecrypted->isChecked()) m_onlyDecrypted->setChecked(false);
+        loadList();
+        applyNameFilter();
+    });
 
     m_search = new QLineEdit;
     m_search->setPlaceholderText(QStringLiteral("Search…   #tag · digits = SNO"));
@@ -508,7 +536,8 @@ QWidget* TexturesTab::buildLeft()
     });
     {
         auto* r = new QHBoxLayout();
-        r->addWidget(m_onlyDecrypted);   // both reparented into the popup
+        r->addWidget(m_onlyDecrypted);   // all reparented into the popup
+        r->addWidget(m_onlyEncrypted);
         r->addWidget(m_orphanCheck);
         r->addWidget(m_rememberFilters);
         r->addStretch(1);
@@ -605,8 +634,9 @@ QWidget* TexturesTab::buildLeft()
         for (QCheckBox* c : std::as_const(m_fmtChecks)) { QSignalBlocker b(c); c->setChecked(false); }
         if (m_orphanCheck)    { QSignalBlocker b(m_orphanCheck);    m_orphanCheck->setChecked(false); }
         if (m_onlyDecrypted)  { QSignalBlocker b(m_onlyDecrypted);  m_onlyDecrypted->setChecked(false); }
+        if (m_onlyEncrypted)  { QSignalBlocker b(m_onlyEncrypted);  m_onlyEncrypted->setChecked(false); }
         if (m_tagSearch)      m_tagSearch->clear();
-        loadList();          // re-include encrypted rows dropped by "Only decrypted"
+        loadList();          // re-include the rows either encryption filter dropped
         applyNameFilter();
     });
     connect(m_tagSearch, &QLineEdit::textChanged, this, [this](const QString& t) {
@@ -699,7 +729,10 @@ QWidget* TexturesTab::buildLeft()
             QAction* a = menu.addAction(QString::fromLatin1(kCols[c]));
             a->setCheckable(true);
             a->setChecked(shown);
-            connect(a, &QAction::triggered, this, [this, c, shown] { m_view->setColumnHidden(c, shown); });
+            connect(a, &QAction::triggered, this, [this, c, shown] {
+                m_view->setColumnHidden(c, shown);
+                if (c == 1) applyListDensity();   // Icon back on → rows must grow to fit it
+            });
         }
         menu.exec(m_view->horizontalHeader()->mapToGlobal(p));
         QSettings().setValue(QStringLiteral("tex/listHeader"),
@@ -715,6 +748,8 @@ QWidget* TexturesTab::buildLeft()
             [this](const QPoint& p) { showBrowserMenu(m_view, p); });
     m_view->viewport()->setMouseTracking(true);      // row hover → info popup
     m_view->viewport()->installEventFilter(this);
+    m_listBaseFont = m_view->font();   // capture BEFORE compacting, so it never shrinks twice
+    applyListDensity();
 
     // ── Grid view: IconMode QListView over the SAME model + selection as the table. ──
     m_model->setIconProvider([this](int sno) { return gridThumb(sno); });
@@ -867,9 +902,9 @@ QWidget* TexturesTab::buildMiddle()
         const QImage img = m_preview->grabImage();
         if (img.isNull()) return;
         QMenu menu(this);
-        menu.addAction(QStringLiteral("Copy image"), this,
+        menu.addAction(MenuText::kCopyImage, this,
                        [img]() { QApplication::clipboard()->setImage(img); });
-        menu.addAction(QStringLiteral("Save image…"), this, [this, img]() {
+        menu.addAction(MenuText::kSaveImage, this, [this, img]() {
             const QString stem = m_currentName.isEmpty() ? QStringLiteral("texture") : m_currentName;
             const QString f = QFileDialog::getSaveFileName(this, QStringLiteral("Save texture"),
                 stem + QStringLiteral(".png"), QStringLiteral("PNG (*.png);;JPEG (*.jpg)"));
@@ -1026,9 +1061,9 @@ void TexturesTab::buildChannelStrip(QVBoxLayout* lay)
                 [this, i](const QPoint& p) {
             if (m_chanFull[i].isNull()) return;
             QMenu menu(this);
-            menu.addAction(QStringLiteral("Copy image"), this,
+            menu.addAction(MenuText::kCopyImage, this,
                            [this, i]() { QApplication::clipboard()->setImage(m_chanFull[i]); });
-            menu.addAction(QStringLiteral("Save image…"), this, [this, i]() {
+            menu.addAction(MenuText::kSaveImage, this, [this, i]() {
                 const QString f = QFileDialog::getSaveFileName(this, QStringLiteral("Save channel"),
                     QStringLiteral("channel.png"), QStringLiteral("PNG (*.png)"));
                 if (!f.isEmpty()) m_chanFull[i].save(f);
@@ -1122,16 +1157,34 @@ QImage TexturesTab::decodeTexCpu(int sno)
     const QString name = m_snoName.value(sno);
     if (name.isEmpty()) return {};
     const QString d4 = Config::d4dataDir();
-    TexMeta meta;
-    if (!d4.isEmpty()) {
-        QFile f(QStringLiteral("%1/json/base/meta/Texture/%2.tex.json").arg(d4, name));
-        if (f.open(QIODevice::ReadOnly)) meta = parseTexMetaJson(f.readAll());
-    }
+    const TexMeta meta = texMetaFor(m_reader, d4, name, sno);
     if (!meta.valid) return {};
     QByteArray payload;
     if (m_reader && m_reader->isReady()) payload = m_reader->readPayloadBySno(quint64(sno));
     if (payload.isEmpty()) return {};
     return BcDecode::decode(payload, meta.width, meta.height, meta.eTexFormat);
+}
+
+// Compact, text-only rows matching the Models tab's List display mode: one point smaller,
+// semi-condensed, fixed 18px rows. The two browsers list the same kind of thing and looked nothing
+// alike — this one used the default table metrics and ran roughly half again as tall per row, so
+// far fewer textures fit on screen.
+//
+// Keyed on the Icon column rather than a mode flag: this table has no display modes, but the header
+// context menu can bring Icon back, and 18px rows would crop it. Icon visible → normal metrics.
+void TexturesTab::applyListDensity()
+{
+    if (!m_view) return;
+    const bool compact = m_view->isColumnHidden(1);   // Icon
+    QFont f = m_listBaseFont;
+    if (compact) {
+        f.setPointSizeF(qMax(7.5, m_listBaseFont.pointSizeF() - 1.0));
+        f.setStretch(QFont::SemiCondensed);
+    }
+    m_view->setFont(f);
+    QHeaderView* vh = m_view->verticalHeader();
+    vh->setSectionResizeMode(QHeaderView::Fixed);   // Fixed, or defaultSectionSize is only a hint
+    vh->setDefaultSectionSize(compact ? 18 : 40);
 }
 
 // ── Grid view ───────────────────────────────────────────────────────────────
@@ -1291,11 +1344,7 @@ void TexturesTab::requestGridThumb(int sno)
         // SEH-guarded: a malformed payload after a game patch must cost one blank thumbnail,
         // not take the whole app down from a worker thread.
         seh::runGuarded("gridThumb", [&]() {
-            TexMeta meta;
-            if (!d4.isEmpty()) {
-                QFile f(QStringLiteral("%1/json/base/meta/Texture/%2.tex.json").arg(d4, name));
-                if (f.open(QIODevice::ReadOnly)) meta = parseTexMetaJson(f.readAll());
-            }
+            const TexMeta meta = texMetaFor(reader, d4, name, sno);
             if (!meta.valid) return;
             const QByteArray payload = reader->readPayloadBySno(quint64(sno));   // mutex-guarded
             if (payload.isEmpty()) return;
@@ -1350,8 +1399,20 @@ void TexturesTab::showBrowserMenu(QAbstractItemView* view, const QPoint& viewpor
     if (!view || !m_model) return;
     QStringList names, snoStrs;
     auto add = [&](const SnoEntry* e) { if (e) { names << e->name; snoStrs << QString::number(e->snoId); } };
-    for (const QModelIndex& idx : view->selectionModel()->selectedRows()) add(m_model->entryAt(idx.row()));
-    if (names.isEmpty()) add(m_model->entryAt(view->indexAt(viewportPos).row()));
+    // CLICKED ROW WINS unless it is part of the selection — the rule Models and Bulk Extract
+    // already use, and the one every file manager uses. This tab consulted the selection FIRST, so
+    // right-clicking an unselected texture acted on whatever happened to be selected elsewhere and
+    // read as the menu simply being wrong.
+    const QModelIndex hit = view->indexAt(viewportPos);
+    const QModelIndexList sel = view->selectionModel()->selectedRows();
+    bool hitInSel = false;
+    for (const QModelIndex& idx : sel)
+        if (idx.row() == hit.row()) { hitInSel = true; break; }
+    if (hit.isValid() && !hitInSel) {
+        add(m_model->entryAt(hit.row()));
+    } else {
+        for (const QModelIndex& idx : sel) add(m_model->entryAt(idx.row()));
+    }
     if (names.isEmpty()) return;
     QMenu menu(this);
     const int n = names.size();
@@ -1363,14 +1424,15 @@ void TexturesTab::showBrowserMenu(QAbstractItemView* view, const QPoint& viewpor
     // Destination shown, the way the card and part menus have always shown it. "last dir"
     // named a folder the menu would not tell you, so the two families disagreed on the one
     // thing the label existed to convey. Same helper, so they cannot drift again.
-    menu.addAction(ViewportPartMenu::withValue(QStringLiteral("Export to last dir"), exLastDir)
-                       + QStringLiteral("  —  %1").arg(exCount), this, [this] { exportSelected(false, true); });
-    menu.addAction(QStringLiteral("Export to…  —  %1").arg(exCount), this, [this] { exportSelected(false, false); });
+    if (!exLastDir.isEmpty())
+        menu.addAction(MenuText::exportSetLast(exCount, exLastDir), this,
+                       [this] { exportSelected(false, true); });
+    menu.addAction(MenuText::exportSetPrompt(exCount), this, [this] { exportSelected(false, false); });
     {
         // Copy the (first) selected texture's decoded image to the clipboard.
         const int firstSno  = snoStrs.first().toInt();
         const QString first = names.first();
-        menu.addAction(QStringLiteral("Copy image  (%1)").arg(prev(first)), this, [this, firstSno, first] {
+        menu.addAction(QStringLiteral("%1  (%2)").arg(MenuText::kCopyImage, prev(first)), this, [this, firstSno, first] {
             if (!m_snoName.contains(firstSno)) m_snoName.insert(firstSno, first);
             const QImage img = decodeTexCpu(firstSno);
             if (!img.isNull()) QApplication::clipboard()->setImage(img);
@@ -1379,7 +1441,7 @@ void TexturesTab::showBrowserMenu(QAbstractItemView* view, const QPoint& viewpor
         // every other image surface in the app (Models rows, channel tiles, GL preview, frame
         // gallery) has the save pair. Same wording as those, so the three spellings this tab used
         // to have do not come back.
-        menu.addAction(QStringLiteral("Save image as…"), this, [this, firstSno, first] {
+        menu.addAction(MenuText::kSaveImage, this, [this, firstSno, first] {
             if (!m_snoName.contains(firstSno)) m_snoName.insert(firstSno, first);
             const QImage img = decodeTexCpu(firstSno);
             if (img.isNull()) return;
@@ -1394,18 +1456,18 @@ void TexturesTab::showBrowserMenu(QAbstractItemView* view, const QPoint& viewpor
         });
     }
     menu.addSeparator();
+    // "Copy file name" and "Copy name" both copied `names` — two labels, one payload, so whichever
+    // you picked you got the same string. A texture's SnoEntry::name IS its file name and there is
+    // no separate display title for one, so the duplicate is dropped rather than faked.
+    //
+    // No "Copy collection name" either: a texture has no collection, so the action could never do
+    // anything. An action that can never apply is not parity, it is clutter.
     if (n == 1) {
-        menu.addAction(QStringLiteral("Copy SNO id  (%1)").arg(snoStrs.first()), this, [snoStrs, copy] { copy(snoStrs); });
-        menu.addAction(QStringLiteral("Copy file name  (%1)").arg(prev(names.first())), this, [names, copy] { copy(names); });
-        menu.addAction(QStringLiteral("Copy name  (%1)").arg(prev(names.first())), this, [names, copy] { copy(names); });
-        // No "Copy collection name" here, in either branch: a texture has no collection, so the
-        // action could never do anything. It used to appear permanently disabled in the
-        // single-select branch and be absent from the multi-select one — inconsistent AND useless.
-        // An action that can never apply is not parity, it is clutter.
+        menu.addAction(QStringLiteral("%1  (%2)").arg(MenuText::kCopySno, snoStrs.first()), this, [snoStrs, copy] { copy(snoStrs); });
+        menu.addAction(QStringLiteral("%1  (%2)").arg(MenuText::kCopyFileName, prev(names.first())), this, [names, copy] { copy(names); });
     } else {
-        menu.addAction(QStringLiteral("Copy %1 SNO ids").arg(n), this, [snoStrs, copy] { copy(snoStrs); });
-        menu.addAction(QStringLiteral("Copy %1 file names").arg(n), this, [names, copy] { copy(names); });
-        menu.addAction(QStringLiteral("Copy %1 names").arg(n), this, [names, copy] { copy(names); });
+        menu.addAction(QStringLiteral("%1  —  %2 rows").arg(MenuText::kCopySno).arg(n), this, [snoStrs, copy] { copy(snoStrs); });
+        menu.addAction(QStringLiteral("%1  —  %2 rows").arg(MenuText::kCopyFileName).arg(n), this, [names, copy] { copy(names); });
     }
     menu.exec(view->viewport()->mapToGlobal(viewportPos));
 }
@@ -1415,7 +1477,15 @@ void TexturesTab::showBrowserMenu(QAbstractItemView* view, const QPoint& viewpor
 void TexturesTab::bulkExportTextures(const QVector<QPair<int, QString>>& items, const QString& dir,
                                      bool onlyNew, const BatchSink* sink)
 {
-    if (items.isEmpty() || dir.isEmpty() || !m_reader || !m_reader->isReady()) return;
+    // Never fail silently — see the same note on ModelsTab::bulkExport. Three distinct causes end
+    // up here (nothing resolved, no folder, CASC not open) and they need telling apart from the
+    // log alone, because that is all a bug report carries.
+    if (items.isEmpty() || dir.isEmpty() || !m_reader || !m_reader->isReady()) {
+        qInfo("bulkExportTextures: nothing to do — %d item(s), dir %s, reader %s",
+              int(items.size()), dir.isEmpty() ? "(none)" : "set",
+              (m_reader && m_reader->isReady()) ? "ready" : "NOT ready");
+        return;
+    }
     const QString d4 = Config::d4dataDir();
     const bool jpg = QSettings().value(QStringLiteral("tex/format"), QStringLiteral("png"))
                          .toString().contains(QLatin1String("jp"), Qt::CaseInsensitive);
@@ -1467,12 +1537,12 @@ void TexturesTab::bulkExportTextures(const QVector<QPair<int, QString>>& items, 
         seh::HardwareFault fault;
         const bool survived = seh::runGuarded("bulk-tex", [&]() {
             QElapsedTimer stage; stage.start();
-            TexMeta meta;
-            { QFile f(QStringLiteral("%1/json/base/meta/Texture/%2.tex.json").arg(d4, it.second));
-              if (f.open(QIODevice::ReadOnly)) meta = parseTexMetaJson(f.readAll()); }
+            const TexMeta meta = texMetaFor(m_reader, d4, it.second, it.first);
             std::optional<QMutexLocker<QMutex>> l;
             auto guard = [&] { if (locked) l.emplace(&shared); };
-            if (!meta.valid) { guard(); texFail(it.second, QStringLiteral("no/invalid .tex.json (update d4data?)")); return; }
+            // "update d4data?" was wrong advice for the commonest cause: an encrypted texture will
+            // never appear in the snapshot, no matter how current it is.
+            if (!meta.valid) { guard(); texFail(it.second, QStringLiteral("no .tex.json and no CASC texture-table entry")); return; }
             const QByteArray payload = m_reader->readPayloadBySno(quint64(it.first));
             nsRead += stage.nsecsElapsed(); stage.restart();
             if (payload.isEmpty()) { guard(); texFail(it.second, QStringLiteral("no payload (encrypted or missing)")); return; }
@@ -1573,6 +1643,10 @@ void TexturesTab::bulkExportTextures(const QVector<QPair<int, QString>>& items, 
     }
     else
         QMessageBox::information(this, QStringLiteral("Bulk extract"), summary);
+    // Always to the log too — the sink only exists for Bulk Extract, so Catalogue and
+    // context-menu exports were leaving no record of what they wrote.
+    qInfo("bulkExportTextures: %d exported, %d already present, %d failed → %s",
+          ok, skip, int(failed.size()), qUtf8Printable(dir));
 }
 
 // Rebuild the view dropdown: "RGBA channels" + one entry per associated material.
@@ -1712,7 +1786,8 @@ void TexturesTab::updateFunnelTint()
     if (!m_filtersToggle) return;
     const bool active = !m_tagFilter.isEmpty() || !m_catFilter.isEmpty() || !m_fmtFilter.isEmpty()
                         || (m_orphanCheck && m_orphanCheck->isChecked())
-                        || (m_onlyDecrypted && m_onlyDecrypted->isChecked());
+                        || (m_onlyDecrypted && m_onlyDecrypted->isChecked())
+                        || (m_onlyEncrypted && m_onlyEncrypted->isChecked());
     m_filtersToggle->setStyleSheet(active
         ? QStringLiteral("QToolButton{padding:1px;border:1px solid #a07a1a;border-radius:3px;"
                          "background:#3a2f12;} QToolButton:hover{border-color:#b0453c;}")
@@ -1733,9 +1808,13 @@ void TexturesTab::rebuildFilterChips()
         chip->setText(label + QStringLiteral("  ✕"));
         chip->setCursor(Qt::PointingHandCursor);
         chip->setToolTip(QStringLiteral("Remove this filter"));
+        // Byte-identical to the Models tab's chips. These were pill-shaped (radius 9, lighter
+        // background, a hover that changed fill instead of border), so the same control looked like
+        // a different widget depending on which tab you were in.
         chip->setStyleSheet(QStringLiteral(
-            "QToolButton{background:#3a3a3a; border:1px solid #565656; border-radius:9px;"
-            " padding:1px 8px; color:#d8a23a;} QToolButton:hover{background:#4a4a4a;}"));
+            "QToolButton{background:#2b2b2b; border:1px solid #555; border-radius:3px;"
+            " padding:1px 6px; color:#d8a23a;}"
+            "QToolButton:hover{border-color:#b0453c;}"));
         connect(chip, &QToolButton::clicked, this, [clear]() { clear(); });
         lay->addWidget(chip);
     };
@@ -1751,6 +1830,8 @@ void TexturesTab::rebuildFilterChips()
         addChip(QStringLiteral("Orphans"), [this] { m_orphanCheck->setChecked(false); });
     if (m_onlyDecrypted && m_onlyDecrypted->isChecked())
         addChip(QStringLiteral("Only decrypted"), [this] { m_onlyDecrypted->setChecked(false); });
+    if (m_onlyEncrypted && m_onlyEncrypted->isChecked())
+        addChip(QStringLiteral("Only encrypted (TACT)"), [this] { m_onlyEncrypted->setChecked(false); });
     updateFunnelTint();
 }
 
@@ -1887,6 +1968,7 @@ void TexturesTab::saveTexFilterState()
     setOf("tex/lastTags", m_tagFilter);
     s.setValue(QStringLiteral("tex/lastOrphan"),   m_orphanCheck && m_orphanCheck->isChecked());
     s.setValue(QStringLiteral("tex/lastOnlyDec"),  m_onlyDecrypted && m_onlyDecrypted->isChecked());
+    s.setValue(QStringLiteral("tex/lastOnlyEnc"),  m_onlyEncrypted && m_onlyEncrypted->isChecked());
     s.setValue(QStringLiteral("tex/lastTagOr"),    m_tagOrMode);
     s.setValue(QStringLiteral("tex/lastSort"),     m_sortCombo ? m_sortCombo->currentData().toString() : QString());
 }
@@ -1911,6 +1993,10 @@ void TexturesTab::restoreTexFilterState()
     }
     if (m_orphanCheck)   { QSignalBlocker b(m_orphanCheck);   m_orphanCheck->setChecked(s.value(QStringLiteral("tex/lastOrphan"), false).toBool()); }
     if (m_onlyDecrypted) { QSignalBlocker b(m_onlyDecrypted); m_onlyDecrypted->setChecked(s.value(QStringLiteral("tex/lastOnlyDec"), false).toBool()); }
+    // Restored only when "Only decrypted" did not also come back set — a stale pair from before they
+    // were made exclusive would otherwise arrive with both ticked, which no click can produce.
+    if (m_onlyEncrypted && !(m_onlyDecrypted && m_onlyDecrypted->isChecked()))
+        { QSignalBlocker b(m_onlyEncrypted); m_onlyEncrypted->setChecked(s.value(QStringLiteral("tex/lastOnlyEnc"), false).toBool()); }
     m_tagOrMode = s.value(QStringLiteral("tex/lastTagOr"), false).toBool();
     if (m_tagOrChk) { QSignalBlocker b(m_tagOrChk); m_tagOrChk->setChecked(m_tagOrMode); }
     if (m_sortCombo) {
@@ -1919,7 +2005,8 @@ void TexturesTab::restoreTexFilterState()
     }
     if (m_search) { QSignalBlocker b(m_search); m_search->setText(s.value(QStringLiteral("tex/lastSearch")).toString()); }
     if (!m_fmtFilter.isEmpty()) ensureFmtIndex();
-    if (m_onlyDecrypted && m_onlyDecrypted->isChecked()) loadList();   // re-filter the source rows
+    if ((m_onlyDecrypted && m_onlyDecrypted->isChecked())
+     || (m_onlyEncrypted && m_onlyEncrypted->isChecked())) loadList();   // re-filter the source rows
     applySort();
     applyNameFilter();
     updateFunnelTint();
@@ -1954,7 +2041,12 @@ void TexturesTab::ensureFmtIndex()
     if (m_fmtReady || m_fmtBuilding || !m_index) return;
     m_fmtBuilding = true;
     const QString cacheBase = AppPaths::dataDir();
-    const QString cachePath = cacheBase + QStringLiteral("/tex_info_v1.bin");
+    // v2: the scan now falls back to the CASC texture tables, so it covers encrypted textures a v1
+    // cache has no rows for. A v1 file loads perfectly well, which is the danger — it would satisfy
+    // the cache check, skip the rebuild, and leave those textures invisible to the format filter
+    // and dimension sort with nothing to indicate why. Same trap as the CoreTOC cache bump.
+    const QString cachePath = cacheBase + QStringLiteral("/tex_info_v2.bin");
+    QFile::remove(cacheBase + QStringLiteral("/tex_info_v1.bin"));
     constexpr quint32 kMagic = 0x7E410001u;
 
     // Try the disk cache first.
@@ -1981,15 +2073,28 @@ void TexturesTab::ensureFmtIndex()
     QVector<QPair<int, QString>> items;
     for (const SnoEntry& e : m_index->entries(kGroupTextureId())) items.append({e.snoId, e.name});
 
-    std::thread([this, items, d4, cacheBase, cachePath, kMagic]() {
+    CascReader* const rd = m_reader;
+    std::thread([this, items, d4, cacheBase, cachePath, kMagic, rd]() {
         static const QRegularExpression rxF(QStringLiteral("\"eTexFormat\":\\s*(\\d+)"));
         static const QRegularExpression rxW(QStringLiteral("\"dwWidth\":\\s*(\\d+)"));
         static const QRegularExpression rxH(QStringLiteral("\"dwHeight\":\\s*(\\d+)"));
         QHash<int, int> fmt; QHash<int, quint32> dim;
         fmt.reserve(items.size()); dim.reserve(items.size());
+        // Built once here rather than per-texture: it is the same table for all of them, and this
+        // loop runs over every group-44 entry.
+        if (rd) TextureDefTable::instance().ensureBuilt(rd);
         for (const auto& it : items) {
             QFile f(QStringLiteral("%1/json/base/meta/Texture/%2.tex.json").arg(d4, it.second));
-            if (!f.open(QIODevice::ReadOnly)) continue;
+            if (!f.open(QIODevice::ReadOnly)) {
+                // Encrypted, or newer than the snapshot. Without this the format filter and the
+                // dimension sort simply could not see those textures at all.
+                const TextureDefTable::Def d = TextureDefTable::instance().lookup(it.first);
+                if (d.valid()) {
+                    fmt.insert(it.first, d.format);
+                    dim.insert(it.first, (quint32(d.width) << 16) | quint32(d.height & 0xFFFF));
+                }
+                continue;
+            }
             const QString raw = QString::fromUtf8(f.readAll());
             const auto mf = rxF.match(raw);
             if (mf.hasMatch()) fmt.insert(it.first, mf.captured(1).toInt());
@@ -2101,6 +2206,25 @@ void TexturesTab::loadList()
             if (m_reader->payloadSize(quint64(e.snoId)) > 0) kept.append(e);
         entries = kept;
     }
+    // "Only encrypted (TACT)": keep the ones the game's own EncryptedSNOs manifest lists. A hash
+    // lookup per row, so it is as fast as any other filter here — the first version probed each
+    // sno's BLTE frame header instead and froze the tool for minutes on this 141k-entry group.
+    if (m_onlyEncrypted && m_onlyEncrypted->isChecked() && m_reader && m_reader->isReady()) {
+        QElapsedTimer t; t.start();
+        const QHash<int, QByteArray>& enc = m_reader->encryptedSnos();
+        QVector<SnoEntry> kept;
+        kept.reserve(enc.size() / 2 + 8);
+        int locked = 0;
+        for (const SnoEntry& e : entries) {
+            const auto hit = enc.constFind(e.snoId);
+            if (hit == enc.constEnd()) continue;
+            if (!m_reader->haveTactKey(hit.value())) ++locked;
+            kept.append(e);
+        }
+        qInfo("textures: %d encrypted of %d in %lld ms, %d of them without a key",
+              int(kept.size()), int(entries.size()), t.elapsed(), locked);
+        entries = kept;
+    }
     m_model->setEntries(entries);
     updateSelLabel();
 }
@@ -2186,11 +2310,7 @@ void TexturesTab::showTexture(int sno, const QString& name)
     if (m_exportFrame) m_exportFrame->setEnabled(false);
 
     const QString d4 = Config::d4dataDir();
-    TexMeta meta;
-    if (!d4.isEmpty()) {
-        QFile f(QStringLiteral("%1/json/base/meta/Texture/%2.tex.json").arg(d4, name));
-        if (f.open(QIODevice::ReadOnly)) meta = parseTexMetaJson(f.readAll());
-    }
+    TexMeta meta = texMetaFor(m_reader, d4, name, sno);
     // Dimension override: the CASC has only headerless pixels, so when the d4data JSON is stale
     // (wrong dims → scrambled) or missing (no descriptor), substitute the real pixel dimensions.
     {
@@ -2208,7 +2328,9 @@ void TexturesTab::showTexture(int sno, const QString& name)
 
     logTex(QStringLiteral("── load %1 [sno %2] ──").arg(name).arg(sno));
     if (!meta.valid)
-        logTex(QStringLiteral("  meta: INVALID (no %1/json/base/meta/Texture/%2.tex.json)").arg(d4, name), true);
+        logTex(QStringLiteral("  meta: INVALID — no %1/json/base/meta/Texture/%2.tex.json AND no "
+                              "entry for sno %3 in the CASC texture tables (%4 defs loaded)")
+                   .arg(d4, name).arg(sno).arg(TextureDefTable::instance().count()), true);
     else
         logTex(QStringLiteral("  meta: fmt=%1 %2 · %3×%4 · faces=%5 · mipMax=%6")
                .arg(meta.eTexFormat).arg(TexFormat::name(meta.eTexFormat))
@@ -2619,9 +2741,9 @@ void TexturesTab::showAssocMenu(const QPoint& pos)
                        [this, idx]() { onAssocDoubleClick(idx); });
     }
     if (sno > 0) {
-        menu.addAction(QStringLiteral("Copy name"), this,
+        menu.addAction(MenuText::kCopyName, this,
                        [label]() { QApplication::clipboard()->setText(label); });
-        menu.addAction(QStringLiteral("Copy SNO"), this,
+        menu.addAction(MenuText::kCopySno, this,
                        [sno]() { QApplication::clipboard()->setText(QString::number(sno)); });
     }
     if (!menu.isEmpty()) menu.exec(m_assocView->viewport()->mapToGlobal(pos));
@@ -2764,9 +2886,9 @@ bool TexturesTab::eventFilter(QObject* obj, QEvent* ev)
             const QImage f = croppedFrame(row, m_trimCheck && m_trimCheck->isChecked());
             if (!f.isNull()) {
                 QMenu menu(this);
-                menu.addAction(QStringLiteral("Copy image"), this,
+                menu.addAction(MenuText::kCopyImage, this,
                                [f]() { QApplication::clipboard()->setImage(f); });
-                menu.addAction(QStringLiteral("Save image…"), this, [this, f]() {
+                menu.addAction(MenuText::kSaveImage, this, [this, f]() {
                     const QString p = QFileDialog::getSaveFileName(this, QStringLiteral("Save frame"),
                         QStringLiteral("frame.png"), QStringLiteral("PNG (*.png);;JPEG (*.jpg)"));
                     if (!p.isEmpty()) f.save(p);
@@ -2878,14 +3000,40 @@ bool TexturesTab::eventFilter(QObject* obj, QEvent* ev)
     return BrowserTab::eventFilter(obj, ev);
 }
 
-QImage TexturesTab::decodeTexture(int sno, const QString& name)
+TexMeta TexturesTab::texMetaFor(CascReader* rd, const QString& d4, const QString& name, int sno)
 {
-    const QString d4 = Config::d4dataDir();
     TexMeta meta;
-    if (!d4.isEmpty()) {
+    if (!name.isEmpty() && !d4.isEmpty()) {
         QFile f(QStringLiteral("%1/json/base/meta/Texture/%2.tex.json").arg(d4, name));
         if (f.open(QIODevice::ReadOnly)) meta = parseTexMetaJson(f.readAll());
     }
+    if (meta.valid || !rd || sno <= 0) return meta;
+    // No JSON: an encrypted texture, or one newer than the d4data snapshot. Width/height/format
+    // come from CASC's own bulk tables instead. Frames (ptFrame) are NOT in those tables, so an
+    // atlas resolved this way decodes whole but cannot be sliced — see frameOverrideCount for the
+    // exported-frame route.
+    TextureDefTable::instance().ensureBuilt(rd);
+    // Look the definition up against the sno whose PAYLOAD will actually be read. 36,930 assets
+    // carry no payload of their own and share another sno's, and readPayloadBySno now follows that
+    // redirect — so describing the source with the source's own dimensions pairs one texture's
+    // bytes with another's width/height/format. BcDecode's size check turns most of that into a
+    // blank, which reads as "still broken" rather than as a mismatch.
+    const TextureDefTable::Def d = TextureDefTable::instance().lookup(
+        int(rd->payloadSourceSno(quint64(sno))));
+    if (d.valid()) {
+        meta.width = d.width;
+        meta.height = d.height;
+        meta.eTexFormat = d.format;
+        meta.faceCount = 1;
+        meta.valid = true;
+    }
+    return meta;
+}
+
+QImage TexturesTab::decodeTexture(int sno, const QString& name)
+{
+    const QString d4 = Config::d4dataDir();
+    const TexMeta meta = texMetaFor(m_reader, d4, name, sno);
     if (!meta.valid) return {};
     QByteArray payload;
     if (m_reader && m_reader->isReady()) payload = m_reader->readPayloadBySno(quint64(sno));
@@ -2982,6 +3130,37 @@ void TexturesTab::exportSelected(bool frames, bool toLast)
 
 // hasFrameExport() gates the two menu items; "selected" exports the frame-list selection (falling
 // back to all when nothing is selected), "all" always exports every frame of the current texture.
+// See the header. The same chain refreshFrames() runs, factored out so the Catalogue gets the
+// identical answer instead of its own approximation.
+QVector<TexFrame> TexturesTab::atlasFramesFor(CascReader* rd, const QString& d4,
+                                              const QString& name, int sno, const QImage& decoded)
+{
+    TexMeta meta = texMetaFor(rd, d4, name, sno);
+    if (!meta.frames.isEmpty() || decoded.isNull()) return meta.frames;
+    // Route 2+3: the table says HOW MANY frames and in what order; the image says WHERE they are.
+    FrameTable::instance().ensureLoaded(rd);
+    const QVector<quint32> handles = FrameTable::instance().handles(quint32(sno));
+    if (handles.isEmpty()) return {};
+    const QVector<QRect> cells = segmentAtlasFrames(decoded);
+    const int W = decoded.width(), H = decoded.height();
+    if (cells.isEmpty() || W <= 0 || H <= 0) return {};
+    const bool pairable = (cells.size() == handles.size());
+    QVector<TexFrame> out;
+    out.reserve(cells.size());
+    for (int i = 0; i < cells.size(); ++i) {
+        const QRect r = cells[i];
+        TexFrame f;
+        f.u0 = float(r.x()) / W;                 f.v0 = float(r.y()) / H;
+        f.u1 = float(r.x() + r.width())  / W;    f.v1 = float(r.y() + r.height()) / H;
+        // Same best-effort pairing as the panel: 2D_table's authored order is not the atlas's
+        // spatial order, so handles attach only when the counts agree. Rectangles are exact either
+        // way, which is all an export needs.
+        f.handle = (pairable && i < handles.size()) ? quint64(handles[i]) : 0;
+        out.append(f);
+    }
+    return out;
+}
+
 bool TexturesTab::hasFrameExport() const       { return !m_frameDefs.isEmpty(); }
 void TexturesTab::exportFramesSelected()       { exportSelectedFrames(false, false); }
 void TexturesTab::exportFramesSelectedToLast() { exportSelectedFrames(false, true); }

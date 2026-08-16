@@ -51,17 +51,40 @@ ItemInfo parseItem(const QByteArray& meta)
 
 // (actorAppearance removed — no callers; ItemDef::parse extracts snoActor itself.)
 
+// The one hero-class table. Row order IS eHeroClass order — do not sort this.
+static const HeroClassDef kHeroClasses[HeroClassCount] = {
+    /* 0 Sorcerer    */ {"sor", "Sorcerer"},
+    /* 1 Druid       */ {"dru", "Druid"},
+    /* 2 Barbarian   */ {"bar", "Barbarian"},
+    /* 3 Rogue       */ {"rog", "Rogue"},
+    /* 4 Necromancer */ {"nec", "Necromancer"},
+    /* 5 Spiritborn  */ {"spi", "Spiritborn"},
+    /* 6 Paladin     */ {"pal", "Paladin"},
+    /* 7 Warlock     */ {"war", "Warlock"},
+};
+static_assert(sizeof(kHeroClasses) / sizeof(kHeroClasses[0]) == HeroClassCount,
+              "kHeroClasses must have exactly one row per HeroClass enumerator");
+
+const HeroClassDef* heroClasses() { return kHeroClasses; }
+
+const char* heroClassCode(int idx)
+{
+    return (idx >= 0 && idx < HeroClassCount) ? kHeroClasses[idx].code : "";
+}
+
+const char* heroClassName(int idx)
+{
+    return (idx >= 0 && idx < HeroClassCount) ? kHeroClasses[idx].name : "";
+}
+
 int heroClassIndex(const QString& prefix)
 {
     const QString p = prefix.toLower();
-    if (p == QLatin1String("sor")) return Sorcerer;
-    if (p == QLatin1String("dru")) return Druid;
-    if (p == QLatin1String("bar")) return Barbarian;
-    if (p == QLatin1String("rog")) return Rogue;
-    if (p == QLatin1String("nec")) return Necromancer;
-    if (p == QLatin1String("spb") || p == QLatin1String("spi")) return Spiritborn;
-    if (p == QLatin1String("pal")) return Paladin;
-    if (p == QLatin1String("war")) return Warlock;
+    // "spb" is an alias the data uses for Spiritborn alongside "spi"; it is the one code that
+    // is not simply the table entry, so it stays an explicit special case rather than a row.
+    if (p == QLatin1String("spb")) return Spiritborn;
+    for (int i = 0; i < HeroClassCount; ++i)
+        if (p == QLatin1String(kHeroClasses[i].code)) return i;
     return -1;
 }
 

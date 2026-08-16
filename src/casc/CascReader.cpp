@@ -132,7 +132,21 @@ int tvfsOffsetFieldSize(int tableSize)
     return 1;
 }
 
-QString firstActiveBuildInfo(const QString& gameDir, QHash<QString, QString>& row)
+// Pick a build row out of .build.info.
+//
+// `wantProduct` (e.g. "fenris" retail, or the PTR product code) selects among MULTIPLE active
+// rows — an install root can carry more than one, and a PTR install is a different Product on
+// the same file format. This used to take the first Active row and ignore the Product column
+// entirely, which made the Settings "Game build (CASC product)" dropdown decorative: it was
+// saved, passed down here and discarded. A control that looks like it works and does not is
+// worse than no control.
+//
+// Fallbacks, in order: exact product match → first Active row → nothing. Falling back rather
+// than failing matters because most installs have exactly one active row and the product code
+// there is whatever Blizzard chose; refusing to open on a mismatch would break every user whose
+// setting does not happen to match their install.
+QString firstActiveBuildInfo(const QString& gameDir, QHash<QString, QString>& row,
+                             const QString& wantProduct = QString())
 {
     QFile f(gameDir + "/.build.info");
     if (!f.open(QIODevice::ReadOnly | QIODevice::Text)) return {};
@@ -140,12 +154,24 @@ QString firstActiveBuildInfo(const QString& gameDir, QHash<QString, QString>& ro
     if (lines.size() < 2) return {};
     QStringList headers;
     for (const QString& h : lines[0].split('|')) headers << h.split('!').first();
+
+    QHash<QString, QString> firstActive;
     for (int i = 1; i < lines.size(); ++i) {
         const QStringList vals = lines[i].split('|');
         if (vals.size() < headers.size()) continue;
         QHash<QString, QString> r;
         for (int k = 0; k < headers.size(); ++k) r.insert(headers[k], vals[k]);
-        if (r.value("Active") == "1") { row = r; return r.value("Build Key").trimmed().toLower(); }
+        if (r.value("Active") != "1") continue;
+        if (firstActive.isEmpty()) firstActive = r;
+        if (!wantProduct.isEmpty()
+            && r.value("Product").trimmed().compare(wantProduct.trimmed(), Qt::CaseInsensitive) == 0) {
+            row = r;
+            return r.value("Build Key").trimmed().toLower();
+        }
+    }
+    if (!firstActive.isEmpty()) {
+        row = firstActive;
+        return firstActive.value("Build Key").trimmed().toLower();
     }
     return {};
 }
@@ -165,6 +191,16 @@ QHash<QString, QString> parseKvFile(const QString& text)
 
 }  // namespace
 
+QString CascReader::lineageKey() const
+{
+    if (!m_product.isEmpty()) return m_product;
+    // Normalised so a trailing slash or a drive-letter case difference cannot look like a second
+    // install. Only the leaf name is used — moving the folder to another drive should keep the
+    // baseline, and the full path would throw it away.
+    const QString dir = QDir(m_gameDir).dirName().trimmed().toLower();
+    return dir.isEmpty() ? QString() : QStringLiteral("dir:") + dir;
+}
+
 QString CascReader::gameVersion(const QString& gameDir)
 {
     QHash<QString, QString> row;
@@ -172,6 +208,10 @@ QString CascReader::gameVersion(const QString& gameDir)
     return row.value(QStringLiteral("Version")).trimmed();
 }
 
+// NOTE: nothing in src/ calls this today — open() does its own reset, so that is the path that
+// actually runs. It is kept because it is the honest counterpart to open(), and it is maintained in
+// step with it deliberately: the two reset lists must not drift, or whichever one a future caller
+// picks decides whether stale state survives.
 void CascReader::close()
 {
     QMutexLocker lock(&m_mutex);
@@ -180,6 +220,24 @@ void CascReader::close()
     m_keyProbe.clear();
     m_root.clear();
     m_gameDir.clear();
+    // Identity of the install being dropped. open() clears these too; close() did not, so anything
+    // calling it would keep answering lineageKey()/product()/openedVersion() with the OLD install —
+    // and lineageKey() is what keeps retail and PTR from overwriting each other's "Latest" baseline.
+    m_product.clear();
+    m_wantProduct.clear();
+    m_gameVersion.clear();
+    m_buildId.clear();
+    // Both are derived from the install we are dropping. The archive paths are absolute, so leaving
+    // them would point a re-open at the OLD install's files — the retail/PTR switch is exactly the
+    // case that would hit, and it would look like corrupt assets rather than a stale cache.
+    m_encSnos.clear();
+    m_encSnosBuilt = false;
+    m_sharedPay.clear();
+    m_sharedPayBuilt = false;
+    {
+        QMutexLocker cl(&m_archiveMutex);
+        m_archivePath.clear();
+    }
 }
 
 QHash<QString, QString> CascReader::locateConfig()
@@ -191,7 +249,7 @@ QHash<QString, QString> CascReader::locateConfig()
 
     // Battle.net: .build.info → Build Key → Data/config/xx/yy/<key>
     QHash<QString, QString> info;
-    const QString buildKey = firstActiveBuildInfo(m_gameDir, info);
+    const QString buildKey = firstActiveBuildInfo(m_gameDir, info, m_wantProduct);
     if (!buildKey.isEmpty() && buildKey.size() >= 4) {
         const QString cfgPath = QStringLiteral("%1/Data/config/%2/%3/%4")
             .arg(m_gameDir, buildKey.mid(0, 2), buildKey.mid(2, 2), buildKey);
@@ -356,6 +414,17 @@ void CascReader::saveIndexCacheFile(const QString& path, const QString& sig) con
 
 QString CascReader::findArchive(quint32 archiveNum, const QString& group) const
 {
+    // Up to twelve QFileInfo::exists calls to locate one archive, and readArchive calls this for
+    // EVERY asset read — so the answer is remembered. Measured cost of not doing so: the "only
+    // encrypted" filter probing a 141k-entry group spent minutes almost entirely in these stats.
+    // Its own mutex, because readArchive deliberately runs outside m_mutex so parallel bulk workers
+    // decompress concurrently; taking m_mutex here would serialise them again.
+    const QString cacheKey = group + QLatin1Char('/') + QString::number(archiveNum);
+    {
+        QMutexLocker cl(&m_archiveMutex);
+        const auto hit = m_archivePath.constFind(cacheKey);
+        if (hit != m_archivePath.constEnd()) return hit.value();
+    }
     const QStringList dirs{m_gameDir + "/Data/" + group, m_gameDir + "/Data/data", m_gameDir + "/Data"};
     for (const QString& d : dirs) {
         const QStringList cands{
@@ -364,8 +433,16 @@ QString CascReader::findArchive(quint32 archiveNum, const QString& group) const
             QStringLiteral("%1/%2").arg(d).arg(archiveNum, 4, 10, QLatin1Char('0')),
             QStringLiteral("%1/%2").arg(d).arg(archiveNum, 8, 10, QLatin1Char('0'))};
         for (const QString& p : cands)
-            if (QFileInfo::exists(p)) return p;
+            if (QFileInfo::exists(p)) {
+                QMutexLocker cl(&m_archiveMutex);
+                m_archivePath.insert(cacheKey, p);
+                return p;
+            }
     }
+    // A miss is cached too. Without that, every read of a missing archive redoes all twelve stats,
+    // which is the exact case a locked-content scan hits hardest.
+    QMutexLocker cl(&m_archiveMutex);
+    m_archivePath.insert(cacheKey, QString());
     return {};
 }
 
@@ -698,14 +775,15 @@ void CascReader::parseTvfs(const QByteArray& data, const QString& prefix,
 
 // First BLTE frame's Salsa20 key name (8 bytes) if the entry's first chunk is
 // 'E'-encrypted; empty when unencrypted/unreadable. Header-only probe, no decode.
-QByteArray CascReader::frameKeyName(const IndexEntry& e) const
+QByteArray CascReader::frameKeyNameFrom(QFile& f, const IndexEntry& e)
 {
-    const QString ap = findArchive(e.archive, e.group);
-    if (ap.isEmpty()) return {};
-    QFile f(ap);
-    if (!f.open(QIODevice::ReadOnly)) return {};
-    if (!f.seek(qint64(e.offset) + ARCHIVE_FRAME_HEADER)) return {};
-    const QByteArray head = f.read(qMin<quint32>(e.size, 8192u));
+    const qint64 base = qint64(e.offset) + ARCHIVE_FRAME_HEADER;
+    if (!f.seek(base)) return {};
+    // Two targeted reads, not one big window. The BLTE header is 12 bytes and tells us where the
+    // first frame's header sits; the frame header we need is 2 bytes plus a key name of at most 16.
+    // The old 8 KB read was ~200x more data than that, which only mattered once a caller started
+    // probing a whole group.
+    const QByteArray head = f.read(qMin<quint32>(e.size, 12u));
     if (!head.startsWith("BLTE") || head.size() < 9) return {};
     const quint32 headerSize = rdBE32(head, 4);
     int frameStart;
@@ -715,14 +793,25 @@ QByteArray CascReader::frameKeyName(const IndexEntry& e) const
         if (head.size() < 12) return {};
         frameStart = 12 + 24 * rdN_BE(head, 9, 3);
     }
-    if (frameStart + 2 > head.size()) return {};
-    if (quint8(head[frameStart]) != 0x45) return {};       // not 'E'-encrypted
-    const int kp = frameStart + 1;
-    const int keyLen = quint8(head[kp]);
-    if (kp + 1 + keyLen > head.size()) return {};
-    QByteArray keyName = head.mid(kp + 1, keyLen);
+    if (frameStart < 0 || quint32(frameStart) + 2 > e.size) return {};
+    if (!f.seek(base + frameStart)) return {};
+    const QByteArray fh = f.read(qMin<quint32>(e.size - quint32(frameStart), 24u));
+    if (fh.size() < 2) return {};
+    if (quint8(fh[0]) != 0x45) return {};                  // not 'E'-encrypted
+    const int keyLen = quint8(fh[1]);
+    if (keyLen <= 0 || 2 + keyLen > fh.size()) return {};
+    QByteArray keyName = fh.mid(2, keyLen);
     std::reverse(keyName.begin(), keyName.end());          // stored little-endian
     return keyName;
+}
+
+QByteArray CascReader::frameKeyName(const IndexEntry& e) const
+{
+    const QString ap = findArchive(e.archive, e.group);
+    if (ap.isEmpty()) return {};
+    QFile f(ap);
+    if (!f.open(QIODevice::ReadOnly)) return {};
+    return frameKeyNameFrom(f, e);
 }
 
 void CascReader::expandNestedManifests()
@@ -890,7 +979,10 @@ void CascReader::writeCoverageReport() const
                         : QStringLiteral("excluded by default — enable \"Include locale packs\" in "
                                          "Settings for the full ~2.6M name set (slower indexing)"));
 
-    const QString path = QDir(QCoreApplication::applicationDirPath()).filePath(QStringLiteral("casc_coverage.txt"));
+    // data\, not beside the exe. This is written on EVERY cold TVFS build — i.e. after every game
+    // patch — so it is the one stray write a normal user would actually hit, and it contradicts
+    // the portability claim the README, the Settings help and the smoke test all make.
+    const QString path = AppPaths::file(QStringLiteral("casc_coverage.txt"));
     QFile f(path);
     if (f.open(QIODevice::WriteOnly | QIODevice::Text)) {
         f.write(out.toUtf8());
@@ -905,10 +997,11 @@ void CascReader::writeCoverageReport() const
 // u8 len + bytes]. ~50 MB for 1.1M paths, loads in a fraction of the expansion time.
 static constexpr quint32 kRootCacheMagic = 0x54564653;   // 'TVFS'
 
-QString CascReader::rootCacheSignature() const
+QString CascReader::buildAndKeySignature() const
 {
     // buildId (vfs-root hash — changes every patch) + a digest of the TACT key NAMES — a new
-    // key can expand containers the cached table lacks, so it must invalidate the cache.
+    // key can expand containers, and can name assets, that a cache built without it lacks.
+    QMutexLocker kl(&m_keysMutex);
     QByteArrayList names;
     names.reserve(m_tactKeys.size());
     for (auto it = m_tactKeys.constBegin(); it != m_tactKeys.constEnd(); ++it)
@@ -918,6 +1011,9 @@ QString CascReader::rootCacheSignature() const
     for (const QByteArray& n : names) h.addData(n);
     return m_buildId + QLatin1Char(':') + QString::fromLatin1(h.result().toHex());
 }
+
+// Same signature, kept as the TVFS path table's own name for readability at its call site.
+QString CascReader::rootCacheSignature() const { return buildAndKeySignature(); }
 
 bool CascReader::loadRootCache(const QString& path, const QString& sig)
 {
@@ -993,7 +1089,7 @@ void CascReader::saveRootCache(const QString& path, const QString& sig) const
           qint64(out.size()) / (1024 * 1024));
 }
 
-bool CascReader::open(const QString& gameDir, const QString& /*product*/)
+bool CascReader::open(const QString& gameDir, const QString& product)
 {
     QMutexLocker lock(&m_mutex);
     m_ready = false;
@@ -1001,8 +1097,53 @@ bool CascReader::open(const QString& gameDir, const QString& /*product*/)
     m_keyProbe.clear();
     m_root.clear();
     m_buildId.clear();
+    m_product.clear();
+    // Same reset close() does — open() does not route through it, so anything added to one has to
+    // be added to the other or a re-open silently inherits the previous install's data.
+    m_encSnos.clear();
+    m_encSnosBuilt = false;
+    m_sharedPay.clear();
+    m_sharedPayBuilt = false;
+    {
+        QMutexLocker cl(&m_archiveMutex);
+        m_archivePath.clear();
+    }
+    m_gameVersion.clear();
     m_gameDir = gameDir;
+    m_wantProduct = product;   // consulted by locateConfig → firstActiveBuildInfo
     if (gameDir.isEmpty()) { m_lastError = "No game directory configured."; return false; }
+
+    // Record which build row actually won, so the log states the product and version rather than
+    // echoing back the SETTING (which may not match what was opened — that mismatch is precisely
+    // what makes a wrong install hard to spot when running retail and PTR side by side).
+    {
+        QHash<QString, QString> row;
+        firstActiveBuildInfo(gameDir, row, product);
+        m_product     = row.value(QStringLiteral("Product")).trimmed();
+        m_gameVersion = row.value(QStringLiteral("Version")).trimmed();
+        if (!m_product.isEmpty()) {
+            qInfo("CASC: .build.info product=%s version=%s%s", qPrintable(m_product),
+                  qPrintable(m_gameVersion),
+                  (!product.isEmpty()
+                   && m_product.compare(product, Qt::CaseInsensitive) != 0)
+                      ? "  [NOTE: differs from the configured product — that row was not present]"
+                      : "");
+        } else {
+            // Say so LOUDLY, and say what was actually there. An empty product is not cosmetic:
+            // it is the lineage key that keeps retail and PTR "Latest" baselines apart, so a blank
+            // one silently puts both installs back in the same slot — the exact overwrite this was
+            // written to prevent. Printing the column names turns "why is it empty" into a
+            // one-glance answer instead of another build cycle.
+            QStringList cols = row.keys();
+            cols.sort();
+            qInfo("CASC: .build.info carries no Product column for %s (columns: %s) — "
+                  "identifying this install by folder name instead: %s",
+                  qPrintable(QDir(gameDir).dirName()),
+                  cols.isEmpty() ? "none; file missing, unreadable, or no Active row"
+                                 : qPrintable(cols.join(QStringLiteral(", "))),
+                  qPrintable(lineageKey()));
+        }
+    }
 
     const QHash<QString, QString> cfg = locateConfig();
     qInfo("CASC: build config keys=%d hasVfsRoot=%d", int(cfg.size()), cfg.contains("vfs-root") ? 1 : 0);
@@ -1079,9 +1220,59 @@ QByteArray CascReader::readFile(const QString& name)
 
 QByteArray CascReader::readPayloadBySno(quint64 sno)
 {
-    QByteArray d = readFile(QStringLiteral("base/payload/%1").arg(sno));
-    if (d.isEmpty()) d = readFile(QStringLiteral("base/paylow/%1").arg(sno));
-    return d;
+    return readPayloadBySno(sno, 0);
+}
+
+QByteArray CascReader::readPayloadBySno(quint64 sno, int depth)
+{
+    const QByteArray d = readFile(QStringLiteral("base/payload/%1").arg(sno));
+    if (!d.isEmpty()) return d;
+
+    // Fall back to the low-detail payload ONLY when the full-detail one genuinely is not in this
+    // install. readFile returns empty for BOTH "no such path" and "the read failed", and the
+    // difference matters enormously here.
+    //
+    // If base/payload EXISTS but came back empty, the read failed — for encrypted content, a TACT
+    // key we do not hold or a bad decrypt. Serving base/paylow in its place hands the caller a
+    // perfectly VALID BLOB THAT DOES NOT DESCRIBE THE SAME MESH: the meta still carries the full
+    // model's vertex/index counts and offsets, so the parser reads them out of a smaller buffer and
+    // tries to allocate the difference. That is precisely the "bad allocation during parse" fault
+    // in model_render_crashes.log, and every entry in it is an encrypted piece
+    // (druF_stor251_TRS and friends).
+    //
+    // Returning empty instead means the piece reports as undecodable, which it honestly is.
+    if (payloadVariants(sno).payload > 0) {
+        static QMutex warnMutex;
+        static QSet<quint64> warned;
+        bool first = false;
+        { QMutexLocker wl(&warnMutex); first = !warned.contains(sno); if (first) warned.insert(sno); }
+        if (first) {
+            const QByteArray kn = tactKeyFor(sno);
+            qWarning("payload sno %llu: base/payload exists but could not be read%s — NOT falling "
+                     "back to base/paylow, whose geometry does not match this asset's meta and has "
+                     "faulted the parser before",
+                     sno,
+                     kn.isEmpty() ? "" : (haveTactKey(kn) ? " (encrypted; we hold the key, so the "
+                                                            "decrypt itself failed)"
+                                                          : " (encrypted with a TACT key we do not "
+                                                            "hold)"));
+        }
+        return {};
+    }
+
+    // No payload of its own. Before giving up, ask the game where it actually lives: D4
+    // deduplicates hard, and 36,930 assets deliberately carry no payload because they share
+    // another sno's. Checked BEFORE paylow, because this is the authoritative full-detail source
+    // while paylow is only a low-detail variant.
+    if (depth < 4) {
+        const QHash<int, int>& shared = sharedPayloads();
+        const auto it = shared.constFind(int(sno));
+        if (it != shared.constEnd() && quint64(it.value()) != sno) {
+            const QByteArray via = readPayloadBySno(quint64(it.value()), depth + 1);
+            if (!via.isEmpty()) return via;
+        }
+    }
+    return readFile(QStringLiteral("base/paylow/%1").arg(sno));
 }
 
 QByteArray CascReader::readMetaBySno(quint64 sno)
@@ -1206,11 +1397,175 @@ QByteArray CascReader::tactKeyFor(quint64 sno)
     return remember(QByteArray());
 }
 
+const QHash<int, QByteArray>& CascReader::encryptedSnos()
+{
+    // The read MUST happen with no lock held: readFile takes m_mutex itself, and QMutex is not
+    // recursive, so building this under the lock would deadlock on the first call.
+    {
+        QMutexLocker lock(&m_mutex);
+        if (m_encSnosBuilt || !m_ready) return m_encSnos;
+    }
+    const QByteArray blob = readFile(QStringLiteral("base/EncryptedSNOs.dat"));
+
+    QMutexLocker lock(&m_mutex);
+    if (m_encSnosBuilt) return m_encSnos;   // another thread got there first
+    m_encSnosBuilt = true;                  // set before any early return: a malformed manifest
+                                            // must not be re-read on every call
+    if (blob.size() < 8) {
+        qWarning("CASC: base/EncryptedSNOs.dat missing or empty — the \"only encrypted\" filters "
+                 "have nothing to filter on and will come back empty");
+        return m_encSnos;
+    }
+    // Layout, from d4data's parse.js:194-205 and verified against the shipped file:
+    //   u32 (version/magic, unread), u32 count, count x { i32 group, i32 sno, u8 keyName[8] }
+    // Note the 16-byte stride — the EncryptedNameDict tables use 8 and are a different file.
+    const uchar* d = reinterpret_cast<const uchar*>(blob.constData());
+    const qint64 count = qint64(qFromLittleEndian<quint32>(d + 4));
+    if (count <= 0 || 8 + count * 16 > blob.size()) {
+        qWarning("CASC: base/EncryptedSNOs.dat declares %lld entries but is only %lld bytes — "
+                 "ignoring it", count, qint64(blob.size()));
+        return m_encSnos;
+    }
+    m_encSnos.reserve(int(count));
+    for (qint64 i = 0; i < count; ++i) {
+        const uchar* r = d + 8 + i * 16;
+        const int sno = int(qFromLittleEndian<qint32>(r + 4));
+        m_encSnos.insert(sno, QByteArray(reinterpret_cast<const char*>(r + 8), 8));
+    }
+    QSet<QByteArray> distinct;
+    for (auto it = m_encSnos.constBegin(); it != m_encSnos.constEnd(); ++it) distinct.insert(it.value());
+    qInfo("CASC: EncryptedSNOs — %d encrypted asset(s) under %d key(s)",
+          m_encSnos.size(), distinct.size());
+    return m_encSnos;
+}
+
+const QHash<int, int>& CascReader::sharedPayloads()
+{
+    // Same lock discipline as encryptedSnos: readFile takes m_mutex, so the read happens unlocked.
+    {
+        QMutexLocker lock(&m_mutex);
+        if (m_sharedPayBuilt || !m_ready) return m_sharedPay;
+    }
+    const QByteArray blob = readFile(QStringLiteral("base/CoreTOCSharedPayloadsMapping.dat"));
+
+    QMutexLocker lock(&m_mutex);
+    if (m_sharedPayBuilt) return m_sharedPay;
+    m_sharedPayBuilt = true;
+    if (blob.size() < 8) {
+        qWarning("CASC: base/CoreTOCSharedPayloadsMapping.dat missing — assets that share another "
+                 "asset's payload will read as having no data at all");
+        return m_sharedPay;
+    }
+    const uchar* d = reinterpret_cast<const uchar*>(blob.constData());
+    const qint64 count = qint64(qFromLittleEndian<quint32>(d + 4));
+    if (count <= 0 || 8 + count * 8 > blob.size()) {
+        qWarning("CASC: CoreTOCSharedPayloadsMapping declares %lld entries but is only %lld bytes — "
+                 "ignoring it", count, qint64(blob.size()));
+        return m_sharedPay;
+    }
+    m_sharedPay.reserve(int(count));
+    for (qint64 i = 0; i < count; ++i) {
+        const uchar* r = d + 8 + i * 8;
+        const int src = int(qFromLittleEndian<quint32>(r));
+        const int dst = int(qFromLittleEndian<quint32>(r + 4));
+        if (src > 0 && dst > 0 && src != dst) m_sharedPay.insert(src, dst);
+    }
+    qInfo("CASC: shared payloads — %d asset(s) read their data from another sno", m_sharedPay.size());
+    return m_sharedPay;
+}
+
+quint64 CascReader::payloadSourceSno(quint64 sno)
+{
+    if (payloadVariants(sno).payload > 0) return sno;   // has its own — no redirect involved
+    const QHash<int, int>& shared = sharedPayloads();
+    quint64 cur = sno;
+    for (int hop = 0; hop < 4; ++hop) {                 // same depth bound readPayloadBySno uses
+        const auto it = shared.constFind(int(cur));
+        if (it == shared.constEnd() || quint64(it.value()) == cur) break;
+        cur = quint64(it.value());
+        if (payloadVariants(cur).payload > 0) break;
+    }
+    return cur;
+}
+
 bool CascReader::haveTactKey(const QByteArray& keyName) const
 {
     if (keyName.isEmpty()) return true;   // unencrypted needs no key
     QMutexLocker kl(&m_keysMutex);
     return !m_tactKeys.value(keyName).isEmpty();
+}
+
+QStringList CascReader::verifyTactKeys(const QString& keyFile)
+{
+    QStringList out;
+    if (!m_ready) { out << QStringLiteral("CASC not open."); return out; }
+
+    // Which dict files this build actually ships, by their hex id.
+    QSet<QString> dictIds;
+    for (const QString& p : rootPathsWithPrefix(QStringLiteral("base/encryptednamedict-"))) {
+        const qsizetype at = p.lastIndexOf(QLatin1String("-0x"));
+        if (at >= 0) dictIds.insert(p.mid(at + 3, 16).toLower());
+    }
+    out << QStringLiteral("build ships %1 EncryptedNameDict file(s)").arg(dictIds.size());
+
+    const int before = tactKeyCount();
+    // ADD the candidates, do not REPLACE. applyTactKeys() begins with m_tactKeys.clear() — it is the
+    // "load the configured key file" entry point — so calling it here silently threw away every key
+    // the user has configured for the rest of the session. Everything encrypted that decoded a
+    // moment earlier would stop, and the summary line below read as additive while the held count
+    // went DOWN. loadKeysFromFile is the same parser without the clear; both mutexes are held here
+    // because that is the contract writers observe (decryptFrame readers take only m_keysMutex).
+    int added = 0;
+    {
+        QMutexLocker lock(&m_mutex);
+        QMutexLocker keysLock(&m_keysMutex);
+        added = loadKeysFromFile(keyFile);
+    }
+    out << QStringLiteral("candidate file: %1 key(s) parsed (held %2 -> %3)")
+               .arg(added).arg(before).arg(tactKeyCount());
+
+    int valid = 0, noDict = 0, badDecode = 0;
+    for (const QByteArray& kn : tactKeyNames()) {
+        QByteArray rev = kn;
+        std::reverse(rev.begin(), rev.end());
+        // The filename hex is the key name BYTE-SWAPPED, but both orders are tried rather than
+        // trusting that convention across a patch.
+        QString path, id;
+        for (const QByteArray& cand : {rev, kn}) {
+            const QString h = QString::fromLatin1(cand.toHex()).toLower();
+            if (dictIds.contains(h)) { id = h; path = QStringLiteral("base/encryptednamedict-0x%1.dat").arg(h); break; }
+        }
+        const QString keyHex = QString::fromLatin1(kn.toHex()).toUpper();
+        if (path.isEmpty()) { ++noDict;
+            out << QStringLiteral("  %1  — no dict in this build (not a D4 key, or unused here)").arg(keyHex);
+            continue; }
+        const QByteArray blob = readFile(path);
+        const bool ok = blob.size() >= 8
+                     && qFromLittleEndian<quint32>(reinterpret_cast<const uchar*>(blob.constData()))
+                            == 0xABCD4567u;
+        if (!ok) { ++badDecode;
+            out << QStringLiteral("  %1  — dict present but did NOT decode (wrong key value)").arg(keyHex);
+            continue; }
+        ++valid;
+        const int n = int(qFromLittleEndian<quint32>(
+            reinterpret_cast<const uchar*>(blob.constData()) + 4));
+        out << QStringLiteral("  %1  ✓ VALID — names %2 SNO(s)").arg(keyHex).arg(n);
+    }
+    out << QStringLiteral("RESULT: %1 valid · %2 with no dict here · %3 present-but-wrong  "
+                          "(coverage %1/%4 dicts)")
+               .arg(valid).arg(noDict).arg(badDecode).arg(dictIds.size());
+    for (const QString& l : out) qInfo().noquote() << "tact-verify:" << l;
+    return out;
+}
+
+QVector<QByteArray> CascReader::tactKeyNames() const
+{
+    QMutexLocker kl(&m_keysMutex);
+    QVector<QByteArray> out;
+    out.reserve(m_tactKeys.size());
+    for (auto it = m_tactKeys.constBegin(); it != m_tactKeys.constEnd(); ++it)
+        out.append(it.key());
+    return out;
 }
 
 quint64 CascReader::payloadSize(quint64 sno)
@@ -1262,13 +1617,57 @@ int CascReader::loadKeysFromFile(const QString& path)
 {
     QFile f(path);
     if (!f.open(QIODevice::ReadOnly | QIODevice::Text)) return 0;
+
+    // TWO formats, because the two upstreams publish differently and folder mode should accept a
+    // file dropped in as-downloaded rather than making people convert it by hand:
+    //
+    //   wowdev / rustydemon   KEYNAME(16 hex) <sep> KEY(32 hex)
+    //   CascLib KeyService.cs [0xKEYNAME] = "KEY".FromHexString(),   // TactKeyId N
+    //
+    // CascLib's file is a C# source carrying Overwatch, WoW AND Diablo IV keys in one table. When
+    // its "Diablo IV" section marker is present we take ONLY that section: the other ~600 keys can
+    // never match a D4 dict, and loading them would make tactKeyCount() and the verify report
+    // meaningless. No marker (a hand-trimmed file) falls back to parsing the whole thing.
+    static const QRegularExpression kCsLine(
+        QStringLiteral("^\\s*\\[0x([0-9A-Fa-f]{16})\\]\\s*=\\s*\"([0-9A-Fa-f]{32})\""));
+    static const QRegularExpression kSep(QStringLiteral("[\\s;,]+"));
+
+    const QByteArray all = f.readAll();
+    const bool isCs = all.contains("FromHexString");
+    int sectionFrom = 0, sectionTo = all.size();
+    if (isCs) {
+        const int d4 = all.indexOf("Diablo IV");
+        if (d4 >= 0) {
+            sectionFrom = all.indexOf('\n', d4) + 1;
+            // The section ends at the next comment header that is NOT a per-key "// TactKeyId N"
+            // trailer. Scanning forward line-by-line is clearer than a regex over the whole blob.
+            int p = sectionFrom;
+            while (p < all.size()) {
+                const int nl = all.indexOf('\n', p);
+                const int end = nl < 0 ? all.size() : nl;
+                const QByteArray ln = all.mid(p, end - p).trimmed();
+                if (ln.startsWith("//") || ln.startsWith("};")) { sectionTo = p; break; }
+                if (nl < 0) break;
+                p = nl + 1;
+            }
+        }
+    }
+
     int added = 0;
-    while (!f.atEnd()) {
-        QString line = QString::fromUtf8(f.readLine());
+    const QList<QByteArray> lines = all.mid(sectionFrom, sectionTo - sectionFrom).split('\n');
+    for (const QByteArray& raw : lines) {
+        QString line = QString::fromUtf8(raw);
+        if (isCs) {
+            const auto m = kCsLine.match(line);
+            if (!m.hasMatch()) continue;
+            const QByteArray name = QByteArray::fromHex(m.captured(1).toLatin1());
+            const QByteArray key  = QByteArray::fromHex(m.captured(2).toLatin1());
+            if (name.size() == 8 && key.size() == 16) { m_tactKeys.insert(name, key); ++added; }
+            continue;
+        }
         const int hash = line.indexOf(QLatin1Char('#'));
         if (hash >= 0) line.truncate(hash);
-        static const QRegularExpression sep(QStringLiteral("[\\s;,]+"));
-        const QStringList parts = line.simplified().split(sep, Qt::SkipEmptyParts);
+        const QStringList parts = line.simplified().split(kSep, Qt::SkipEmptyParts);
         if (parts.size() < 2 || parts[0].size() != 16 || parts[1].size() != 32) continue;
         const QByteArray name = QByteArray::fromHex(parts[0].toLatin1());
         const QByteArray key = QByteArray::fromHex(parts[1].toLatin1());

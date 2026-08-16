@@ -1,6 +1,9 @@
 #pragma once
 #include <QHash>
+#include <QMutex>
 #include <QString>
+
+#include <atomic>
 
 class CascReader;
 
@@ -42,14 +45,18 @@ public:
     // Overlays whose TACT key is absent simply do not decode and are skipped.
     void ensureBuilt(CascReader* rd);
     void reset();
-    bool ready() const { return m_ready; }
-    int  count() const { return m_defs.size(); }
+    // Atomic: written inside the locked build, read here unlocked from other worker threads.
+    bool ready() const { return m_ready.load(std::memory_order_acquire); }
+    int  count() const;
 
-    Def lookup(int sno) const { return m_defs.value(sno); }
+    Def lookup(int sno) const;
 
 private:
     TextureDefTable() = default;
     void parseTable(const QByteArray& blob, const QString& label, int* added);
+    // Guards m_defs across the build and every lookup — see the note in ensureBuilt. lookup() is
+    // called once per texture load, so the contention is a hash probe, not the parse.
+    mutable QMutex m_mutex;
     QHash<int, Def> m_defs;
-    bool m_ready = false;
+    std::atomic<bool> m_ready{false};
 };

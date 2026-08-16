@@ -22,6 +22,9 @@ MarkingDef markingDef(const QString& d4, const QString& stem)
     m.bodyTex   = o.value(QStringLiteral("snoMaskBody")).toObject().value(QStringLiteral("name")).toString().section('/', -1);
     m.colorStem = o.value(QStringLiteral("snoDefaultColor")).toObject().value(QStringLiteral("name")).toString().section('/', -1);
     m.emissive  = float(o.value(QStringLiteral("flEmissiveStrength")).toDouble(0.0));
+    // The shape's own swatch. Read here rather than at the call site so every consumer of a
+    // MarkingShape gets the same four facts from one parse.
+    m.icon      = quint32(o.value(QStringLiteral("hIconImage")).toDouble(0.0));
     return m;
 }
 
@@ -57,6 +60,16 @@ MarkingPaint markingPaint(const QString& d4, const QString& stem)
     if (!f.open(QIODevice::ReadOnly)) return p;
     const QJsonObject o = QJsonDocument::fromJson(f.readAll()).object();
     p.isTattoo  = o.value(QStringLiteral("fIsTattoo")).toBool(false);
+    // No tint, scale or darkening is applied to the ramp. The authored samples are used exactly as
+    // they are, sRGB-encoded from the file's linear values and nothing more.
+    //
+    // This was verified rather than assumed: the samples are exactly (n/255)^2.2, so the encode
+    // recovers the artist's original 8-bit colour; Inked Tattoo composites to #093437, which is
+    // within a few units of the in-game reading. A 0.45 ink multiplier was tried here and was far
+    // too dark. If tattoos ever look wrong again, the cause is downstream of this file — viewport
+    // lighting lifts a dark CHROMATIC albedo much harder than a dark neutral one, which is why
+    // bodymarking_bar044_stor (snoDefaultColor = null → the neutral fallback ramp) reads as clean
+    // black ink while an authored teal-black does not. Fix it there, not by scaling the data.
     if (o.contains(QStringLiteral("flPaintRoughness"))) p.roughness = float(o.value(QStringLiteral("flPaintRoughness")).toDouble());
     if (o.contains(QStringLiteral("flPaintMetalness"))) p.metalness = float(o.value(QStringLiteral("flPaintMetalness")).toDouble());
     return p;

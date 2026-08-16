@@ -23,7 +23,14 @@ public:
     bool has(quint32 handle) const { return m_frames.contains(handle); }
 
     // Build (or load from cache) on a background thread. No-op if ready/in-progress.
-    void ensureBuilt(const QString& d4dataDir);
+    //
+    // `reader` is what makes ENCRYPTED atlases resolvable. The d4data scan below can only see
+    // atlases the snapshot ships a 2D*.tex.json for, so every collab/store atlas contributed zero
+    // handles and its cards rendered blank — the same shape of bug TexturesTab had, one layer up.
+    // With a reader, a second pass reads the game's own base/Misc/2D_table.dat (handle → atlas +
+    // frame) and the CASC texture tables (dimensions + format), neither of which needs d4data.
+    // Null reader keeps the old JSON-only behaviour.
+    void ensureBuilt(const QString& d4dataDir, CascReader* reader = nullptr);
     // Drop the in-memory index + delete the on-disk cache, so the next ensureBuilt rebuilds
     // from scratch. Called when the game build / d4data changes (stale-cache invalidation).
     void reset();

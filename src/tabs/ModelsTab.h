@@ -120,6 +120,9 @@ public:
 signals:
     void scanStatus(const QString& msg);   // merged background-scan status → the app's floating toast
     void filtersChanged();                 // combos / tag groups were rebuilt (meta ready) → mirrors re-sync
+    // Clicking a "Sold in" bundle → open it in the Catalogue. MainWindow routes this the same way
+    // it routes the Catalogue's own reveal requests, so nav history (Alt+Left) still works.
+    void revealBundleRequested(int storeProductSno);
 
 protected:
     bool eventFilter(QObject* obj, QEvent* ev) override;   // hover-hide tile captions
@@ -153,6 +156,9 @@ private:
     // TEXTURE PREVIEW channel strip (COLOR/ROUGHNESS/METAL/NORMAL/ALPHA/EMISSIVE).
     QImage decodeTexImage(const QString& texName, int texSno) const;  // BC → RGBA8888
     QImage baseColorForMaterial(const QString& matName);   // material → decoded BASE_COLOR
+    // The texture currently inside decodeTexImage, so a hardware fault during the panel fill can
+    // name it. Mutable: decodeTexImage is const and this is diagnostic state, not model state.
+    mutable int            m_decodingTexSno = 0;
     QImage normalForMaterial(const QString& matName);      // material → decoded NORMAL
     QImage ormForMaterial(const QString& matName);         // pack rough(G)/metal(B)/ao(R)
     QImage emissiveForMaterial(const QString& matName);    // material → decoded EMISSIVE
@@ -169,7 +175,8 @@ private:
     void   reapplyOverlays();            // re-push ALL overlay state (master gate + each box)
     // Shared row context-menu builders — list AND thumbnail grid compose from these,
     // so the two views can never drift apart again.
-    void   addRowImageActions(QMenu& menu, const QList<int>& snos);
+    // `clicked` = the single row the menu was opened on, for the one-image clipboard action.
+    void   addRowImageActions(QMenu& menu, const QList<int>& snos, int clicked);
     void   addRowExportCopyActions(QMenu& menu, const QList<int>& snos);
     // ── Viewport control panels — parity with the Wardrobe preview toolbar ──
     void   buildCameraPanel();     void toggleCameraPanel();     // FOV · angles · turntable · presets
@@ -249,13 +256,24 @@ private:
     // Quarantine the model, clear the guard, log it, and show a hint — all without
     // killing the process. `stage` is a short label for the log/overlay.
     void handleModelFault(int sno, const QString& name, const QString& stage);
-    QList<int> contextSnos(const QPoint& viewportPt) const; // selection, or row under cursor
+    // Selection, or the row under the cursor when that row is outside the selection. `view` must
+    // be the view the point came from — m_list and m_gridView have completely different geometry.
+    QList<int> contextSnos(class QAbstractItemView* view, const QPoint& viewportPt) const;
+    // The ONE row under the cursor, for single-subject actions (Load / preview, Copy image). Those
+    // used to take snos.first(), so with a multi-row selection they acted on the first SELECTED row
+    // rather than the one right-clicked. Falls back to fallback.first() off empty space.
+    int clickedSno(class QAbstractItemView* view, const QPoint& viewportPt,
+                   const QList<int>& fallback) const;
     void copyIconImage(int sno);                            // icon → clipboard
     void saveIconImages(const QList<int>& snos, bool chooseDir);   // icon(s) → PNG
     void saveTileImage(int tile, bool chooseDir);           // texture-preview tile → PNG
+    // applyLayout: group the run into subfolders per Settings ▸ Export ▸ Folder layout. True for
+    // the tab's own batch paths; FALSE for Bulk Extract, which has already grouped its items and
+    // would otherwise nest a second time (barbarian\barbarian\).
     void exportModels(const QVector<QPair<int, QString>>& models, const QString& dir,
                       const struct BatchSink* sink = nullptr,
-                      QStringList* failures = nullptr);   // "name — reason" per failure
+                      QStringList* failures = nullptr,
+                      bool applyLayout = true);           // "name — reason" per failure
     void setListIconSize(int px); // icon size + matching row height + column width
     void setGridThumbPx(int px);  // Grid thumbnail size (Ctrl+scroll), persisted
     void showColumnMenu(const QPoint& globalPos);   // table column show/hide menu (header + Columns button)
@@ -282,7 +300,19 @@ private:
     AnimParser::DecodedAnim decodeAnimByName(const QString& animName) const;   // decode only (no UI)
     AnimParser::DecodedAnim decodeAnimForSkeleton(const QString& animName,
                                                   const ModelGeometry& geo) const;   // batch variant
-    QStringList animClipsFor(int sno, const QString& nameLower) const;   // own + inherited clip names
+    // The REAL animation sources, kept separate because a gear piece owns none of its own and
+    // must be able to export with none. See util/AnimExportScope.h.
+    QStringList authoredAnimClips(int sno, const QString& nameLower) const;   // …and named in its family
+    QStringList setAnimClips(int sno, const QString& nameLower) const;    // …named outside it (IGC/Conv)
+    // NOT an export source — only the dedup baseline for baseAnimClips. See its definition.
+    QStringList ownAnimClips(int sno, const QString& nameLower) const;
+    QStringList baseAnimClips(int sno, const QString& nameLower) const;   // inherited base-rig clips
+    QStringList animClipsFor(int sno, const QString& nameLower,
+                             bool wantOriginal, bool wantSets, bool wantBase) const;   // union
+    // The clip names an export would embed, WITHOUT decoding — the one definition of the
+    // export scope's result, shared by the menu label, the panel header and the exporter.
+    QStringList plannedExportAnimNames(bool ignoreSelection = false) const;
+    QHash<QString, int> clipFrameMap(int sno, const QString& nameLower) const;  // clip → keyframes
     void collectExportAnims(QVector<AnimParser::DecodedAnim>& anims, QStringList& names) const;  // export scope
     void exportAnimationsOnly(bool toLast = false);   // rig + selected clips only (no mesh); toLast → remembered dir
     void tickAnimation();         // advance the playback frame
@@ -290,7 +320,13 @@ private:
     void updateCount();           // "N models" label
     void rebuildFilterChips();    // inline removable active-filter pills
     void updateIndexStatus();     // clear the transient (load/render) scan messages
-    void setScan(const QString& key, const QString& msg);   // set/clear a scan message → emit merged status
+    void setScan(const QString& key, const QString& msg);
+    // A one-shot completion message that CLEARS ITSELF. The bulk-export and anim-pull paths used to
+    // `emit scanStatus(...)` directly with a finished-message: MainWindow keys that into
+    // m_idxTabMsgs under "models" and, being non-empty, the floating toast showed it — with a
+    // spinner glyph — until something else happened to overwrite it. "Bulk extract: 40 exported"
+    // therefore sat on screen forever.
+    void flashScan(const QString& key, const QString& msg, int ms = 8000);   // set/clear a scan message → emit merged status
     void updateTabCounts();       // live (N) on each material/texture detail tab
 
     // ── Left column: filters + list ──
@@ -430,6 +466,8 @@ private:
     QToolButton*           m_detailBtn    = nullptr;   // "Detail maps" (dev-only)
     QToolButton*           m_physBtn      = nullptr;   // "Physics" (dev-only)
     QFrame*                m_camPanel     = nullptr;
+    // Re-reads the viewport into the Camera panel's Yaw/Pitch controls. Built with the panel.
+    std::function<void()>  m_camOrbitSync;
     QFrame*                m_lightPanel   = nullptr;
     QFrame*                m_shaderPanel  = nullptr;
     QFrame*                m_detailPanel  = nullptr;

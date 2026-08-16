@@ -717,7 +717,18 @@ bool ModelExporter::exportGlb(const ModelGeometry& geo, const QString& path,
                 QJsonArray samplers, channels;
 
                 // Time (input) accessor for `count` frames, with the required min/max.
+                //
+                // CACHED PER CLIP. This used to write a fresh timestamp array on every call, and
+                // it is called once per CHANNEL — up to three times per bone. On barM's 318-bone
+                // rig that is 954 byte-identical float arrays per clip, plus 954 accessors and 954
+                // bufferViews of JSON describing them, when every channel of a given key-count can
+                // share one. The timestamps depend only on (count, fps), both constant within a
+                // clip, so sharing is exact rather than an approximation: glTF explicitly permits
+                // several samplers to reference the same input accessor.
+                QHash<int, int> timeAccFor;   // key count → accessor index, this clip only
                 auto addTimeAcc = [&](int count) -> int {
+                    const auto hit = timeAccFor.constFind(count);
+                    if (hit != timeAccFor.constEnd()) return hit.value();
                     QVector<float> times(count);
                     for (int i = 0; i < count; ++i) times[i] = float(i) / fps;
                     const int acc = addFloatAcc(times, 1, "SCALAR");
@@ -725,6 +736,7 @@ bool ModelExporter::exportGlb(const ModelGeometry& geo, const QString& path,
                     a["min"] = QJsonArray{0.0};
                     a["max"] = QJsonArray{count > 0 ? double(count - 1) / double(fps) : 0.0};
                     accessors[acc] = a;
+                    timeAccFor.insert(count, acc);
                     return acc;
                 };
                 auto addChannel = [&](int node, const char* pathName, int inAcc, int outAcc) {

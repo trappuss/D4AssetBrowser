@@ -33,6 +33,11 @@ public:
     explicit BulkExtractorTab(ModelsTab* models, TexturesTab* textures, QWidget* parent = nullptr);
     void refresh() override;   // (re)populate the tag dropdowns + count when the appearance meta lands
 
+signals:
+    // "Export settings…" — MainWindow opens the shared dialog on its Export tab. Same route the
+    // Textures tab's "Options…" takes, so there is one dialog and one set of keys.
+    void exportSettingsRequested();
+
 protected:
     // Makes double-click a true *additive* toggle of a row's selection (see the .cpp for why the
     // pre-click snapshot is needed) without disturbing the rest of the Ctrl/Shift selection.
@@ -55,9 +60,41 @@ private:
     QVector<QPair<int, QString>> workSet();          // queued rows (manual) else all matches
     void syncExtractButtons();                      // label + enablement from the current work set
     void syncQueue();                               // reconcile the visible selection into the queue
+    void queueAllMatches();                         // queue EVERY match, including rows past the list cap
     void rebuildQueueWidget();                      // refill the queue list widget from m_queued
     void reflectQueueInList();                      // re-select the visible rows that are queued
     void saveQueue(int mode) const;                 // persist a mode's queue to settings
+    // Built-in query presets (class sets, weapons, global customization). Generated from
+    // ItemDef's hero-class table at runtime, so a new class extends them with no edit here.
+    struct FactoryPreset {
+        QString name;      // combo label
+        int     mode;      // 0 = models, 1 = textures
+        QString query;     // NAME-box text (may use the '|' OR syntax)
+        QStringList tags;  // funnel tag selection (ANDed unless tagOr)
+        bool    tagOr = false;
+        // Models mode only: also decode each model's matching textures into a "textures"
+        // subfolder. On for every MODEL preset — "all the files related to X" is the whole
+        // point of a preset, and a preset that silently depended on a checkbox you last
+        // touched days ago is not self-contained. (The checkbox now lives in Settings ▸ Export;
+        // applyFactoryPreset writes the key directly, exactly as toggling it used to.)
+        bool    coTex = false;
+    };
+    static const QVector<FactoryPreset>& factoryPresets();
+    void applyFactoryPreset(const FactoryPreset& p);
+    // Resolve an explicit query to matches. computeMatches() is this called with the current UI
+    // state; auditPresets() is this called once per built-in. One matcher, two callers.
+    QVector<QPair<int, QString>> matchesFor(bool texMode, const QString& nameText,
+                                            const QSet<QString>& texCats, const QString& facet,
+                                            const QSet<QString>& tags, bool tagOr, bool hideUnrend);
+
+public:
+    // Writes data\preset_audit.txt: one line per built-in preset with its match count. A preset
+    // that returns 0 (a typo in a pattern) or an implausible count (a pattern too loose) is
+    // otherwise indistinguishable from a working one until you extract it. Returns a one-line
+    // summary for the caller to log.
+    QString auditPresets();
+
+private:
     void loadQueueForMode(int mode);                // load a mode's persisted queue into m_queued
     void writeRunReport(const QString& dir, const QVector<QPair<int, QString>>& items) const;
     void showListMenu(const QPoint& pos);           // right-click menu on the matches list
@@ -66,7 +103,14 @@ private:
     void savePreset();
     void deletePreset();
     void loadPreset(const QString& name);
-    QString subfolderFor(int sno) const;     // organize: the item's tag value for the chosen group ("" = flat)
+    QString subfolderFor(int sno) const;
+    // export/folderLayout is mirrored in Settings ▸ Export ▸ Models, so this combo has to be
+    // re-pointed whenever the dialog changes it — two widgets, one key, never disagreeing.
+    // Re-point the mirrored layout combo when the Settings dialog changes export/folderLayout.
+    void onSettingsChanged() override { syncLayoutCombo(); }
+    void syncLayoutCombo();
+    void updateLayoutModeAvailability();
+    bool m_syncingLayout = false;   // suppress the write-back while syncLayoutCombo() sets the index     // organize: the item's tag value for the chosen group ("" = flat)
 
     ModelsTab*   m_models = nullptr;
     TexturesTab* m_textures = nullptr;
@@ -97,7 +141,6 @@ private:
     QRadioButton* m_onlyNew = nullptr;   // skip already-extracted (incremental)
     QRadioButton* m_overwrite = nullptr; // re-extract + overwrite existing
     QCheckBox*   m_showList = nullptr;  // "Pick items manually": enables selection into the queue
-    QCheckBox*   m_coTextures = nullptr;    // (models mode) also extract each model's textures as PNG
     QListWidget* m_list = nullptr;      // LEFT: every matched name (select to queue in manual mode)
     QListWidget* m_queue = nullptr;     // RIGHT: the queued items to extract
     QLabel*      m_listLbl = nullptr;   // "Matches (N)" header (centered)

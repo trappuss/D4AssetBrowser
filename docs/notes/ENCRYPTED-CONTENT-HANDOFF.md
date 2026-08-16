@@ -1,4 +1,4 @@
-# Encrypted (TACT) content — state and next steps
+﻿# Encrypted (TACT) content — state and next steps
 
 Written 2026-07-29. Goal: make encrypted content (Doom collab Praetor's Suits,
 seasonal store sets) browsable and renderable.
@@ -27,11 +27,43 @@ Measured from `d4data/json/base/EncryptedSNOs.dat.json` and `D4_DUMP_ENCRYPTED`:
 | Source | Verdict |
 |---|---|
 | `Appearance/<name>.app.json` self-name field | **None.** Walked every string in `BarF_stor212_BTS.app.json`; zero contain the stem. |
-| `EncryptedNameDict.dat.json` | **4 entries total.** Useless. |
+| `EncryptedNameDict.dat.json` (d4data's) | **4 entries. The verdict below was wrong** — see the correction. |
+| **`base/EncryptedNameDict-0x<key>.dat` (in CASC)** | **WORKS, and is authoritative.** 189 dicts, one per TACT key. |
 | Actor / Item / Cloth / Material payloads | **Zero** name-shaped strings: 0 of 102, 0 of 77, 0 of 146, 0 of 303. |
 | **Appearance payload (ClothData name field)** | **WORKS.** `necM_stor245_TRS_cape`, `palF_stor171_LEG_hipPlate`, `DruM_stor235_GLV_fur_HQO`, `spiM_stor190_HLM_main`. |
 
 `stor245` is the Doom set (`Chest_Cosmetic_Necro_245_stor`).
+
+### Correction (2026-08-02): the name dict is the real answer
+
+The "4 entries, useless" row above judged the wrong artefact. d4data's
+`json/base/EncryptedNameDict.dat.json` is not a merge of the dicts — `parse.js`
+writes that file from **inside** its per-file loop (`parse.js:212-243`), so every
+dict overwrites the previous one and the JSON only ever holds whichever it read
+last. The dicts themselves are complete.
+
+The game ships **189** `base/EncryptedNameDict-0x<keyName>.dat` files in the
+current build, each encrypted with the key it is named after, plus
+`base/EncryptedSNOs.dat` (sno -> group + key). Holding a TACT key therefore means
+holding the authored names of everything that key covers — we hold 8, worth
+~2,600 SNOs, including `f159f1f70eabaab1` (the Doom collab).
+
+Format, from `parse.js` and verified against the shipped files:
+
+    u32  magic = 0xABCD4567
+    u32  count
+    count x { i32 snoGroup, i32 snoId }
+    packed NUL-terminated names, same order as the table
+
+Implemented as `SnoIndex::applyEncryptedNameDicts`. It runs before
+`recoverEncryptedNames`, which stays as the fallback for pieces under keys we do
+not hold.
+
+This is why `barF_stor251_HLM/BTS/GLV` (snos 2519666-2519668) were invisible while
+`_TRS` and `_LEG` were not: only the latter two have cloth, so only they had a
+name the payload heuristic could reach. Four independent sources agreed the
+assets existed — d4analyzer exports them by name, and the SNOs sit in the middle
+of the same authored run — but nothing in CoreTOC named them.
 
 ### Also ruled out
 
@@ -55,8 +87,8 @@ this; now measured. Do not build on it.
 - Models tab: **"Only encrypted (TACT)"** filter, mutually exclusive with
   "Only decrypted". Backed by `CascReader::tactKeyFor` / `haveTactKey`
   (header-only BLTE frame probe, memoised in a memory-only hash).
-- `Dump Encrypted SNOs.bat` — `D4_DUMP_ENCRYPTED=1`, with a stale-binary guard.
-- `Check Encrypted Render.bat` — triages the render failure below.
+- `Dump - Encrypted SNOs.bat` — `D4_DUMP_ENCRYPTED=1`, with a stale-binary guard.
+- `Audit - Encrypted Render.bat` — triages the render failure below.
 
 **Partial by construction:** only cloth-bearing pieces carry a ClothData name, so
 this recovers capes/skirts/chests, not plain boots or gloves. Closing that gap by
@@ -127,7 +159,7 @@ appearances (which have no `.app.json`) can be textured. The binary already give
 the per-sub-object material ORDER at `ModelParser.cpp:356`; only the sno LIST is
 missing.
 
-Driven by `Dump Material SNO Table.bat` (builds + sweeps + reports, unattended).
+Driven by `Dump - Material SNO Table.bat` (builds + sweeps + reports, unattended).
 Scores a candidate rule against the JSON on ~63,700 named appearances.
 
 ### Established
@@ -249,7 +281,7 @@ names are already known before applying it to the rest.
    sub-objects on another buffer and lose them (`barF_base00` 14/31). The log
    still shows ~37 drops per session. `nVertOffset` is per-buffer relative, so
    dropping is the safe failure. Proper fix = decode each buffer with its own
-   layout and merge. Core geometry path — use `Cloth Audit.bat` as the regression
+   layout and merge. Core geometry path — use `Audit - Cloth.bat` as the regression
    net.
 
 3. **Optional: widen name recovery.** Only cloth-bearing pieces carry a ClothData

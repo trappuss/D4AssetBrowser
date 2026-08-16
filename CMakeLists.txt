@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.21)
 
 project(D4AssetBrowser
-    VERSION 2.1.0
+    VERSION 2.2.8
     DESCRIPTION "Native C++/Qt6 Diablo IV asset browser (d4analyzer code stack)"
     LANGUAGES CXX)
 
@@ -67,6 +67,7 @@ qt_add_executable(D4AssetBrowser WIN32
     src/model/AppearanceMatBin.h src/model/AppearanceMatBin.cpp
     src/tex/TextureDefTable.h   src/tex/TextureDefTable.cpp
     src/index/IconIndex.h       src/index/IconIndex.cpp
+    src/index/StoreProductIndex.h src/index/StoreProductIndex.cpp
     src/index/AssetLinks.h      src/index/AssetLinks.cpp
     src/index/ItemDef.h         src/index/ItemDef.cpp
     src/index/DadOverride.h     src/index/DadOverride.cpp
@@ -104,6 +105,7 @@ qt_add_executable(D4AssetBrowser WIN32
     src/deps/UpdateCheck.h      src/deps/UpdateCheck.cpp
 
     src/util/CsvCopy.h          src/util/CsvCopy.cpp
+    src/util/ProcQuiet.h
 
     src/tabs/BrowserTab.h
     src/tabs/PanelBox.h
@@ -119,6 +121,7 @@ qt_add_executable(D4AssetBrowser WIN32
     src/tabs/WardrobeTab2_Panels.cpp
     src/tabs/MarkingCompose.h   src/tabs/MarkingCompose.cpp
     src/tabs/StableTab2.h       src/tabs/StableTab2.cpp
+    src/tabs/CatalogueTab.h     src/tabs/CatalogueTab.cpp
     src/tabs/BulkExtractorTab.h src/tabs/BulkExtractorTab.cpp
 )
 

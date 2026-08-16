@@ -25,6 +25,7 @@
 #include <thread>
 #include <vector>
 #include <QUrl>  // partExportFlags (outliner camera toggles)
+#include "model/MaterialDecode.h"
 #include "model/ModelExporter.h"
 #include "model/ModelGeometry.h"
 #include "model/ModelParser.h"
@@ -45,6 +46,7 @@
 #include <QFile>
 #include <QFileDialog>
 #include <QFileInfo>
+#include <QElapsedTimer>
 #include <QHash>
 #include <QJsonArray>
 #include <QJsonDocument>
@@ -59,6 +61,10 @@
 #include <QPushButton>
 #include <QSet>
 #include <QSettings>
+#include <QTextStream>
+#include "util/AnimExportScope.h"   // which animation sources this run embeds
+// Folder layout for a multi-model run, shared with Bulk Extract.
+#include "util/ExportLayout.h"
 #include <QShortcut>
 #include <QString>
 #include <QStringList>
@@ -70,16 +76,53 @@
 
 // Defined (external linkage) in ModelsTab.cpp — the default-look material roster + the .glb material
 // builder, shared by single and batch export.
-QStringList appearancePalette(const QString& d4, const QString& name);
+// reader/idx/sno let it fall back to the CASC meta binary when there is no .app.json — without
+// them an encrypted or newly-patched appearance yields an empty palette and exports untextured.
+QStringList appearancePalette(const QString& d4, const QString& name,
+                              CascReader* reader = nullptr, const SnoIndex* idx = nullptr,
+                              qint64 sno = 0);
 QVector<ModelExporter::ExportMaterial> buildExportMats(
     const QStringList& palette, const ModelGeometry& geo, const QString& modelName,
     const QString& d4, CascReader* reader, bool wantTex);
 
 // ── File-local export helpers (used only in this TU) ──────────────────────────
 
+// Appearance group id. kGroupAppearance is file-local to ModelsTab.cpp and not visible here,
+// so it is repeated rather than reached for — the alternative is exporting a constant purely
+// to share a 9.
+constexpr int kApprGroup = 9;
+
+// Opposite-gender twin of a D4 appearance name, or empty when there isn't one.
+// Names encode gender as the 4th character of the class prefix: barF_stor23_TRS ↔ barM_stor23_TRS.
+// Case is preserved so the twin matches the index's own spelling.
+static QString genderTwinName(const QString& name)
+{
+    if (name.size() < 4) return {};
+    const QChar g = name.at(3);
+    const QChar lower = g.toLower();
+    if (lower != QLatin1Char('m') && lower != QLatin1Char('f')) return {};
+    QString twin = name;
+    const QChar other = (lower == QLatin1Char('m')) ? QLatin1Char('f') : QLatin1Char('m');
+    twin[3] = g.isUpper() ? other.toUpper() : other;
+    return twin;
+}
+
+
 // Export the raw source files a model depends on — its .app payload plus each material's
 // .tex textures — into `destDir`. These are the BLTE-decoded game payloads (the same bytes
 // the tool reads) written with the conventional extension: the source assets behind the .glb.
+// Raw source files (.app + every .tex its materials reference) into `destDir`.
+//
+// destDir is now ONE "deps" folder per output folder, shared by every model written beside it,
+// rather than a "<model>_deps" folder each. That is what makes it follow the Bulk Extract layout:
+// Flat puts every model's sources in <out>/deps, by-Class in <out>/<Class>/deps, and by-Model in
+// <out>/<model>/deps — which is the per-model layout the old code hardcoded, now reachable by
+// choosing it rather than imposed on all three.
+//
+// Sharing the folder deduplicates: models in a run reference the same textures constantly, and a
+// .tex already on disk is the same bytes whoever asked for it, so it is skipped rather than
+// rewritten. The .app files stay per-model and name their own materials, so which model pulled
+// what is still recoverable.
 static void exportModelDeps(quint64 modelSno, const QString& modelName,
                             const QStringList& palette, const QString& d4,
                             CascReader* reader, const QString& destDir)
@@ -91,6 +134,12 @@ static void exportModelDeps(quint64 modelSno, const QString& modelName,
         QFile f(QDir(destDir).filePath(modelName + QStringLiteral(".app")));
         if (f.open(QIODevice::WriteOnly)) f.write(app);
     }
+    // One deps folder is now shared by every model in an output folder, and processItem() runs on a
+    // thread pool — so two workers can reach the same .tex path at once. The check-then-write below
+    // is a TOCTOU: open(WriteOnly) truncates, so the loser sees size 0, decides the file is missing,
+    // and both write over each other. Serialised here rather than by forcing par=1, because this
+    // holds only for the length of one file write and the decode work stays parallel.
+    static QMutex depsMx;
     QSet<qint64> doneTex;
     QSet<QString> seenMat;
     for (const QString& matName : palette) {
@@ -101,61 +150,362 @@ static void exportModelDeps(quint64 modelSno, const QString& modelName,
         for (const MatTexture& mt : parseMaterialJson(mf.readAll())) {
             if (mt.texSno == 0 || doneTex.contains(mt.texSno)) continue;
             doneTex.insert(mt.texSno);
-            const QByteArray tex = reader->readPayloadBySno(quint64(mt.texSno));
-            if (tex.isEmpty()) continue;
             const QString tn = mt.texName.isEmpty() ? QStringLiteral("tex_%1").arg(mt.texSno) : mt.texName;
-            QFile tf(QDir(destDir).filePath(tn + QStringLiteral(".tex")));
-            if (tf.open(QIODevice::WriteOnly)) tf.write(tex);
+            const QString tp = QDir(destDir).filePath(tn + QStringLiteral(".tex"));
+            // Checked BEFORE the CASC read: written by an earlier model in this same folder means
+            // identical payload, so both the read and the write are pure cost. This is the dedup
+            // that sharing one deps folder buys.
+            //
+            // Size, not mere existence. QFile::open(WriteOnly) creates and truncates first, so a run
+            // killed mid-write leaves a 0-byte .tex — and an existence test would then treat that
+            // corpse as done forever, in every later run, with nothing in the log. Anything non-empty
+            // is a complete payload, because the write is a single call.
+            {
+                QMutexLocker lock(&depsMx);
+                if (QFileInfo(tp).size() > 0) continue;
+                const QByteArray tex = reader->readPayloadBySno(quint64(mt.texSno));
+                if (tex.isEmpty()) continue;
+                QFile tf(tp);
+                if (tf.open(QIODevice::WriteOnly)) tf.write(tex);
+            }
         }
     }
 }
 
-// ── Fit-reference body (Settings ▸ Export ▸ Retarget & modding) ──────────────
-// Append the matching base body mesh (e.g. "barF_base00" for "BarF_base14_TRS",
-// resolved from the piece's name prefix) under exported player armor, as a separate
-// "__fitReference" material. Joints are remapped by bone-name hash onto the piece's
-// skeleton — requires a genuinely shared rig (≥50 matching bones), so weapons,
-// monsters and props pass through untouched. Runs BEFORE the retarget transforms so
-// the reference body participates in cloth-collapse / anchor-remap like everything else.
-static bool appendFitReferenceBody(CascReader* reader, SnoListModel* list,
-                                   const QString& pieceName, ModelGeometry& geo)
+// ── Loose textures beside the model (Settings ▸ Export ▸ Model export) ───────
+// Writes each material's maps as PNGs into `<dir>/textures/`, named
+// <model>_<material>_<map>.png.
+//
+// ADDITIVE, never a substitute: the .glb keeps its embedded copies, so the file stays
+// self-contained and drag-and-drop into Blender behaves exactly as before. Turning this on can
+// therefore never break an existing workflow — the worst case is unused files on disk. That is the
+// whole reason it does not attempt to rewrite the glTF to reference external URIs, which would
+// change what a .glb IS and break every caller that assumes it is standalone.
+//
+// Costs nothing extra: these QImages were already decoded to be embedded, so this is a re-save,
+// not a second decode. Skips silently when the setting is off or nothing was resolved — with
+// "include textures" off there are no images to write, which is correct rather than an error.
+// Write the material textures as loose PNGs beside the .glb.
+//
+// TWO SCOPES, because "the textures for this model" has two honest answers:
+//
+//   export/looseTextures     the four maps the .glb itself uses — basecolor / normal / orm /
+//                            emissive, as COMPOSITED for glTF. Written to textures\.
+//   export/looseTexturesAll  EVERY texture the materials reference, as the GAME stores them.
+//                            D4 binds up to ten per material: the four above plus up to three
+//                            tiled detail normals, their detail roughness maps, translucency, a
+//                            cutout mask, the dye mask and a dye ramp. glTF has no slot for any of
+//                            the latter, so files are the only way they leave the tool. Written to
+//                            textures\material_maps\.
+//
+// INDEPENDENT, not nested. Either one alone produces output — asking for every material map is a
+// complete request on its own, and making it wait on the other setting would be a switch that
+// silently does nothing. Separate folders because the two sets overlap by ROLE (both contain a
+// normal map) but not by content: one is reconstructed for glTF, the other is the raw game map.
+// Sharing a folder meant whichever was written first won and the other was silently dropped.
+//
+// Read through MaterialDecode::texturesFor(), which its own header calls the only correct way to
+// read a material's textures (it prefers the .mat.json and falls back to the binary, so encrypted
+// and snapshot-missing materials still resolve). Names carry the shader ROLE, and a manifest
+// records slot, role, SNO and the per-map UV tiling — detail maps tile 8-20x, so a bare PNG
+// without its scale is not reconstructable.
+static void writeLooseTextures(const QVector<ModelExporter::ExportMaterial>& mats,
+                               const QString& dir, const QString& modelName,
+                               CascReader* reader, const QString& d4)
+{
+    const bool four = QSettings().value(QStringLiteral("export/looseTextures"), false).toBool();
+    const bool all  = QSettings().value(QStringLiteral("export/looseTexturesAll"), false).toBool();
+    if ((!four && !all) || mats.isEmpty() || dir.isEmpty()) return;
+    const QString texDir = QDir(dir).filePath(QStringLiteral("textures"));
+    const QString rawDir = QDir(texDir).filePath(QStringLiteral("material_maps"));
+    int written = 0, extra = 0;
+    QSet<QString> done;   // one material can appear at several indices; write each map once
+    // Two materials on one model routinely bind the SAME texture — one packed map serving both
+    // ROUGHNESS and METALLIC, a shared detail map, a shared dye ramp. The filename carries the
+    // material name, so each of those is a separate file, and each used to pay its own decode and
+    // its own PNG encode for identical bytes.
+    //
+    // Both files are still written: skipping the second one loses a map that a consumer looking for
+    // <model>_<material>_metallic.png expects, and textures.txt is truncated per model in a batch
+    // so the row pointing at the other file would not survive the run either. What is shared is the
+    // WORK — encode once, write the same bytes twice. The output is byte-for-byte what it was.
+    // Keyed on sno AND name, matching MaterialDecode::texture()'s own cache key — NOT on the sno
+    // alone. One sno can decode two different ways: a material with a .mat.json supplies a real
+    // texture name and the dimensions come from <name>.tex.json, while an encrypted material takes
+    // the binary route with an empty name and the dimensions come from the CASC texture tables,
+    // after a payload redirect. Keying on the sno would let the first spelling's bytes be written
+    // under the second's filename — the same collision texture()'s key exists to prevent.
+    // Remembers the FILENAME each texture was first written to, not its bytes. The duplicate is
+    // then produced with a file copy, which costs no memory at all and beats re-running the PNG
+    // compressor on a 2048² map by an order of magnitude.
+    //
+    // This started out holding the encoded bytes, capped at 32 MB per call. That cap was the wrong
+    // shape: writeLooseTextures() runs on up to 16 export-pool threads at once, so the honest
+    // worst case was half a gigabyte of PNG buffers held to avoid an encode. A few short strings
+    // and a QFile::copy do the same job.
+    QHash<QString, QString> fileByTex;
+    int reused = 0;
+    QStringList manifest;
+
+    // `sno` > 0 opts into the encode cache: the raw-map pass passes the texture's sno, the
+    // composited four-map pass passes 0 because its images are built per material and share no
+    // identity. Encoding to bytes rather than straight to a file is what lets the second write of
+    // the same texture skip the PNG compressor.
+    auto save = [&](const QImage& img, const QString& intoDir, const QString& base,
+                    const QString& suffix, const QString& texKey = QString()) {
+        if (img.isNull()) return QString();
+        const QString fn = QStringLiteral("%1_%2_%3.png").arg(modelName, base, suffix);
+        const QString key = intoDir + QLatin1Char('|') + fn;
+        if (done.contains(key)) return QString();
+        done.insert(key);
+        QDir().mkpath(intoDir);   // only reached when there is content to put in it
+        const QString path = QDir(intoDir).filePath(fn);
+        // Same texture, second material, second filename: copy the file we already wrote. Identical
+        // bytes, no encode, no buffer. QFile::copy will not overwrite, so clear any stale file from
+        // an earlier run first — the export otherwise silently keeps the old one.
+        if (!texKey.isEmpty()) {
+            const auto it = fileByTex.constFind(texKey);
+            if (it != fileByTex.constEnd()) {
+                QFile::remove(path);
+                if (!QFile::copy(QDir(intoDir).filePath(it.value()), path)) return QString();
+                ++reused; ++written;
+                return fn;
+            }
+        }
+        if (!img.save(path, "PNG")) return QString();
+        if (!texKey.isEmpty()) fileByTex.insert(texKey, fn);
+        ++written;
+        return fn;
+    };
+
+    for (const ModelExporter::ExportMaterial& em : mats) {
+        const QString base = em.name.isEmpty() ? modelName : em.name;
+        if (four) {
+            const struct { const QImage* img; const char* suffix; } kMaps[] = {
+                {&em.baseColor, "basecolor"}, {&em.normal, "normal"},
+                {&em.orm,       "orm"},       {&em.emissive, "emissive"},
+            };
+            for (const auto& mp : kMaps) save(*mp.img, texDir, base, QLatin1String(mp.suffix));
+        }
+
+        if (!all || em.name.isEmpty() || !reader) continue;
+        // Every remaining bound texture, by role. Decoded here rather than reused from the four
+        // above because those have been composited for glTF (ORM packed, normal reconstructed) —
+        // these are the maps as the game stores them.
+        for (const MatTexture& mt : MaterialDecode::texturesFor(reader, d4, em.name)) {
+            QString role = mt.role.isEmpty() ? QStringLiteral("slot%1").arg(mt.slot) : mt.role.toLower();
+            role.replace(QLatin1Char(' '), QLatin1Char('_'));
+            const QImage img = MaterialDecode::texture(reader, d4, mt.texName, mt.texSno);
+            if (img.isNull()) continue;
+            // Roles repeat (three DETAIL_NORMAL slots), so disambiguate rather than overwrite.
+            QString suffix = role;
+            for (int n = 2; done.contains(rawDir + QLatin1Char('|')
+                     + QStringLiteral("%1_%2_%3.png").arg(modelName, base, suffix)); ++n)
+                suffix = QStringLiteral("%1_%2").arg(role).arg(n);
+            const QString fn = save(img, rawDir, base, suffix,
+                                    QString::number(mt.texSno) + QLatin1Char('|') + mt.texName);
+            if (fn.isEmpty()) continue;
+            ++extra;
+            manifest << QStringLiteral("%1\t%2\tslot=%3\trole=%4\tsno=%5\tuScale=%6\tvScale=%7\t%8")
+                            .arg(fn, em.name).arg(mt.slot).arg(mt.role.isEmpty() ? QStringLiteral("?") : mt.role)
+                            .arg(mt.texSno).arg(mt.uScale).arg(mt.vScale).arg(mt.texName);
+        }
+    }
+
+    if (!manifest.isEmpty()) {
+        QFile mf(QDir(rawDir).filePath(QStringLiteral("textures.txt")));
+        if (mf.open(QIODevice::WriteOnly | QIODevice::Text)) {
+            QTextStream ts(&mf);
+            ts << "file\tmaterial\tslot\trole\tsno\tuScale\tvScale\ttexture\n";
+            for (const QString& l : manifest) ts << l << '\n';
+        }
+    }
+    // Says so either way — a silent zero here reads as "the setting does nothing".
+    qInfo("export: loose textures — %d file(s) for %s (%d material maps%s)%s",
+          written, qUtf8Printable(modelName), extra,
+          reused ? qUtf8Printable(QStringLiteral(", %1 copied instead of re-encoded").arg(reused))
+                 : "",
+          written ? "" : " (nothing resolved; is 'include textures' on?)");
+}
+
+// ── Base body ("Include base body", Settings ▸ Export ▸ Model export) ────────────────────────────
+//
+// Joints are remapped by bone-name hash onto the piece's skeleton — requires a genuinely shared rig
+// (≥50 matching bones), so weapons, monsters and props pass through untouched. Runs BEFORE the
+// retarget transforms, so the body participates in cloth-collapse / anchor-remap like everything
+// else in the file.
+//
+// THE NUDE BODY IS THE test999 SUITE, not <class><gender>_base00.
+//
+// Measured in d4data: barF_test999_TRS carries exactly ONE material, `armor_skin_mat` — bare skin.
+// barF_base00 carries barF_base00_BTS_mat / _LEG_mat / _TRS_mat, barbarianF_wrath_mat, a hair
+// material, fur meshes, fx meshes and sim cages: it is the class's fully-dressed default rig, not
+// a body. Appending THAT under an armour piece is what put a whole untextured barbarian in the
+// file — the bug this rewrite fixes, not a cosmetic rename.
+//
+// The suite is four slots (TRS/GLV/LEG/BTS) per class+gender; there is no test999 head, so the
+// reference is body-only, which is what a fit check wants.
+//
+// All four are merged into ONE primitive under a single `__baseBody` material, so in Blender it
+// arrives as one material slot you can select and delete in a single action instead of four.
+static bool appendBaseBody(CascReader* reader, SnoListModel* list,
+                           const QString& pieceName, ModelGeometry& geo)
 {
     if (!reader || !reader->isReady() || !list || geo.skeleton.isEmpty())
         return false;
     const int us = pieceName.indexOf(QLatin1Char('_'));
     if (us <= 0)
         return false;
-    const QString bodyName = pieceName.left(us) + QStringLiteral("_base00");
-    if (pieceName.compare(bodyName, Qt::CaseInsensitive) == 0)
-        return false;                                   // exporting the body itself
-    int sno = -1;
-    for (int r = 0; r < list->rowCount(); ++r)
-        if (const SnoEntry* e = list->entryAt(r))
-            if (e->name.compare(bodyName, Qt::CaseInsensitive) == 0) { sno = e->snoId; break; }
-    if (sno < 0)
+    const QString prefix = pieceName.left(us);          // "barF", "sorM", …
+    if (pieceName.contains(QLatin1String("_test999"), Qt::CaseInsensitive))
+        return false;                                   // exporting the base body itself
+
+    // Resolve the suite by name. Missing slots are skipped rather than fatal: a class that ships
+    // only some of them still gets a usable reference.
+    static const char* kSlots[] = {"TRS", "GLV", "LEG", "BTS"};
+    QVector<int> snos;
+    for (const char* slot : kSlots) {
+        const QString want = prefix + QStringLiteral("_test999_") + QString::fromLatin1(slot);
+        for (int r = 0; r < list->rowCount(); ++r)
+            if (const SnoEntry* e = list->entryAt(r))
+                if (e->name.compare(want, Qt::CaseInsensitive) == 0) { snos << e->snoId; break; }
+    }
+    if (snos.isEmpty()) {
+        qInfo("export: base body — no %s_test999_* pieces in the index; nothing appended",
+              qUtf8Printable(prefix));
         return false;
-    ModelGeometry body;   // guarded: parsing an arbitrary reference-body appearance
-    if (!seh::runGuarded("fitBody", [&]() {
-            body = ModelParser::parseApp(reader->readMetaBySno(quint64(sno)),
-                                         reader->readPayloadBySno(quint64(sno))); }))
-        return false;
-    if (!body.valid || body.skeleton.isEmpty() || body.primitives.isEmpty())
-        return false;
+    }
+
     QHash<quint32, int> byHash;
     for (int i = 0; i < geo.skeleton.size(); ++i)
         byHash.insert(geo.skeleton[i].nameHash, i);
-    QVector<int> map(body.skeleton.size(), -1);
+
+    MeshPrimitive merged;
+    merged.materialName  = QStringLiteral("__baseBody");
+    merged.materialIndex = -1;                          // plain default material in the .glb
+    int usedPieces = 0;
+    for (int sno : snos) {
+        ModelGeometry body;   // guarded: parsing an arbitrary reference-body appearance
+        if (!seh::runGuarded("baseBody", [&]() {
+                body = ModelParser::parseApp(reader->readMetaBySno(quint64(sno)),
+                                             reader->readPayloadBySno(quint64(sno))); }))
+            continue;
+        if (!body.valid || body.skeleton.isEmpty() || body.primitives.isEmpty())
+            continue;
+        QVector<int> map(body.skeleton.size(), -1);
+        int shared = 0;
+        for (int i = 0; i < body.skeleton.size(); ++i) {
+            map[i] = byHash.value(body.skeleton[i].nameHash, -1);
+            if (map[i] >= 0) ++shared;
+        }
+        if (shared < 50) continue;                      // not the same rig family
+        ++usedPieces;
+        for (const MeshPrimitive& p : body.primitives) {
+            // Concatenate into the single primitive: indices shift by the running vertex count.
+            const quint32 base = quint32(merged.vertices.size());
+            for (MeshVertex v : p.vertices) {
+                float sum = 0.0f;
+                for (int k = 0; k < 4; ++k) {
+                    const int nj = (v.weights[k] > 0.0f && v.joints[k] < map.size())
+                                       ? map[v.joints[k]] : -1;
+                    if (nj < 0) { v.weights[k] = 0.0f; v.joints[k] = 0; }
+                    else        { v.joints[k] = quint16(nj); sum += v.weights[k]; }
+                }
+                if (sum > 1e-6f)
+                    for (int k = 0; k < 4; ++k) v.weights[k] /= sum;
+                merged.vertices.append(v);
+            }
+            for (quint32 idx : p.indices) merged.indices.append(base + idx);
+            merged.doubleSided = merged.doubleSided || p.doubleSided;
+        }
+    }
+    // Never a silent zero: "the setting did nothing" and "the setting is off" must not look alike.
+    if (merged.vertices.isEmpty() || merged.indices.isEmpty()) {
+        qInfo("export: base body — %s_test999_* resolved %lld piece(s) but produced no geometry "
+              "(rig mismatch, or the pieces failed to parse)",
+              qUtf8Printable(prefix), qint64(snos.size()));
+        return false;
+    }
+    geo.primitives.append(merged);
+    qInfo("export: base body — %s_test999 merged %d piece(s), %lld verts, into one \"__baseBody\" "
+          "primitive", qUtf8Printable(prefix), usedPieces, qint64(merged.vertices.size()));
+    return true;
+}
+
+// ── Base head ("Include base head", Settings ▸ Export ▸ Model export) ────────────────────────────
+//
+// The head lives in the appearance <class><gender>_P00 (measured: barF_P00 carries barF_P00_HED,
+// barF_P00_BOD, base_teethtongue_mat, global_eyeball_mat, Global_Eyelashes_F00_mat,
+// Global_Eyeshadow_00_mat and a facial-hair mesh). Only the "_HED" submesh is taken: the rest is
+// teeth, tongue, eyeballs, lashes, eyeshadow, stubble and a duplicate body — invisible in game
+// behind the face, but very much in the way on a bare reference. That is the same rule the
+// Wardrobe's untextured-character export uses (headCore, not hed), kept deliberately identical.
+//
+// Submesh identity comes from the MATERIAL ROSTER, not from MeshPrimitive::materialName: the
+// parser only stores "Material_<index>", so filtering on the primitive's own string would match
+// nothing and silently produce an empty head.
+static bool appendBaseHead(CascReader* reader, SnoListModel* list, const SnoIndex* index,
+                           const QString& pieceName, ModelGeometry& geo)
+{
+    if (!reader || !reader->isReady() || !list || geo.skeleton.isEmpty())
+        return false;
+    const int us = pieceName.indexOf(QLatin1Char('_'));
+    if (us <= 0)
+        return false;
+    const QString prefix = pieceName.left(us);
+    // druM ships as "druM_newModel_P00"; every other class is "<prefix>_P00".
+    const QStringList candidates{prefix + QStringLiteral("_P00"),
+                                 prefix + QStringLiteral("_newModel_P00")};
+    if (candidates.contains(pieceName, Qt::CaseInsensitive))
+        return false;                                   // exporting the head appearance itself
+    int sno = -1; QString headName;
+    for (const QString& want : candidates) {
+        for (int r = 0; r < list->rowCount(); ++r)
+            if (const SnoEntry* e = list->entryAt(r))
+                if (e->name.compare(want, Qt::CaseInsensitive) == 0) {
+                    sno = e->snoId; headName = e->name; break;
+                }
+        if (sno >= 0) break;
+    }
+    if (sno < 0) {
+        qInfo("export: base head — no %s_P00 appearance in the index; nothing appended",
+              qUtf8Printable(prefix));
+        return false;
+    }
+    ModelGeometry head;   // guarded: parsing an arbitrary head appearance
+    if (!seh::runGuarded("baseHead", [&]() {
+            head = ModelParser::parseApp(reader->readMetaBySno(quint64(sno)),
+                                         reader->readPayloadBySno(quint64(sno))); }))
+        return false;
+    if (!head.valid || head.skeleton.isEmpty() || head.primitives.isEmpty())
+        return false;
+    const QStringList pal = appearancePalette(Config::d4dataDir(), headName, reader, index, sno);
+
+    QHash<quint32, int> byHash;
+    for (int i = 0; i < geo.skeleton.size(); ++i)
+        byHash.insert(geo.skeleton[i].nameHash, i);
+    QVector<int> map(head.skeleton.size(), -1);
     int shared = 0;
-    for (int i = 0; i < body.skeleton.size(); ++i) {
-        map[i] = byHash.value(body.skeleton[i].nameHash, -1);
+    for (int i = 0; i < head.skeleton.size(); ++i) {
+        map[i] = byHash.value(head.skeleton[i].nameHash, -1);
         if (map[i] >= 0) ++shared;
     }
-    if (shared < 50)
-        return false;                                   // not the same rig family
-    for (MeshPrimitive p : body.primitives) {           // copy each primitive
-        p.materialName  = QStringLiteral("__fitReference");
-        p.materialIndex = -1;                           // plain default material in the .glb
-        for (MeshVertex& v : p.vertices) {
+    if (shared < 50) {
+        qInfo("export: base head — %s shares only %d bone(s) with %s; not the same rig, skipped",
+              qUtf8Printable(headName), shared, qUtf8Printable(pieceName));
+        return false;
+    }
+
+    MeshPrimitive merged;
+    merged.materialName  = QStringLiteral("__baseHead");
+    merged.materialIndex = -1;
+    int kept = 0;
+    for (const MeshPrimitive& p : head.primitives) {
+        const QString mat = pal.value(p.materialIndex);
+        if (!mat.contains(QLatin1String("_HED"), Qt::CaseInsensitive)) continue;   // head mesh only
+        ++kept;
+        const quint32 base = quint32(merged.vertices.size());
+        for (MeshVertex v : p.vertices) {
             float sum = 0.0f;
             for (int k = 0; k < 4; ++k) {
                 const int nj = (v.weights[k] > 0.0f && v.joints[k] < map.size())
@@ -165,9 +515,22 @@ static bool appendFitReferenceBody(CascReader* reader, SnoListModel* list,
             }
             if (sum > 1e-6f)
                 for (int k = 0; k < 4; ++k) v.weights[k] /= sum;
+            merged.vertices.append(v);
         }
-        geo.primitives.append(p);
+        for (quint32 idx : p.indices) merged.indices.append(base + idx);
+        merged.doubleSided = merged.doubleSided || p.doubleSided;
     }
+    if (merged.vertices.isEmpty()) {
+        // Distinguish "no roster" from "roster with no _HED": the first is a data/decrypt problem,
+        // the second means the naming convention moved and this rule needs revisiting.
+        qInfo("export: base head — %s parsed %lld submesh(es) but none matched \"_HED\" (%s)",
+              qUtf8Printable(headName), qint64(head.primitives.size()),
+              pal.isEmpty() ? "material roster is EMPTY" : "roster present");
+        return false;
+    }
+    geo.primitives.append(merged);
+    qInfo("export: base head — %s kept %d \"_HED\" submesh(es), %lld verts, as \"__baseHead\"",
+          qUtf8Printable(headName), kept, qint64(merged.vertices.size()));
     return true;
 }
 
@@ -283,8 +646,15 @@ void ModelsTab::exportCurrentModelGlb(const QVector<int>& keep, const QString& l
         return;
     QSettings().setValue(QStringLiteral("models/lastExportDir"), QFileInfo(path).absolutePath());
 
-    if (QSettings().value(QStringLiteral("retarget/fitReference"), false).toBool())
-        appendFitReferenceBody(m_reader, m_listModel, m_curName, geo);
+    if (QSettings().value(QStringLiteral("export/includeBaseBody"), false).toBool())
+        appendBaseBody(m_reader, m_listModel, m_curName, geo);
+    if (QSettings().value(QStringLiteral("export/includeBaseHead"), false).toBool())
+        appendBaseHead(m_reader, m_listModel, m_index, m_curName, geo);
+
+    // Same cache as the batch path. One model, but buildExportMats() decodes once per palette
+    // SLOT rather than per distinct material, and every empty slot resolves to the same fallback
+    // material — so even a single export repeats work. writeLooseTextures() below is inside it too.
+    MaterialDecode::TextureCacheScope texCache;
 
     // Active-look roster (index == materialIndex), so the export matches the preview.
     const QStringList palette(m_appMatNames.begin(), m_appMatNames.end());
@@ -310,20 +680,56 @@ void ModelsTab::exportCurrentModelGlb(const QVector<int>& keep, const QString& l
         return;
     }
 
-    // Optionally dump the raw source files (.app + .tex) into a "<name>_deps" subfolder.
+    // Same textures\ folder the batch path writes, so a single export and a bulk export of the
+    // same piece produce the same layout.
+    writeLooseTextures(mats, QFileInfo(path).dir().path(),
+                       m_curName.isEmpty() ? QFileInfo(path).completeBaseName() : m_curName,
+                       m_reader, Config::d4dataDir());
+
+    // Optionally dump the raw source files (.app + .tex) into a "deps" subfolder beside the .glb —
+    // the same folder name and the same shared-folder rule the batch path uses, so a single export
+    // and a bulk export of the same piece produce the same layout.
     if (QSettings().value(QStringLiteral("export/withDeps"), false).toBool())
         exportModelDeps(quint64(m_curSno), m_curName, palette, d4, m_reader,
-                        QFileInfo(path).dir().filePath(m_curName + QStringLiteral("_deps")));
+                        QFileInfo(path).dir().filePath(QStringLiteral("deps")));
 
     int tris = 0;
     for (const MeshPrimitive& p : geo.primitives) tris += p.indices.size() / 3;
     const bool remapNote = !anims.isEmpty()
         && QSettings().value(QStringLiteral("retarget/remapWeights"), false).toBool();
     ExportNotifier::instance().notify(
-        QStringLiteral("Exported %1  ·  %2 parts, %3 tris%4")
+        QStringLiteral("Exported %1  ·  %2 parts, %3 tris%4%5")
             .arg(QFileInfo(path).fileName()).arg(geo.primitives.size()).arg(tris)
-            .arg(remapNote ? QStringLiteral("  (rig reduced to 26 bones)") : QString()),
+            .arg(remapNote ? QStringLiteral("  (rig reduced to 26 bones)") : QString(),
+                 ExportNotifier::glbOptionsLine(opt)),
         QFileInfo(path).absolutePath());
+
+    // ── Opposite-gender twin ──────────────────────────────────────────────────────────────────
+    // This is the SINGLE-model path — Ctrl+E, "Export to…", and every context-menu export — so it
+    // needs its own hook; the batch expansion in exportModels() never sees these.
+    //
+    // Routed through exportModels() rather than re-implementing the export: the twin is a
+    // different appearance that is not currently loaded, and exportModels already knows how to
+    // parse one from its SNO and apply every export setting to it. The bothGenders check there
+    // will not re-expand this list, because the twin's own twin is the model just written and is
+    // filtered out as already present.
+    if (QSettings().value(QStringLiteral("export/bothGenders"), false).toBool() && m_index) {
+        const QString twin = genderTwinName(m_curName);
+        if (!twin.isEmpty()) {
+            int tsno = 0;
+            for (const SnoEntry& e : m_index->entries(kApprGroup))
+                if (e.name.compare(twin, Qt::CaseInsensitive) == 0) { tsno = e.snoId; break; }
+            if (tsno > 0)
+                // applyLayout=false: this is the SINGLE-model path. The twin belongs beside the
+                // model the user actually exported, not in a subfolder of its own — grouping a pair
+                // is the surprise ExportLayout's header says single exports must never spring.
+                exportModels({{tsno, twin}}, QFileInfo(path).absolutePath(), nullptr, nullptr,
+                             /*applyLayout*/ false);
+            else
+                qInfo("export: both-genders — no twin '%s' in the index; exported %s alone",
+                      qPrintable(twin), qPrintable(m_curName));
+        }
+    }
 }
 
 // Batch-export a set of (sno, name) models to a folder, honoring the Tex/Anim
@@ -338,7 +744,15 @@ void ModelsTab::exportCurrentModelGlb(const QVector<int>& keep, const QString& l
 void ModelsTab::bulkExport(const QVector<QPair<int, QString>>& items, const QString& dir, bool onlyNew,
                            const BatchSink* sink)
 {
-    if (items.isEmpty() || dir.isEmpty()) return;
+    // Say so on the way out. A caller that resolved nothing — a Catalogue bundle whose items did
+    // not map, a filter that matched none — otherwise gets a completely silent no-op, which reads
+    // as "the export is broken" rather than "there was nothing to export". Absence of a log line
+    // has twice been the only evidence available while debugging, and both times it cost hours.
+    if (items.isEmpty() || dir.isEmpty()) {
+        qInfo("bulkExport: nothing to do — %d item(s), dir %s",
+              int(items.size()), dir.isEmpty() ? "(none)" : "set");
+        return;
+    }
     const QString manPath = QDir(dir).filePath(QStringLiteral("_bulk_manifest.json"));
     QJsonArray man;
     { QFile f(manPath); if (f.open(QIODevice::ReadOnly)) man = QJsonDocument::fromJson(f.readAll()).array(); }
@@ -369,7 +783,10 @@ void ModelsTab::bulkExport(const QVector<QPair<int, QString>>& items, const QStr
         sink->log(QStringLiteral("Skipping %1 already-present item(s).").arg(skipped));
 
     QStringList failReasons;
-    exportModels(todo, dir, sink, &failReasons);   // hardened batch pipeline (per-item SEH guard)
+    // applyLayout=false: Bulk Extract grouped this list itself before calling — it needs the group
+    // map for its own buffer and name-matched-texture passes — and `dir` is already the group's
+    // folder. Grouping again here would nest a second copy inside it.
+    exportModels(todo, dir, sink, &failReasons, /*applyLayout*/ false);
 
     // Append the items that now have a .glb on disk to the ledger; anything without one failed.
     QStringList failed;
@@ -401,19 +818,85 @@ void ModelsTab::bulkExport(const QVector<QPair<int, QString>>& items, const QStr
                                 .arg(todo.size() - failed.size()).arg(skipped).arg(failed.size())
                                 .arg(failed.isEmpty() ? QString() : QStringLiteral(" (see _bulk_failed.txt)"));
     if (sink && sink->log) sink->log(summary);
-    emit scanStatus(summary);
+    // Unconditionally to the log as well, not only to the sink and the toast: the sink is null for
+    // every non-Bulk caller (Catalogue, context menus, multi-select), so those exports left no
+    // record of what they produced.
+    qInfo("bulkExport: %d exported, %d already present, %d failed → %s",
+          int(todo.size() - failed.size()), skipped, int(failed.size()), qUtf8Printable(dir));
+    flashScan(QStringLiteral("bulk"), summary);
 }
 
 void ModelsTab::exportModels(const QVector<QPair<int, QString>>& models, const QString& dir,
-                             const BatchSink* sink, QStringList* failures)
+                             const BatchSink* sink, QStringList* failures, bool applyLayout)
 {
     if (models.isEmpty() || dir.isEmpty() || !m_reader || !m_reader->isReady()) return;
+
+    // ── One decode cache for the whole batch ──────────────────────────────────────────────────
+    // Every path that exports more than one model funnels through here — Bulk Extract, the
+    // multi-select export, the context-menu batch, the both-genders twin — so this is the seam
+    // where the repeats are.
+    //
+    // And there are a lot of them. Nothing downstream remembered a decode: buildExportMats() calls
+    // buildMat() once per palette SLOT rather than once per distinct material, so a roster naming
+    // one material at five indices decoded it five times, and every empty slot resolves to the same
+    // fallback material and decoded that again. Across models it was worse — a class's appearances
+    // share their leather/fabric/metal detail maps almost completely, and each model re-read and
+    // re-BC-decoded every one of them from scratch.
+    //
+    // The cache is SHARED across threads, not per-thread, because the loop below hands its items to
+    // a std::thread pool whenever `sink` is set (every Bulk Extract run). Those workers decode the
+    // same maps concurrently, so a per-thread cache would share nothing and save nothing.
+    //
+    // Constructed here and destroyed when this function returns — after the pool is joined, so no
+    // worker can still be using it.
+    MaterialDecode::TextureCacheScope texCache;
+    QElapsedTimer runT; runT.start();
+
+    // ── Opposite-gender pairing (Settings ▸ Export ▸ Model export) ─────────────────────────────
+    // Done by EXPANDING THE LIST rather than by special-casing the export itself, so every option
+    // below — textures, animations, raw source files, set-aware expansion, the filename template —
+    // applies to the twin identically. This is also why it lives here: Bulk Extract, multi-select
+    // export and the context-menu batch paths all funnel through exportModels().
+    QVector<QPair<int, QString>> work = models;
+    if (QSettings().value(QStringLiteral("export/bothGenders"), false).toBool() && m_index) {
+        QSet<int> have;
+        for (const auto& m : work) have.insert(m.first);
+        int added = 0;
+        const QVector<SnoEntry>& all = m_index->entries(kApprGroup);
+        QHash<QString, int> byName;
+        byName.reserve(all.size());
+        for (const SnoEntry& e : all) byName.insert(e.name.toLower(), e.snoId);
+        for (const auto& m : models) {
+            const QString twin = genderTwinName(m.second);
+            if (twin.isEmpty()) continue;
+            const int tsno = byName.value(twin.toLower(), 0);
+            // Skip when the twin does not exist in the data, or is already in the selection —
+            // exporting the same asset twice would just race two writes at one filename.
+            if (tsno <= 0 || have.contains(tsno)) continue;
+            work.append({tsno, twin});
+            have.insert(tsno);
+            ++added;
+        }
+        if (added > 0)
+            qInfo("export: both-genders added %d opposite-gender twin(s) to a %lld-model batch",
+                  added, qint64(models.size()));
+    }
     const QString d4 = Config::d4dataDir();
     // Flags come from SETTINGS, not the Models tab's mirror checkboxes — so the Bulk Extract
     // tab's own option toggles (which write these keys) govern its runs directly.
     const bool wantTex  = QSettings().value(QStringLiteral("export/includeTex"), true).toBool();
     const bool wantAnim = QSettings().value(QStringLiteral("export/includeAnim"), false).toBool();
-    const bool animAll  = QSettings().value(QStringLiteral("export/animScope"), 0).toInt() == 1;
+    // Which SOURCES of animation (util/AnimExportScope.h). "previewed" is meaningless for a batch
+    // item that isn't the loaded model, and "pulled" only exists as list state on the loaded model
+    // — so for every other item the batch honours `original`, `sets` and `base`, which are all
+    // data-derived and therefore answerable for any model.
+    //
+    // EVERY data-derived source must appear in animAll: it is the sole gate on the branch that
+    // calls animClipsFor() below AND on kicking the clip index. Omitting one here does not narrow
+    // the result, it silently exports NOTHING for that scope — a sets-only selection, which is the
+    // whole reason `sets` exists, would have produced clip-free files with no log line saying so.
+    const AnimExportScope animSc = AnimExportScope::load();
+    const bool animAll  = animSc.original || animSc.sets || animSc.base;
     const bool wantDeps = QSettings().value(QStringLiteral("export/withDeps"), false).toBool();
     const bool setAware = QSettings().value(QStringLiteral("retarget/setManifest"), false).toBool();
     // Batch animation export needs the clip index; kick it off if it hasn't run and say so ONCE.
@@ -430,7 +913,7 @@ void ModelsTab::exportModels(const QVector<QPair<int, QString>>& models, const Q
     static const QStringList kSlots{QStringLiteral("HLM"), QStringLiteral("TRS"),
                                     QStringLiteral("GLV"), QStringLiteral("LEG"),
                                     QStringLiteral("BTS")};
-    QVector<QPair<int, QString>> jobs = models;
+    QVector<QPair<int, QString>> jobs = work;   // `work` = models + any opposite-gender twins
     if (setAware && m_listModel) {
         QSet<int> have;
         for (const auto& m : jobs) have.insert(m.first);
@@ -455,6 +938,25 @@ void ModelsTab::exportModels(const QVector<QPair<int, QString>>& models, const Q
             }
         }
     }
+
+    // ── Where each job goes ───────────────────────────────────────────────────────────────────
+    // Resolved AFTER the twin and set-aware expansions, so a sibling pulled in by expansion is
+    // filed under its own identity rather than the model that requested it.
+    //
+    // A per-job folder rather than a loop over groups: `dir` is read in only three places inside
+    // the item pipeline, and the pipeline runs on a thread pool — turning it into an outer loop
+    // would serialise the groups against each other for no reason.
+    QHash<int, QString> jobDir;
+    if (applyLayout) {
+        const QString layout = ExportLayout::mode();
+        if (!layout.isEmpty())
+            for (const ExportLayout::Group& g : ExportLayout::group(layout, jobs)) {
+                const QString f = ExportLayout::folderFor(dir, g);
+                for (const auto& it : g.items) jobDir.insert(it.first, f);
+            }
+    }
+    // Every job resolves through this, so the no-layout case is one hash miss, not a branch.
+    auto dirFor = [&](int sno) { return jobDir.value(sno, dir); };
 
     QJsonArray manifest;
     int ok = 0, fail = 0, step = 0;
@@ -481,7 +983,9 @@ void ModelsTab::exportModels(const QVector<QPair<int, QString>>& models, const Q
         // (access violation in the parser or BC decoder) killed the whole app mid-run. Now a
         // bad item logs its fault and the run continues.
         bool wrote = false;
-        QString glbPath = QDir(dir).filePath(NameTemplate::model(m.second, m.first) + QStringLiteral(".glb"));
+        const QString outDir = dirFor(m.first);
+        if (outDir != dir) QDir().mkpath(outDir);
+        QString glbPath = QDir(outDir).filePath(NameTemplate::model(m.second, m.first) + QStringLiteral(".glb"));
         seh::HardwareFault fault;
         const bool survived = seh::runGuarded("bulk-export", [&]() {
             ModelGeometry geo;
@@ -503,15 +1007,28 @@ void ModelsTab::exportModels(const QVector<QPair<int, QString>>& models, const Q
                 const QByteArray payload = m_reader->readPayloadBySno(quint64(m.first));
                 if (payload.isEmpty()) { reportFail(m.second, QStringLiteral("no payload (encrypted or missing)")); return; }
                 geo = ModelParser::parseApp(meta, payload);
-                pal = appearancePalette(d4, m.second);
+                // sno + reader so an appearance with no .app.json (encrypted, or newer than the
+                // snapshot) still gets its material roster from the binary — otherwise it exports
+                // with no materials and lands as an untextured .glb.
+                pal = appearancePalette(d4, m.second, m_reader, m_index, m.first);
             }
             if (!geo.valid || geo.primitives.isEmpty()) {
                 reportFail(m.second, QStringLiteral("no exportable geometry (parse failed or empty)"));
                 return;
             }
-            if (QSettings().value(QStringLiteral("retarget/fitReference"), false).toBool())
-                appendFitReferenceBody(m_reader, m_listModel, m.second, geo);
+            if (QSettings().value(QStringLiteral("export/includeBaseBody"), false).toBool())
+                appendBaseBody(m_reader, m_listModel, m.second, geo);
+            if (QSettings().value(QStringLiteral("export/includeBaseHead"), false).toBool())
+                appendBaseHead(m_reader, m_listModel, m_index, m.second, geo);
             const auto mats = buildExportMats(pal, geo, m.second, d4, m_reader, wantTex);
+            // An empty palette means NO materials, which produces a .glb with geometry and nothing
+            // on it — visually identical to a successful export until you open it. That is exactly
+            // how encrypted armour shipped untextured without a single line in the log. Say it.
+            if (wantTex && pal.isEmpty())
+                qInfo("export: %s [%lld] — NO material roster (no .app.json and the meta binary "
+                      "gave nothing); the .glb will be untextured",
+                      qUtf8Printable(m.second), qint64(m.first));
+            writeLooseTextures(mats, outDir, m.second, m_reader, d4);
             // Animations: the loaded model uses the interactive collector (honours the list
             // selection); every OTHER batch item decodes its own clip set against its own
             // skeleton — this is the fix for "bulk export never included animations".
@@ -526,7 +1043,8 @@ void ModelsTab::exportModels(const QVector<QPair<int, QString>>& models, const Q
                         warnedAnimIdx = true;
                     }
                 } else {
-                    for (const QString& nm : animClipsFor(m.first, m.second.toLower())) {
+                    for (const QString& nm : animClipsFor(m.first, m.second.toLower(),
+                                                          animSc.original, animSc.sets, animSc.base)) {
                         const AnimParser::DecodedAnim a = decodeAnimForSkeleton(nm, geo);
                         if (a.valid && !a.bones.isEmpty()) { anims << a; animNames << nm; }
                     }
@@ -557,7 +1075,10 @@ void ModelsTab::exportModels(const QVector<QPair<int, QString>>& models, const Q
                     if (setAware) {
                         const int us = m.second.lastIndexOf(QLatin1Char('_'));
                         const QString suf = us > 0 ? m.second.mid(us + 1).toUpper() : QString();
-                        QJsonObject e{{"file", NameTemplate::model(m.second, m.first) + QStringLiteral(".glb")},
+                        // Path RELATIVE TO THE RUN ROOT, not a bare filename: with a folder layout
+                        // in force the .glb is a level down, and a manifest whose whole purpose is
+                        // reproducible re-exports cannot name files that are not there.
+                        QJsonObject e{{"file", QDir(dir).relativeFilePath(glbPath)},
                                       {"sno", m.first},
                                       {"name", m.second}};
                         if (kSlots.contains(suf)) e["slot"] = suf;
@@ -565,7 +1086,7 @@ void ModelsTab::exportModels(const QVector<QPair<int, QString>>& models, const Q
                     }
                 }
                 if (wantDeps) exportModelDeps(quint64(m.first), m.second, pal, d4, m_reader,
-                                              QDir(dir).filePath(m.second + QStringLiteral("_deps")));
+                                              QDir(outDir).filePath(QStringLiteral("deps")));
             } else {
                 reportFail(m.second, QStringLiteral("glb write failed"));
             }
@@ -584,9 +1105,10 @@ void ModelsTab::exportModels(const QVector<QPair<int, QString>>& models, const Q
     };   // processItem
 
     // Parallel model export (Bulk Extract runs): geometry/material/glb work per item is fully
-    // independent, so it parallelizes with byte-identical output. Animation and fit-reference
-    // exports stay serial — those paths share caches/GUI state the workers must not race on.
-    const bool fitRef = QSettings().value(QStringLiteral("retarget/fitReference"), false).toBool();
+    // independent, so it parallelizes with byte-identical output. Animation and base-body exports
+    // stay serial — those paths share caches/GUI state the workers must not race on.
+    const bool fitRef = QSettings().value(QStringLiteral("export/includeBaseBody"), false).toBool()
+                        || QSettings().value(QStringLiteral("export/includeBaseHead"), false).toBool();
     int par = 1;
     if (sink) {
         const int cfg = QSettings().value(QStringLiteral("bulk/parallel"), -1).toInt();
@@ -595,11 +1117,15 @@ void ModelsTab::exportModels(const QVector<QPair<int, QString>>& models, const Q
     if (par > 1 && (wantAnim || fitRef)) {
         par = 1;
         if (sink && sink->log)
-            sink->log(QStringLiteral("   (parallel off for this run — animation / fit-reference exports are serial-only)"));
+            sink->log(QStringLiteral("   (parallel off for this run — animation / base-body exports are serial-only)"));
     }
     if (par > 1 && jobs.size() > 1) {
         std::atomic<int> next{0}, done{0};
         auto workerFn = [&]() {
+            // Join the shared decode cache. Participation is per-thread by design (see
+            // TextureCacheScope) — without this the workers, which are where the decoding actually
+            // happens, would be the only threads NOT using it.
+            MaterialDecode::TextureCacheScope workerCache;
             for (;;) {
                 if (sink->canceled && sink->canceled()) break;   // also holds here while paused
                 const int i = next.fetch_add(1);
@@ -639,11 +1165,33 @@ void ModelsTab::exportModels(const QVector<QPair<int, QString>>& models, const Q
         if (mf.open(QIODevice::WriteOnly))
             mf.write(QJsonDocument(root).toJson(QJsonDocument::Indented));
     }
+    // Env-gated, permanent, in the house style: this is the number that says whether the cache is
+    // earning its memory, and whether decoding is even what a slow run is spending its time on.
+    // Set D4_DUMP_EXPORTPERF=1 and export a class's appearances; a run with lots of shared detail
+    // maps should show hits far outnumbering misses.
+    if (!qEnvironmentVariableIsEmpty("D4_DUMP_EXPORTPERF")) {
+        const qint64 h = texCache.hits();
+        const qint64 m = texCache.misses();
+        // jobs, not work: `work` is the requested models plus the opposite-gender twins, while
+        // `jobs` adds the set-aware sibling expansion — and jobs is what the loop actually ran, so
+        // it is what the per-model figure has to divide by.
+        // The state of the cache is part of the measurement, so the line says it. Without this a
+        // baseline run and a cached run are two numbers with no way to tell which was which.
+        qInfo("export perf: %d model(s) in %lld ms — texture decodes %lld, served from cache %lld "
+              "(%lld%% reuse, %lld MB not re-decoded) [cache %s]",
+              int(jobs.size()), runT.elapsed(), m, h,
+              (h + m) ? (100 * h / (h + m)) : 0, texCache.bytesSaved() >> 20,
+              texCache.disabled() ? "OFF (D4_NO_TEXCACHE)" : "on");
+    }
     QSettings().setValue(QStringLiteral("models/lastExportDir"), dir);
     ExportNotifier::instance().notify(
-        QStringLiteral("Exported %1 model(s)%2%3")
+        QStringLiteral("Exported %1 model(s)%2%3%4")
             .arg(ok).arg(fail ? QStringLiteral(", %1 failed").arg(fail) : QString(),
-                 setAware && !manifest.isEmpty() ? QStringLiteral("  (+ manifest.json)") : QString()),
+                 setAware && !manifest.isEmpty() ? QStringLiteral("  (+ manifest.json)") : QString(),
+                 // Re-resolved rather than reusing the per-model `opt` inside the loop above: it is
+                 // out of scope here, and optionsFromSettings() is deterministic, so this is the
+                 // same value every model in the run was written with.
+                 ExportNotifier::glbOptionsLine(ModelExporter::optionsFromSettings())),
         dir);
 }
 
@@ -658,7 +1206,7 @@ void ModelsTab::showDependencies(int sno, const QString& name)
     const QString d4 = Config::d4dataDir();
     const QStringList palette = (sno == m_curSno)
         ? QStringList(m_appMatNames.begin(), m_appMatNames.end())
-        : appearancePalette(d4, name);
+        : appearancePalette(d4, name, m_reader, m_index, sno);
 
     QDialog dlg(this);
     dlg.setWindowTitle(QStringLiteral("Dependencies — %1").arg(name));
@@ -820,7 +1368,10 @@ void ModelsTab::startModelDrag()
     const QString dir = QDir::temp().filePath(QStringLiteral("d4ab_drag"));
     QDir().mkpath(dir);
     QApplication::setOverrideCursor(Qt::WaitCursor);
-    exportModels(items, dir);
+    // applyLayout=false: this stages into a temp folder and then rebuilds each path by hand to
+    // hand the drag its file:// URLs. A layout would move the files under it and every exists()
+    // below would miss, so the drag would silently carry nothing.
+    exportModels(items, dir, nullptr, nullptr, /*applyLayout*/ false);
     QApplication::restoreOverrideCursor();
     QList<QUrl> urls;
     for (const auto& m : items) {
@@ -865,10 +1416,14 @@ bool ModelsTab::hasAnimExport() const
 // Count-aware label: singular when one clip (or the playing one) is targeted, else plural.
 QString ModelsTab::animExportLabel() const
 {
-    int n = m_anims ? m_anims->selectedItems().size() : 0;
-    if (n == 0 && !m_playingAnim.isEmpty()) n = 1;
-    return n == 1 ? QStringLiteral("Export animation only (.glb)…")
-                  : QStringLiteral("Export animations only (.glb)…");
+    // The REAL count, from the same function the exporter decodes. It used to report the list
+    // SELECTION size, which is 0 for the normal case of "export what the scope says" — so the menu
+    // said nothing about how many clips were about to be written, and a scope change that halved
+    // the export looked identical from here.
+    const int n = plannedExportAnimNames().size();
+    if (n == 0) return QStringLiteral("Export animations only (.glb) — no clips in scope");
+    if (n == 1) return QStringLiteral("Export animation only (.glb) — 1 clip…");
+    return QStringLiteral("Export animations only (.glb) — %1 clips…").arg(n);
 }
 
 void ModelsTab::exportAnimations() { exportAnimationsOnly(); }

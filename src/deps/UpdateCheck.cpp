@@ -9,6 +9,7 @@
 #include <QFile>
 #include <QFileInfo>
 #include <QProcess>
+#include "util/ProcQuiet.h"   // no console-window flash for the startup probes
 #include <QSettings>
 #include <QStandardPaths>
 #include <QStringList>
@@ -17,6 +18,10 @@ namespace {
 // The upstream repo moved the keys file (root/d4_tact_keys_clean.txt → keys/d4.keys) — which is
 // exactly why this is a CANDIDATE LIST now: newest-known location first, older ones as fallbacks,
 // so the next reorganisation degrades to a fallback hit instead of a hard "offline?".
+// Only the PRIMARY list is probed for updates. The secondary source (CascLib's KeyService.cs,
+// fetched alongside it by Settings ▸ Download) is a historical table: measured against a live
+// build, none of its 361 Diablo IV keys overlap ours and only one is still usable by the current
+// patch. Notifying on every commit to a WoW library would be noise, not news.
 constexpr const char* kTactKeysUrls[] = {
     "https://raw.githubusercontent.com/HoldMyBeer-gg/rustydemon/main/keys/d4.keys",
     "https://raw.githubusercontent.com/HoldMyBeer-gg/rustydemon/main/d4_tact_keys_clean.txt",
@@ -76,6 +81,7 @@ void UpdateCheck::checkD4Data()
         return;
     }
     auto* loc = new QProcess(this);
+    quietProcess(*loc);   // background probe — never show a console for it
     loc->setProgram(git);
     loc->setArguments({QStringLiteral("-C"), dir, QStringLiteral("rev-parse"), QStringLiteral("HEAD")});
     connect(loc, &QProcess::finished, this, [this, loc, git, dir](int code, QProcess::ExitStatus) {
@@ -83,6 +89,7 @@ void UpdateCheck::checkD4Data()
         loc->deleteLater();
         if (code != 0 || local.isEmpty()) { done(false, Unknown, QStringLiteral("local HEAD unknown")); return; }
         auto* rem = new QProcess(this);
+        quietProcess(*rem);
         rem->setProgram(git);
         rem->setArguments({QStringLiteral("-C"), dir, QStringLiteral("ls-remote"),
                            QStringLiteral("origin"), QStringLiteral("HEAD")});
@@ -132,6 +139,7 @@ void UpdateCheck::tryTactKeysUrl(const QString& curl, const QString& file, int u
     constexpr int kUrlCount = int(sizeof(kTactKeysUrls) / sizeof(kTactKeysUrls[0]));
     if (urlIdx >= kUrlCount) { done(true, Unknown, QStringLiteral("offline?")); return; }
     auto* p = new QProcess(this);
+    quietProcess(*p);
     p->setProgram(curl);
     p->setArguments({QStringLiteral("-s"), QStringLiteral("-L"), QStringLiteral("-f"),
                      QString::fromLatin1(kTactKeysUrls[urlIdx])});   // body → stdout

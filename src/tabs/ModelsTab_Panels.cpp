@@ -15,6 +15,7 @@
 #include "tabs/ModelsTab.h"
 
 #include "gl/GLModelWidget.h"
+#include "util/CameraOrbitRow.h"
 
 #include <QCheckBox>
 #include <QColor>
@@ -67,6 +68,7 @@ void ModelsTab::toggleCameraPanel()
     if (m_lightPanel) m_lightPanel->hide();   // one preview popup open at a time
     if (m_vpPanel)    m_vpPanel->hide();
     if (!m_camPanel) buildCameraPanel();
+    if (m_camOrbitSync) m_camOrbitSync();   // the camera may have been orbited since the last open
     m_camPanel->adjustSize();
     m_camPanel->move(panelPosLeftOf(m_camBtn, m_camPanel->sizeHint()));
     m_camPanel->show();
@@ -182,6 +184,11 @@ void ModelsTab::buildCameraPanel()
     });
     pl->addWidget(spinChk);
     pl->addLayout(spinRow);
+
+    // Numeric orbit control. Placed AFTER the turntable so it can be handed that checkbox —
+    // editing an angle by hand unticks it, since the spin would otherwise overwrite yaw 30x a
+    // second and the control would look dead.
+    m_camOrbitSync = CameraOrbit::addRows(m_camPanel, pl, m_modelView, spinChk);
 
     // Orthographic vs perspective projection.
     auto* orthoChk = new QCheckBox(QStringLiteral("Orthographic projection"), m_camPanel);

@@ -1,5 +1,6 @@
 #include "index/IconAudit.h"
 
+#include "app/AppPaths.h"
 #include "casc/CascReader.h"
 #include "index/AppearanceMeta.h"
 #include "index/DadOverride.h"
@@ -107,6 +108,10 @@ QString IconAudit::run(const QString& d4dataDir, const SnoIndex* index, CascRead
             }
             candNames = AppearanceMeta::styleAppearanceNames(actor, classPrefs);
         }
+        // Route 3. Until this was added the audit never entered a WEAPON appearance into its
+        // expected-handle set, so it could neither confirm nor DIFF one: every weapon icon was
+        // invisible to the audit and its reported coverage overstated itself.
+        candNames = AppearanceMeta::withSelfName(candNames, di.stem.toLower());
         if (candNames.isEmpty())
             continue;
         bool used = false;
@@ -193,10 +198,12 @@ QString IconAudit::run(const QString& d4dataDir, const SnoIndex* index, CascRead
             .arg(ok).arg(missing).arg(diffs).arg(nosprite)
             .arg(spriteCheck ? QString() : QStringLiteral(" (sprite check skipped: icon index not ready)"));
 
-    // Atomic write next to the exe — readable through the sandbox mount while the
-    // app is still running (unlike the truncating log).
-    const QString outPath = QCoreApplication::applicationDirPath()
-                            + QStringLiteral("/icon_audit.txt");
+    // Atomic write into data/ — readable while the app is still running (unlike the
+    // truncating log). It used to go beside the EXE, which meant a downloaded copy grew an
+    // icon_audit.txt next to D4AssetBrowser.exe the first time indexing finished, contradicting
+    // the README's "everything the tool writes lives in data\". The release smoke test missed it
+    // because the app was closed before indexing completed, so the audit never ran.
+    const QString outPath = AppPaths::file(QStringLiteral("icon_audit.txt"));
     QSaveFile out(outPath);
     if (out.open(QIODevice::WriteOnly)) {
         QByteArray body = summary.toUtf8();
