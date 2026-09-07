@@ -114,7 +114,10 @@ private:
     void exportBundleList(QVector<int> bundles, bool promptDir);   // the shared batch writer
     // What one bundle produced, so the caller can total a batch and write ONE status line.
     // `skipped` = "only new" found a previous export that already covered what was asked for.
-    struct Written { int models = 0, textures = 0, icons = 0, frames = 0; bool skipped = false; };
+    // `unresolved` carries the NAMES, not just a count: after a batch the status line names the
+    // first few, because "2 unresolved" tells you something is missing and nothing about what.
+    struct Written { int models = 0, textures = 0, icons = 0, frames = 0; bool skipped = false;
+                     QStringList unresolved; };
     Written writeBundle(const StoreProductIndex::Product& b, const QString& parentDir,
                         int nth, int total);
     // What the Export menu actually runs: the selected rows when there are any, else the bundle.
@@ -194,6 +197,12 @@ private:
     // nowhere else; every other kind returns 0 and is unaffected. GUI thread only (m_portrait).
     quint32 portraitFor(const QString& payloadName) const;
     mutable QHash<QString, quint32> m_portrait;   // actor name -> handle (0 = probed, has none)
+    // Route 4 of appearancesForProduct: the product's appearance by REFERENCE
+    // (Item.snoActor -> Actor.snoAppearance) rather than by reconstructing its name.
+    // Returns the appearance's own name, or empty when the chain does not resolve.
+    // GUI thread only (m_actorApp). Memoised, misses included.
+    QString appearanceNameByRef(const QString& payloadName) const;
+    mutable QHash<QString, QString> m_actorApp;   // payload name -> appearance name ("" = none)
 
     // ── Name→SNO lookups, built ONCE ────────────────────────────────────────────────────────
     // The first cut rebuilt a QHash over the whole Appearance group (67,104 entries) inside

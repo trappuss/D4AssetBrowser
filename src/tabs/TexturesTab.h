@@ -2,6 +2,7 @@
 #include "tabs/BrowserTab.h"
 #include "tex/TexMeta.h"
 
+#include <QCache>
 #include <QHash>
 #include <QImage>
 #include <QPixmap>
@@ -190,6 +191,12 @@ private:
     QListView*      m_grid      = nullptr;
     QToolButton*    m_gridBtn   = nullptr;
     QSet<int>       m_gridPending;               // snos with a decode in flight (dedupe)
+    // Grid thumbnails live HERE, not in the global QPixmapCache they used to use. That pool is
+    // shared with every QIcon Qt renders anywhere in the app and defaults to 10 MB — at 160x160x4
+    // (100 KB) it held barely 100 thumbnails, often less than one screenful, and any other widget
+    // painting an icon could evict them. This cache is ours alone, so nothing outside this tab can
+    // flush it, and the budget is stated in KB of pixmap rather than left to a Qt default.
+    QCache<int, QPixmap> m_gridThumbs{ 96 * 1024 };   // ~960 thumbnails at 160x160
     int             m_gridPx     = 88;           // grid tile icon size (Ctrl+wheel resizes; persisted)
     int             m_hoverGridSno = 0;          // grid/list row under the cursor (0 = none)
     bool            m_hoverIconArea = false;     // cursor is on an ICON (grid cell) → include the image

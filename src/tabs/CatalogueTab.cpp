@@ -1119,6 +1119,7 @@ void CatalogueTab::reset()
     m_appByName.clear();
     m_texByName.clear();
     m_portrait.clear();   // keyed by NAME, and a d4data switch can re-author the actor behind it
+    m_actorApp.clear();   // same: a new snapshot can re-point Item.snoActor / Actor.snoAppearance
     m_thumbs.clear();   // a new build/snapshot can re-author the same bundle's art
     if (m_list) m_list->clear();
     if (m_branchFilter) {   // else a d4data switch keeps the previous snapshot's patch list
@@ -1483,8 +1484,8 @@ void CatalogueTab::showBundle(int sno)
             "supported classes are unavailable — those exist only in the snapshot's text files. "
             "Everything below comes from the game itself and is complete: contents, artwork and "
             "models all export normally.\n\n"
-            "Re-running File ▸ Dependencies… once d4data catches up with your game build will fill "
-            "in the missing text."));
+            "Re-downloading d4data once it catches up with your game build will fill in the "
+            "missing text: Settings ▸ General ▸ Directories ▸ \"d4data folder\" ▸ Download."));
 
     // ── Provenance and relationships ────────────────────────────────────────────────────────────
     // Everything below comes from fields the .prd has always carried and this tab never read.
@@ -1955,6 +1956,77 @@ quint32 CatalogueTab::portraitFor(const QString& payloadName) const
     return h;
 }
 
+// ── Route 4: the appearance by REFERENCE, not by name ───────────────────────────────────────────
+// Routes 1-3 all RECONSTRUCT a candidate appearance name from the product's own name and look it
+// up. That works for the overwhelming majority — armour follows <class><gender>_<token>_<SLOT>,
+// and weapons, mounts, trophies and companions are usually named exactly as their item is — and
+// it silently writes nothing whenever an asset breaks the pattern.
+//
+// Measured case: Bundle_Companion_stor100_schnoz lists three items and exported one. Its trophy
+// item mnt_stor270_trophy owns the appearance mnt_stor270_trophy_TROPHY — the suffix doubled —
+// so every name route missed and the bundle export dropped it without an error. Its siblings
+// mnt_stor271_trophy and mnt_stor272_trophy name their appearances exactly as themselves, which
+// is why two of the three trophies in that collab came out and one did not.
+//
+// The game does not need the names to agree, because it follows references:
+//     Item.snoActor -> Actor.snoAppearance
+// so that is what this does. It is the same correction the back-trophy chain already documents
+// (resolve by sno REFERENCE, never by filename), applied to the one resolver that still guessed.
+//
+// Read on demand, two small files per product and only for a product the earlier routes failed on
+// — so the common path costs nothing. Memoised for the session, misses included.
+QString CatalogueTab::appearanceNameByRef(const QString& payloadName) const
+{
+    // Too short to prefix-match safely — a 3-char payload would "extend" into half the catalogue.
+    if (payloadName.size() < 6) return QString();
+    const auto cached = m_actorApp.constFind(payloadName);
+    if (cached != m_actorApp.constEnd()) return cached.value();
+
+    const QDir d4(Config::d4dataDir());
+    // Pull the quoted value of `key`'s sibling "name" field out of a d4data SNO reference block.
+    // Text scan rather than a full parse, exactly as portraitFor does: actor files run to
+    // thousands of lines and this is one string. "name": cannot collide with "groupName": or
+    // "__targetFileName__": — both spell it with a capital N, so the opening quote disambiguates.
+    auto refName = [](const QByteArray& t, const char* key) -> QString {
+        const int k = t.indexOf(key);
+        if (k < 0) return QString();
+        const int nk = t.indexOf("\"name\":", k);
+        if (nk < 0 || nk - k > 600) return QString();   // real blocks measure 100-300 bytes
+        // ...and genuinely inside it. Distance alone was not enough: a revision that emits this
+        // SnoRef without a "name" member would let the scan adopt the NEXT block's name, i.e.
+        // hand back a plausible wrong actor — exactly the silent-wrong-model failure the guard in
+        // appearancesForProduct exists to prevent. A closing brace in between says we left.
+        const int close = t.indexOf('}', k);
+        if (close >= 0 && close < nk) return QString();
+        int i = t.indexOf('"', nk + 7);
+        if (i < 0) return QString();
+        const int e = t.indexOf('"', ++i);
+        return e > i ? QString::fromUtf8(t.mid(i, e - i)) : QString();
+    };
+    auto readAll = [&d4](const QString& rel) -> QByteArray {
+        QFile f(d4.filePath(rel));
+        return f.open(QIODevice::ReadOnly) ? f.readAll() : QByteArray();
+    };
+
+    // The actor is named by the ITEM. Falling back to the payload name when the item file is
+    // absent matches portraitFor's assumption and costs one extra probe when it is wrong.
+    QString actor = refName(readAll(QStringLiteral("json/base/meta/Item/%1.itm.json").arg(payloadName)),
+                            "\"snoActor\"");
+    if (actor.isEmpty()) actor = payloadName;
+    const QString app = refName(readAll(QStringLiteral("json/base/meta/Actor/%1.acr.json").arg(actor)),
+                                "\"snoAppearance\"");
+    // The credibility check lives HERE, not at the call site, for two reasons: the memo then
+    // stores the decision rather than the raw reference (so the log below fires once per product
+    // per session instead of on every keystroke that re-resolves the shown bundle), and the
+    // rejection reason it prints is the real one.
+    const QString kept = app.startsWith(payloadName, Qt::CaseInsensitive) ? app : QString();
+    if (kept.isEmpty() && !app.isEmpty())
+        qInfo("catalogue: %s -> %s ignored (drop proxy or unrelated appearance)",
+              qUtf8Printable(payloadName), qUtf8Printable(app));
+    m_actorApp.insert(payloadName, kept);
+    return kept;
+}
+
 QVector<QPair<int, QString>> CatalogueTab::appearancesForProduct(const QString& payloadName) const
 {
     QVector<QPair<int, QString>> out = appearancesFor(payloadName);
@@ -1964,6 +2036,40 @@ QVector<QPair<int, QString>> CatalogueTab::appearancesForProduct(const QString& 
     ensureNameMaps();
     for (const QString& nm : AppearanceMeta::withSelfName(QStringList(), payloadName)) {
         const auto it = m_appByName.constFind(nm.toLower());
+        if (it != m_appByName.constEnd()) out.append(it.value());
+    }
+    if (!out.isEmpty()) return out;
+    // Route 4 — follow the reference, then CHECK IT.
+    //
+    // Actor.snoAppearance is the DROP PROXY, not the transmog: measured over a 400-item sample,
+    // 219 of them resolve to Armor_flippy / Helmet_flippy / Item_Saddle_Drop_flippy — the generic
+    // mesh that spins on the ground — and only 180 to something belonging to the item. Taking the
+    // reference on trust would therefore export the wrong model for over half of everything that
+    // reaches this route, which is strictly worse than exporting nothing: a missing file is
+    // visible in the manifest, a plausible wrong one is not.
+    //
+    // So the reference is used to DISCOVER a name the earlier routes could not construct, and is
+    // kept only when it EXTENDS this product's own name. That admits the case this route exists
+    // for (item mnt_stor270_trophy owning the appearance mnt_stor270_trophy_TROPHY) and rejects
+    // every proxy.
+    //
+    // Deliberately one-directional. Accepting a SHORTER name too was tried and measured: over 600
+    // items it let through mnt_uniq15_trophy_pvp -> mnt_uniq15_trophy and
+    // S11_MemoryFragment_Andariel01 -> S11_MemoryFragment, i.e. exactly the shared-base-mesh
+    // pattern the flippy proxies are a special case of. A name that is longer and starts with the
+    // item's own is specific to it; a shorter one is something it borrows.
+    //
+    // A rejection is not a dead end any more: the product lands in the manifest's "unresolved"
+    // list and in the export status line, so a genuine miss is visible and chaseable, which a
+    // silently wrong model would not be.
+    // appearanceNameByRef applies that check itself and returns empty when it fails, so anything
+    // non-empty here has already been judged this product's own. Resolved through m_appByName like
+    // every other route, so the caller still gets the INDEX's canonical name (the export filename
+    // stem) rather than the JSON's spelling, and an appearance the index does not carry yields
+    // nothing.
+    const QString byRef = appearanceNameByRef(payloadName);
+    if (!byRef.isEmpty()) {
+        const auto it = m_appByName.constFind(byRef.toLower());
         if (it != m_appByName.constEnd()) out.append(it.value());
     }
     return out;
@@ -2066,6 +2172,37 @@ CatalogueTab::Resolved CatalogueTab::resolveBundle(const StoreProductIndex::Prod
                     r.unresolved << (mstem.isEmpty() ? c->name : mstem);
                 break;
             }
+            case StoreProductIndex::Emblem: {
+                // ── An emblem is TWO ICON HANDLES ───────────────────────────────────────────────
+                // EmblemDefinition holds nothing else: no mesh, no texture reference, just
+                // hSmallIcon and hLargeIcon. So it fell through to the default branch, resolved to
+                // no appearance (correctly — there is none), and was reported unresolved forever.
+                // Measured on the Diablo IV x Berserk collab: Bundle_Companion_stor100_schnoz
+                // listed three items and exported one, and its emblem was one of the two missing.
+                //
+                // The handles go through addArt like every other piece of shop art, so they land
+                // in the same icons/ folder and cost no new export path.
+                const QString estem = payloadNameOf(*c);
+                quint32 small = 0, large = 0;
+                if (!estem.isEmpty()) {
+                    QFile ef(QDir(Config::d4dataDir()).filePath(
+                        QStringLiteral("json/base/meta/Emblem/%1.emb.json").arg(estem)));
+                    if (ef.open(QIODevice::ReadOnly)) {
+                        const QJsonObject eo = QJsonDocument::fromJson(ef.readAll()).object();
+                        small = quint32(eo.value(QStringLiteral("hSmallIcon")).toDouble(0.0));
+                        large = quint32(eo.value(QStringLiteral("hLargeIcon")).toDouble(0.0));
+                    }
+                }
+                addArt(small);
+                addArt(large);
+                r.appsPerChild.insert(cs, (small ? 1 : 0) + (large ? 1 : 0));
+                // Still reported when it yields nothing — most often because the Emblem group has
+                // not been downloaded yet (it was added to the sparse list at the same time as
+                // this case), which must read as a miss rather than as "emblems have no art".
+                if (!small && !large)
+                    r.unresolved << (estem.isEmpty() ? c->name : estem);
+                break;
+            }
             case StoreProductIndex::None:
                 r.unresolved << (c->name.isEmpty() ? QStringLiteral("product %1").arg(cs) : c->name);
                 break;
@@ -2091,7 +2228,14 @@ CatalogueTab::Resolved CatalogueTab::resolveBundle(const StoreProductIndex::Prod
                         }
                 } else if (c->kind != StoreProductIndex::Emote
                         && c->kind != StoreProductIndex::Power
-                        && c->kind != StoreProductIndex::DyeArmor) {
+                        && c->kind != StoreProductIndex::DyeArmor
+                        // A TownPortalCosmetic is a chain of EffectGroups — the cast VFX, the
+                        // loop, the proxy — and never geometry or a texture of its own. Checked
+                        // rather than assumed: portal_glo017_stor's record is four snoEffectGroup
+                        // references and an eClassRestriction, nothing else. Counting it as a miss
+                        // would report a gap that no amount of work could close, which is exactly
+                        // the noise that makes an "unresolved" list stop being read.
+                        && c->kind != StoreProductIndex::TownPortal) {
                     // Only the genuinely mesh-less kinds are silent. A MOUNT or COMPANION that did
                     // not resolve is a real miss, and blanket-suppressing the default case hid it
                     // from both the status line and the manifest's "unresolved" list — the one
@@ -2191,13 +2335,16 @@ void CatalogueTab::exportBundleList(QVector<int> bundles, bool promptDir)
 
     m_exportLog.clear();   // one batch, one log
     int nModels = 0, nTex = 0, nIcons = 0, nFrames = 0, done = 0, nSkipped = 0;
+    QStringList unresolved;
     for (int bs : bundles) {
         const auto* pb = StoreProductIndex::instance().product(bs);
         if (!pb) continue;   // re-checked: resolveBundle below spins the event loop
         const Written w = writeBundle(*pb, dir, ++done, int(bundles.size()));
         if (w.skipped) { ++nSkipped; continue; }
         nModels += w.models; nTex += w.textures; nIcons += w.icons; nFrames += w.frames;
+        unresolved += w.unresolved;
     }
+    unresolved.removeDuplicates();   // one shared item listed by two bundles is one gap, not two
 
     // The pipelines' own per-run summaries went to the sink instead of a modal box; anything that
     // FAILED is named in them, so surface that count here rather than letting a partial batch look
@@ -2218,6 +2365,34 @@ void CatalogueTab::exportBundleList(QVector<int> bundles, bool promptDir)
                                               .arg(nSkipped) : QString())
                           .arg(failedRuns ? QStringLiteral("  ·  %1 run(s) had failures — see the log")
                                                 .arg(failedRuns) : QString()));
+    // NAMED, and appended rather than folded into the format above so the sentence still reads if
+    // there are none. Three names is the most a status line can carry; the manifest has them all,
+    // and saying where to look is the difference between a warning and a dead end.
+    if (!unresolved.isEmpty()) {
+        const QStringList head = unresolved.mid(0, 3);
+        // A COLON, not brackets: some entries are themselves parenthesised ("product 12345 (not in
+        // index)"), and wrapping the list would nest them into something unreadable.
+        //
+        // The manifest is optional (Settings ▸ Export ▸ Catalogue export ▸ Manifest, forced on by
+        // "only new"), so the pointer has to match what this run actually wrote — telling someone
+        // to read a file the export was configured not to produce is worse than saying nothing.
+        // The log always has the full list either way.
+        const bool wroteManifests =
+            QSettings().value(QStringLiteral("export/catManifest"), true).toBool()
+            || QSettings().value(QStringLiteral("export/catOnlyNew"), false).toBool();
+        m_status->setText(m_status->text()
+            + QStringLiteral("  ·  %1 not resolved: %2%3 — %4")
+                  .arg(unresolved.size())
+                  .arg(head.join(QStringLiteral(", ")))
+                  .arg(unresolved.size() > head.size()
+                           ? QStringLiteral(", +%1 more").arg(unresolved.size() - head.size())
+                           : QString())
+                  .arg(wroteManifests
+                           ? QStringLiteral("full list in the manifest.json beside each bundle")
+                           : QStringLiteral("full list in Help ▸ Export log")));
+        for (const QString& u : unresolved)
+            qInfo().noquote() << "catalogue export: unresolved —" << u;
+    }
     for (const QString& l : m_exportLog) qInfo().noquote() << "catalogue export:" << l;
 }
 
@@ -2377,6 +2552,11 @@ CatalogueTab::Written CatalogueTab::writeBundle(const StoreProductIndex::Product
     out.textures = wantArt    ? int(r.textures.size()) : 0;
     out.icons    = icons;
     out.frames   = frameFiles;
+    // Everything the bundle LISTS but this run could not turn into a file. It has always been
+    // written to the manifest and never shown, which is a poor trade: nobody opens a JSON file
+    // after an export that reported success, so a bundle quietly exporting one of its three items
+    // read as a complete export. Handed up so the batch's status line can say so.
+    out.unresolved = r.unresolved;
     return out;   // the status line is written once, by the caller, for the whole batch
 }
 

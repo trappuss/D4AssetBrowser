@@ -17,6 +17,13 @@ void SnoListModel::setEntries(const QVector<SnoEntry>& entries)
 {
     beginResetModel();
     m_all = entries;
+    // The icons are keyed by sno and survive a row rebuild, which is right for a re-filter but
+    // WRONG here: setEntries is how a tab is repointed at different data (a group switch, or
+    // reset() after the game/d4data install changed). TexturesTab::reset() drops its decoded
+    // thumbnails for exactly that reason, and leaving the finished icons behind would keep the
+    // previous build's art on screen — permanently for any texture whose new decode fails, since
+    // nothing would then request a redecode to displace it.
+    m_iconCache.clear();
     rebuild();
     endResetModel();
 }
@@ -224,6 +231,7 @@ Qt::ItemFlags SnoListModel::flags(const QModelIndex& index) const
 void SnoListModel::setIconProvider(std::function<QPixmap(int)> fn)
 {
     m_iconProvider = std::move(fn);
+    m_iconCache.clear();          // a different source pixmap for every sno
     refreshIcons();
 }
 
@@ -231,6 +239,7 @@ void SnoListModel::setIconPx(int px)
 {
     if (px == m_iconPx) return;
     m_iconPx = px;
+    m_iconCache.clear();          // every cached icon is scaled to the OLD size
     refreshIcons();
 }
 
@@ -245,6 +254,9 @@ void SnoListModel::setGridMode(bool on)
 
 void SnoListModel::refreshIcons()
 {
+    // Every caller of this is an "all icons changed" event (provider swapped, size changed, badge
+    // settings toggled), so the whole memo goes. Per-thumbnail arrivals use refreshIconForSno.
+    m_iconCache.clear();
     if (m_rows.isEmpty()) return;
     // Models layout: cover the Icon column (1) AND FILENAME (2) — the grid view draws its
     // thumbnail on column 2, so it must repaint too when thumbnails load/render.
@@ -259,6 +271,7 @@ void SnoListModel::refreshIconForSno(int sno)
     // Repaint only the row that owns `sno`. A single-row DecorationRole dataChanged
     // repaints one cell without triggering a full items-relayout — so selecting/loading
     // a model no longer reflows the grid or resets the scroll position.
+    m_iconCache.remove(sno);   // this sno's pixmap just changed; everything else stays cached
     for (int r = 0; r < m_rows.size(); ++r)
         if (m_rows[r] >= 0 && m_all[m_rows[r]].snoId == sno) {
             const int c1 = m_modelsCols ? 1 : 0;
@@ -274,6 +287,8 @@ void SnoListModel::refreshIconRange(int firstRow, int lastRow)
     firstRow = qBound(0, firstRow, int(m_rows.size()) - 1);
     lastRow  = qBound(0, lastRow,  int(m_rows.size()) - 1);
     if (lastRow < firstRow) return;
+    for (int r = firstRow; r <= lastRow; ++r)          // only the span's icons are stale
+        if (m_rows[r] >= 0) m_iconCache.remove(m_all[m_rows[r]].snoId);
     const int c1 = m_modelsCols ? 1 : 0;
     const int c2 = m_modelsCols ? 2 : 0;
     emit dataChanged(index(firstRow, c1), index(lastRow, c2), {Qt::DecorationRole});
@@ -283,6 +298,12 @@ void SnoListModel::refreshRowForSno(int sno)
 {
     // Repaint one row across every column and role — used when a model's state changes
     // (e.g. it just got blocklisted) so the dim/⚠ styling appears immediately.
+    //
+    // The memo MUST be dropped here as well as repainted. This is the entry point for exactly the
+    // events that flip the presence badge (+1 has a model → -1 icon-only), and the badge is
+    // composited into the cached icon: without this the row went dim with a ⚠ in its text while
+    // its icon still showed the green ✓, i.e. the same row asserting both answers at once.
+    m_iconCache.remove(sno);
     for (int r = 0; r < m_rows.size(); ++r)
         if (m_rows[r] >= 0 && m_all[m_rows[r]].snoId == sno) {
             emit dataChanged(index(r, 0), index(r, columnCount() - 1));
@@ -297,16 +318,21 @@ void SnoListModel::refreshRowForSno(int sno)
 // render thumbnail is used.
 QVariant SnoListModel::iconData(int sno) const
 {
+    // Memoized: see m_iconCache in the header for why returning a fresh QIcon per paint was
+    // costing both a double rescale and the whole global pixmap cache.
+    if (const QIcon* hit = m_iconCache.object(sno))
+        return hit->isNull() ? QVariant() : QVariant(*hit);
+
     // Return a QIcon (not a raw QPixmap) so the view scales it to the current
     // iconSize and clips to the cell — a raw pixmap draws at native size and spills.
-    QPixmap pm;
-    if (m_iconProvider)
-        pm = m_iconProvider(sno);
-    else {
-        const auto it = m_thumbs.constFind(sno);
-        if (it != m_thumbs.constEnd()) pm = it.value();
-    }
-    if (pm.isNull()) return QVariant();
+    // The provider is the ONLY source. There used to be a fallback to an m_thumbs hash here, but
+    // nothing has written that hash since setThumbnail was removed (see the note above), so the
+    // branch could only ever yield a null pixmap — a fallback that looked like a safety net and
+    // was a guaranteed miss. Both models that exist install a provider (ModelsTab, TexturesTab).
+    QPixmap pm = m_iconProvider ? m_iconProvider(sno) : QPixmap();
+    // A miss is cached as a NULL icon too, so a row whose thumbnail has not decoded yet stops
+    // re-running the provider on every repaint. refreshIconForSno drops it when the pixmap lands.
+    if (pm.isNull()) { m_iconCache.insert(sno, new QIcon(), 1); return QVariant(); }
     // Scale to the requested icon size so the view can draw icons LARGER than the source pixmap
     // (a plain QIcon caps at the source size → the list could only ever shrink). 0 = unscaled.
     if (m_iconPx > 0 && (pm.width() != m_iconPx || pm.height() != m_iconPx))
@@ -315,7 +341,11 @@ QVariant SnoListModel::iconData(int sno) const
     if (m_presence && IconBadge::anyEnabled(m_badgeTab))
         pm = IconBadge::withBadge(pm, m_presence(sno),
                                   IconBadge::showPresent(m_badgeTab), IconBadge::showMissing(m_badgeTab));
-    return QVariant(QIcon(pm));
+    const QIcon ic(pm);
+    // Cost in KB of the pixmap actually held, so a tab with big tiles caches proportionally fewer.
+    const int costKB = qMax(1, int((qint64(pm.width()) * pm.height() * 4) / 1024));
+    m_iconCache.insert(sno, new QIcon(ic), costKB);
+    return QVariant(ic);
 }
 
 const SnoEntry* SnoListModel::entryAt(int row) const

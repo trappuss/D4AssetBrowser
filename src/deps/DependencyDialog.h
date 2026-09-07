@@ -7,7 +7,8 @@ class QProgressBar;
 class QPushButton;
 class D4DataDownloader;
 
-// File ▸ Dependencies… — shows d4data status and downloads/updates it with one
+// Settings ▸ General ▸ Directories ▸ "d4data folder" ▸ Download — shows d4data status
+// and downloads/updates it with one
 // click (git sparse checkout under the hood). Mirrors the Python original's
 // Dependencies dialog. Emits d4dataInstalled() so the main window can reload.
 class DependencyDialog : public QDialog {

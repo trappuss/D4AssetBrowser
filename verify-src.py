@@ -17,6 +17,10 @@ multi-minute MSVC cycle:
                                       never added. Only a real directive counts here.
   3. printf-style arg mismatch      — qInfo/qWarning/qDebug/printf format specifiers vs args.
   4. Qt macro collisions            — a local named `emit`/`signals`/`slots` silently vanishes.
+  5. Duplicate QHash/QMap keys      — a repeated key in one brace initializer. The LAST literal
+                                      wins, so a later guess silently overwrote two measured
+                                      entries in SnoIndex::groupNameMap and the correction
+                                      shipped doing nothing. Compiles, links, reads fine.
 
 Exit code 0 = clean, 1 = problems found. Run from anywhere:
 
@@ -393,6 +397,119 @@ def check_duplicate_locals(path: Path, code: str) -> list[str]:
     return problems
 
 
+MAP_CONTAINERS = ("QHash", "QMap", "std::map", "std::unordered_map")
+
+
+def strip_comments(text: str) -> str:
+    """Comments out, string CONTENTS kept — strip_code blanks strings, which this check needs."""
+    out, i, n = [], 0, len(text)
+    while i < n:
+        c = text[i]
+        nxt = text[i + 1] if i + 1 < n else ""
+        if c == "/" and nxt == "/":
+            while i < n and text[i] != "\n":
+                i += 1
+            continue
+        if c == "/" and nxt == "*":
+            i += 2
+            while i + 1 < n and not (text[i] == "*" and text[i + 1] == "/"):
+                if text[i] == "\n":
+                    out.append("\n")
+                i += 1
+            i += 2
+            continue
+        if c in "\"'":
+            q, out_start = c, i
+            i += 1
+            while i < n and text[i] != q:
+                if text[i] == "\\":
+                    i += 1
+                i += 1
+            i += 1
+            out.append(text[out_start:i])
+            continue
+        out.append(c)
+        i += 1
+    return "".join(out)
+
+
+def check_duplicate_map_keys(path: Path, raw: str) -> list[str]:
+    """A key repeated inside one QHash/QMap brace initializer.
+
+    THIS EXISTS BECAUSE IT SILENTLY UNDID A CORRECTION. SnoIndex::groupNameMap() set
+    {140,"Face"} and {152,"AppearanceSet"} from measured CoreTOC data, and twelve lines later
+    the same initializer repeated 140 and 152 as "BattlePassTier" and "TrackedReward". A brace
+    initializer keeps the LAST literal for a repeated key, so two guesses overwrote two facts,
+    the fix appeared in the diff, shipped, and did nothing. Nothing warned: it compiles, it is
+    not a duplicate symbol, and the file reads correctly unless you happen to compare every key
+    against every other one.
+
+    Scoped to the associative containers ONLY. An array of structs may legitimately repeat its
+    first member, so flagging every `{a, b}` list would be noise; in a QHash/QMap initializer a
+    repeated key is a bug every time.
+    """
+    problems = []
+    text = strip_comments(raw)
+    for m in re.finditer(r"=\s*\{", text):
+        head = text[max(0, m.start() - 220):m.start()]
+        head = head[head.rfind(";") + 1:]                 # this declaration only
+        if not any(c in head for c in MAP_CONTAINERS):
+            continue
+        # Walk to the matching close brace, collecting the elements one level in.
+        i, depth, n = m.end() - 1, 0, len(text)
+        elems = []                                        # (key, offset)
+        while i < n:
+            ch = text[i]
+            if ch in "\"'":                                # skip a literal wholesale
+                q = ch
+                i += 1
+                while i < n and text[i] != q:
+                    i += 2 if text[i] == "\\" else 1
+                i += 1
+                continue
+            if ch == "{":
+                depth += 1
+                if depth == 2:                            # start of one element
+                    j, d2 = i + 1, 0
+                    while j < n:
+                        c2 = text[j]
+                        if c2 in "\"'":
+                            q = c2
+                            j += 1
+                            while j < n and text[j] != q:
+                                j += 2 if text[j] == "\\" else 1
+                        elif c2 in "{([":
+                            d2 += 1
+                        elif c2 in "})]":
+                            if d2 == 0:
+                                break
+                            d2 -= 1
+                        elif c2 == "," and d2 == 0:
+                            break
+                        j += 1
+                    elems.append((" ".join(text[i + 1:j].split()), i))
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    break
+            i += 1
+        if len(elems) < 3:                                # not a lookup table
+            continue
+        seen = {}
+        for key, off in elems:
+            if not key:
+                continue
+            if key in seen:
+                line = text[:off].count("\n") + 1
+                problems.append(
+                    f"line {line}: key {key} repeated in this QHash/QMap initializer "
+                    f"(first at line {seen[key]}) — the LAST literal wins, so the earlier "
+                    f"entry is silently discarded")
+            else:
+                seen[key] = text[:off].count("\n") + 1
+    return problems
+
+
 def check_truncation(path: Path, raw: str) -> list[str]:
     """Empty or near-empty source file — almost always a botched write, not intent.
 
@@ -452,6 +569,7 @@ def main() -> int:
                     + check_format_args(f, raw)
                     + check_qt_macro_names(f, code)
                     + check_duplicate_locals(f, code)
+                    + check_duplicate_map_keys(f, raw)
                     + check_ctx_menu_order(raw))
         if problems:
             total += len(problems)
@@ -464,7 +582,7 @@ def main() -> int:
         if not quiet:
             print(f"verify-src: OK — {len(files)} file(s) clean "
                   f"(non-empty, balance, header-only includes, format args, Qt macro names, "
-                  f"duplicate lambdas)")
+                  f"duplicate lambdas, duplicate map keys)")
         return 0
     print(f"\nverify-src: {total} problem(s) in {len(files)} file(s) — fix before building.")
     return 1

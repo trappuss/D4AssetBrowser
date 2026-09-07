@@ -75,7 +75,6 @@
 #include <QListView>
 #include <QMessageBox>
 #include <QPixmap>
-#include <QPixmapCache>
 #include <QProgressDialog>
 #include <QRunnable>
 #include <QStyledItemDelegate>
@@ -243,6 +242,15 @@ QImage channelGrey(const QImage& srcAny, int ch)
         }
     }
     return out;
+}
+
+// One reader for the whole tab, so the key cannot drift into a second spelling (convention: one
+// setting, one key). Default ON: a BC5 export with B = 0 is unusable as a normal map in every DCC,
+// and the preview/channel views are deliberately NOT routed through this - what you INSPECT stays
+// the game's own bytes, what you EXPORT is the surface the game actually renders.
+static bool exportNormalZ()
+{
+    return QSettings().value(QStringLiteral("tex/reconstructNormalZ"), true).toBool();
 }
 
 // ── Texture categories (derived from real d4data name conventions) ──────────────────────────────
@@ -899,7 +907,8 @@ QWidget* TexturesTab::buildMiddle()
     m_preview->setToolTip(QStringLiteral("Scroll = zoom · drag = pan · double-click = reset"));
     m_preview->setContextMenuPolicy(Qt::CustomContextMenu);
     connect(m_preview, &QWidget::customContextMenuRequested, this, [this](const QPoint& p) {
-        const QImage img = m_preview->grabImage();
+        QImage img = m_preview->grabImage();
+        if (exportNormalZ()) img = BcDecode::withNormalZ(img, m_curMeta.eTexFormat);
         if (img.isNull()) return;
         QMenu menu(this);
         menu.addAction(MenuText::kCopyImage, this,
@@ -1162,7 +1171,10 @@ QImage TexturesTab::decodeTexCpu(int sno)
     QByteArray payload;
     if (m_reader && m_reader->isReady()) payload = m_reader->readPayloadBySno(quint64(sno));
     if (payload.isEmpty()) return {};
-    return BcDecode::decode(payload, meta.width, meta.height, meta.eTexFormat);
+    const QImage img = BcDecode::decode(payload, meta.width, meta.height, meta.eTexFormat);
+    // Copy-image and Save-image off a row are both export-family actions, so they get the
+    // reconstructed Z. The preview and the channel tiles do not go through here.
+    return exportNormalZ() ? BcDecode::withNormalZ(img, meta.eTexFormat) : img;
 }
 
 // Compact, text-only rows matching the Models tab's List display mode: one point smaller,
@@ -1319,17 +1331,16 @@ void TexturesTab::showGridPreview(int sno)
 QPixmap TexturesTab::gridThumb(int sno)
 {
     if (sno <= 0) return {};
-    QPixmap pm;
-    QPixmapCache::find(QStringLiteral("texgrid_%1").arg(sno), &pm);
-    return pm;   // null → the delegate draws a placeholder until the thumbnail is decoded
+    if (const QPixmap* hit = m_gridThumbs.object(sno)) return *hit;
+    return {};   // null → the delegate draws a placeholder until the thumbnail is decoded
 }
 
 // Enqueue a background CPU decode for one texture (dedup via cache + in-flight set). No disk cache —
-// QPixmapCache is a bounded, auto-evicting, in-memory store only.
+// m_gridThumbs is a bounded, auto-evicting, in-memory store only.
 void TexturesTab::requestGridThumb(int sno)
 {
     if (sno <= 0) return;
-    { QPixmap cached; if (QPixmapCache::find(QStringLiteral("texgrid_%1").arg(sno), &cached)) return; }
+    if (m_gridThumbs.contains(sno)) return;
     if (m_gridPending.contains(sno)) return;   // decode already in flight
 
     const QString name = m_snoName.value(sno);
@@ -1389,8 +1400,10 @@ void TexturesTab::onGridThumbReady(int sno, const QImage& img)
 {
     m_gridPending.remove(sno);
     if (img.isNull()) return;   // undecodable texture — leave the placeholder
-    QPixmapCache::insert(QStringLiteral("texgrid_%1").arg(sno), QPixmap::fromImage(img));
-    if (m_model) m_model->refreshIconForSno(sno);
+    const QPixmap pm = QPixmap::fromImage(img);
+    m_gridThumbs.insert(sno, new QPixmap(pm),
+                        qMax(1, int((qint64(pm.width()) * pm.height() * 4) / 1024)));
+    if (m_model) m_model->refreshIconForSno(sno);   // also drops this sno from the model icon memo
 }
 
 // Shared right-click menu for both the table and the grid (they share one selection model).
@@ -1509,6 +1522,9 @@ void TexturesTab::bulkExportTextures(const QVector<QPair<int, QString>>& items, 
     std::atomic<qint64> nsRead{0}, nsDecode{0}, nsEncode{0};
 
     int ok = 0, skip = 0, step = 0;
+    // Read ONCE here, on the GUI thread. processOne runs on parallel workers and a QSettings
+    // construction per texture would be both a lock and a file read inside the hot loop.
+    const bool reconZ = exportNormalZ();
     QStringList failed;
     QMutex shared;   // guards man / already / ok / skip / failed across the parallel workers
     // Sink (Bulk Extract's live console) or the classic modal dialog.
@@ -1546,7 +1562,8 @@ void TexturesTab::bulkExportTextures(const QVector<QPair<int, QString>>& items, 
             const QByteArray payload = m_reader->readPayloadBySno(quint64(it.first));
             nsRead += stage.nsecsElapsed(); stage.restart();
             if (payload.isEmpty()) { guard(); texFail(it.second, QStringLiteral("no payload (encrypted or missing)")); return; }
-            const QImage img = BcDecode::decode(payload, meta.width, meta.height, meta.eTexFormat);
+            QImage img = BcDecode::decode(payload, meta.width, meta.height, meta.eTexFormat);
+            if (reconZ) img = BcDecode::withNormalZ(img, meta.eTexFormat);
             nsDecode += stage.nsecsElapsed(); stage.restart();
             if (img.isNull()) { guard(); texFail(it.second, QStringLiteral("BC decode failed (format %1)").arg(meta.eTexFormat)); return; }
             bool saved = false;
@@ -2183,6 +2200,8 @@ void TexturesTab::selectBySno(int sno)
 
 void TexturesTab::reset()
 {
+    m_gridThumbs.clear();   // new storage → the decoded thumbnails belong to the old game build
+    m_gridPending.clear();
     m_loaded = false;
     m_model->setEntries({});
     m_currentName.clear();
@@ -3039,7 +3058,8 @@ QImage TexturesTab::decodeTexture(int sno, const QString& name)
     if (m_reader && m_reader->isReady()) payload = m_reader->readPayloadBySno(quint64(sno));
     if (payload.isEmpty()) return {};
     m_preview->setTexture(payload, meta.width, meta.height, meta.eTexFormat);
-    return m_preview->grabImage();
+    const QImage img = m_preview->grabImage();
+    return exportNormalZ() ? BcDecode::withNormalZ(img, meta.eTexFormat) : img;
 }
 
 // ── Export-menu hooks (BrowserTab) ───────────────────────────────────────────
@@ -3063,7 +3083,8 @@ void TexturesTab::exportSelectionToLast() { exportTexture(/*toLast=*/true); }
 
 void TexturesTab::exportTexture(bool toLast)
 {
-    const QImage img = m_preview->grabImage();
+    QImage img = m_preview->grabImage();
+    if (exportNormalZ()) img = BcDecode::withNormalZ(img, m_curMeta.eTexFormat);
     if (img.isNull()) {
         QMessageBox::warning(this, QStringLiteral("Export"), QStringLiteral("No decoded texture."));
         return;

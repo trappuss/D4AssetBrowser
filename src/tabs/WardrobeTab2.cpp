@@ -386,10 +386,21 @@ const CreatorCat kCreator[9] = {
     {"Marking colour","MarkingColor", ".mcl.json"},
     {"Jewelry",       "Jewelry",      ".jwl.json"}};
 constexpr int kHairColorCat = 2;   // index into kCreator
+constexpr int kMarkingCat   = 6;   // MarkingShape — the one category with a CASC fallback
 
-// Catalogue one creator category: file stems usable by the given class (fubc index)
-// and gender. Entries without fUsableByClass (e.g. MarkingShape/Color) are always included.
-QStringList creatorEntries(const QString& d4, const CreatorCat& cat, int fubc, bool male)
+// Catalogue one creator category: file stems usable by the given class (fubc index).
+// Entries without fUsableByClass (e.g. MarkingShape/Color) are always included.
+//
+// NO GENDER FILTER, and that is a correction rather than an omission. This used to drop any stem
+// whose name contained "male"/"female", to stop a female character being offered male beards. Two
+// things were wrong with it. It never fired: across all nine creator folders — 554 files — not one
+// stem contains either word, because the gendered naming is on the MATERIALS a def points at
+// (Global_Male_Facialhair_02_FuManchu), never on the def itself (Fine_FuManchu). And had it fired
+// it would have been wrong anyway: every FacialHair def authors BOTH snoShellMaterialM and
+// snoShellMaterialF, all 17 of them with a real 3-4 texture female material, so the full list is
+// what a female character is genuinely entitled to. What is male-only is the beard MESH, and that
+// is gated separately at the load site (`maleFH`), which is the right place for it.
+QStringList creatorEntries(const QString& d4, const CreatorCat& cat, int fubc)
 {
     QStringList out;
     if (d4.isEmpty()) return out;
@@ -398,16 +409,7 @@ QStringList creatorEntries(const QString& d4, const CreatorCat& cat, int fubc, b
     for (const QString& fn : dir.entryList(QStringList{QStringLiteral("*") + QString::fromLatin1(cat.ext)}, QDir::Files)) {
         const QString stem = fn.left(fn.size() - extLen);
         if (stem.contains(QLatin1String("Bad Data"))) continue;
-        // Gender lock: facial hair (and any gender-named creator asset) is authored per gender
-        // as Global_Male_* / Global_Female_*. Hide the wrong gender's entries so a female
-        // character doesn't get male beards (note "female" contains "male", so test it first).
-        {
-            const QString sl = stem.toLower();
-            const bool nameFemale = sl.contains(QLatin1String("female"));
-            const bool nameMale   = !nameFemale && sl.contains(QLatin1String("male"));
-            if (nameMale && !male) continue;
-            if (nameFemale && male) continue;
-        }
+        // (No gender filter here, deliberately — see the note above the signature.)
         QFile f(dir.filePath(fn));
         if (!f.open(QIODevice::ReadOnly)) continue;
         const QJsonObject o = QJsonDocument::fromJson(f.readAll()).object();
@@ -584,17 +586,16 @@ QString femaleCleanFacialHairMat(const QString& d4)
 {
     if (d4.isEmpty()) return QString();
     QDir dir(d4 + QStringLiteral("/json/base/meta/FacialHair"));
-    QString best;
+    // Match on the MATERIAL, not on the def's file name. The previous version scanned for a file
+    // name containing "female" and there is no such file — every def is named for its style
+    // (Clean, Bushy_LongBeard, Rogue), and the gendered name lives on snoShellMaterialF. So it
+    // returned empty every single time and the caller's literal fallback was doing all the work.
     for (const QString& fn : dir.entryList(QStringList{QStringLiteral("*.fhr.json")}, QDir::Files)) {
-        const QString sl = fn.toLower();
-        if (!sl.contains(QLatin1String("female"))) continue;                 // female-authored only
-        const QString stem = fn.left(fn.size() - 9);                          // strip ".fhr.json"
-        if (sl.contains(QLatin1String("clean")) || sl.contains(QLatin1String("_00"))) {
-            best = stem; break;                                              // prefer the clean/00 entry
-        }
-        if (best.isEmpty()) best = stem;                                     // else remember the first female one
+        if (fn.contains(QLatin1String("Bad Data"))) continue;
+        const QString mat = facialHairMat(d4, fn.left(fn.size() - 9), /*male=*/false);
+        if (mat.contains(QLatin1String("clean"), Qt::CaseInsensitive)) return mat;
     }
-    return best.isEmpty() ? QString() : facialHairMat(d4, best, false);
+    return QString();   // caller falls back to the known literal
 }
 
 // Read a HairColor's rgbaColors as authored (no reordering).
@@ -1247,8 +1248,8 @@ QPixmap nonePigmentPixmap(int size)
 
 WardrobeTab2::WardrobeTab2(QWidget* parent) : BrowserTab(parent)
 {
-    // Decoder sanity checks (run once): catch silent regressions in the BC7 tables and the
-    // marking R/G channel model. Failures are logged to the console, not fatal.
+    // Decoder sanity checks (run once): catch silent regressions in the BC7 tables, the marking
+    // R/G channel model, and the normal-map convention. Failures are logged, not fatal.
     static bool s_selfTested = false;
     if (!s_selfTested) {
         s_selfTested = true;
@@ -1256,7 +1257,10 @@ WardrobeTab2::WardrobeTab2(QWidget* parent) : BrowserTab(parent)
         if (!bt.isEmpty()) qWarning().noquote() << "[self-test] BcDecode FAILED:" << bt;
         const QString mt = markingSelfTest();
         if (!mt.isEmpty()) qWarning().noquote() << "[self-test] marking FAILED:" << mt;
-        if (bt.isEmpty() && mt.isEmpty()) qInfo().noquote() << "[self-test] decoders OK (BC7 + marking)";
+        const QString nt = ModelExporter::normalConventionSelfTest();
+        if (!nt.isEmpty()) qWarning().noquote() << "[self-test] normal convention FAILED:" << nt;
+        if (bt.isEmpty() && mt.isEmpty() && nt.isEmpty())
+            qInfo().noquote() << "[self-test] decoders OK (BC7 + marking + normal convention)";
     }
     // Hard cap the temporary decode pool at 256 MB (cost measured in KiB below). LRU eviction
     // keeps it bounded — it can never grow without limit, so it won't bloat.
@@ -4230,6 +4234,81 @@ void WardrobeTab2::exportItemModel(int sno, const QString& name, bool toLast)
 
 // Fill the nine creator pickers from real game data, filtered to this class/gender,
 // restoring the saved selection per category.
+// Group ids by NAME, with the MEASURED id as the fallback. Both halves earned their place: the
+// name lookup survives a renumbering, and the fallback survives a wrong name table — which is not
+// hypothetical, because this code shipped broken on exactly that. SnoIndex's map had 115 as
+// "Biome" and 123 as "MarkingShape" (it is neither), so the lookup overrode a correct hard-coded
+// 115 with 123 and the scan below walked 468 territory records instead of 374 markings, finding
+// nothing. The map is fixed; the fallbacks stay as the second opinion.
+//
+// Ground truth, from d4data's own CoreTOC.dat.json: 115 holds Barbarian_bodyMarking_01 and 373
+// siblings, 133 holds "Inked Tattoo" / "Blue Paint", 44 holds the textures.
+static int mshGroup()   { static const int g = SnoIndex::groupIdByName(QStringLiteral("MarkingShape"), 115); return g; }
+static int mclGroup()   { static const int g = SnoIndex::groupIdByName(QStringLiteral("MarkingColor"), 133); return g; }
+static int texGroupId() { static const int g = SnoIndex::groupIdByName(QStringLiteral("Texture"), 44); return g; }
+
+// A marking's masks + swatch, from the snapshot when it describes one and from the game when it
+// does not. The snapshot stays authoritative: it carries flEmissiveStrength, which the binary
+// layout probe did not set out to locate, so a marking that HAS json must keep using it.
+MarkingDef WardrobeTab2::markingDefAny(const QString& d4, const QString& stem) const
+{
+    MarkingDef md = markingDef(d4, stem);
+    if (!md.faceTex.isEmpty() || !md.bodyTex.isEmpty()) return md;   // snapshot answered
+    if (stem.isEmpty() || !m_reader || !m_index || !m_index->isLoaded()) return md;
+
+    const int sno = m_index->snoForName(mshGroup(), stem);
+    if (sno <= 0) return md;
+    const MarkingBin b = markingBinParse(m_reader->readMetaBySno(quint64(sno)));
+    if (!b.valid) return md;
+    // SNO -> name, because every consumer downstream joins on names (texSnoFor, markingPaint).
+    md.faceSno   = b.maskFaceSno;
+    md.bodySno   = b.maskBodySno;
+    // Names are best-effort from here down. nameForSno returns EMPTY for an encrypted record, and
+    // encrypted records are exactly the population this function exists for, so nothing downstream
+    // may read an empty name as "no mask" - the sno above is the identity.
+    md.faceTex   = b.maskFaceSno ? m_index->nameForSno(texGroupId(), int(b.maskFaceSno)) : QString();
+    md.bodyTex   = b.maskBodySno ? m_index->nameForSno(texGroupId(), int(b.maskBodySno)) : QString();
+    md.colorStem = b.defColorSno ? m_index->nameForSno(mclGroup(),   int(b.defColorSno)) : QString();
+    md.icon      = b.icon;
+    return md;
+}
+
+// Append every MarkingShape the game has and the snapshot does not, filtered to this class.
+void WardrobeTab2::appendCascOnlyMarkings(QStringList& stems, int fubc) const
+{
+    if (!m_reader || !m_index || !m_index->isLoaded()) return;
+    if (!m_cascMarkingsBuilt) {
+        m_cascMarkingsBuilt = true;   // set FIRST: a failed scan must not retry on every repopulate
+        const QString d4 = Config::d4dataDir();
+        QDir jsonDir(d4 + QStringLiteral("/json/base/meta/MarkingShape"));
+        QSet<QString> described;
+        for (const QString& fn : jsonDir.entryList(QStringList{QStringLiteral("*.msh.json")}, QDir::Files))
+            described.insert(fn.left(fn.size() - 9).toLower());
+        int read = 0, kept = 0;
+        for (const SnoEntry& e : m_index->entries(mshGroup())) {
+            if (described.contains(e.name.toLower())) continue;
+            ++read;
+            // Encrypted records reach the index as "~unnamed_<sno>" and are NOT skipped: they are
+            // real markings, they are exactly the newest content, and the parse below rejects any
+            // whose payload could not be read. Dropping them by name would be the same silent
+            // omission this whole function exists to undo.
+            const MarkingBin b = markingBinParse(m_reader->readMetaBySno(quint64(e.snoId)));
+            if (!b.valid) continue;
+            m_cascMarkings.append({e.name, b.classRestriction});
+            ++kept;
+        }
+        qInfo("wardrobe: markings — %d in the game, %d in the snapshot, %d read from CASC, %d usable",
+              int(m_index->entries(mshGroup()).size()), int(described.size()), read, kept);
+    }
+    QSet<QString> have;
+    for (const QString& s : stems) have.insert(s.toLower());
+    for (const auto& m : m_cascMarkings) {
+        if (m.second >= 0 && m.second != fubc) continue;   // authored for a different class
+        if (!have.contains(m.first.toLower())) stems << m.first;
+    }
+    stems.sort(Qt::CaseInsensitive);
+}
+
 void WardrobeTab2::populateCreator()
 {
     const QString d4 = Config::d4dataDir();
@@ -4241,7 +4320,9 @@ void WardrobeTab2::populateCreator()
         const QString saved = QSettings().value(QStringLiteral("wardrobe2/creator/%1").arg(i)).toString();
         m_creator[i]->clear();
         m_creator[i]->addItem(QStringLiteral("(default)"), QString());
-        for (const QString& stem : creatorEntries(d4, kCreator[i], fubc, male)) {
+        QStringList stems = creatorEntries(d4, kCreator[i], fubc);
+        if (i == kMarkingCat) appendCascOnlyMarkings(stems, fubc);
+        for (const QString& stem : stems) {
             // Show the game's REAL localized name + the file stem, e.g. "Caldean Rouge  (05)".
             // (Facial-hair names are gender-correct.) Fall back to the humanised stem if the game
             // ships no string for this def — never a fabricated name.
@@ -6341,7 +6422,7 @@ QString WardrobeTab2::markingAuthoredColorStem() const
     const auto it = cache.constFind(key);
     if (it != cache.constEnd()) return it.value();
     if (cache.size() > 512) cache.clear();          // bounded; 304 shapes ship today
-    const QString stem = markingDef(d4, shape).colorStem;
+    const QString stem = markingDefAny(d4, shape).colorStem;
     cache.insert(key, stem);
     return stem;
 }
@@ -6495,6 +6576,83 @@ static QImage creatorRampSwatch(std::array<QColor, 3> r)
     return img;
 }
 
+// A Marking card's swatch when the shop atlas cannot serve one.
+//
+// Every MarkingShape's hIconImage points into a packed 2D atlas, and IconIndex can only crop an
+// atlas whose per-frame UV rectangles it knows: from d4data's .tex.json, or - for a SINGLE-frame
+// atlas only - from the game's own 2D_table. Creator swatches are packed many to a sheet, so a
+// marking newer than the snapshot has a handle the game knows and a rectangle nobody does, and its
+// card came up blank with nothing on screen to say why. IconIndex is right to refuse: its own
+// comment records that pairing 2D_table's authored order back to an atlas's spatial order is
+// approximate, and an icon showing the WRONG marking is worse than one showing none.
+//
+// The mask IS the marking, though, and by this point it is already resolved. Painting it with the
+// marking's own default colour ramp gives a swatch that is arguably better than the shop art: it
+// shows the design itself rather than Blizzard's promotional crop, at the same 72px the colour
+// swatches use.
+QImage WardrobeTab2::markingMaskSwatch(const QString& d4, const MarkingDef& md) const
+{
+    if (!m_reader || !m_index) return QImage();
+    // Name first, then the sno the record itself carried. The name join is the path every other
+    // marking has always taken, so it stays authoritative; MarkingDef::faceSno/bodySno is the
+    // FALLBACK for the case that has no name at all - an encrypted mask texture, where
+    // nameForSno returns empty by design. Ordering it this way means the new field cannot change
+    // the answer for any marking that already worked.
+    auto load = [&](const QString& name, quint32 sno) -> QImage {
+        qint64 s = name.isEmpty() ? 0 : m_index->snoForName(texGroupId(), name);
+        if (s <= 0) s = qint64(sno);
+        return s > 0 ? MaterialDecode::texture(m_reader, d4, name, s) : QImage();
+    };
+    QImage mask = load(md.bodyTex, md.bodySno);
+    if (mask.isNull()) mask = load(md.faceTex, md.faceSno);
+    if (mask.isNull()) return QImage();
+    mask = mask.convertToFormat(QImage::Format_RGBA8888);
+
+    // Crop to the design. A body marking covers a few percent of a full-body UV sheet, so the
+    // uncropped mask scaled to 72px is a grey square with a speck in it. RED is coverage (see the
+    // marking model at the top of MarkingCompose.h), so the coverage bbox IS the design's extent.
+    // Strided because these sheets run to 4k and the bbox does not need every texel.
+    const int W = mask.width(), H = mask.height();
+    int x0 = W, y0 = H, x1 = -1, y1 = -1;
+    const int step = qMax(1, qMin(W, H) / 512);
+    for (int y = 0; y < H; y += step) {
+        const uchar* p = mask.constScanLine(y);
+        for (int x = 0; x < W; x += step)
+            if (p[x * 4] > 8) { x0 = qMin(x0, x); x1 = qMax(x1, x); y0 = qMin(y0, y); y1 = qMax(y1, y); }
+    }
+    if (x1 < 0) return QImage();   // an all-black mask is not a marking we can draw
+    const int pad = qMax(2, step * 2);
+    x0 = qMax(0, x0 - pad); y0 = qMax(0, y0 - pad);
+    x1 = qMin(W - 1, x1 + pad); y1 = qMin(H - 1, y1 + pad);
+    const int cw = x1 - x0 + 1, ch = y1 - y0 + 1;
+    // Square the crop, clamped to the sheet, so the 72x72 scale below never has to stretch: an
+    // IgnoreAspectRatio scale of a non-square crop is what turns a round design into an oval.
+    const int side = qMin(qMax(cw, ch), qMin(W, H));
+    x0 = qBound(0, x0 - (side - cw) / 2, W - side);
+    y0 = qBound(0, y0 - (side - ch) / 2, H - side);
+    QImage crop = mask.copy(x0, y0, side, side)
+                      .scaled(72, 72, Qt::IgnoreAspectRatio, Qt::SmoothTransformation)
+                      .convertToFormat(QImage::Format_RGBA8888);   // scaled() drops RGBA8888
+
+    // Same model the viewport paints with: albedo = lerp(skin, rampLerp(ramp, G), R).
+    const std::array<QColor, 3> ramp = markingRamp(d4, md.colorStem);
+    const bool haveRamp = ramp[0].isValid() || ramp[1].isValid();
+    const QColor skin(96, 76, 64);   // neutral backdrop so a low-coverage design still reads
+    QImage out(72, 72, QImage::Format_RGB888);
+    for (int y = 0; y < 72; ++y) {
+        const uchar* p = crop.constScanLine(y);
+        for (int x = 0; x < 72; ++x) {
+            const float cov = p[x * 4] / 255.0f;
+            const float pos = p[x * 4 + 1] / 255.0f;
+            const QColor ink = haveRamp ? rampLerp(ramp, pos) : QColor(226, 220, 208);
+            out.setPixel(x, y, qRgb(int(skin.red()   + (ink.red()   - skin.red())   * cov),
+                                    int(skin.green() + (ink.green() - skin.green()) * cov),
+                                    int(skin.blue()  + (ink.blue()  - skin.blue())  * cov)));
+        }
+    }
+    return out;
+}
+
 // A creator item's icon: hIconImage (Makeup/Marking/Jewelry), gender tIcons (Hair/FacialHair),
 // or a colour swatch (Hair/Eye/Marking colour). Face has none. Null until IconIndex is ready.
 QImage WardrobeTab2::creatorIconImage(int cat, const QString& stem) const
@@ -6518,6 +6676,32 @@ QImage WardrobeTab2::creatorIconImage(int cat, const QString& stem) const
     else if (cat == 0) { /* Face: no icon */ }
     else if (!IconIndex::instance().ready()) {
         return QImage();   // not ready yet — don't cache; retry on readyChanged
+    } else if (cat == kMarkingCat) {
+        // Markings go through markingDefAny, which reads the snapshot when it describes one and
+        // the game's binary when it does not — the binary carries hIconImage in the same field.
+        // The generic path below cannot serve them: it opens <stem>.msh.json, and a CASC-only
+        // marking has no such file, so the open fails, `h` stays 0, the null is deliberately not
+        // cached, and every grid refill and search keystroke retries a card that can never fill.
+        const MarkingDef md = markingDefAny(d4, stem);
+        if (md.icon) img = IconIndex::instance().iconImage(md.icon, m_reader);
+        if (img.isNull()) {
+            // The atlas could not serve this one. Draw the marking from its own mask instead.
+            img = markingMaskSwatch(d4, md);
+            // Both diagnostics are one-shot PER STEM. A null result is deliberately not cached
+            // (creatorIconImage retries it on the next fill), so an unrate-limited line here would
+            // repeat on every grid refill and every search keystroke.
+            static QSet<QString> said;
+            static int drawn = 0;
+            if (!said.contains(stem)) {
+                said.insert(stem);
+                if (img.isNull())
+                    qInfo("wardrobe: marking %s has neither an atlas icon nor a readable mask",
+                          qUtf8Printable(stem));
+                else if (++drawn % 25 == 1)
+                    qInfo("wardrobe: %d marking swatch(es) drawn from the mask (their hIconImage "
+                          "has no atlas rectangle in d4data or the game's 2D_table)", drawn);
+            }
+        }
     } else {
         QFile f(d4 + QStringLiteral("/json/base/meta/") + QLatin1String(kCreator[cat].folder)
                 + QStringLiteral("/") + stem + QLatin1String(kCreator[cat].ext));
@@ -7738,7 +7922,7 @@ void WardrobeTab2::rebuildOutfitImpl(bool async)
                                ? QColor(m_skinTone->currentData().toString()) : QColor();
     float makeupInt = 1.0f;
     const QString makeupTex = makeupTexName(d4, sel(5), makeupInt);       // Makeup
-    const MarkingDef mark = markingDef(d4, sel(6));                       // Marking shape
+    const MarkingDef mark = markingDefAny(d4, sel(6));                    // Marking shape (json or CASC)
     // Marking colour: explicit pick, else the shape's default colour.
     const QString markColStem = !sel(7).isEmpty() ? sel(7) : mark.colorStem;
     MarkingPaint markPaint = markingPaint(d4, markColStem);   // ramp + roughness/metalness/tattoo
@@ -7767,8 +7951,15 @@ void WardrobeTab2::rebuildOutfitImpl(bool async)
     }
     // Decode the makeup/marking overlay + mask textures once (resolve name → SNO).
     const QImage makeupImg = makeupTex.isEmpty() ? QImage() : MaterialDecode::texture(m_reader, d4, makeupTex, texSnoFor(makeupTex));
-    const QImage markFaceImg = mark.faceTex.isEmpty() ? QImage() : MaterialDecode::texture(m_reader, d4, mark.faceTex, texSnoFor(mark.faceTex));
-    const QImage markBodyImg = mark.bodyTex.isEmpty() ? QImage() : MaterialDecode::texture(m_reader, d4, mark.bodyTex, texSnoFor(mark.bodyTex));
+    // SNO first. mark.faceTex/bodyTex are empty for an ENCRYPTED mask texture (nameForSno refuses
+    // to hand back a "~unnamed_" placeholder), and gating the decode on the name meant every such
+    // marking listed in the picker and then painted nothing at all.
+    // Name first (the path every marking has always taken), record sno only as the fallback, so
+    // this cannot change the answer for a marking that already resolved.
+    qint64 markFaceSno = texSnoFor(mark.faceTex); if (markFaceSno <= 0) markFaceSno = qint64(mark.faceSno);
+    qint64 markBodySno = texSnoFor(mark.bodyTex); if (markBodySno <= 0) markBodySno = qint64(mark.bodySno);
+    const QImage markFaceImg = markFaceSno <= 0 ? QImage() : MaterialDecode::texture(m_reader, d4, mark.faceTex, markFaceSno);
+    const QImage markBodyImg = markBodySno <= 0 ? QImage() : MaterialDecode::texture(m_reader, d4, mark.bodyTex, markBodySno);
     if (!sel(6).isEmpty()) {   // marking material diagnostic (surfaces the real authored values on-screen)
         const QImage& dmask = !markBodyImg.isNull() ? markBodyImg : markFaceImg;
         // Report the R (coverage) and G (ink→gold) channels separately — that's the real encoding.
@@ -7958,7 +8149,9 @@ void WardrobeTab2::rebuildOutfitImpl(bool async)
     QHash<QString, DetailCacheEntry> cDetail;   // material → composited detail maps + summed strengths
     QHash<QString, QString> cShader;            // material → shader-map name (one JSON read, reused)
     QString furProbe;   // per-fur-part mask coverage → fur_probe.txt (log is mount-stale while app runs)
+    int primIdx = -1;   // ordinal of this primitive in `merged` — indexes primSlot below
     for (const MeshPrimitive& p : merged.primitives) {
+        ++primIdx;
         const QString& m = p.materialName;
         auto cached = [&](QHash<QString, QImage>& c, const char* role, const QString& key, auto fn) -> QImage {
             auto it = c.constFind(key);
@@ -7983,23 +8176,62 @@ void WardrobeTab2::rebuildOutfitImpl(bool async)
             }
             c.insert(key, img); return img;
         };
+        // Shader-map lookup, cached per material name (one JSON read each). A lambda rather than
+        // the old inline IIFE because it is now called twice with DIFFERENT arguments: once on the
+        // raw name for the placeholder test, once on the substituted name for everything below.
+        auto shaderOf = [&](const QString& name) -> QString {
+            auto it = cShader.constFind(name);
+            if (it != cShader.constEnd()) return it.value();
+            const QString sh = shaderMapOf(d4, name); cShader.insert(name, sh); return sh;
+        };
         // Material substitutions:
         //  • test999 body uses a black placeholder (armor_skin_mat) → real face body-skin.
         //  • the face's facial-hair material → the selected FacialHair style's shell material.
+        //
+        // Seven of the eight classes name the facial-hair slot "Global_<gender>_Facialhair_NN_*",
+        // which the name test catches. ROGUE MALE names it "lambert1_skin" — a Maya default that
+        // shipped with an EMPTY texture roster — so nothing was substituted, the slot decoded to
+        // no texture at all, and "skin" in the name additionally earned it a pointless skin-tone
+        // recolour. Measured across all sixteen face pieces (8 classes x 2 genders) the shader
+        // hero_opaque_hollow occurs exactly once, on that one material, so the SHADER identifies
+        // the slot without hard-coding a name that a patch could rename.
+        //
+        // Scoped to CHARACTER parts (primSlot < 0 — body, face, hair, beard, jewellery; armour and
+        // weapons carry a real slot tag), so no equipment material can ever be caught by it. A
+        // short primSlot fails the test and leaves the old behaviour, never a wrong substitution.
+        const bool isCharacterPart = primIdx < primSlot.size() && primSlot[primIdx] < 0;
         const bool isSkinPlaceholder = m.contains(QLatin1String("skin_mat"), Qt::CaseInsensitive);
-        const bool isFacialHairPrim  = m.contains(QLatin1String("facialhair"), Qt::CaseInsensitive);
+        // !fhMat.isEmpty() is part of the TEST, not just of the substitution below: without it a
+        // style that resolves to no shell material would still flip this prim to "facial hair" and
+        // send its own unsubstituted placeholder down the hair path, which is a different wrong
+        // answer from the one being fixed. No shell material ⇒ behave exactly as before.
+        const bool isFacialHairPrim  = m.contains(QLatin1String("facialhair"), Qt::CaseInsensitive)
+                            || (isCharacterPart && !fhMat.isEmpty()
+                                && shaderOf(m).compare(QLatin1String("hero_opaque_hollow"),
+                                                       Qt::CaseInsensitive) == 0);
         QString effMat = m;
         if (isSkinPlaceholder && !bodySkinMat.isEmpty()) effMat = bodySkinMat;
         else if (isFacialHairPrim && !fhMat.isEmpty())   effMat = fhMat;
-        // Resolve the material's shader-map ONCE (a JSON read), cached per material, and reuse it for
-        // both the eye test and the FX classification below instead of reading the file twice.
-        const QString effShader = [&] {
-            auto it = cShader.constFind(effMat);
-            if (it != cShader.constEnd()) return it.value();
-            const QString sh = shaderMapOf(d4, effMat); cShader.insert(effMat, sh); return sh;
-        }();
+        // Reused by the eye test and the FX classification below.
+        const QString effShader = shaderOf(effMat);
 
+        // Hair by SHADER first — the same move that fixed the eye below, for the same reason. The
+        // name tests miss every class-signature beard: those materials are <class><gender>_B09_mat,
+        // which is not "facialhair", and kHairRx looks for _H<NN> while these carry _B09. Rogue B09,
+        // Druid B02-B09 and Spiritborn B09 therefore got no strand alpha — despite each shipping an
+        // explicit _Alpha map — and no hair colour, so they rendered as opaque, wrongly-coloured
+        // cards. EXACT match, never contains("hair"): eyelashes use hair_pbr_igc and are
+        // deliberately NOT hair here, and a substring test would silently change how they render.
+        // CHARACTER parts only, matching the placeholder test above. The hair path is not a small
+        // change of look — it replaces the authored ORM, forces metal 0 / roughness 0.92, derives
+        // alpha from the strand mask and recolours by the character's hair ramp. That is right for
+        // a beard and wrong for a helmet, so an armour or weapon material that happens to use the
+        // hero_hair shader must not be dragged into it by a fix aimed at beards. (The pre-existing
+        // name tests below stay unscoped: changing them is not this fix's business.)
         const bool isHair = isFacialHairPrim   // facial hair (incl. class beards like barF_B09_mat)
+                            || (isCharacterPart
+                                && effShader.compare(QLatin1String("hero_hair"),
+                                                     Qt::CaseInsensitive) == 0)
                             || effMat.contains(QLatin1String("hair"), Qt::CaseInsensitive)
                             || kHairRx.match(effMat).hasMatch();   // RogF_H00_mat, barF_H09_…
         const bool isHead = effMat.contains(QLatin1String("_HED"), Qt::CaseInsensitive)

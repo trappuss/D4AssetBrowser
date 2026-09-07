@@ -171,11 +171,28 @@ void IconIndex::ensureBuilt(const QString& d4dataDir, CascReader* reader)
         // single-frame atlas is its own icon, UV 0..1. That is exactly the shape of the bundle art
         // (2DInventory_Bundle_HArmor_bar_stor251 and siblings) this exists to recover.
         //
-        // Multi-frame atlases are COUNTED AND SKIPPED, not guessed. The Textures tab recovers their
-        // rectangles by alpha-gutter segmentation, but its own comment records that pairing those
-        // rectangles back to handles is approximate because 2D_table's authored order is not the
-        // atlas's spatial order — and an icon silently showing the WRONG item is worse than one
-        // showing nothing. Those stay served by data/icon_overrides.
+        // Multi-frame atlases are COUNTED AND SKIPPED, not guessed — and that refusal is now
+        // MEASURED rather than assumed. Over the 2,635 multi-frame atlases that 2D_table and
+        // d4data both describe, so that both the authored order and the true rectangles are
+        // known:
+        //
+        //   2D_table frameIndex == position in ptFrame[]   2635 / 2635   100.0%   UNANIMOUS
+        //   row-major spatial sort == ptFrame[] order        740 / 2635    28.1%
+        //       of which  2DInventory_*   390 / 798   48.9%
+        //                 2DUI_Bundle_*   162 / 1125  14.4%
+        //                 2DUI_*          184 / 666   27.6%
+        //
+        // So the ORDINAL is completely reliable — which is what makes data/icon_overrides, keyed
+        // on atlas + frame index, sound. What is not reliable is the only thing that could supply
+        // a rectangle for an atlas d4data has never described: pairing alpha-gutter-segmented
+        // rects back to handles by position. Bucketing rows with a tolerance (0.002 / 0.01 / 0.03)
+        // recovers exactly ZERO additional atlases, so this is not float drift — the packer's
+        // order simply is not spatial. On 2DUI_Bundle_*, the family the newest store and collab
+        // art lands in, it would put the wrong icon on the card six times in seven.
+        //
+        // Do not "improve" this into a heuristic. A card showing the WRONG item is worse than a
+        // card showing nothing, and the Wardrobe's own answer for the markings that land here is
+        // to draw the swatch from the marking's mask instead (WardrobeTab2::markingMaskSwatch).
         int fromCasc = 0, multiSkipped = 0, noDef = 0;
         if (rd && FrameTable::instance().isLoaded()) {
             TextureDefTable::instance().ensureBuilt(rd);

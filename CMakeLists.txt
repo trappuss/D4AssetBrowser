@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.21)
 
 project(D4AssetBrowser
-    VERSION 2.2.8
+    VERSION 2.2.9
     DESCRIPTION "Native C++/Qt6 Diablo IV asset browser (d4analyzer code stack)"
     LANGUAGES CXX)
 

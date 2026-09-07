@@ -40,7 +40,10 @@ public:
         parts << (opt.blenderFriendly ? QStringLiteral("Blender axes") : QStringLiteral("glTF axes"));
         if (opt.unitScale != 1.0f)
             parts << QStringLiteral("scale x%1").arg(double(opt.unitScale), 0, 'g', 4);
-        if (opt.flipNormalGreen)     parts << QStringLiteral("DirectX normals");
+        // Stated either way, never only when set: the meaning of this flag was inverted once
+        // already, and reporting only one of its two states is how that went unnoticed.
+        parts << (opt.flipNormalGreen ? QStringLiteral("OpenGL normals (G flipped)")
+                                      : QStringLiteral("DirectX normals (G as decoded)"));
         if (!opt.reconstructNormalZ) parts << QStringLiteral("normal Z as decoded");
         return QStringLiteral("  ·  ") + parts.join(QStringLiteral(", "));
     }

@@ -9,13 +9,31 @@
 
 namespace {
 constexpr auto kRepoUrl = "https://github.com/DiabloTools/d4data.git";
-// The tool reads exactly TWENTY of d4data's 133 asset groups. Fetching all of json/base pulled
-// 780,780 files; these twenty are 462,954 — so 317,826 files, ~41% of the extract time and a
+// The tool reads exactly TWENTY-FOUR of d4data's 133 asset groups. Fetching all of json/base pulled
+// 780,780 files; these twenty-four are 463,113 — so 317,667 files, ~41% of the extract time and a
 // matching slice of the disk cost, were being spent on groups nothing ever opens.
 //
 // Derived by grepping every "json/base/meta/<Group>" literal in the source, not by judgement.
 // If a new reader is added for another group, ADD IT HERE — a missing group is not fatal (the
 // binary CASC path covers most of it) but it silently loses whatever the JSON provided.
+//
+// THE GREP IS NOT ENOUGH ON ITS OWN, and this list carried the scar for three releases: Face,
+// HairStyle and Jewelry are read by WardrobeTab2::creatorEntries(), which builds the path by
+// CONCATENATING kCreator[].folder onto "/json/base/meta/". No literal exists for them anywhere
+// in the source, so the grep could not see them and they were never downloaded — every class,
+// both genders, got an empty Face / Hair style / Jewelry list with nothing on screen to say why.
+// The other six creator folders survived only by accident, because each also appears as a
+// literal somewhere else (facialHairStyle() opens "/json/base/meta/FacialHair/", and so on).
+// So: any group reached through a TABLE rather than a literal must be added here by hand.
+//
+// Emblem was the same failure by a different road: it is named only by a StoreProduct FIELD
+// (snoEmblem), so no path literal existed to grep and a bundle's emblem silently exported nothing.
+// 93 records, each two icon handles (hSmallIcon / hLargeIcon — read out of the repo's own tree
+// with `git show HEAD:json/base/meta/Emblem/emblem_glo052_stor.emb.json`, since the group is not
+// checked out until this list ships). Its neighbours in that family were checked at the same time
+// and deliberately NOT added: snoHeadstone points into Actor (already downloaded, and resolvable),
+// and snoTownPortal into TownPortalCosmetic, whose records are chains of EffectGroups rather than
+// anything exportable — pulling it in would mean pulling EffectGroup too, for VFX, for no files.
 //
 // Cone mode also includes files sitting directly in the listed parents, so json/base/CoreTOC.dat.json
 // arrives without being named — it is the only top-level file the code reads.
@@ -24,10 +42,13 @@ const QStringList kSparse = {
     "json/base/meta/Actor",         "json/base/meta/Anim",
     "json/base/meta/AnimSet",       "json/base/meta/Appearance",
     "json/base/meta/AppearanceSet", "json/base/meta/Cloth",
-    "json/base/meta/Dye",           "json/base/meta/Emote",
-    "json/base/meta/EyeColor",      "json/base/meta/FacialHair",
-    "json/base/meta/HairColor",     "json/base/meta/Item",
-    "json/base/meta/ItemType",      "json/base/meta/Makeup",
+    "json/base/meta/Dye",           "json/base/meta/Emblem",
+    "json/base/meta/Emote",         "json/base/meta/EyeColor",
+    "json/base/meta/Face",
+    "json/base/meta/FacialHair",    "json/base/meta/HairColor",
+    "json/base/meta/HairStyle",     "json/base/meta/Item",
+    "json/base/meta/ItemType",      "json/base/meta/Jewelry",
+    "json/base/meta/Makeup",
     "json/base/meta/MarkingColor",  "json/base/meta/MarkingShape",
     "json/base/meta/Material",      "json/base/meta/PlayerClass",
     "json/base/meta/StoreProduct",  "json/base/meta/Texture",

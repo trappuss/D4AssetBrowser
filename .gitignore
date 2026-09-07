@@ -52,3 +52,5 @@ build.del/
 _perftest_out/
 _perftest_baseline.log
 _perftest_cached.log
+# "Test - Export Cache.bat" folder-picker scratch — rewritten on every run.
+pick

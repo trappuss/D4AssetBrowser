@@ -50,13 +50,26 @@ struct ExportMaterial {
 // GLModelWidget::blenderizeSkeletonNames.
 // Full export options. `unitScale` multiplies every position / bone translation /
 // inverse-bind translation / anim translation (rotations & normals untouched) — for
-// centimeter pipelines (Unreal/Skyrim FBX round-trips) use 100. `flipNormalGreen`
-// inverts the normal map's G channel (OpenGL → DirectX convention).
+// centimeter pipelines (Unreal/Skyrim FBX round-trips) use 100.
+//
+// flipNormalGreen: inverts the normal map's G channel, DirectX → OpenGL.
+//
+// The direction was BACKWARDS until it was measured, and it defaulted to "no flip", so the two
+// presets that need the flip (Blender, Unity) were the two that did not do it. D4's normal maps
+// are DIRECTX convention: G points toward the BOTTOM of the texture. Measured on
+// barM_P00_BOD_normal from three features with known anatomy, with no integration involved — on
+// a convex bump the upper half carries the HIGHER G under OpenGL and the LOWER G under DirectX,
+// and both nipples (−15, −13) and both pectoral mounds (−5, −4) read DirectX, as did the navel
+// taken as a pit (+6). The same statistic on a synthetic bump of each convention returns +14 /
+// −14, so its sign is established rather than assumed.
+//
+// glTF mandates OpenGL-convention normal maps and Blender is OpenGL-convention, so glTF output
+// FLIPS by default; only a DirectX target (Unreal/Skyrim) wants the channel as decoded.
 struct Options {
     bool  reconstructNormalZ = true;
     bool  blenderFriendly    = false;
     float unitScale          = 1.0f;
-    bool  flipNormalGreen    = false;
+    bool  flipNormalGreen    = true;
     // Symmetrize the rig for Blender's Pose ▸ X-Axis Mirror (only with blenderFriendly):
     // each .R bone's world rest rotation is rewritten to the exact mirror of its .L
     // partner's, locals/inverse-binds rebuilt, anim curves conjugated into the new local
@@ -83,4 +96,19 @@ bool exportGlb(const ModelGeometry& geo, const QString& path,
                const QStringList& animNames = {},
                bool reconstructNormalZ = true,
                bool blenderFriendly = false);
+
+// Invert a normal map's G channel in place: DirectX <-> OpenGL. Shared by exportGlb and the
+// self-test below, deliberately — a test that reimplements the transform it is guarding proves
+// nothing about the code that ships.
+void flipNormalGreenChannel(QImage& nrm);
+
+// Startup sanity check of the normal-map CONVENTION. Empty string on success.
+//
+// This exists because the green channel's meaning has been wrong twice in this codebase and
+// neither time produced a symptom anything could catch: it compiles, it renders, it exports, and
+// the only evidence is that relief looks subtly inside-out in someone else's DCC. The seam fix on
+// mirrored UV islands is blind to it too — flipping both sides makes them AGREE, whichever one is
+// right. So the invariant is asserted directly: given a bump authored the way D4 authors them
+// (DirectX, G toward the image bottom), the default export path must emit OpenGL.
+QString normalConventionSelfTest();
 }

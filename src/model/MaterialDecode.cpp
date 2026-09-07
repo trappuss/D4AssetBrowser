@@ -496,8 +496,15 @@ QImage MaterialDecode::orm(CascReader* reader, const QString& d4, const QString&
     auto chan = [&](const QImage& im, int def) -> QImage {
         QImage out(w, h, QImage::Format_RGBA8888);
         if (im.isNull()) { out.fill(QColor(def, def, def)); return out; }
-        return im.convertToFormat(QImage::Format_RGBA8888)
-                 .scaled(w, h, Qt::IgnoreAspectRatio, Qt::SmoothTransformation);
+        // convertToFormat AFTER the scale, not before it — the same trap bakeDetail documents.
+        // Qt's smooth scaler has no Format_RGBA8888 path: it converts to ARGB32_Premultiplied
+        // and returns THAT, so a convert-then-scale leaves the image in BGRA byte order and the
+        // `pr[x * 4]` reads below pick up BLUE. It has been harmless only by luck — AO, rough
+        // and metal decode from single-channel BC4, where R == G == B, so the wrong byte holds
+        // the right value. The first packed multi-channel source here would have made every ORM
+        // channel silently wrong, with no symptom but bad shading.
+        return im.scaled(w, h, Qt::IgnoreAspectRatio, Qt::SmoothTransformation)
+                 .convertToFormat(QImage::Format_RGBA8888);
     };
     const QImage R = chan(ao, 255), G = chan(rough, 153), B = chan(metal, 0);
     QImage out(w, h, QImage::Format_RGBA8888);

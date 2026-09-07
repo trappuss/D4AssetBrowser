@@ -363,13 +363,11 @@ bool ModelExporter::exportGlb(const ModelGeometry& geo, const QString& path,
                     }
                 }
                 if (opt.flipNormalGreen) {
-                    // OpenGL → DirectX normal convention (Unreal/Skyrim): invert the G channel.
-                    nrm = nrm.convertToFormat(QImage::Format_RGBA8888);
-                    for (int y = 0; y < nrm.height(); ++y) {
-                        uchar* s = nrm.scanLine(y);
-                        for (int x = 0; x < nrm.width(); ++x)
-                            s[x*4+1] = uchar(255 - s[x*4+1]);
-                    }
+                    // DirectX → OpenGL normal convention: invert the G channel. D4 authors
+                    // DirectX (G = image-down; measured, see ModelExporter.h) and glTF/Blender
+                    // are OpenGL, so this is the DEFAULT and a DirectX target opts out of it.
+                    // Shared with normalConventionSelfTest(), which guards this exact call.
+                    flipNormalGreenChannel(nrm);
                 }
                 const int tex = addTexture(nrm);
                 if (tex >= 0)
@@ -897,6 +895,81 @@ bool ModelExporter::exportGlb(const ModelGeometry& geo, const QString& path,
 // Resolve export options from QSettings, applying the target-engine preset
 // (Settings ▸ Export ▸ "Retarget & modding"). Preset 0 (Custom) respects the
 // individual toggles + retarget/unitScale; the named presets override them.
+void ModelExporter::flipNormalGreenChannel(QImage& nrm)
+{
+    nrm = nrm.convertToFormat(QImage::Format_RGBA8888);
+    for (int y = 0; y < nrm.height(); ++y) {
+        uchar* s = nrm.scanLine(y);
+        for (int x = 0; x < nrm.width(); ++x)
+            s[x * 4 + 1] = uchar(255 - s[x * 4 + 1]);
+    }
+}
+
+QString ModelExporter::normalConventionSelfTest()
+{
+    // A convex bump, authored the way D4 authors one. h = exp(-r^2/s), so along the surface
+    //   normal_up   = +dh/drow   (image-up component)
+    //   normal_right= -dh/dcol
+    // and a DIRECTX map stores the NEGATED up-component in G, because its G axis points at the
+    // bottom of the image. Everything below follows from those two lines alone.
+    const int   N = 64, C = N / 2;
+    const float S = 220.0f, GAIN = 3.0f;
+    auto enc = [GAIN](float v) {
+        return uchar(qBound(0.0f, (v * GAIN * 0.5f + 0.5f) * 255.0f, 255.0f));
+    };
+    QImage img(N, N, QImage::Format_RGBA8888);
+    for (int y = 0; y < N; ++y) {
+        uchar* p = img.scanLine(y);
+        for (int x = 0; x < N; ++x) {
+            const float dx = float(x - C), dy = float(y - C);
+            const float h   = std::exp(-(dx * dx + dy * dy) / S);
+            const float nUp = h * (-2.0f * dy / S);          // +dh/drow
+            const float nRt = h * ( 2.0f * dx / S);          // -dh/dcol
+            p[x * 4]     = enc(nRt);
+            p[x * 4 + 1] = enc(-nUp);                        // DirectX: G points image-DOWN
+            p[x * 4 + 2] = 0;                                // BC5 decodes with B = 0
+            p[x * 4 + 3] = 255;
+        }
+    }
+    // The statistic: on a convex bump the upper half carries the HIGHER G under OpenGL and the
+    // LOWER G under DirectX. Same test that measured barM_P00_BOD_normal (see ModelExporter.h).
+    auto aboveMinusBelow = [](const QImage& im) {
+        const int c = im.height() / 2, r = im.height() / 3;
+        const int lo = c - r, hi = c + r;
+        double top = 0, bot = 0; int nt = 0, nb = 0;
+        for (int y = lo; y <= hi; ++y) {
+            const uchar* p = im.constScanLine(y);
+            for (int x = lo; x <= hi; ++x) {
+                if (y < c - r / 4)      { top += p[x * 4 + 1]; ++nt; }
+                else if (y > c + r / 4) { bot += p[x * 4 + 1]; ++nb; }
+            }
+        }
+        return (nt && nb) ? (top / nt - bot / nb) : 0.0;
+    };
+
+    // 1. The FIXTURE is what it claims to be. Without this the rest could pass on a broken bump.
+    const double src = aboveMinusBelow(img);
+    if (!(src < -1.0))
+        return QStringLiteral("fixture is not DirectX: above-below = %1, expected clearly negative")
+                   .arg(src, 0, 'f', 2);
+
+    // 2. The SHIPPING transform turns it into OpenGL.
+    QImage flipped = img;
+    flipNormalGreenChannel(flipped);
+    const double out = aboveMinusBelow(flipped);
+    if (!(out > 1.0))
+        return QStringLiteral("flipNormalGreenChannel did not produce OpenGL: above-below = %1, "
+                              "expected clearly positive").arg(out, 0, 'f', 2);
+
+    // 3. The DEFAULT applies it. This is the assertion that would have caught the original bug:
+    // the transform was correct all along, it simply defaulted to off, so the two presets that
+    // needed it (Blender, Unity) were the two that skipped it.
+    if (!Options{}.flipNormalGreen)
+        return QStringLiteral("Options::flipNormalGreen defaults to false — glTF and Blender are "
+                              "OpenGL and D4 ships DirectX, so the default must flip");
+    return QString();
+}
+
 ModelExporter::Options ModelExporter::optionsFromSettings()
 {
     const QSettings s;
@@ -908,17 +981,17 @@ ModelExporter::Options ModelExporter::optionsFromSettings()
     case 1:   // Blender — meters, OpenGL normals, Blender-friendly rig
         opt.blenderFriendly = true;
         opt.unitScale       = 1.0f;
-        opt.flipNormalGreen = false;
+        opt.flipNormalGreen = true;    // Blender is OpenGL; D4 ships DirectX
         break;
     case 2:   // Unreal / Skyrim — cm pipelines (Blender→FBX), DirectX normals
         opt.blenderFriendly = true;
         opt.unitScale       = 100.0f;
-        opt.flipNormalGreen = true;
+        opt.flipNormalGreen = false;   // DirectX target: D4's G channel is already right
         break;
     case 3:   // Unity — plain glTF (Y-up, meters, OpenGL normals)
         opt.blenderFriendly = false;
         opt.unitScale       = 1.0f;
-        opt.flipNormalGreen = false;
+        opt.flipNormalGreen = true;
         break;
     default:  // Custom
         opt.unitScale = float(s.value(QStringLiteral("retarget/unitScale"), 1.0).toDouble());

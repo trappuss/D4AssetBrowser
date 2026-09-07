@@ -2,6 +2,9 @@
 #include "tabs/BrowserTab.h"
 #include "model/ModelExporter.h"
 #include "model/ModelGeometry.h"
+// MarkingDef is markingDefAny()'s return type below, so it must be complete HERE, not
+// only in the .cpp. MarkingCompose.h pulls in nothing but Qt + <array>, so no cycle.
+#include "tabs/MarkingCompose.h"
 
 #include <QCache>
 #include <QHash>
@@ -143,6 +146,37 @@ private:
                     int* outBone = nullptr, std::array<float,16>* outMz = nullptr,
                     bool bake = true);
     void populateCreator();  // fill the 9 character-creator pickers for this class/gender
+    // ── Markings the d4data snapshot has never described ────────────────────────────────────────
+    // The game ships 374 MarkingShapes and the snapshot describes 304. Everything in that gap was
+    // simply absent from the Marking picker — not greyed, not named — which is indistinguishable
+    // from "this class has none". These two read the missing ones straight out of the game.
+    //
+    // BOTH ARE GUI-THREAD ONLY: SnoIndex::nameForSno / snoForName build a lazy reverse map behind
+    // a const signature, so handing them to a worker is a silent data race (see SnoIndex.h).
+    MarkingDef markingDefAny(const QString& d4, const QString& stem) const;
+    // The Marking card's swatch when its hIconImage has no rectangle anywhere (see the definition).
+    QImage     markingMaskSwatch(const QString& d4, const MarkingDef& md) const;
+    // WardrobeTab2 had no reset() of its own — it inherited BrowserTab's no-op — so this is the
+    // first time the tab forgets anything when MainWindow repoints at a different install.
+    // Everything cleared here is keyed to the GAME BUILD and would otherwise be answered from the
+    // previous one:
+    //   m_cascMarkings  the CASC marking scan
+    //   m_texSno        texture name -> sno for the whole of group 44, built once and never
+    //                   dropped, so mask/material lookups would return the old install's snos
+    //   m_loaded        refresh() early-returns on it, so without clearing it the tab never
+    //                   repopulates and the marking list stays as it was until the user happens
+    //                   to change class or gender
+    void reset() override {
+        m_cascMarkings.clear();
+        m_cascMarkingsBuilt = false;
+        m_texSno.clear();
+        m_loaded = false;
+    }
+    void       appendCascOnlyMarkings(QStringList& stems, int fubc) const;
+    // (stem, eClassRestriction) for every MarkingShape in the game that the snapshot lacks.
+    // Scanned once — a class switch re-filters this list rather than re-reading CASC.
+    mutable QVector<QPair<QString, int>> m_cascMarkings;
+    mutable bool                         m_cascMarkingsBuilt = false;
     void resetDefaults();    // reset every wardrobe selection to defaults
     void populateSets();     // group slot appearances into m_sets (feeds right-click Equip Theme)
     QString themeToken(const QString& appearanceName) const;   // middle id (e.g. "stor007")

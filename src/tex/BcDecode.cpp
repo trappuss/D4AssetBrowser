@@ -6,6 +6,7 @@
 #include <QSet>
 #include <QString>
 #include <array>
+#include <cmath>
 #include <cstring>
 
 namespace {
@@ -281,6 +282,28 @@ QImage BcDecode::decode(const QByteArray& data, int width, int height, int eTexF
         }
     }
     return img;
+}
+
+bool BcDecode::isTwoChannel(int eTexFormat)
+{
+    return TexFormat::codec(eTexFormat).glInternalFormat == TexFormat::GL_BC5;
+}
+
+QImage BcDecode::withNormalZ(const QImage& img, int eTexFormat)
+{
+    if (img.isNull() || !isTwoChannel(eTexFormat)) return img;
+    QImage out = img.convertToFormat(QImage::Format_RGBA8888);
+    for (int y = 0; y < out.height(); ++y) {
+        uchar* s = out.scanLine(y);
+        for (int x = 0; x < out.width(); ++x) {
+            const float nx = s[x * 4]     / 255.0f * 2.0f - 1.0f;
+            const float ny = s[x * 4 + 1] / 255.0f * 2.0f - 1.0f;
+            const float nz = std::sqrt(std::max(0.0f, 1.0f - nx * nx - ny * ny));
+            s[x * 4 + 2] = uchar(qBound(0.0f, (nz * 0.5f + 0.5f) * 255.0f, 255.0f));
+            s[x * 4 + 3] = 255;
+        }
+    }
+    return out;
 }
 
 QString BcDecode::selfTest()

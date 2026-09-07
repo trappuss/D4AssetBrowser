@@ -13,7 +13,7 @@
         "CMAKE_TOOLCHAIN_FILE": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake",
         "VCPKG_TARGET_TRIPLET": "x64-windows",
         "CMAKE_OBJECT_PATH_MAX": "240",
-        "VCPKG_INSTALL_OPTIONS": "--x-buildtrees-root=C:/Users/notso/vbt"
+        "VCPKG_INSTALL_OPTIONS": "--x-buildtrees-root=$env{VCPKG_ROOT}/bt"
       }
     },
     {

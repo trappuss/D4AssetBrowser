@@ -125,6 +125,10 @@ private:
     // data\prd_probe.txt, then exit. Needs StoreProductIndex ready, so finishReload may defer it
     // to readyChanged. Unattended: "Dump StoreProduct Layout.bat" waits on the process.
     void dumpPrdProbe();
+    // D4_DUMP_MSH=1 — measure the MarkingShape binary's field offsets against the 302 records that
+    // DO ship json, and name every MarkingShape the snapshot is missing. Writes msh_probe.txt and
+    // quits. See the long note at the call site for why the missing list is the point.
+    void dumpMshProbe();
 
     // ── Global navigation: Ctrl+K jump palette + Alt+Left/Right history ──
     void showJumpPalette();          // Ctrl+K: search models+textures by name/SNO, jump on Enter

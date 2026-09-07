@@ -33,7 +33,7 @@ if not defined VCPKG_ROOT (
 :: 2. Configure + build the standalone d4cloth target (own build dir; the app build is untouched).
 echo [2/3] Configuring + building d4cloth...
 powershell -NoProfile -ExecutionPolicy Bypass -Command ^
-  "cmake -S tools/d4cloth -B tools/d4cloth/build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_TOOLCHAIN_FILE='%VCPKG_ROOT%/scripts/buildsystems/vcpkg.cmake' -DVCPKG_TARGET_TRIPLET=x64-windows '-DVCPKG_INSTALL_OPTIONS=--x-buildtrees-root=C:/Users/notso/vbt' 2>&1 | Tee-Object -FilePath '%~dp0d4cloth_build_log.txt'; exit $LASTEXITCODE"
+  "cmake -S tools/d4cloth -B tools/d4cloth/build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_TOOLCHAIN_FILE='%VCPKG_ROOT%/scripts/buildsystems/vcpkg.cmake' -DVCPKG_TARGET_TRIPLET=x64-windows '-DVCPKG_INSTALL_OPTIONS=--x-buildtrees-root=%VCPKG_ROOT%/bt' 2>&1 | Tee-Object -FilePath '%~dp0d4cloth_build_log.txt'; exit $LASTEXITCODE"
 if not "%errorlevel%"=="0" (
     REM Select-String, not findstr: Tee-Object writes the log as UTF-16, which findstr
     REM cannot read - it warns and produces an EMPTY error file, so a failed build

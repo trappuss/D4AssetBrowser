@@ -200,9 +200,21 @@ fit-reference body → cloth collapse → anchor remap → bone naming → expor
 
 **Target engine preset** (`retarget/enginePreset`) resolves the final
 `ModelExporter::Options`: Blender = Blender-friendly rig, meters; Unreal/Skyrim =
-Blender-friendly rig, ×100 unit scale + DirectX normals (G channel flipped) for
-Blender→FBX round-trips (beware: glTF importers that auto-convert m→cm will
-double-scale); Unity = plain glTF. Custom respects the individual toggles plus
+Blender-friendly rig, ×100 unit scale for Blender→FBX round-trips (beware: glTF
+importers that auto-convert m→cm will double-scale); Unity = plain glTF.
+
+**Normal-map green channel.** D4 authors normal maps in the **DirectX** convention
+(G points toward the BOTTOM of the texture). Measured on `barM_P00_BOD_normal`
+across three features with known anatomy — on a convex bump the upper half carries
+the higher G under OpenGL and the lower G under DirectX; both nipples (−15, −13)
+and both pectoral mounds (−5, −4) read DirectX, and the navel read as a pit (+6).
+The same statistic on a synthetic bump of each convention returns +14 / −14.
+
+glTF mandates OpenGL-convention normal maps and Blender is OpenGL-convention, so
+`flipNormalGreen` now **defaults to true** and only the Unreal/Skyrim preset turns
+it off. It was the other way round until this was measured, which meant the two
+presets that needed the flip (Blender, Unity) were the two that skipped it. The
+export toast states the resulting convention on every export, either way. Custom respects the individual toggles plus
 `retarget/unitScale`. Unit scaling multiplies vertex positions, ALL local bone
 translations, inverse-bind translations and anim translation channels (uniform-
 scale conjugation — rotations/scales invariant).

@@ -1087,11 +1087,14 @@ void MainWindow::reload()
         // group is thousands of entries and a material miss can happen for every part of every
         // model. Lower-cased keys because .mat.json names and index names differ in case.
         if (r.idx) {
-            // BOTH material groups. The name table calls 37 "Material" and 57 "Material (2)", and
-            // the ones that matter are in 57 — PalM_stor188_LEG_mat and armor_skin_mat are both
-            // there. Building from groupIdByName("Material") alone returns 37 and yields a map
-            // that misses essentially every real material, which is a fix that silently does
-            // nothing.
+            // BOTH material groups. 57 is the real one — 102,661 records, and every stem in
+            // d4data's json/base/meta/Material resolves there in CoreTOC; 37 holds a different
+            // 3,633 (2D_prims_transparent and friends). The name table used to have those two
+            // BACKWARDS, so groupIdByName("Material") returned 37 and building from it alone
+            // produced a map that missed essentially every real material — a fix that silently
+            // did nothing. The labels are now the measured way round (see groupNameMap), and this
+            // loop still takes both groups deliberately: 37 is not empty, and nothing has
+            // established that no material of interest lives there.
             auto map = std::make_shared<QHash<QString, qint64>>();
             for (const int g : {SnoIndex::groupIdByName(QStringLiteral("Material"), 37),
                                 SnoIndex::groupIdByName(QStringLiteral("Material (2)"), 57)})
@@ -1170,6 +1173,19 @@ void MainWindow::finishReload(const ReloadResult& r)
     //
     // So: kick the index, run on readyChanged, write, quit. Same shape as D4_HEALTH_AUDIT and
     // D4_CHAINTEST, which is exactly what makes those safe to drive from a .bat.
+    // ── D4_DUMP_MSH=1: the MarkingShape probe ───────────────────────────────────────────────────
+    // Needs only CASC and the d4data folder — no background index has to finish first — so unlike
+    // the PRD probe below it runs inline. dumpMshProbe posts quit() when it is done, which is what
+    // makes it safe to drive from a .bat.
+    //
+    // It must NOT return early, and this is not a style point: m_reloading is cleared exactly once,
+    // at the bottom of this function. Qt 6's quit() posts an event rather than calling exit(), so
+    // the window still receives closeEvent — which, with m_reloading stuck true, spins its 20s
+    // drain loop pumping events, and can surface the startup update dialog into an unattended run
+    // that has nobody to dismiss it. Letting the rest of finishReload run costs a few resets on a
+    // process that is already exiting; skipping it costs twenty seconds and a possible hang.
+    if (r.cascOk && m_casc && qEnvironmentVariableIsSet("D4_DUMP_MSH"))
+        dumpMshProbe();
     if (r.cascOk && m_casc && qEnvironmentVariableIsSet("D4_DUMP_PRD")) {
         StoreProductIndex& spi = StoreProductIndex::instance();
         if (spi.ready()) {
@@ -1418,7 +1434,8 @@ void MainWindow::finishReload(const ReloadResult& r)
     // so they rebuild fresh. This keeps the tool working across game/d4data updates.
     {
         // ── The TACT KEY COUNT belongs in the fingerprint ───────────────────────────────────────
-        // Without it, "File ▸ Update TACT Keys" changed nothing visible. Every cache that recorded
+        // Without it, re-downloading the TACT keys (Settings ▸ General ▸ Directories)
+        // changed nothing visible. Every cache that recorded
         // "this asset could not be decoded" — appearance metadata, icons, texture info — stayed
         // valid, so newly-unlocked collab and seasonal content remained invisible until some
         // UNRELATED change (a game patch, a d4data pull) happened to move the fingerprint. The one
@@ -2103,6 +2120,219 @@ void MainWindow::updateStalenessWarning()
     m_staleWarn->setText(QStringLiteral("⚠ %1").arg(warns.join(QStringLiteral(" · "))));
     m_staleWarn->setToolTip(tips.join(QStringLiteral("\n\n")));
     m_staleWarn->show();
+}
+
+// ── D4_DUMP_MSH=1: measure the MarkingShape binary, and name what the snapshot is missing ────────
+//
+// Why this exists. The Wardrobe's Marking list is built ENTIRELY from d4data's
+// json/base/meta/MarkingShape/*.msh.json. When the game ships a marking the snapshot has not
+// described yet, the Wardrobe cannot show it at all — not greyed, not named, simply absent — and
+// nothing on screen distinguishes that from "this class has no such marking".
+//
+// Measured case, the Diablo IV x Berserk collab: its Brand of Sacrifice markings have textures in
+// CASC (they extract fine from the Textures tab) and NO MarkingShape json. They sit exactly in the
+// numbering gaps of each class's sequence — bar 057,[058],059 · dru 045,[046],047 ·
+// nec 051,[052-053],054 · sor 051,[052-055],056 · spi 026,[027-028],029 · rog 058,[059-060],061 —
+// which is what a snapshot lagging the game looks like from underneath.
+//
+// Reading them from CASC needs the .msh binary layout, and this MEASURES it rather than guessing,
+// the same way D4_DUMP_PRD found the StoreProduct layout: for every marking that DOES have json
+// every answer is already known, so their values are searched for inside their own meta blob and
+// every hit offset is reported. An offset that is unanimous across all of them is a field.
+// Anything less is a coincidence and is reported as one.
+//
+// PHASE 3 is the part that pays off immediately, before any parser exists: it lists every
+// MarkingShape sno the index knows and the snapshot does not, BY NAME. That list is the answer to
+// "what am I missing", and it needs no layout at all.
+void MainWindow::dumpMshProbe()
+{
+    QStringList rep;
+    rep << QStringLiteral("MarkingShape .msh binary probe — field offsets + snapshot coverage");
+
+    // ── The known-answers set: every marking d4data describes ────────────────────────────────
+    struct Known {
+        QString stem;
+        int     sno = 0;
+        quint32 maskFace = 0, maskBody = 0, defColor = 0, icon = 0;
+        int     classRestriction = -1;
+    };
+    QVector<Known> known;
+    const QDir mshDir(QDir(Config::d4dataDir()).filePath(QStringLiteral("json/base/meta/MarkingShape")));
+    const QStringList files = mshDir.entryList(QStringList{QStringLiteral("*.msh.json")}, QDir::Files);
+    for (const QString& fn : files) {
+        QFile f(mshDir.filePath(fn));
+        if (!f.open(QIODevice::ReadOnly)) continue;
+        const QJsonObject o = QJsonDocument::fromJson(f.readAll()).object();
+        Known k;
+        k.stem = fn.left(fn.size() - 9);   // strip ".msh.json"
+        k.sno  = o.value(QStringLiteral("__snoID__")).toInt();
+        // __raw__ is the reference's real sno. Reading the raw value rather than re-resolving the
+        // name keeps this a measurement of the binary and not of our own name joins.
+        auto raw = [&o](const char* key) {
+            return quint32(o.value(QLatin1String(key)).toObject()
+                               .value(QStringLiteral("__raw__")).toDouble(0.0));
+        };
+        k.maskFace = raw("snoMaskFace");
+        k.maskBody = raw("snoMaskBody");
+        k.defColor = raw("snoDefaultColor");
+        k.icon     = quint32(o.value(QStringLiteral("hIconImage")).toDouble(0.0));
+        k.classRestriction = o.value(QStringLiteral("eClassRestriction")).toInt(-1);
+        if (k.sno > 0) known << k;
+    }
+    rep << QStringLiteral("markingshape json count: %1").arg(known.size());
+    if (known.isEmpty())
+        rep << QStringLiteral("NO MARKINGS INDEXED — this is not a finding about the binary. "
+                              "Check that d4data is downloaded and json/base/meta/MarkingShape "
+                              "exists.");
+
+    // ── PHASE 1 — where does each known value sit in the blob? ───────────────────────────────
+    // One histogram per field: offset -> how many records put the value there. A field is an offset
+    // that wins unanimously; a near-miss is reported as a near-miss, never rounded up to a finding.
+    struct Field { const char* name; quint32 Known::*u; };
+    static const Field kFields[] = {
+        {"snoMaskFace",      &Known::maskFace},
+        {"snoMaskBody",      &Known::maskBody},
+        {"snoDefaultColor",  &Known::defColor},
+        {"hIconImage",       &Known::icon},
+    };
+    QHash<QString, QHash<int, int>> hist;   // field -> offset -> count
+    // How many records could actually SPEAK to each field. Not the same as `sampled`: a record
+    // whose snoDefaultColor is 0 was never asked the question and must not be counted as a vote
+    // against the offset. Measured on the shipped snapshot the shortfalls are real and large —
+    // 14 markings author no default colour, 26 author eClassRestriction -1 — so scoring hits out
+    // of `sampled` would cap eClassRestriction at 278/304 and report every genuine field as "not
+    // unanimous", i.e. throw away the one answer this probe exists to produce.
+    QHash<QString, int> eligible;            // field -> records that carried a usable value
+    int sampled = 0, noMeta = 0;
+    for (const Known& k : known) {
+        const QByteArray meta = m_casc ? m_casc->readMetaBySno(quint64(k.sno)) : QByteArray();
+        if (meta.size() < 8) { ++noMeta; continue; }
+        ++sampled;
+        auto u32at = [&meta](int off) -> quint32 {
+            return quint32(uchar(meta[off])) | quint32(uchar(meta[off + 1])) << 8
+                 | quint32(uchar(meta[off + 2])) << 16 | quint32(uchar(meta[off + 3])) << 24;
+        };
+        for (const Field& fd : kFields) {
+            const quint32 want = k.*(fd.u);
+            if (!want) continue;   // absent on this record — it can prove nothing about the offset
+            const QString fn = QString::fromLatin1(fd.name);
+            eligible[fn]++;
+            for (int off = 0; off + 4 <= meta.size(); ++off)
+                if (u32at(off) == want) hist[fn][off]++;
+        }
+        // eClassRestriction is a SIGNED int and -1 is by far the commonest value, so a raw search
+        // would light up every 0xFFFFFFFF in the blob. Only the class-restricted records (a real
+        // 0..7) can locate it, which is exactly the subset used here.
+        if (k.classRestriction >= 0 && k.classRestriction < 8) {
+            eligible[QStringLiteral("eClassRestriction")]++;
+            for (int off = 0; off + 4 <= meta.size(); ++off)
+                if (u32at(off) == quint32(k.classRestriction))
+                    hist[QStringLiteral("eClassRestriction")][off]++;
+        }
+    }
+    rep << QStringLiteral("sampled %1 record(s), %2 had no meta blob").arg(sampled).arg(noMeta);
+    rep << QString();
+    rep << QStringLiteral("-- field offsets (offset:hits, scored out of the records that carry "
+                          "that field at all) --");
+    // Driven by the FIELD LIST, not by the histogram. A field that matched nowhere is the single
+    // most decisive thing this probe can report — "that value is not stored as a little-endian u32
+    // in this record, so this whole route is out" — and iterating `hist` renders exactly that
+    // result as a line that silently does not appear. QHash order is unstable between runs too,
+    // so a fixed order makes two reports diffable.
+    QStringList fieldNames;
+    for (const Field& fd : kFields) fieldNames << QString::fromLatin1(fd.name);
+    fieldNames << QStringLiteral("eClassRestriction");
+    for (const QString& fname : fieldNames) {
+        const int elig = eligible.value(fname, 0);
+        const QHash<int, int> h = hist.value(fname);
+        if (elig == 0) {
+            rep << QStringLiteral("  %1  %2   %3").arg(fname, -18).arg(QString(), -52)
+                       .arg(QStringLiteral("no record carried a value — nothing to measure"));
+            continue;
+        }
+        if (h.isEmpty()) {
+            rep << QStringLiteral("  %1  %2   %3").arg(fname, -18).arg(QString(), -52)
+                       .arg(QStringLiteral("DEAD END — value never found in any blob (%1 tried). "
+                                           "Not stored as a little-endian u32.").arg(elig));
+            continue;
+        }
+        QVector<QPair<int, int>> byCount;                    // (count, offset)
+        for (auto it = h.constBegin(); it != h.constEnd(); ++it)
+            byCount << qMakePair(it.value(), it.key());
+        std::sort(byCount.begin(), byCount.end(),
+                  [](const QPair<int, int>& a, const QPair<int, int>& b) { return a.first > b.first; });
+        QStringList top;
+        for (int i = 0; i < byCount.size() && i < 6; ++i)
+            top << QStringLiteral("0x%1:%2").arg(byCount[i].second, 0, 16).arg(byCount[i].first);
+        const int best = byCount.first().first;
+        rep << QStringLiteral("  %1  %2   %3")
+                   .arg(fname, -18)
+                   .arg(top.join(QLatin1Char(' ')), -52)
+                   .arg(best == elig ? QStringLiteral("UNANIMOUS (%1/%1) — this is the field").arg(elig)
+                                     : QStringLiteral("not unanimous (%1/%2) — NOT an answer")
+                                           .arg(best).arg(elig));
+    }
+
+    // ── PHASE 2 — what the whole blob looks like, for three records ──────────────────────────
+    // Offsets alone do not say whether the record is a flat struct or has a header to walk. Three
+    // hexdumps cost nothing and answer that by eye.
+    rep << QString();
+    rep << QStringLiteral("-- first 128 bytes of three records --");
+    for (int i = 0, shown = 0; i < known.size() && shown < 3; ++i) {
+        const QByteArray meta = m_casc ? m_casc->readMetaBySno(quint64(known[i].sno)) : QByteArray();
+        if (meta.isEmpty()) continue;   // keep looking — three dumps, not "three tries"
+        ++shown;
+        rep << QStringLiteral("  %1 [%2] %3 bytes").arg(known[i].stem).arg(known[i].sno).arg(meta.size());
+        for (int off = 0; off < 128 && off < meta.size(); off += 16) {
+            QStringList cols;
+            for (int b = 0; b < 16 && off + b < meta.size(); ++b)
+                cols << QStringLiteral("%1").arg(uchar(meta[off + b]), 2, 16, QLatin1Char('0'));
+            rep << QStringLiteral("    %1  %2").arg(off, 4, 16, QLatin1Char('0')).arg(cols.join(QLatin1Char(' ')));
+        }
+    }
+
+    // ── PHASE 3 — the coverage gap, BY NAME ──────────────────────────────────────────────────
+    // The immediately useful half. Every MarkingShape the index knows and the snapshot does not is
+    // a marking the Wardrobe cannot currently show, and naming them turns "something is missing"
+    // into a list you can go and look at in the Textures tab.
+    //
+    // The group is found by looking for the known stems rather than hard-coded: a group number
+    // written down once is the kind of constant that rots silently when the game renumbers.
+    rep << QString();
+    rep << QStringLiteral("-- snapshot coverage --");
+    QSet<QString> haveJson;
+    for (const Known& k : known) haveJson.insert(k.stem.toLower());
+    int mshGroup = -1;
+    for (int g : m_index.groups()) {
+        int hit = 0;
+        for (const SnoEntry& e : m_index.entries(g)) {
+            if (haveJson.contains(e.name.toLower()) && ++hit >= 3) break;
+        }
+        if (hit >= 3) { mshGroup = g; break; }
+    }
+    if (mshGroup < 0) {
+        rep << QStringLiteral("  could not identify the MarkingShape group in the index - "
+                              "no group contained three of the json stems.");
+    } else {
+        QStringList missing;
+        for (const SnoEntry& e : m_index.entries(mshGroup))
+            if (!haveJson.contains(e.name.toLower())) missing << e.name;
+        missing.sort(Qt::CaseInsensitive);
+        rep << QStringLiteral("  group %1: %2 records in the game, %3 described by the snapshot, "
+                              "%4 MISSING")
+                   .arg(mshGroup).arg(m_index.entries(mshGroup).size())
+                   .arg(known.size()).arg(missing.size());
+        rep << QStringLiteral("  (these are in the game and NOT in the Wardrobe's marking list)");
+        for (const QString& m : missing) rep << QStringLiteral("    %1").arg(m);
+    }
+
+    const QString path = AppPaths::file(QStringLiteral("msh_probe.txt"));
+    QFile out(path);
+    if (out.open(QIODevice::WriteOnly | QIODevice::Truncate))
+        out.write(rep.join(QLatin1Char('\n')).toUtf8() + '\n');
+    qInfo().noquote() << "msh-probe: wrote" << path;
+    for (const QString& l : rep) qInfo().noquote() << l;
+    QCoreApplication::quit();
 }
 
 // ── Health check (Help ▸ Health check) ──────────────────────────────────────────────────────────

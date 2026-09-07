@@ -34,11 +34,13 @@ hair, makeup and animations.
    writes lives in `data\` next to the exe.
 2. Run **`D4AssetBrowser.exe`**.
 3. **File → Settings** — set your **Diablo IV game folder**.
-4. **File → Dependencies…** — download **d4data** (community metadata snapshot). One click.
+4. **Settings → General → Directories → "d4data folder" → Download** — fetches **d4data**
+   (the community metadata snapshot). One click.
    Budget **~4–6 GB** and 10–20 minutes: it writes ~460,000 small JSON files, so the
-   *Extracting* step is limited by your drive, not your connection. Only the 20 asset
+   *Extracting* step is limited by your drive, not your connection. Only the 24 asset
    groups the tool reads are fetched (of 133), and the folder is NTFS-compressed.
-5. **File → Update TACT Keys** — fetches the community decryption keys.
+5. **Settings → General → Directories → "TACT keys folder" → Download** — fetches the
+   community decryption keys.
 
 No Python. No `pip`. No d4extract.
 
@@ -89,6 +91,12 @@ categories drawn from real game data — Face, Hair style, Hair colour, Eye colo
 Makeup, Marking, Marking colour, Jewelry — each filtered to what your class and gender can
 actually use. Plus skin tone and a skin-detail overlay (freckles / vitiligo). Eye colour is
 composited from the game's own base/normal/ORM/emissive maps.
+
+Markings come from the game as well as from the community data snapshot. The snapshot describes
+304 of the 374 body markings the game ships, and the rest were simply absent from the picker with
+nothing on screen to explain it — newest-first, so collab sets like the Berserk Brand of Sacrifice
+were exactly the ones missing. Those are now read straight out of the game and drawn with a swatch
+composited from the marking's own mask and default colour.
 
 **Equipment — 10 slots.** Helm · Torso · Gloves · Legs · Boots · Main · Off · Sheath ·
 Sheath 2 · Back trophy. Weapon slots your class can't use are greyed out. Each slot has its
@@ -149,6 +157,13 @@ Every texture in the game, decoded (BC1/3/4/5/7). **Channel isolation** (RGB · 
 Filter by **format**, by **gear tags** (the class/type/gender of appearances that use the
 texture), orphans-only, or decrypted-only. Search supports `#tag`, SNO digits, and `-exclude`.
 
+Exported normal maps get their **blue channel rebuilt** *(Settings ▸ Export ▸ Texture export)*.
+Diablo IV stores normals as BC5, which carries only two channels — the third is implied and
+rebuilt at render time, which is why the in-app preview always looked right while the exported PNG
+lit wrong in Photoshop, Blender and Substance. Filling the channel with white by hand is not the
+same thing: it flattens the relief by about 4% on average and up to 24% on the steepest texels.
+Only exports are affected; the preview and the channel tiles still show the game's own bytes.
+
 **TEXFRAMES** lists the sprite frames packed into an atlas, with an optional **Trim** that crops
 each export to its tight bounds. **ASSOCIATED MODELS** walks texture → material → appearance and
 lets you jump straight to the model in the Models tab. Images can be dragged out of the preview
@@ -185,7 +200,7 @@ purely because only those two shipped a description file. Those records are now 
 from the game's binary, so their contents, artwork and models are all present and export normally.
 What the game files do *not* carry is the shop's display text, so such a bundle shows its asset
 name instead of a title and says so plainly: *"read from game files — no shop text in this
-snapshot"*. Re-running **File → Dependencies…** once d4data catches up fills the text back in.
+snapshot"*. Re-downloading d4data once it catches up fills the text back in.
 
 ### Bulk Extract
 
@@ -312,6 +327,11 @@ contents list. The Export menu names what it will act on before you commit — *
 pipelines, so every option here applies. *Settings ▸ Export ▸ Catalogue export* adds every frame of
 each shop atlas as its own PNG.
 
+**Normal-map convention.** Diablo IV authors normal maps DirectX-style (green pointing down the
+texture); glTF and Blender expect OpenGL. Exports flip the green channel to match by default, and
+the Unreal/Skyrim preset turns that off because its target wants the channel as the game stores
+it. Every export names the convention it wrote in its completion toast, either way.
+
 **Modding / retarget options** *(Settings ▸ Export ▸ Advanced)* — engine presets for Blender,
 Unreal/Skyrim and Unity (unit scale and normal-map convention), rebuild normal-map blue
 channel, readable bone names, hardpoints as empties, Blender-friendly `.L`/`.R` rig names,
@@ -387,7 +407,7 @@ same compiler either way.
 | `src\` | all C++ — see the table below |
 | `res\` | application icon and Qt resource script |
 | `tools\d4cloth\` | standalone cloth-format probe used to derive the physics parsing |
-| `docs\` | format notes and investigation write-ups |
+| `docs\` | format notes and investigation write-ups — start at `docs\README.md` |
 | `.github\workflows\` | the release build |
 | `*.bat` · `*.ps1` · `verify-src.py` | build, audit, dump and test entry points — all double-clickable |
 
@@ -547,8 +567,8 @@ If a change touches parsing, say which assets you tested it against; a format de
 works on the ten models you tried and fails on the eleventh is the usual failure here, and
 `Audit Asset Health.bat` diffs the whole index against your previous run for exactly that reason.
 
-**After a game patch:** run **File → Update TACT Keys**, then re-run **File → Dependencies…**
-to refresh d4data. New seasonal and collab content usually needs both. If something still
+**After a game patch:** re-download the TACT keys and then d4data — both are Download buttons in
+**Settings → General → Directories**. New seasonal and collab content usually needs both. If something still
 won't load, `Audit Asset Health.bat` diffs against your last run and reports exactly what
 changed — attach that output to an issue and it saves a lot of back-and-forth.
 

@@ -1189,6 +1189,22 @@ the internal <code>barF_stor150_HLM</code>.</li>
 
         exChk(fx, QStringLiteral("tex/trim"), QStringLiteral("Trim frames to non-transparent bounds"), false, QString());
 
+        exChk(fx, QStringLiteral("tex/reconstructNormalZ"),
+              QStringLiteral("Rebuild the blue channel of two-channel (BC5) textures"), true,
+              QStringLiteral("D4's normal maps are BC5 and carry only X and Y - the game rebuilds Z\n"
+                             "at render time, and so does this app's viewport, which is why the\n"
+                             "preview looks right while the exported PNG does not. Without this the\n"
+                             "file goes out with an empty blue channel and Photoshop, Blender and\n"
+                             "Substance all read it as Z=0 and light the surface wrong.\n\n"
+                             "Filling the blue channel with white by hand is NOT the same thing: it\n"
+                             "flattens the relief by about 4% on average and up to 24% on the\n"
+                             "steepest texels. This writes the real Z = sqrt(1 - x^2 - y^2).\n\n"
+                             "Applies to EXPORTS only (single, selected, bulk, and the row's Copy /\n"
+                             "Save image). The preview and the channel tiles always show the game's\n"
+                             "own bytes. Turn it off if you are extracting BC5 textures that are\n"
+                             "packed two-channel MASKS rather than normal maps - those have no\n"
+                             "implied Z, so the rebuilt channel would be meaningless."));
+
         auto* texDir = new QLineEdit(QSettings().value(QStringLiteral("tex/lastDir")).toString(), exBox);
         auto* texBrowse = new QPushButton(QStringLiteral("Browse…"), exBox);
         QObject::connect(texBrowse, &QPushButton::clicked, this, [this, texDir] {
@@ -2445,6 +2461,7 @@ static QStringList liveSettingKeys()
         QStringLiteral("wardrobe2/perf/coalesce"), QStringLiteral("wardrobe2/perf/asyncLoad"),
         QStringLiteral("wardrobe2/perf/texCache"), QStringLiteral("wardrobe2/perf/vramPool"),
         QStringLiteral("tex/format"), QStringLiteral("tex/trim"), QStringLiteral("tex/lastDir"),
+        QStringLiteral("tex/reconstructNormalZ"),
         QStringLiteral("export/gifFps"), QStringLiteral("export/gifTurntableFrames"),
         QStringLiteral("export/gifScale"), QStringLiteral("export/gifMaxColors"),
         QStringLiteral("export/gifOptimize"), QStringLiteral("export/gifTargetMB"),

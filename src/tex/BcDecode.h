@@ -19,4 +19,22 @@ QImage decode(const QByteArray& data, int width, int height, int eTexFormat);
 // failure. Cheap enough to run at startup; guards against silent table regressions
 // like the 3-subset BC7 gap.
 QString selfTest();
+
+// ── Rebuilding the implied Z of a two-channel (BC5) texture ─────────────────────────────────
+// BC5 stores TWO channels. The third is not "zero", it is IMPLIED — D4's own shader rebuilds it,
+// and so does this app's viewport (nz = sqrt(1 - dot(nxy, nxy))), which is why the preview has
+// always looked right while the exported PNG did not. decode() writes B = 0 because that is the
+// honest representation of "this codec carried no third channel", and every DCC then reads it as
+// Z = 0 and lights the surface wrong.
+//
+// Painting B white by hand is the usual workaround and it is NOT equivalent. Z = 1 with the
+// stored X/Y, once the DCC renormalises, flattens the relief: measured on barM_P00_BOD_normal,
+// 4.2% of the tilt lost on average and 23.6% on the steepest 1% of texels. withNormalZ writes
+// the real value instead.
+//
+// Gated on the CODEC, never on the file name. The one thing it cannot know is whether a given
+// BC5 texture is a normal map or a packed two-channel mask; a mask would get a fabricated blue
+// channel, which is why the caller keeps this behind a setting the user can turn off.
+bool   isTwoChannel(int eTexFormat);
+QImage withNormalZ(const QImage& img, int eTexFormat);   // returns img unchanged if not BC5
 }

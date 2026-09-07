@@ -18,26 +18,59 @@
 
 namespace {
 
+// ── Group id → name, DERIVED FROM CoreTOC, not adopted ──────────────────────────────────────────
+// How every corrected id below was established: for each json/base/meta/<Folder> in the d4data
+// snapshot, take each file's stem, look it up in d4data's own CoreTOC.dat.json (which is
+// {groupId: {sno: name}}), and accept the owning group ONLY where every unambiguous stem agrees.
+// All 23 folders the sparse checkout carries came back unanimous — 131/131 for Actor, 399/399 for
+// Texture and Cloth, 303/303 for MarkingShape, 252/252 for Material — so these are measurements,
+// not readings of a table someone else wrote.
+//
+// Why it is worth the trouble: all 18 callers of groupIdByName pass a hard-coded fallback, and the
+// map WINS over that fallback. A wrong label therefore does not degrade to the fallback, it
+// overrides it — groupIdByName("MarkingShape", 115) returned 123 and the wardrobe's marking scan
+// walked 468 territory records instead of 374 markings. Every wrong entry here is that bug waiting
+// for its first caller.
+//
+// What the audit found and this fixes:
+//     11  was "AnimTree"      → Cloth        (15,477 records; the old "Cloth" 36 holds
+//                                             minimap_marker / rope_additive)
+//     57  was "Material (2)"  → Material     (102,661 records; the old "Material" 37 holds
+//                                             2D_prims_transparent — the two are SWAPPED, which
+//                                             keeps MainWindow's both-groups material map working)
+//     98  was "GearItem"      → ItemType     (GearItem / Mace / Mace2H; the old "ItemType" 93
+//                                             holds Scosglen_Corbach — territories)
+//     121 was "Unknown (121)" → Emblem       (the old "Emblem" 78 holds Scos_Ruin_Wall_B — terrain)
+//
+// Three ids carried a name that ALREADY belonged to another id. A repeated name makes
+// groupIdByName return whichever the QHash walk reaches first, which is not deterministic across
+// builds, so the impostor is now Unknown: 85 (real Jewelry is 119), 165 (real Emote is 118),
+// 162 (real Dye is 122).
+//
+// Displaced ids get "Unknown (N)" rather than a replacement guess. A confidently wrong label is
+// the whole reason this audit was needed, and the ~110 ids with no folder in the sparse checkout
+// were left exactly as they were — unverified is not the same as wrong, and inventing names for
+// them would put this map straight back where it started.
 const QHash<int, QString>& groupNameMap()
 {
     static const QHash<int, QString> kMap = {
         {1,"Actor"}, {2,"Adventure"}, {5,"Anim2D"}, {6,"Anim"}, {7,"Unknown"},
-        {8,"AnimSet"}, {9,"Appearance"}, {11,"AnimTree"}, {12,"Sound"},
+        {8,"AnimSet"}, {9,"Appearance"}, {11,"Cloth"}, {12,"Sound"},
         {14,"TimedEvent"}, {15,"UI"}, {17,"Conversation"}, {18,"Global"},
         {19,"LevelArea"}, {20,"GameBalance"}, {21,"Global (2)"}, {22,"Particle"},
         {23,"Scene"}, {24,"Actor (2)"}, {26,"Observer"}, {27,"Anim (2)"},
         {28,"Encounter"}, {29,"Power"}, {31,"Quest"}, {32,"RopeSim"},
-        {33,"Sound (2)"}, {36,"Cloth"}, {37,"Material"}, {38,"Explosion"},
+        {33,"Sound (2)"}, {36,"Unknown (36)"}, {37,"Material (2)"}, {38,"Explosion"},
         {39,"FlagSet"}, {40,"FogVolume"}, {42,"StringList"}, {43,"Subzone"},
         {44,"Texture"}, {45,"Trail"}, {46,"UI (2)"}, {47,"VectorField"},
-        {48,"Vibration"}, {49,"Weather"}, {51,"Zone"}, {57,"Material (2)"},
+        {48,"Vibration"}, {49,"Weather"}, {51,"Zone"}, {57,"Material"},
         {59,"Reverb"}, {60,"MarkerSet"}, {62,"Recipe"}, {63,"Reputation"},
         {67,"Crafter"}, {68,"HoudiniParticles"}, {71,"SoundBank"}, {72,"Actor (NPC)"},
-        {73,"Item"}, {74,"PlayerClass"}, {76,"Font"}, {77,"Affix"}, {78,"Emblem"},
+        {73,"Item"}, {74,"PlayerClass"}, {76,"Font"}, {77,"Affix"}, {78,"Unknown (78)"},
         {79,"DungeonAffix"}, {80,"MonsterAffix"}, {81,"MaterialValue"},
-        {82,"MaterialValueSet"}, {85,"Jewelry"}, {86,"Condition"}, {88,"ActorService"},
-        {90,"Boost"}, {92,"ItemRequirement"}, {93,"ItemType"}, {95,"Achievement"},
-        {96,"Season"}, {98,"GearItem"}, {99,"WwiseSoundBank"}, {100,"MonsterFamily"},
+        {82,"MaterialValueSet"}, {85,"Unknown (85)"}, {86,"Condition"}, {88,"ActorService"},
+        {90,"Boost"}, {92,"ItemRequirement"}, {93,"Unknown (93)"}, {95,"Achievement"},
+        {96,"Season"}, {98,"ItemType"}, {99,"WwiseSoundBank"}, {100,"MonsterFamily"},
         {101,"Physics"}, {102,"BehaviorContainer"}, {103,"Modal"}, {104,"Power (2)"},
         {105,"Surface"}, {106,"SkillKit"}, {107,"Shader"}, {108,"ShaderMap"},
         // 110 is StoreProductDefinition — the Cosmetics Shop catalogue — NOT a Power group.
@@ -45,21 +78,42 @@ const QHash<int, QString>& groupNameMap()
         // json/base/meta/StoreProduct/*.prd.json for it. It was labelled "Power (3)" and excluded
         // below, inherited from the Python fork, which hid 9,308 store products from every tab.
         {109,"NPCComponentSet"}, {110,"StoreProduct"}, {111,"Stagger"}, {112,"Wall"},
-        {114,"Rope"}, {115,"Biome"}, {116,"DemonScroll"}, {117,"EyeColor"},
-        {118,"FacialHair"}, {119,"HairColor"}, {120,"HairStyle"}, {121,"Makeup"},
-        {122,"MarkingColor"}, {123,"MarkingShape"}, {124,"Face"}, {126,"Lore"},
+        // ── The creator / cosmetics block, CORRECTED against CoreTOC ────────────────────────────
+        // Every id below was measured, not adopted: for each json/base/meta/<Folder> the stems of
+        // up to 40 files were looked up in d4data's own CoreTOC.dat.json and the owning group
+        // taken only where every stem agreed. All of these were unanimous.
+        //
+        // The previous labels here were off by a wide margin — 115 was "Biome" but holds 374
+        // bodyMarking records, 122 was "MarkingColor" but holds Green/Blue/Purple (Dye), 133 was
+        // "ParagonBoard" but holds Inked Tattoo/Blue Paint (MarkingColor). That mattered the
+        // moment anything called groupIdByName for one of them: a name lookup written precisely
+        // to avoid hard-coding a number returned a WORSE number than the hard-coded one, and the
+        // wardrobe's CASC marking scan iterated 468 territory records instead of 374 markings.
+        //
+        // Ids whose label was displaced by a measured one are marked Unknown rather than given a
+        // guessed name — a confidently wrong label is what caused this.
+        {114,"Rope"}, {115,"MarkingShape"}, {116,"DemonScroll"}, {117,"Unknown (117)"},
+        {118,"Emote"}, {119,"Jewelry"}, {120,"Unknown (120)"}, {121,"Emblem"},
+        {122,"Dye"}, {123,"Unknown (123)"}, {124,"Unknown (124)"}, {126,"Lore"},
         {127,"Tutorial"}, {128,"Storyboard"}, {129,"Movie"}, {130,"FogOfWar"},
-        {131,"FootstepTable"}, {132,"MercenaryClass"}, {133,"ParagonBoard"},
-        {134,"ParagonGlyph"}, {135,"ParagonGlyphAffix"}, {136,"ParagonNode"},
-        {137,"ParagonThreshold"}, {138,"Raid"}, {139,"Territory"},
+        {131,"EyeColor"}, {132,"Makeup"}, {133,"MarkingColor"},
+        {134,"HairColor"}, {135,"ParagonGlyphAffix"}, {136,"ParagonNode"},
+        {137,"ParagonThreshold"}, {138,"HairStyle"}, {139,"FacialHair"},
+        {140,"Face"}, {152,"AppearanceSet"},
         // 143 was "StoreProduct" before 110 was correctly identified as the real one. Two groups
         // sharing a name makes groupIdByName's QHash walk return whichever comes first, which is
         // nondeterministic — renamed on the existing "Power (2)" / "Material (2)" pattern.
-        {140,"BattlePassTier"}, {141,"CommunityModifier"}, {143,"StoreProduct (2)"},
+        // 140 and 152 USED TO BE REPEATED HERE as "BattlePassTier" and "TrackedReward", after
+        // being set to their measured values ("Face", "AppearanceSet") a dozen lines above. A
+        // QHash initializer list keeps the LAST literal for a repeated key, so those two guesses
+        // silently overwrote two measured facts in the same initializer and the correction never
+        // took effect. Both guessed labels are gone: 140 holds Caucasian/Asian (Face) and 152
+        // holds Mount_Armor_Horse (AppearanceSet), verified against CoreTOC.dat.json.
+        {141,"CommunityModifier"}, {143,"StoreProduct (2)"},
         {145,"TownPortalCosmetic"}, {146,"CollectiblePower"}, {149,"GenericSkillTree"},
-        {150,"ABTest"}, {151,"Aspect"}, {152,"TrackedReward"}, {156,"PlayerTitle"},
-        {157,"DeathKit"}, {158,"CrowdTemplates"}, {160,"SoundTable"}, {162,"Dye"},
-        {165,"Emote"}, {166,"QuestChain"}, {167,"DataStore"}, {169,"AudioContext"},
+        {150,"ABTest"}, {151,"Aspect"}, {156,"PlayerTitle"},
+        {157,"DeathKit"}, {158,"CrowdTemplates"}, {160,"SoundTable"}, {162,"Unknown (162)"},
+        {165,"Unknown (165)"}, {166,"QuestChain"}, {167,"DataStore"}, {169,"AudioContext"},
         {170,"PowerModifier"}, {172,"SetItemBonus"}, {173,"WorldState"},
         {174,"MountProfile"}, {175,"CrafterTab"}, {176,"Vendor"}, {177,"TiledStyle"},
         {180,"UIDesignerNotification"},

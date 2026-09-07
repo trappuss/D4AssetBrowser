@@ -11,6 +11,36 @@
 // See MarkingCompose.h / STATUS.md for the model. All functions are data-driven — no per-marking
 // constants. Grayscale (BC4) masks work because R==G collapses to the design value.
 
+MarkingBin markingBinParse(const QByteArray& meta)
+{
+    MarkingBin m;
+    // Offsets measured, see the header. Bounds-checked against the whole record rather than each
+    // field: a blob shorter than 0x34 is not a MarkingShape and must not be read piecemeal.
+    constexpr int kMagicAt = 0x00, kClassAt = 0x18, kIconAt = 0x24;
+    constexpr int kFaceAt  = 0x28, kBodyAt  = 0x2c, kColorAt = 0x30;
+    constexpr int kNeed    = kColorAt + 4;
+    if (meta.size() < kNeed) return m;
+    auto u32 = [&meta](int off) -> quint32 {
+        const uchar* d = reinterpret_cast<const uchar*>(meta.constData());
+        return quint32(d[off]) | quint32(d[off + 1]) << 8
+             | quint32(d[off + 2]) << 16 | quint32(d[off + 3]) << 24;
+    };
+    if (u32(kMagicAt) != 0xDEADBEEFu) return m;
+    // 0xFFFFFFFF is the authored "none" for a SNO reference here, NOT a real sno — mapping it
+    // through the index would look up asset 4294967295 and quietly return nothing, which reads as
+    // "this marking has no mask" rather than "this field is unset".
+    auto sno = [](quint32 v) -> quint32 { return v == 0xFFFFFFFFu ? 0u : v; };
+    const qint32 cr = qint32(u32(kClassAt));
+    m.classRestriction = (cr >= 0 && cr < 8) ? int(cr) : -1;
+    m.icon        = u32(kIconAt);
+    m.maskFaceSno = sno(u32(kFaceAt));
+    m.maskBodySno = sno(u32(kBodyAt));
+    m.defColorSno = sno(u32(kColorAt));
+    // A record with neither mask is not usable as a marking, whatever else it parsed.
+    m.valid = (m.maskFaceSno != 0 || m.maskBodySno != 0);
+    return m;
+}
+
 MarkingDef markingDef(const QString& d4, const QString& stem)
 {
     MarkingDef m;
@@ -25,6 +55,14 @@ MarkingDef markingDef(const QString& d4, const QString& stem)
     // The shape's own swatch. Read here rather than at the call site so every consumer of a
     // MarkingShape gets the same four facts from one parse.
     m.icon      = quint32(o.value(QStringLiteral("hIconImage")).toDouble(0.0));
+    // __raw__ via toDouble, never toInt: a sno above INT_MAX makes QJsonValue::toInt return its
+    // default and the mask silently becomes "none".
+    auto rawOf = [&o](const char* key) {
+        return quint32(o.value(QLatin1String(key)).toObject()
+                           .value(QStringLiteral("__raw__")).toDouble(0.0));
+    };
+    m.faceSno   = rawOf("snoMaskFace");
+    m.bodySno   = rawOf("snoMaskBody");
     return m;
 }
 

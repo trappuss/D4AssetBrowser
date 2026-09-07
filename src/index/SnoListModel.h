@@ -2,7 +2,9 @@
 #include "index/CoreToc.h"   // SnoEntry
 
 #include <QAbstractTableModel>
+#include <QCache>
 #include <QHash>
+#include <QIcon>
 #include <QPixmap>
 #include <QString>
 #include <QStringList>
@@ -53,7 +55,8 @@ public:
     void setFailedPredicate(std::function<bool(int)> fn) { m_failed = std::move(fn); }
     // Model-presence badge: `fn` maps sno → +1 (has a renderable model), -1 (icon but no model),
     // 0 (unknown). `tab` selects the per-tab settings that gate the ✓/✗ overlays. Both optional.
-    void setPresence(std::function<int(int)> fn, const QString& tab) { m_presence = std::move(fn); m_badgeTab = tab; }
+    void setPresence(std::function<int(int)> fn, const QString& tab)
+    { m_presence = std::move(fn); m_badgeTab = tab; m_iconCache.clear(); }
     // Target icon size (px). When >0 the model scales each pixmap to this size so the view can
     // render icons LARGER than their source (a raw QIcon never upscales past its source pixmap,
     // which made the list's Ctrl+scroll only ever shrink icons). 0 = legacy (unscaled QIcon).
@@ -104,7 +107,24 @@ private:
     std::function<int(int)>              m_presence;     // sno → +1 has model / -1 icon-only / 0 unknown
     QString                              m_badgeTab;     // per-tab settings key for the ✓/✗ overlays
     std::function<QPixmap(int)>          m_iconProvider;
-    QHash<int, QPixmap> m_thumbs;   // sno → thumbnail icon
+    // FINISHED icons (provider pixmap, scaled to m_iconPx, badge composited), keyed by sno.
+    //
+    // iconData() is called by the view for EVERY visible cell on EVERY repaint — and a repaint is
+    // what a mouse-over is. Without this it re-ran a smooth rescale, a badge composite and a
+    // QSettings read per cell per paint, and returned a BRAND-NEW QIcon each time. A fresh QIcon
+    // has a fresh cache key, so the delegate's QIcon::pixmap() call missed the global QPixmapCache
+    // and inserted a pixmap that could never be hit again: moving the mouse across a grid pumped
+    // ~31 KB of garbage per repainted cell into a 10 MB pool shared with everything else, evicting
+    // whatever was already there. The Textures grid keeps its only copy of each thumbnail in that
+    // pool, so its images visibly vanished while the mouse moved — "previews unload on hover".
+    //
+    // BOUNDED, deliberately: keyed by sno, this would otherwise grow one entry per row the user
+    // ever scrolled past — 140k entries x an 88px icon is gigabytes, which is a worse bug than the
+    // one it fixes. QCache evicts least-recently-used, and the budget below holds thousands of
+    // icons: orders of magnitude more than a viewport, so scrolling still never re-scales.
+    //
+    // mutable because iconData() is const; every mutation point below drops the affected keys.
+    mutable QCache<int, QIcon> m_iconCache{ 96 * 1024 };   // cost unit = KB of pixmap
     int               m_iconPx = 0;   // >0 → scale icons to this size (allows upscaling)
     bool              m_gridMode = false;   // icon-grid layout (decoration also on FILENAME col)
     int               m_sortCol = 0;

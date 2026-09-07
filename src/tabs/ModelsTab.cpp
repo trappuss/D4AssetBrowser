@@ -10242,6 +10242,11 @@ void ModelsTab::addRowImageActions(QMenu& menu, const QList<int>& snos, int clic
             this, [this]() {
                 m_renderBlocklist.clear();
                 QSettings().remove(QStringLiteral("models/renderBlocklist"));
+                // refreshIcons(), not a bare viewport update: this flips the presence badge on
+                // every previously-blocked row, and the badge is baked into the model's cached
+                // icon. A raw repaint redraws the STALE icon — the ⚠ and the dimming would clear
+                // while every ✗ stayed put until something else happened to drop the memo.
+                if (m_listModel) m_listModel->refreshIcons();
                 if (m_list) m_list->viewport()->update();          // drop dim/⚠ on cleared rows
                 if (m_gridView) m_gridView->viewport()->update();
             });
