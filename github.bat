@@ -574,12 +574,15 @@ echo   1   Name and email on your commits
 echo   2   Which branch on GitHub this folder pushes into
 echo   3   The remote URL
 echo   4   Sign-in to GitHub
+echo   5   Fix "would publish a private email" on the last commit
 echo   0   Back
 echo.
 set "SO="
 set /p "SO=  Choose: "
 
 if "%SO%"=="1" ( call :set_identity & exit /b 0 )
+
+if "%SO%"=="5" ( call :fix_author & exit /b 0 )
 
 if "%SO%"=="2" (
     echo.
@@ -667,4 +670,61 @@ set /p "NE=  Email (blank keeps it): "
 if defined NE git config --global user.email "!NE!"
 echo.
 echo   Saved.
+exit /b 0
+
+:: ----------------------------------------------------------------------------
+:: GH007. GitHub can be told to refuse any push that would publish your real
+:: address ("Block command line pushes that expose my email"). The push is then
+:: rejected for the EMAIL INSIDE THE COMMIT, which is baked in at commit time -
+:: so changing your identity in option 1 fixes the NEXT commit and does nothing
+:: for the one being rejected. That is the trap this exists for: option 1 looks
+:: like the fix, reports "Saved", and the very next push fails identically.
+::
+:: --reset-author rewrites BOTH the author and the committer of the last commit
+:: to whatever git config currently says. It only touches the tip, so it is safe
+:: while a commit is unpushed - which, by definition, it is if GitHub refused it.
+:fix_author
+echo.
+echo   Use this when a push was rejected with:
+echo     "GH007: Your push would publish a private email address"
+echo.
+echo   The address is stored INSIDE the rejected commit, so setting a new
+echo   identity alone will not clear it - the commit has to be rewritten.
+echo.
+set "CURE="
+for /f "delims=" %%E in ('git config user.email 2^>nul') do set "CURE=%%E"
+set "CMTE="
+for /f "delims=" %%E in ('git --no-pager log -1 --format^=%%ae 2^>nul') do set "CMTE=%%E"
+echo   email on the last commit : !CMTE!
+echo   email git would use now  : !CURE!
+echo.
+echo   Your no-reply address is on GitHub under Settings - Emails, and looks
+echo   like  12345678+yourname@users.noreply.github.com
+echo.
+set "NE="
+set /p "NE=  Email to use (blank = keep '!CURE!'): "
+if defined NE (
+    git config user.email "!NE!"
+    echo   Set for THIS folder only, so your other repos are untouched.
+    set "CURE=!NE!"
+)
+if not defined CURE (
+    echo.
+    echo   [X] No email configured. Set one first, then run this again.
+    exit /b 0
+)
+echo.
+echo   Rewriting the last commit to author it as !CURE! ...
+git commit --amend --reset-author --no-edit
+if errorlevel 1 (
+    echo.
+    echo   [X] Could not amend. If a rebase or merge is in progress, finish or
+    echo       abort that first, then run this again.
+    exit /b 0
+)
+set "NEWE="
+for /f "delims=" %%E in ('git --no-pager log -1 --format^=%%ae 2^>nul') do set "NEWE=%%E"
+echo.
+echo   Last commit now authored as: !NEWE!
+echo   Choose 1 from the main menu to push it.
 exit /b 0
