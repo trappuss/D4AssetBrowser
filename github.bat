@@ -574,7 +574,7 @@ echo   1   Name and email on your commits
 echo   2   Which branch on GitHub this folder pushes into
 echo   3   The remote URL
 echo   4   Sign-in to GitHub
-echo   5   Fix "would publish a private email" on the last commit
+echo   5   Fix "would publish a private email" on your commits
 echo   0   Back
 echo.
 set "SO="
@@ -672,37 +672,42 @@ echo.
 echo   Saved.
 exit /b 0
 
+
 :: ----------------------------------------------------------------------------
 :: GH007. GitHub can be told to refuse any push that would publish your real
-:: address ("Block command line pushes that expose my email"). The push is then
-:: rejected for the EMAIL INSIDE THE COMMIT, which is baked in at commit time -
-:: so changing your identity in option 1 fixes the NEXT commit and does nothing
-:: for the one being rejected. That is the trap this exists for: option 1 looks
-:: like the fix, reports "Saved", and the very next push fails identically.
-::
-:: --reset-author rewrites BOTH the author and the committer of the last commit
-:: to whatever git config currently says. It only touches the tip, so it is safe
-:: while a commit is unpushed - which, by definition, it is if GitHub refused it.
+:: address ("Block command line pushes that expose my email"). The rejection is
+:: about the email stored INSIDE each commit, which is fixed at commit time - so
+:: option 1 above changes your identity for the NEXT commit and does nothing for
+:: the ones being rejected. That is the trap: option 1 looks like the fix, says
+:: "Saved", and the very next push fails identically. Worse, every retry that
+:: commits again adds one more commit carrying the same address.
 :fix_author
 echo.
 echo   Use this when a push was rejected with:
 echo     "GH007: Your push would publish a private email address"
 echo.
-echo   The address is stored INSIDE the rejected commit, so setting a new
-echo   identity alone will not clear it - the commit has to be rewritten.
+echo   The address is stored INSIDE each commit, so setting a new identity
+echo   alone will not clear it - the commits have to be rewritten.
+echo.
+set "CNT=0"
+for /f "delims=" %%C in ('git --no-pager rev-list --count origin/!TARGET!..HEAD 2^>nul') do set "CNT=%%C"
+if "!CNT!"=="0" (
+    echo   Nothing unpushed - there is no commit here to rewrite.
+    exit /b 0
+)
+echo   Commits waiting to be pushed: !CNT!
+echo.
+git --no-pager log --format="     %%h  %%ae   %%s" origin/!TARGET!..HEAD
 echo.
 set "CURE="
 for /f "delims=" %%E in ('git config user.email 2^>nul') do set "CURE=%%E"
-set "CMTE="
-for /f "delims=" %%E in ('git --no-pager log -1 --format^=%%ae 2^>nul') do set "CMTE=%%E"
-echo   email on the last commit : !CMTE!
-echo   email git would use now  : !CURE!
+echo   email git would use now : !CURE!
 echo.
 echo   Your no-reply address is on GitHub under Settings - Emails, and looks
 echo   like  12345678+yourname@users.noreply.github.com
 echo.
 set "NE="
-set /p "NE=  Email to use (blank = keep '!CURE!'): "
+set /p "NE=  Email to use (blank = keep the one above): "
 if defined NE (
     git config user.email "!NE!"
     echo   Set for THIS folder only, so your other repos are untouched.
@@ -713,18 +718,35 @@ if not defined CURE (
     echo   [X] No email configured. Set one first, then run this again.
     exit /b 0
 )
+if exist ".git\rebase-merge" goto :fa_busy
+if exist ".git\rebase-apply" goto :fa_busy
+if exist ".git\MERGE_HEAD"   goto :fa_busy
 echo.
-echo   Rewriting the last commit to author it as !CURE! ...
-git commit --amend --reset-author --no-edit
+echo   Rewriting !CNT! commit(s) to author them as !CURE! ...
+echo.
+if "!CNT!"=="1" (
+    git commit --amend --reset-author --no-edit
+) else (
+    REM Replays the same trees onto the same base and re-authors each one. The
+    REM content does not change, so this should never raise a conflict - and if
+    REM it somehow stops, "git rebase --abort" puts everything back untouched.
+    git rebase --exec "git commit --amend --reset-author --no-edit" origin/!TARGET!
+)
 if errorlevel 1 (
     echo.
-    echo   [X] Could not amend. If a rebase or merge is in progress, finish or
-    echo       abort that first, then run this again.
+    echo   [X] Rewrite failed. Nothing was pushed and your work is intact.
+    echo       If it stopped mid-rebase, run:  git rebase --abort
     exit /b 0
 )
-set "NEWE="
-for /f "delims=" %%E in ('git --no-pager log -1 --format^=%%ae 2^>nul') do set "NEWE=%%E"
 echo.
-echo   Last commit now authored as: !NEWE!
-echo   Choose 1 from the main menu to push it.
+echo   Now authored as:
+git --no-pager log --format="     %%h  %%ae   %%s" origin/!TARGET!..HEAD
+echo.
+echo   Choose 1 from the main menu to push.
+exit /b 0
+
+:fa_busy
+echo.
+echo   [X] A merge or rebase is already in progress. Finish or abort that
+echo       first, then try again.
 exit /b 0
