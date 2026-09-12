@@ -138,6 +138,12 @@ private:
     void highlightMaterialsForLook(int look);   // tint material rows for SOA index = look
     void highlightMaterialsForParts(const QList<int>& parts);   // tint rows for parts' materials
     QList<int> selectedParts() const;            // primitives of all selected outliner nodes
+    // The PARTS table's own selection. This tab has TWO surfaces that select parts — the outliner
+    // (selectedParts, above) and the flat parts table — and each drives the viewport highlight
+    // independently. The context menu has to consider both to answer "is the part I right-clicked
+    // already selected".
+    QList<int> selectedPartRows() const;
+    int        partsRowFor(int part) const;      // PARTS-table row for a primitive index, or -1
     void buildOutlinerSubtree();                 // after load: hang anim/armature/parts off the model row
     void onOutlinerNodeSelected(const QModelIndex& ix);   // subtree node → drive the detail panels
     void updateBreadcrumb();                     // model › part › material path above the properties column
@@ -198,6 +204,13 @@ private:
     void   rebuildDyeCombo();            // repopulate: Custom + real dyes + saved pigments
     void   recomputePartVisibility();   // combine parts-tree checks with FX/SIM toggles
     // The shared part menu (util/ViewportPartMenu.h) — raised by the viewport and the PARTS panel.
+    // The part inspector — see src/model/MaterialReport.h for what it answers and why.
+    // materialName empty = the whole model. apprName/apprSno default to the LOADED model, so the
+    // part menu passes only the material; the browse list passes a row that may not be loaded at
+    // all — which is the case that matters, since nobody loads a model to ask why it looks wrong
+    // before they have looked at it.
+    void   showMaterialReport(const QString& materialName,
+                              const QString& apprName = QString(), int apprSno = 0);
     void   showPartContextMenu(int part, const QPoint& gp);
     void   setFlaggedPartsChecked(const QVector<bool>& partFlags, bool checked);   // FX/SIM/GIB toggle → tree checks
     void   clearAnimationSelection();   // stop + clear the playing animation/selection

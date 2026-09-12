@@ -55,10 +55,11 @@ echo   %WEBURL%
 echo ============================================================
 call :show_state
 echo.
-echo   1   Update GitHub        commit and push  ^(the usual one^)
-echo   2   See what changed     no writes, nothing is sent
-echo   3   Pull from GitHub     take changes made on the website
-echo   4   Cut a release        tag this commit; the workflow builds the zip
+echo   1   Update GitHub        commit and push to !TARGET!  ^(the usual one^)
+echo   2   Publish a release    build the zip and publish it with the changelog
+echo.
+echo   3   See what changed     no writes, nothing is sent
+echo   4   Pull from GitHub     take changes made on the website
 echo   5   Open the repo in your browser
 echo   6   Open the build workflow ^(Actions^)
 echo   7   Settings             identity, sign-in, remote, target branch
@@ -68,9 +69,9 @@ set "OPT="
 set /p "OPT=  Choose: "
 
 if "%OPT%"=="1" ( call :do_update   & call :hold & goto :menu )
-if "%OPT%"=="2" ( call :do_status   & call :hold & goto :menu )
-if "%OPT%"=="3" ( call :do_pull     & call :hold & goto :menu )
-if "%OPT%"=="4" ( call :do_release  & call :hold & goto :menu )
+if "%OPT%"=="2" ( call :do_release  & call :hold & goto :menu )
+if "%OPT%"=="3" ( call :do_status   & call :hold & goto :menu )
+if "%OPT%"=="4" ( call :do_pull     & call :hold & goto :menu )
 if "%OPT%"=="5" ( start "" "%WEBURL%" & goto :menu )
 if "%OPT%"=="6" ( start "" "%WEBURL%/actions" & goto :menu )
 if "%OPT%"=="7" ( call :do_settings & call :hold & goto :menu )
@@ -522,38 +523,151 @@ exit /b 0
 :: match - so that workflow has never actually run and those zips were uploaded
 :: by hand. The first v-tag pushed from here will be the first time it builds.
 :do_release
-echo.
-echo   Pushing a tag like v2.2.8 makes GitHub build the portable zip and
-echo   publish it as a Release. Nothing is built on this machine.
-echo.
-echo   [note] Your existing releases are tagged 2.2.0 - 2.2.7 with no "v", and
-echo          the workflow only fires on v* - so it has never run. A v-tag is
-echo          the first one that will actually build.
-echo.
-set "LASTTAG="
-for /f "delims=" %%T in ('git --no-pager tag --sort^=-v:refname 2^>nul') do (
-    if not defined LASTTAG set "LASTTAG=%%T"
-)
-if defined LASTTAG ( echo     most recent local tag: !LASTTAG! ) else ( echo     ^(no tags in this folder yet^) )
+:: ----------------------------------------------------------------------------
+:: Builds the zip HERE with package-release.bat, tags the commit, and publishes
+:: the release with the matching section of CHANGELOG.md as its notes.
+::
+:: Building locally rather than on the runner is deliberate: package-release.bat
+:: already blocks on verify-src, checks the Qt deploy actually produced
+:: platforms\qwindows.dll, and writes a spec-compliant zip. A build that only
+:: ever happens on a runner is a build nobody watched.
+::
+:: The checks below each exist because they have produced a wrong release: a bare
+:: tag the workflow never listened for, a tag disagreeing with the version baked
+:: into the exe, and notes that were raw commit subjects.
+::
+:: Two cmd rules this routine has already been bitten by, both silent:
+::   * Never write a literal [!] with delayed expansion on. cmd pairs that ! with
+::     the next one on the line, so "[!] !TAG! ... !APPVER!" printed as
+::     "[TAGAPPVER" - the marker ate the variables. Use [note].
+::   * Never put a close-paren in a REM inside a parenthesised block. It ends the
+::     block early, and the failure looks like a syntax error somewhere else.
 echo.
 
+:: --- the version the exe will actually report -------------------------------
+REM %%~V already strips the surrounding quotes, so "2.2.9" arrives as 2.2.9.
+set "APPVER="
+for /f "tokens=2 delims=()" %%V in ('findstr /c:"setApplicationVersion" "src\main.cpp"') do set "APPVER=%%~V"
+if not defined APPVER (
+    echo   [X] Could not read the version out of src\main.cpp. Aborting rather
+    echo       than tagging something that may not match the build.
+    exit /b 1
+)
+echo     version in src\main.cpp : !APPVER!
+set "ZIP=%~dp0dist\D4AssetBrowser_v!APPVER!.zip"
+
+:: --- is there a changelog section for it? -----------------------------------
+set "HAVELOG="
+if exist "CHANGELOG.md" findstr /b /c:"## !APPVER!" "CHANGELOG.md" >nul 2>&1 && set "HAVELOG=1"
+if defined HAVELOG (
+    echo     CHANGELOG.md           : "## !APPVER!" section found
+) else (
+    echo     CHANGELOG.md           : NO "## !APPVER!" section
+    echo   [note] The release notes come from that section. Without it the release
+    echo       gets the raw commit subjects instead.
+)
+
+:: --- the zip is built from the WORKING TREE, the tag points at the COMMIT ----
 %GIT% diff --quiet
 if errorlevel 1 (
-    echo   [note] You have uncommitted changes. The release is built from the
-    echo          last COMMIT, so anything uncommitted will not be in the zip.
     echo.
+    echo   [note] You have uncommitted changes. They WILL be in the zip built here
+    echo       but NOT in the commit the tag points at. Choose 1 first so the
+    echo       source on GitHub matches the binary people download.
 )
 
 set "TAG="
-set /p "TAG=  New tag, e.g. v2.2.8 (blank cancels): "
-if not defined TAG ( echo   Cancelled. & exit /b 1 )
+set /p "TAG=  Tag [blank = v!APPVER!]: "
+if not defined TAG set "TAG=v!APPVER!"
 
+echo !TAG! | findstr /r "^v[0-9]" >nul || (
+    echo.
+    echo   [X] "!TAG!" does not start with v + a digit. Use v!APPVER!.
+    exit /b 1
+)
+if /i not "!TAG!"=="v!APPVER!" (
+    echo.
+    echo   [note] !TAG! does not match the version in the exe ^(!APPVER!^).
+    echo       Set the version first with "Release - Set Version.bat".
+    set "YN2="
+    set /p "YN2=  Tag it anyway? [y/N] "
+    if /i not "!YN2!"=="y" ( echo   Cancelled. & exit /b 1 )
+)
+%GIT% rev-parse -q --verify "refs/tags/!TAG!" >nul 2>&1
+if not errorlevel 1 (
+    echo.
+    echo   Tag !TAG! already exists in this folder. Checking GitHub...
+    set "REMOTETAG="
+    for /f "delims=" %%R in ('git ls-remote --tags origin "refs/tags/!TAG!" 2^>nul') do set "REMOTETAG=%%R"
+    if defined REMOTETAG (
+        echo   !TAG! is on GitHub too.
+        where gh >nul 2>&1
+        if errorlevel 1 (
+            echo   [X] Without GitHub CLI this cannot be resumed from here. Either
+            echo       install it ^(winget install GitHub.cli^) or bump the version.
+            exit /b 1
+        )
+        REM The tag being pushed does NOT mean the release went out. Publishing is
+        REM a separate step and it can fail on its own - gh not signed in, network
+        REM - which used to leave this option with nothing to offer but "bump the
+        REM version", i.e. throw away a good tag and a good build over a login.
+        gh release view "!TAG!" >nul 2>&1
+        if errorlevel 1 (
+            echo   No release has been published for it yet - resuming from there.
+        ) else (
+            echo   A release already exists; its zip will be replaced.
+        )
+        if not exist "!ZIP!" (
+            echo   [X] !ZIP! is missing, so there is nothing to publish. Run
+            echo       package-release.bat first, then choose 2 again.
+            exit /b 1
+        )
+        goto :rel_publish
+    )
+    echo.
+    echo   It is NOT on GitHub - left over from an earlier attempt, or one you
+    echo   deleted on the website. Deleting a tag there does NOT remove the local
+    echo   copy, and this local one may point at a commit that no longer exists:
+    echo   rewriting or rebasing orphans it, and releasing from an orphaned tag
+    echo   would ship a build of the wrong source.
+    for /f "delims=" %%D in ('git --no-pager log -1 --oneline "!TAG!" 2^>nul') do echo       it points at: %%D
+    echo.
+    set "YND="
+    set /p "YND=  Delete the local tag !TAG! and carry on? [y/N] "
+    if /i not "!YND!"=="y" ( echo   Cancelled. & exit /b 1 )
+    %GIT% tag -d "!TAG!" || ( echo   [X] Could not delete it. & exit /b 1 )
+)
+
+:: --- 1. build the zip on this machine ---------------------------------------
 echo.
-echo   This tags the current commit and pushes it, which starts the build:
+echo   Step 1 of 3 - building the release zip here with package-release.bat.
+echo   This compiles from scratch and can take several minutes.
+set "YNB="
+set /p "YNB=  Build now? [Y/n] "
+if /i "!YNB!"=="n" (
+    if not exist "!ZIP!" (
+        echo   [X] No existing !ZIP! to publish. Cancelled.
+        exit /b 1
+    )
+    echo   Skipping the build - publishing the zip already in dist\.
+) else (
+    call "%~dp0package-release.bat"
+    if not exist "!ZIP!" (
+        echo.
+        echo   [X] The build did not produce !ZIP!.
+        echo       Nothing has been tagged or published. Fix the build and retry.
+        exit /b 1
+    )
+)
+for %%Z in ("!ZIP!") do echo   zip ready: %%~nxZ  ^(%%~zZ bytes^)
+
+:: --- 2. tag and push --------------------------------------------------------
+echo.
+echo   Step 2 of 3 - tagging this commit:
 for /f "delims=" %%C in ('git --no-pager log -1 --oneline') do echo     %%C
 set "YN="
-set /p "YN=  Go ahead? [y/N] "
-if /i not "!YN!"=="y" ( echo   Cancelled. & exit /b 1 )
+set /p "YN=  Publish !TAG!? [y/N] "
+if /i not "!YN!"=="y" ( echo   Cancelled - the zip is still in dist\. & exit /b 1 )
 
 %GIT% tag -a "!TAG!" -m "!TAG!" || ( echo   [X] Could not create the tag. & exit /b 1 )
 %GIT% push origin "!TAG!"
@@ -563,8 +677,66 @@ if errorlevel 1 (
     call :auth_hint
     exit /b 1
 )
+
+:: --- 3. publish, with the changelog as the notes ----------------------------
+:rel_publish
 echo.
-echo   Tag !TAG! pushed. Watch the build at %WEBURL%/actions
+echo   Publishing the release.
+where gh >nul 2>&1
+if errorlevel 1 (
+    echo.
+    echo   GitHub CLI ^(gh^) is not installed, so the zip cannot be uploaded from
+    echo   here. The tag is pushed, so the workflow will build and publish its
+    echo   own zip in a few minutes - watch %WEBURL%/actions
+    echo.
+    echo   To publish your locally built zip instead:
+    echo     winget install GitHub.cli
+    echo   then re-run this option, or upload !ZIP!
+    echo   by hand at %WEBURL%/releases
+    exit /b 0
+)
+
+REM Same extraction the workflow uses: "## <ver>" up to the next "## ". Single
+REM quotes on the pattern - in a double-quoted PowerShell string the regex group
+REM "$(.*?)" is read as a subexpression and evaluated.
+set "NOTES=%~dp0dist\RELEASE_BODY.md"
+REM Delete first. A leftover file from an earlier version would otherwise be
+REM published as THIS version's notes, and the only symptom is a release whose
+REM body describes the wrong release.
+if exist "!NOTES!" del /q "!NOTES!"
+REM WriteAllText with a no-BOM UTF8Encoding, not Set-Content -Encoding utf8:
+REM Windows PowerShell writes a BOM, and gh puts it in the release body as a
+REM stray character at the very top. Same reason set-version.ps1 does this.
+powershell -NoProfile -Command "$v='!APPVER!'; $md=Get-Content 'CHANGELOG.md' -Raw -ErrorAction SilentlyContinue; if ($md) { $rx='(?ms)^##[ \t]+v?'+[regex]::Escape($v)+'[ \t]*\r?$(.*?)(?=^##[ \t]|\z)'; $m=[regex]::Match($md,$rx); if ($m.Success) { [System.IO.File]::WriteAllText('!NOTES!', $m.Groups[1].Value.Trim(), (New-Object System.Text.UTF8Encoding($false))) } }"
+
+REM Branch on the two questions separately rather than building an argument
+REM string: "set VAR=--notes-file "path"" nests quotes inside a quoted SET on a
+REM line that also has to close a block, and cmd does not read that the way it
+REM looks.
+if not exist "!NOTES!" echo   [note] No changelog section for !APPVER! - using generated notes.
+gh release view "!TAG!" >nul 2>&1
+if errorlevel 1 (
+    if exist "!NOTES!" (
+        gh release create "!TAG!" "!ZIP!" --title "!TAG!" --notes-file "!NOTES!"
+    ) else (
+        gh release create "!TAG!" "!ZIP!" --title "!TAG!" --generate-notes
+    )
+) else (
+    REM --clobber: re-running after a failed publish must REPLACE the asset, not
+    REM error out on a name that is already there.
+    gh release upload "!TAG!" "!ZIP!" --clobber
+)
+if errorlevel 1 (
+    echo.
+    echo   [X] gh could not publish. The tag IS pushed, so the workflow will
+    echo       still build and publish its own zip. If gh asked you to sign in,
+    echo       run:  gh auth login
+    exit /b 1
+)
+echo.
+echo   Published: %WEBURL%/releases/tag/!TAG!
+echo   The workflow also builds this tag as a cross-check; it will not replace
+echo   the release you just published.
 exit /b 0
 
 :: ============================================================================

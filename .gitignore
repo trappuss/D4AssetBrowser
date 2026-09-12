@@ -54,3 +54,10 @@ _perftest_baseline.log
 _perftest_cached.log
 # "Test - Export Cache.bat" folder-picker scratch — rewritten on every run.
 pick
+RELEASE_BODY.md
+
+
+# "Organize Folder.bat" and the folder audit park generated files here rather than deleting them,
+# so you can glance at the list before removing the folder yourself. Nothing in it is
+# needed by a build.
+_to_delete/

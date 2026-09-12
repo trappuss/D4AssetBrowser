@@ -72,6 +72,19 @@ public:
         // those live only in the JSON and its string tables.
         bool     fromCasc = false;
         QString  payloadName;
+        // ── TACT-locked: the record exists, its CONTENTS do not decrypt ─────────────────────────
+        // Distinct from fromCasc. A fromCasc product was read out of the game binary because
+        // d4data never described it; a locked one could not be read AT ALL, because the payload is
+        // encrypted under a key nobody has published. It used to be dropped outright — the whole
+        // Diablo IV x DOOM collab is locked, and every one of its bundles vanished from the
+        // Catalogue with nothing on screen to say why.
+        //
+        // The NAME is still known (the game's own CoreTOC carries it even when d4data's snapshot
+        // has it blank), and that is enough to be useful: the shop art is derived from the name by
+        // suffix convention, so a locked bundle still shows its real card. Its children and payload
+        // are genuinely unknowable and are left empty rather than guessed at.
+        bool     encrypted = false;
+        QString  tactKey;    // the key name from base/EncryptedSNOs.dat, for the "why" on screen
         QVector<quint32> art;        // UI image handles (IconIndex handle space)
 
         // ── Relationships between products, straight out of the .prd ────────────────────────────
@@ -112,7 +125,29 @@ public:
     const Product* product(int sno) const;
     const Product* byName(const QString& name) const;
     // Bundle SNOs, sorted by display title. Bundles only — leaves are reachable via children.
+    // ── Coverage: what happened to every record in the group ────────────────────────────────────
+    // Every bug this tab has had was the same shape - content vanished and nothing on screen could
+    // tell "missing" from "does not exist". The markings, the creator lists and the whole DOOM
+    // collab all failed silently. So the index accounts for its own population: these five add up
+    // to `known`, and a future gap becomes a number that does not balance instead of a silence.
+    struct Coverage {
+        int known      = 0;   // group-110 records the SNO index reported
+        int described  = 0;   // d4data shipped a .prd.json
+        int recovered  = 0;   // no json; read out of the game binary
+        int locked     = 0;   // TACT-encrypted; name and art only
+        int unreadable = 0;   // known but produced no product at all - the residual, and the
+                              // number that should stay at or near zero
+    };
+    const Coverage& coverage() const { return m_coverage; }
+
     const QVector<int>& bundles() const { return m_bundles; }
+    // Products that are not a bundle and are in no bundle. Reachable by no drill-down, so they are
+    // invisible in a bundle-centric list unless something asks for them by name. 337 of them.
+    const QVector<int>& loose() const { return m_loose; }
+    // Products whose record is TACT-encrypted. Kept SEPARATE from bundles() rather than merged:
+    // whether a locked product is a bundle or a leaf is unreadable, so claiming either would be a
+    // guess. The Catalogue decides whether to show them, hide them, or show only them.
+    const QVector<int>& locked() const { return m_locked; }
 
     // ── "What sold this?" ───────────────────────────────────────────────────────────────────────
     // Any asset sno (Item, Actor, Appearance, …) -> the store products that reach it. Built by
@@ -136,6 +171,9 @@ private:
     QHash<int, Product> m_byId;
     QHash<QString, int> m_byName;   // lowercased name -> sno
     QVector<int>        m_bundles;
+    QVector<int>        m_locked;    // derived in install() from Product::encrypted
+    QVector<int>        m_loose;     // derived in install(): no children, and nobody's child
+    Coverage            m_coverage;
     QHash<int, QVector<int>> m_soldIn;   // asset sno -> products that reach it
     bool m_ready = false;
     bool m_building = false;

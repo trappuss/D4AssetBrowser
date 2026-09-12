@@ -1397,6 +1397,19 @@ QByteArray CascReader::tactKeyFor(quint64 sno)
     return remember(QByteArray());
 }
 
+QVector<int> CascReader::snosForTactKey(const QByteArray& keyName)
+{
+    QVector<int> out;
+    if (keyName.isEmpty()) return out;
+    // encryptedSnos() takes the lock itself and must not be called with one held.
+    const QHash<int, QByteArray>& all = encryptedSnos();
+    out.reserve(1024);
+    for (auto it = all.constBegin(); it != all.constEnd(); ++it)
+        if (it.value() == keyName) out.append(it.key());
+    std::sort(out.begin(), out.end());
+    return out;
+}
+
 const QHash<int, QByteArray>& CascReader::encryptedSnos()
 {
     // The read MUST happen with no lock held: readFile takes m_mutex itself, and QMutex is not

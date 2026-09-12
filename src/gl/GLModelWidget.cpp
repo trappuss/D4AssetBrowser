@@ -364,7 +364,8 @@ uniform float uFxFresnel;       // authored Fresnel Slope (edge exponent)
 uniform float uTime;
 uniform int   uFDetail, uFSubsurf, uFHair, uFIbl, uFMask, uFTonemap, uFDye;
 uniform int   uSpecAA;   // geometric specular anti-aliasing toggle (Preview Settings)
-uniform int   uViewChannel;   // 0 shaded · 1 base colour · 2 normal · 3 rough · 4 metal · 5 AO · 6 emissive
+uniform int   uViewChannel;   // 0 shaded · 1 base colour · 2 normal · 3 rough · 4 metal · 5 AO
+                              // 6 emissive · 7 detail-map select · 8 dye/material-mask zones
 uniform float uSkinCurv;      // pre-integrated-skin curvature scale (= model radius)
 uniform float uExposure;
 uniform int   uColorGrade;    // 1 = apply the post-tonemap colour grade (off by default)
@@ -721,7 +722,27 @@ void main() {
         float normalVar = 0.5 * (dot(dNx, dNx) + dot(dNy, dNy));
         rough = clamp(sqrt(rough*rough + min(normalVar, 0.18)), 0.04, 1.0);
     }
-    vec3 emis = (uHasEmissive==1) ? texture(uEmissiveTex,vUV).rgb * uEmisColor * uEmisMul * uEmisScale : vec3(0.0);
+    // ── Emissive: sampled and scaled in ONE place ───────────────────────────────────────────────
+    // The texture and the authored colour are sRGB-ENCODED. uEmisMul (the material's authored
+    // "emissive multiplier") and uEmisScale (the slider) are LINEAR INTENSITIES. They used to be
+    // folded together here and then handed as one value to pow(x, 2.2) further down, which raised
+    // the intensity to the 2.2 along with the colour:
+    //
+    //     authored multiplier 10  ->  10^2.2 = 158x        (D4 authors 5-20 on glowing gems)
+    //     the 0.50 default slider ->  0.50^2.2 = 0.22x
+    //
+    // A rune therefore reached the ACES tonemapper an order of magnitude past white, came out
+    // desaturated to paper, and only showed its colour again at slider 0 — where the emissive term
+    // is gone entirely and the base colour is all that is left. That is the whole symptom.
+    //
+    // Decoded here rather than at the pow() below so every consumer — the emissive debug channel,
+    // the unlit PBR-off path, the lit combine — reads the same finished value.
+    vec3 emis = vec3(0.0);
+    if (uHasEmissive==1) {
+        vec3 e = texture(uEmissiveTex,vUV).rgb * uEmisColor;   // the sRGB-encoded part
+        if (uFTonemap==1) e = pow(e, vec3(2.2));               // decode it, and only it
+        emis = e * uEmisMul * uEmisScale;                      // linear gain, applied after
+    }
 
     // D4 dye: single-channel DyeMask.r = how dyeable the texel is; single-channel
     // DyeRamp.r = position along the dye's gradient (shading). The dye colour itself
@@ -813,7 +834,7 @@ void main() {
         albedo *= mix(uFurRootColor, uFurTipColor, vFurShell);
     // sRGB-correct: when tonemapping, light in linear space (albedo/emissive are
     // sRGB-encoded textures) and re-encode at the end.
-    if (uFTonemap==1) { albedo = pow(albedo, vec3(2.2)); emis = pow(emis, vec3(2.2)); }
+    if (uFTonemap==1) albedo = pow(albedo, vec3(2.2));   // emis was decoded at its sample, above
     // Wetness (rain-slick): a wet surface soaks in — its diffuse darkens — and its microsurface fills
     // with water, so it turns glossier (lower roughness) and reflects more. D4 authors a per-material
     // "Wetness Bias"; this global slider stands in for it. Eyes are already wet, so skip them.
@@ -1199,6 +1220,11 @@ void GLModelWidget::setGeometry(const ModelGeometry& geo, bool keepView)
     m_indices.clear();
     m_parts.clear();
     m_followParts.clear();   // stale part indices from the previous model
+    // Same reason, and the reason is not cosmetic: an index that is still IN RANGE for the new
+    // model outlines the WRONG part rather than being filtered out, and a picked SET makes that a
+    // whole wrong set instead of one stray part.
+    m_picked.clear();
+    m_highlight.clear();
     m_vJoints.clear();
     m_vWeights.clear();
     m_bindVerts.clear();   // IMPORTANT: clear before clearAnimation(), else it restores
@@ -4485,11 +4511,15 @@ void main() { o = vec4(mix(uBot, uTop, clamp(vT, 0.0, 1.0)), uA); })";
             for (int i : m_highlight)
                 if (i >= 0 && i < m_parts.size() && m_parts[i].visible && m_parts[i].count)
                     outline.push_back({i, 0});
-            if (m_pickedPart >= 0 && m_pickedPart < m_parts.size()
-                && m_parts[m_pickedPart].visible && m_parts[m_pickedPart].count) {
+            // Every picked part, not one: a right-click inside a multi-selection turns the whole
+            // selection blue, because that is the set the menu acts on. Each is removed from the
+            // red list first so a part that is both selected and picked draws blue only.
+            for (int p : m_picked) {
+                if (p < 0 || p >= m_parts.size() || !m_parts[p].visible || !m_parts[p].count)
+                    continue;
                 for (int k = outline.size() - 1; k >= 0; --k)
-                    if (outline[k].first == m_pickedPart) outline.removeAt(k);
-                outline.push_back({m_pickedPart, 1});
+                    if (outline[k].first == p) outline.removeAt(k);
+                outline.push_back({p, 1});
             }
             // No stencil attachment → the stencil test always passes and the jittered draws would
             // paint eight solid copies of the part. Fall back to the old wireframe in that case.
@@ -4766,10 +4796,28 @@ void GLModelWidget::setHighlightPart(int i)
     if (s != m_highlight) { m_highlight = s; update(); }
 }
 
+void GLModelWidget::setPickedParts(const QList<int>& parts)
+{
+    QSet<int> s;
+    for (int i : parts)
+        if (i >= 0 && i < m_parts.size()) s.insert(i);
+    if (s != m_picked) { m_picked = s; update(); }
+}
+
 void GLModelWidget::setPickedPart(int i)
 {
-    const int v = (i >= 0 && i < m_parts.size()) ? i : -1;
-    if (v != m_pickedPart) { m_pickedPart = v; update(); }
+    setPickedParts(i >= 0 ? QList<int>{i} : QList<int>{});
+}
+
+// Lowest index rather than "whichever the hash walk reaches first": QSet iteration order is
+// randomised per process in Qt, so anything that reads this would otherwise be nondeterministic
+// across launches — the same trap the Stable clip-carrier tiebreak hit.
+int GLModelWidget::pickedPart() const
+{
+    int best = -1;
+    for (int i : m_picked)
+        if (best < 0 || i < best) best = i;
+    return best;
 }
 
 void GLModelWidget::setHighlightParts(const QList<int>& parts)
@@ -5594,6 +5642,15 @@ void GLModelWidget::mousePressEvent(QMouseEvent* e)
 {
     m_lastPos = e->pos();
     if (e->button() == Qt::RightButton) m_rightPressPx = e->pos();   // remember for click-vs-drag test
+    if (e->button() == Qt::LeftButton) {
+        m_leftPressPx = e->pos();      // same test: orbit vs select
+        // Cleared on every press, not only when it is consumed. The flag is set by a double-click
+        // and eaten by the release that follows — but that release can be a DRAG, which fails the
+        // threshold test below and would leave the flag set to swallow the next genuine click.
+        // A press always precedes that click, so clearing here closes it, and also covers a
+        // double-click whose second release never arrives (focus loss, grab stolen).
+        m_swallowLeftClick = false;
+    }
     // Middle-click = reset/re-frame the view (replaces the old "Reset view" toolbar button).
     // Middle-drag isn't used for anything here, so the press is unambiguous.
     if (e->button() == Qt::MiddleButton) {
@@ -5612,12 +5669,28 @@ void GLModelWidget::mouseReleaseEvent(QMouseEvent* e)
         emit partRightClicked(part, e->globalPosition().toPoint());
         e->accept();
     }
+    // Left-click select, on the same click-vs-drag test — a left-DRAG orbits the camera and must
+    // never change the selection, which is why this is on RELEASE and gated on the cursor barely
+    // having moved rather than on the press.
+    //
+    // The modifiers ride along instead of being resolved here: what "Ctrl" means is the parts
+    // panel's business, not the viewport's, and each tab owns a different selection model.
+    // NOT accepted: the orbit handler and this can both be interested in the same release, and
+    // swallowing it here would be a behaviour change for the camera.
+    if (e->button() == Qt::LeftButton
+        && (e->pos() - m_leftPressPx).manhattanLength() < 4) {
+        // The release that closes a double-click is swallowed — see m_swallowLeftClick. pickPart()
+        // is a full CPU raycast, so this also spares the third one of a double-click.
+        if (m_swallowLeftClick) m_swallowLeftClick = false;
+        else                    emit partClicked(pickPart(e->pos()), e->modifiers());
+    }
 }
 
 // Double-click a part to focus it: ray-pick the front-most triangle under the cursor, frame
 // that part's live bounds (keeping the current angle), and notify listeners for slot sync.
 void GLModelWidget::mouseDoubleClickEvent(QMouseEvent* e)
 {
+    m_swallowLeftClick = true;   // the release after this one must not re-toggle the selection
     const int part = pickPart(e->pos());
     // "Frame part on select": whether the camera snaps to the picked part. Read live from
     // QSettings so ONE setting governs every viewport (Models/Wardrobe/Stable) with no parity

@@ -36,18 +36,18 @@ class PanelBox;   // right-column stacking panel, shared with Models/Wardrobe (P
 // Stable (rewrite): mount previewer modeled on the Wardrobe tab. A mount "look" is
 // three layered appearance slots — Mount body, Barding (armor), Trophy — plus a Pet
 // viewing mode. The three picks are parsed and combined onto one model, textured on
-// the shared PBR pipeline, and can be saved as named "Stables" (ensembles), framed
-// with the Lighting/Camera popups, and exported to .glb. Mounts are NOT dyeable in
+// the shared PBR pipeline, framed with the Lighting/Camera popups, and exported to
+// .glb (mesh, or rig + clips only). Mounts are NOT dyeable in
 // Diablo IV, so there is deliberately no dye control (unlike the Wardrobe tab).
 class StableTab2 : public BrowserTab {
     Q_OBJECT
 public:
     explicit StableTab2(QWidget* parent = nullptr);
     void refresh() override;
-    // Reload/build change: drop the session material-decode cache (decodes could differ on a new
-    // build). Deliberately does NOT reset m_loaded — the tab's reload behavior is unchanged.
-    void reset() override { m_cBase.clear(); m_cNorm.clear(); m_cOrm.clear();
-                            m_cEmis.clear(); m_cMask.clear(); m_cTrans.clear(); }
+    // Reload/build change: forget everything keyed to the GAME BUILD, or it gets answered from
+    // the previous one. Defined in the .cpp — it has to touch the on-disk thumbnail cache, and it
+    // is long enough now that inlining it hid what it does NOT clear.
+    void reset() override;
     void onSettingsChanged() override { fillGrid(); }    // re-stamp card icons (presence-badge toggles)
     void persistView() override { saveCameraState(); }   // flush camera/FOV on app close
 
@@ -57,6 +57,11 @@ public:
     void    exportSelection() override { exportMount(); }
     void    exportSelectionToLast() override { exportMount(QVector<int>(), QString(), true); }
     QString exportNoun() const override { return QStringLiteral("mount"); }
+
+    // Contextual "anim export" action in the Export menu — rig + clips, no mesh.
+    bool    hasAnimExport() const override;
+    QString animExportLabel() const override;   // names the clip set it will actually write
+    void    exportAnimations() override;
 
 protected:
     bool eventFilter(QObject* obj, QEvent* ev) override;
@@ -97,6 +102,7 @@ private:
 
     // ── Assemble + texture ───────────────────────────────────────────────────
     void rebuildMount();                            // parse the 3 slots, merge, texture, show
+    void scheduleRebuild();                         // 35 ms debounce for repeatable interactive changes
     void saveCurrent();                             // persist the live selection for next launch
     void restoreCurrent();                          // reload the last selection
     void saveCameraState();                         // remember orbit/zoom/fov/ortho
@@ -117,6 +123,11 @@ private:
     QPixmap badgeIcon(int sno, const QPixmap& pm) const;   // overlay the ✓/✗ model-presence badge
     QString thumbPath(int sno) const;
     QList<int> primitivesOf(QTreeWidgetItem* it) const;
+    QTreeWidgetItem* itemForPart(int part) const;   // parts-tree row for a merged primitive index
+    // Everything that follows the parts-tree selection: the viewport outline and the texture
+    // tiles. Named, so the viewport's click handler can edit the tree with signals blocked and
+    // then run one sync rather than two — the tiles are six smooth rescales.
+    void syncPartSelection();
     QList<int> selectedParts() const;
     void installCopyMenu(QWidget* view, int nameCol);   // right-click → Copy name / Copy all
 
@@ -127,7 +138,6 @@ private:
     // the whole set at once (right-click a mount card → "Equip matching set").
     void buildThemeMap();                              // scan StoreProduct bundles (lazy, once)
     void equipMountTheme(const StableEntry& mount);    // equip mount + matching armor + trophy
-    bool hasTheme(const QString& mountAppr);           // any matching armor/trophy exists?
     void equipEntry(int slot, const StableEntry& e);   // equip one item into a slot (menu "Equip")
     bool matchingSetPiece(const StableEntry& mount, int slot, StableEntry& out);  // set's armor/trophy
     int  themeItemCount(const StableEntry& mount);     // # of matching set pieces we can equip
@@ -138,15 +148,48 @@ private:
     // ── Animations ───────────────────────────────────────────────────────────
     void buildAnimPanel();
     void populateAnims();                           // discover clips for the current mount rig
+    // D4_DUMP_MNTTROPHYANIM=1 — one-shot: which mount trophy appearances own clips. Gates whether
+    // reopening the trophy sub-rig placement problem (see seatTrophyOnMount) is worth anything.
+    void dumpMountTrophyAnims();
+    // D4_DUMP_PETANIM=1 — one-shot: which companions resolve to a carrier that owns clips.
+    void dumpPetAnims();
     void fillAnimList();                            // apply the search filter to the cached rows
     void playAnimByName(const QString& name);
     void resetAnimToDefault();                      // "Reset to default": nav-idle clip + 1x + loop
-    QStringList discoverClips(int carrier, const QString& speciesTok);   // scan Anim/ for a carrier's clips
+    // Every clip carrying a species token, bucketed by the appearance that OWNS it. ONE directory
+    // scan per token, cached for the session; carrier resolution reads the buckets instead of
+    // trusting a name (see animCarrierFor).
+    // The returned reference lives in m_clipTok: a LATER clipBuckets() call with an unseen token
+    // inserts and can rehash, so never hold this across one — resolve the carrier first, then read.
+    const QHash<int, QStringList>& clipBuckets(const QString& speciesTok);
+    // Disk cache for the above (stable_anims_v2.json). The walk is 45,549 files and used to run
+    // once per SPECIES TOKEN per session; this makes it once per d4data snapshot.
+    static QString animCacheSig();
+    void loadClipCache();
+    void saveClipCache();
+    QStringList currentClipRows();                  // rows for the live selection (the ONE row source)
+    // Species token for the Anim/ scan. For a mount, its species; for a PET, the species too —
+    // the last segment, not the first two. The game shares one clip family across every
+    // variant of a species (CMP_dogLarge_nav_idle), which no variant-bearing token can match.
+    static QString animTokenFor(const QString& appr, bool pet, const QString& catHint);
+    // The appearance that owns `appr`'s clips. `catHint` is the authoritative eMountType token
+    // when the caller has one (mountCategory()), empty to derive it from the name.
+    int  animCarrierFor(const QString& appr, int apprSno, bool pet, const QString& catHint = QString());
+    // The species hint for `appr`: mountCategory() when it is the live selection, else empty.
+    QString hintForAppr(const QString& appr, bool pet) const;
+    // Which clips an export carries (Settings ▸ Export scope), and the one decoder that turns
+    // names into clips. Every export path goes through this pair, so they all ship the same set
+    // for the same settings (clips that fail to decode are dropped, so a menu count is an upper
+    // bound on what reaches the file).
+    QStringList exportClipNames(const QString& appr, int apprSno, bool pet);
+    void collectExportAnims(const ModelGeometry& geo, const QStringList& clipNames,
+                            QVector<AnimParser::DecodedAnim>& anims, QStringList& names);
+    void exportAnimLibrary();                      // rig + selected clips only (no mesh)
     QString exportMenuSuffix(const QString& appr, bool pet);             // "1 model + N anims + M raw" per settings
     void applyAnimSpeed();
     void tickAnimation();
     void clearAnim();                               // stop playback + reset
-    int  animCarrierSno() const;                    // the appearance SNO that owns the clips
+    int  animCarrierSno();                          // the appearance SNO that owns the clips
 
     // ── Lighting / Camera / Graphics / Shaders / Overlays popups ─────────────
     void buildLightingPanel();
@@ -163,6 +206,9 @@ private:
     // viewport AND parts panel. `groupPart` is any part belonging to the group whose HEADER was
     // right-clicked: part stays -1 (no single part was picked) but the model-level actions still
     // scope to that group's source item instead of falling back to the whole assembly.
+    // "Why does this part look the way it does" — authored vs assumed values, roster source,
+    // texture roles — in the shared read-only pane (util/TextReportDialog.h).
+    void showMaterialReport(const QString& materialName, const QString& apprName, int apprSno);
     void showPartContextMenu(int part, const QPoint& globalPos, int groupPart = -1);
 
     void reapplyOverlays();        // re-push ALL overlay state (master gate + each box)
@@ -179,8 +225,11 @@ private:
     // ── Wardrobe-parity chrome: viewport N-strip, fullscreen, right sidebar ──
     void buildVpStrip();                            // floating button strip on the viewport edge
     void positionVpStrip();                         // pin it to the viewport's right edge
-    void buildSidebar(QSplitter* mainSplit);        // PanelBox sidebar (PARTS · INFO)
+    void buildSidebar(QSplitter* mainSplit);        // PanelBox sidebar (PARTS · MATERIALS · TEXTURES · INFO · ANIMATIONS)
     void showSidePanel(int page, bool on);          // strip toggle → panel in/out
+    void moveSidePanel(int page, int delta);        // ▲▼ reorder among the panels that are up
+    void saveSidePanelLayout();                     // which panels, what order, what heights
+    void updateSidebarCollapse();                   // no panels up → shrink the column to the strip
     void toggleFullscreen(bool on);                 // hide chrome, viewport fills the tab (Esc)
 
     // ── Export ───────────────────────────────────────────────────────────────
@@ -252,7 +301,10 @@ private:
     QSplitter*    m_rsplit = nullptr;               // stacked PanelBoxes
     QVector<PanelBox*>    m_rsections;              // registration order == page id
     QVector<QToolButton*> m_rpageBtns;              // sidebar strip toggles
-    QVector<QString>      m_rkeys;                  // settings key per panel
+    QVector<QString>      m_rids;                   // STABLE layout id per panel (never the title)
+    QVector<bool>         m_rdefOn;                 // default up? — used only by the one-time migration
+    QWidget*              m_rstripW = nullptr;      // the icon strip (updateSidebarCollapse sizes to it)
+    bool                  m_panelRestore = false;   // replaying a layout — suppress writes
 
     // Animations
     QWidget*      m_animPanel = nullptr;
@@ -261,13 +313,17 @@ private:
     QLineEdit*    m_animSearch = nullptr;
     QSlider*      m_animSlider = nullptr;
     QPushButton*  m_playBtn = nullptr;
+    QPushButton*  m_resetBtn = nullptr;   // whole-mount reset — lives in the left picker column
     QComboBox*    m_speedCombo = nullptr;
     QCheckBox*    m_loopCheck = nullptr;
     QTimer*       m_animTimer = nullptr;
     float         m_animFps = 30.0f;
     QString       m_playingAnim;
     AnimParser::DecodedAnim m_curAnim;
-    QHash<int, QStringList> m_animCache;   // carrier SNO → clip rows
+    // Species token → (owning appearance SNO → clip rows). One entry per token scanned; every
+    // clip consumer reads this, so the preview list and the export can never disagree.
+    QHash<QString, QHash<int, QStringList>> m_clipTok;
+    bool m_clipDiskLoaded = false;   // the disk cache is read once per session, not per token
 
     QVector<int>  m_partFx, m_partSim, m_partHidden;   // per-primitive FX / simulated / force-hidden (collision) flags
     // Per merged primitive: which of the up-to-three equipped appearances it came from. The mount,
@@ -292,6 +348,7 @@ private:
     QHash<QString, QString>     m_themeArmor;       // mount → its set's Mount Armor appearance
     QHash<QString, QStringList> m_themeTrophy;      // mount → its set's Trophy appearance(s)
     bool                        m_themesBuilt = false;
+    QTimer* m_rebuildTimer = nullptr;               // scheduleRebuild()'s 35 ms coalescing timer
     QTimer* m_gridReflow = nullptr;                 // debounce grid rebuild on panel resize
     int  m_gridCols = 0;                            // last column count (reflow only when it changes)
     // Rendered card thumbnails (no inventory icons exist for mounts).
@@ -305,7 +362,15 @@ private:
     bool                m_thumbDirty = false;        // a batch rendered → restore the live mount after
     bool m_petReady = false;
     bool m_petBuilding = false;
+    // Generation counter: reset() bumps it, and a scan already in flight compares before it
+    // installs. Without this, fixing reset() turns a fingerprint change mid-scan into the OLD
+    // roster overwriting the new one — the exact failure the counter exists to stop.
+    int  m_petGen = 0;
 
+    // Wired ONCE, not once per refresh(). reset() clears m_loaded so the tab repopulates on a new
+    // build, so refresh() can run more than once — and its two singleton connections are lambdas,
+    // which Qt::UniqueConnection cannot dedupe.
+    bool m_signalsWired = false;
     bool m_loaded = false;
     bool m_framed = false;
 };

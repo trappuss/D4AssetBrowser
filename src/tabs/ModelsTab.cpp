@@ -17,6 +17,8 @@
 #include "model/Attachments.h"
 #include "model/Material.h"
 #include "model/MaterialDecode.h"
+#include "model/MaterialReport.h"
+#include "util/TextReportDialog.h"
 #include "model/ModelExporter.h"
 #include "model/Retarget.h"
 #include "model/Hardpoints.h"
@@ -105,6 +107,8 @@
 #include <QMouseEvent>
 #include <QDialog>
 #include <QDialogButtonBox>
+#include <QFontDatabase>   // the material report is column-aligned; it needs a fixed font
+#include <QPlainTextEdit>   // the material report pane
 #include <QIcon>
 #include <QInputDialog>
 #include <QPainter>
@@ -883,6 +887,22 @@ QVector<ModelExporter::ExportMaterial> buildExportMats(
             }
             em.normal = reconstructNormal(normalRG);
             em.orm = packORM(aoImg, roughImg, metalImg);
+            // ── Emissive COLOUR, for the case the JSON could not answer ─────────────────────────
+            // emisR/G/B are set above from MaterialValues, which is .mat.json-only — so an
+            // encrypted material arrived here with all three at zero while its EMISSIVE map was
+            // embedded a few lines up. glTF then wrote emissiveFactor [0,0,0]: a black glow, the
+            // map multiplied out of existence. The same derivation the viewport uses, so the
+            // export and the preview state the same colour instead of two different ones.
+            if (!em.emissive.isNull()) {
+                em.hasEmissive = true;
+                if (em.emisR <= 0.0f && em.emisG <= 0.0f && em.emisB <= 0.0f) {
+                    const QColor ec = MaterialDecode::emissiveTint(d4, matName,
+                                                                   em.emissive, em.baseColor);
+                    em.emisR = float(ec.redF());
+                    em.emisG = float(ec.greenF());
+                    em.emisB = float(ec.blueF());
+                }
+            }
             // Bake the active pigment into the exported base colour (matches preview).
             if (bakeDye && !dyeMaskImg.isNull() && !em.baseColor.isNull())
                 em.baseColor = applyDyeBake(em.baseColor, dyeMaskImg, dyeRampImg, pigment);
@@ -3021,7 +3041,8 @@ ModelsTab::ModelsTab(QWidget* parent) : BrowserTab(parent)
             if (!m_modelView) return;
             QList<int> sel;
             for (const QModelIndex& ix : m_partsView->selectionModel()->selectedRows(0))
-                sel << m_partsModel->item(ix.row(), 0)->data(Qt::UserRole).toInt();
+                if (QStandardItem* it = m_partsModel->item(ix.row(), 0))
+                    sel << it->data(Qt::UserRole).toInt();
             m_modelView->setHighlightParts(sel);
             highlightMaterialsForParts(sel);
         });
@@ -3269,24 +3290,51 @@ ModelsTab::ModelsTab(QWidget* parent) : BrowserTab(parent)
     // click-in-viewport-highlights-in-outliner). Double-clicking the SAME part again, or empty
     // space (part = -1), deselects — the selection returns to the model's own row so the browse
     // list never ends up with nothing current.
+    // partFocused (double-click) no longer moves the selection. A single left-click owns that,
+    // into the PARTS table; the first click of a double has already done it. Re-selecting here
+    // also drove the OUTLINER, whose own selection handler overwrites the viewport highlight with
+    // its set — so a double-click silently wiped the red outline off a parts-table multi-selection
+    // that the context menu would still have acted on. The camera move lives in GLModelWidget.
+    //
+    // It does still reveal the part in the outliner, which is the useful half: expand to it and
+    // scroll, without changing what is selected anywhere.
     connect(m_modelView, &GLModelWidget::partFocused, this, [this](int part) {
-        if (!m_treeModel) return;
+        if (!m_treeModel || !m_list || part < 0) return;
         const int host = m_treeModel->subtreeRow();
         if (host < 0) return;
-        const QModelIndex hostIx = m_treeModel->index(host, 0);
-        const QModelIndex ix = part >= 0 ? m_treeModel->indexOfPart(part) : QModelIndex();
-        const QModelIndex cur = m_list->currentIndex();
-        const bool samePart = ix.isValid() && cur.isValid()
-                              && cur.parent() == ix.parent() && cur.row() == ix.row();
-        if (!ix.isValid() || samePart) {   // miss or re-click → unselect the part
-            m_list->selectionModel()->setCurrentIndex(
-                hostIx, QItemSelectionModel::ClearAndSelect | QItemSelectionModel::Rows);
+        const QModelIndex ix = m_treeModel->indexOfPart(part);
+        if (!ix.isValid()) return;
+        m_list->expand(m_treeModel->index(host, 0));
+        m_list->scrollTo(ix);
+    });
+    // Single left-click → select in the PARTS table, which is this tab's per-part surface and is
+    // already ExtendedSelection. Plain click replaces, Ctrl or Shift adds or toggles, empty space
+    // clears. The outliner stays on double-click, as it was: it selects NODES, of which a part is
+    // only one kind, so it is the wrong surface for accumulating a part set.
+    connect(m_modelView, &GLModelWidget::partClicked, this, [this](int part, Qt::KeyboardModifiers mods) {
+        if (!m_partsView || !m_partsModel || !m_partsView->selectionModel()) return;
+        const bool add = mods & (Qt::ControlModifier | Qt::ShiftModifier);
+        const int row = partsRowFor(part);
+        QItemSelectionModel* sm = m_partsView->selectionModel();
+        if (row < 0) {                          // miss
+            if (!add) sm->clearSelection();
             return;
         }
-        m_list->expand(hostIx);
-        m_list->selectionModel()->setCurrentIndex(
-            ix, QItemSelectionModel::ClearAndSelect | QItemSelectionModel::Rows);
-        m_list->scrollTo(ix);
+        const QModelIndex ix = m_partsModel->index(row, 0);
+        const bool already = sm->isSelected(ix);
+        // ClearAndSelect in ONE call for the plain case, rather than clearSelection() followed by
+        // select(): the selection handler here repaints the viewport outline and re-colours every
+        // material row, and two emissions per click pays that twice.
+        if (!add) {
+            sm->select(ix, QItemSelectionModel::ClearAndSelect | QItemSelectionModel::Rows);
+        } else {
+            sm->select(ix, (already ? QItemSelectionModel::Deselect : QItemSelectionModel::Select)
+                           | QItemSelectionModel::Rows);
+        }
+        if (!(add && already)) {
+            sm->setCurrentIndex(ix, QItemSelectionModel::NoUpdate);
+            m_partsView->scrollTo(ix);
+        }
     });
     // Right-click a part in the viewport → hide/show/isolate it + copy its material name.
     // The viewport and the PARTS panel raise the SAME menu — see showPartContextMenu.
@@ -6957,7 +7005,11 @@ void ModelsTab::rebuildAssembledGeometry()
                 if (meta.isEmpty() || pay.isEmpty()) continue;
                 ModelGeometry childGeo = ModelParser::parseApp(meta, pay);
                 if (!childGeo.valid) continue;
-                const QStringList childRoster = MaterialDecode::appearanceRoster(d4, a.childApprName);
+                // ...Any: an attached child can be encrypted just as easily as the base can, and
+                // the base path a few hundred lines up already falls back to the meta binary.
+                const QStringList childRoster =
+                    MaterialDecode::appearanceRosterAny(m_reader, d4, a.childApprName,
+                                                        meta, a.childApprSno, m_index);
                 if (a.isMount) {
                     // Mount: seat via the MOUNT's own saddle hardpoint (its rig, not the rider's),
                     // so the mount ends up under the rider (who stays at the origin).
@@ -7149,6 +7201,23 @@ void ModelsTab::updateTabCounts()
 // nothing on right-click while Wardrobe and Stable — whose part panels call their own
 // equivalent of this — offered the full set. ViewportPartMenu.h claims six entry points; this
 // is what makes that true.
+// "Explain this material…" — the whole of MaterialReport in a read-only, selectable, copyable
+// pane. Deliberately plain text rather than a table: the answer is a short argument about where
+// each fact came from, and the useful thing to do with it is paste it somewhere.
+void ModelsTab::showMaterialReport(const QString& materialName,
+                                   const QString& apprName, int apprSno)
+{
+    const QString appr = apprName.isEmpty() ? m_curName : apprName;
+    const int     sno  = apprName.isEmpty() ? m_curSno  : apprSno;
+    const QString text = MaterialReport::explain(m_reader, m_index, Config::d4dataDir(),
+                                                 appr, sno, materialName);
+    TextReport::show(this, materialName.isEmpty()
+                               ? QStringLiteral("Explain materials — %1")
+                                     .arg(appr.isEmpty() ? QStringLiteral("model") : appr)
+                               : QStringLiteral("Explain material — %1").arg(materialName),
+                     text);
+}
+
 void ModelsTab::showPartContextMenu(int part, const QPoint& gp)
 {
     if (!m_treeModel) return;
@@ -7157,13 +7226,42 @@ void ModelsTab::showPartContextMenu(int part, const QPoint& gp)
         for (auto it = all.constBegin(); it != all.constEnd(); ++it) m_treeModel->setPartCheck(it.key(), true);
         recomputePartVisibility();
     };
+    // ── What this menu ACTS ON ────────────────────────────────────────────────────────────────
+    // Right-clicking a part that is already selected acts on the WHOLE selection. Both surfaces
+    // are consulted, most-specific first: the PARTS table is where a part multi-selection is
+    // built, the outliner selects nodes that happen to contain parts. Right-clicking outside every
+    // selection falls back to that one part.
+    //
+    // The result is both what the actions run on and what turns blue, so the outline can never
+    // disagree with what the menu is about to do.
+    QList<int> acted;
+    if (part >= 0) {
+        const QList<int> rows = selectedPartRows();
+        const QList<int> tree = selectedParts();
+        if (rows.contains(part))      acted = rows;
+        else if (tree.contains(part)) acted = tree;
+        else {
+            acted = QList<int>{part};
+            // Bring the PARTS table in line, as the Wardrobe and Stable do with their trees:
+            // otherwise red stays on the old selection while blue moves to this one, and the next
+            // right-click on an old member silently re-expands the scope back to it.
+            const int row = partsRowFor(part);
+            if (row >= 0 && m_partsView && m_partsModel && m_partsView->selectionModel())
+                m_partsView->selectionModel()->select(
+                    m_partsModel->index(row, 0),
+                    QItemSelectionModel::ClearAndSelect | QItemSelectionModel::Rows);
+        }
+        std::sort(acted.begin(), acted.end());
+        acted.erase(std::unique(acted.begin(), acted.end()), acted.end());
+    }
     // Right-click SELECTS the part (blue outline) but must NOT move the camera — framing is
     // an explicit menu action. Shared builder: util/ViewportPartMenu.h.
-    if (m_modelView) m_modelView->setPickedPart(part);
+    if (m_modelView) m_modelView->setPickedParts(acted);
     ViewportPartMenu::Info in;
     ViewportPartMenu::Actions act;
     int modelTris = 0;
-    for (int i = 0; i < m_curGeo.primitives.size(); ++i) modelTris += m_modelView->partTriangles(i);
+    if (m_modelView)
+        for (int i = 0; i < m_curGeo.primitives.size(); ++i) modelTris += m_modelView->partTriangles(i);
     in.sourceModel   = m_curName;
     in.sourceFileName= m_curName;
     in.sourceName    = m_curName;
@@ -7182,28 +7280,75 @@ void ModelsTab::showPartContextMenu(int part, const QPoint& gp)
         // screen. Fall back to it only when the roster has no entry for this index.
         in.partName     = m_appMatNames.value(m_curGeo.primitives[part].materialIndex);
         if (in.partName.isEmpty()) in.partName = m_curGeo.primitives[part].materialName;
-        in.partFileName = in.partName;
+        in.partMaterial = in.partName;
         in.partTris     = m_modelView->partTriangles(part);
         in.visible      = checks.value(part, true);
         in.isFx         = part < m_partIsFx.size()  && m_partIsFx[part];
         in.isSim        = part < m_partIsSim.size() && m_partIsSim[part];
-        act.setVisible  = [this, part](bool on) { m_treeModel->setPartCheck(part, on); recomputePartVisibility(); };
-        act.isolate     = [this, part] {
-            QHash<int, bool> all; m_treeModel->partChecks(all);
-            for (auto it = all.constBegin(); it != all.constEnd(); ++it)
-                m_treeModel->setPartCheck(it.key(), it.key() == part);
+        // Everything below runs on `acted`, which for a single pick is exactly {part}.
+        const QVector<int> actedV(acted.begin(), acted.end());
+        if (acted.size() > 1) {
+            in.selParts = actedV;
+            int t = 0;
+            QStringList mats;
+            for (int p : acted) {
+                t += m_modelView ? m_modelView->partTriangles(p) : 0;
+                QString mn;
+                if (p >= 0 && p < m_curGeo.primitives.size()) {
+                    mn = m_appMatNames.value(m_curGeo.primitives[p].materialIndex);
+                    if (mn.isEmpty()) mn = m_curGeo.primitives[p].materialName;
+                }
+                if (!mn.isEmpty() && !mats.contains(mn)) mats << mn;
+            }
+            in.selTris = t;
+            in.selMaterials = mats;
+        }
+        act.setVisible  = [this, acted](bool on) {
+            for (int p : acted) m_treeModel->setPartCheck(p, on);
             recomputePartVisibility();
         };
-        act.frame       = [this, part] {
+        act.isolate     = [this, acted] {
+            QHash<int, bool> all; m_treeModel->partChecks(all);
+            const QSet<int> keep(acted.begin(), acted.end());
+            for (auto it = all.constBegin(); it != all.constEnd(); ++it)
+                m_treeModel->setPartCheck(it.key(), keep.contains(it.key()));
+            recomputePartVisibility();
+        };
+        act.frame       = [this, actedV] {
             if (!m_modelView) return;
             QVector3D c; float r;
-            if (m_modelView->partsBounds(QVector<int>{part}, c, r))
+            if (m_modelView->partsBounds(actedV, c, r))
                 m_modelView->frameRegionKeepRotation(c, r, /*animate=*/true);
         };
-        act.selectPart  = [this, part] { selectPartInOutliner(part); };
-        const QString pn = in.partName.isEmpty() ? QStringLiteral("part") : in.partName;
-        act.exportPart        = [this, part, pn] { exportCurrentModelGlb(QVector<int>{part}, pn, false); };
-        act.exportPartLastDir = [this, part, pn] { exportCurrentModelGlb(QVector<int>{part}, pn, true); };
+        // Single part keeps the outliner (one node, scrolled to). A set goes to the PARTS table,
+        // which is the only surface here that can show several parts selected at once.
+        act.selectPart  = [this, acted, part] {
+            if (acted.size() <= 1) { selectPartInOutliner(part); return; }
+            if (!m_partsView || !m_partsModel || !m_partsView->selectionModel()) return;
+            QItemSelectionModel* sm = m_partsView->selectionModel();
+            sm->clearSelection();
+            int firstRow = -1;
+            for (int p : acted) {
+                const int row = partsRowFor(p);
+                if (row < 0) continue;
+                sm->select(m_partsModel->index(row, 0),
+                           QItemSelectionModel::Select | QItemSelectionModel::Rows);
+                if (firstRow < 0) firstRow = row;
+            }
+            if (firstRow >= 0) m_partsView->scrollTo(m_partsModel->index(firstRow, 0));
+        };
+        // in.partName IS the resolved roster material name (the struct's own comment says so), so
+        // this asks about exactly the material the row is labelled with — not MeshPrimitive's
+        // "Material_<n>" placeholder.
+        const QString matName = in.partName;
+        act.explainMaterial = [this, matName] { showMaterialReport(matName); };
+        // The export's file stem: one part keeps its material name, a set is named for the model
+        // they came from — a stem built from eleven material names is not a filename.
+        const QString pn = acted.size() > 1
+            ? (m_curName.isEmpty() ? QStringLiteral("parts") : m_curName)
+            : (in.partName.isEmpty() ? QStringLiteral("part") : in.partName);
+        act.exportPart        = [this, actedV, pn] { exportCurrentModelGlb(actedV, pn, false); };
+        act.exportPartLastDir = [this, actedV, pn] { exportCurrentModelGlb(actedV, pn, true); };
     }
     // Scoped to the model under the cursor. exportSelectedGlb/exportSelectionToLast take the
     // LIST selection as their scope and would export other selected rows too.
@@ -8481,6 +8626,16 @@ void autoSizeTable(QTableView* t, int maxRows)
 void ModelsTab::fillPartsPage()
 {
     if (!m_partsModel) return;
+    // The rebuild below drops every row, which drops the SELECTION with it — and this function is
+    // called from recomputePartVisibility, i.e. from the very menu actions that act on a selected
+    // set. Hiding three parts therefore destroyed the three-part selection that "Isolate" was
+    // about to be used on next. Remembered by primitive index, which survives the rebuild, and
+    // restored at the end.
+    QList<int> keepSel;
+    if (m_partsView && m_partsView->selectionModel())
+        for (const QModelIndex& ix : m_partsView->selectionModel()->selectedRows(0))
+            if (QStandardItem* it = m_partsModel->item(ix.row(), 0))
+                keepSel << it->data(Qt::UserRole).toInt();
     m_partsPageSync = true;             // our own setCheckState must not re-enter itemChanged
     m_partsModel->setRowCount(0);
     int shown = 0;
@@ -8504,6 +8659,15 @@ void ModelsTab::fillPartsPage()
             new QStandardItem(m_appMatNames.value(pr.materialIndex))});
     }
     m_partsPageSync = false;
+    if (!keepSel.isEmpty() && m_partsView && m_partsView->selectionModel()) {
+        QItemSelectionModel* sm = m_partsView->selectionModel();
+        const QSet<int> want(keepSel.begin(), keepSel.end());
+        for (int r = 0; r < m_partsModel->rowCount(); ++r)
+            if (QStandardItem* it = m_partsModel->item(r, 0))
+                if (want.contains(it->data(Qt::UserRole).toInt()))
+                    sm->select(m_partsModel->index(r, 0),
+                               QItemSelectionModel::Select | QItemSelectionModel::Rows);
+    }
     autoSizeTable(m_partsView, 12);
     if (m_partsHdr)
         m_partsHdr->setText(total > 0 ? QStringLiteral("PARTS · %1 of %2 shown").arg(shown).arg(total)
@@ -8841,13 +9005,16 @@ void ModelsTab::applyPartMaterials()
         }
         furCache.insert(mn, isF); return isF;
     };
+    // One d4data path for the whole function. It used to be declared inside decodeFactors' body,
+    // which reads at a glance like a function-scope local and is not one — the emissive reads in
+    // the part loop below referenced it and would not compile.
+    const QString d4 = Config::d4dataDir();
     // Material scalar factors (metal/rough) are a tiny pure-per-material JSON read → local dedupe.
     QHash<QString, QPair<float, float>> facCache;
     auto decodeFactors = [&](const QString& mn) -> QPair<float, float> {
         const auto it = facCache.constFind(mn);
         if (it != facCache.constEnd()) return it.value();
         QPair<float, float> mr(0.0f, 0.6f);
-        const QString d4 = Config::d4dataDir();
         QFile mf(QStringLiteral("%1/json/base/meta/Material/%2.mat.json").arg(d4, mn));
         if (mf.open(QIODevice::ReadOnly)) {
             const MaterialValues v = parseMaterialValues(mf.readAll());
@@ -8920,6 +9087,13 @@ void ModelsTab::applyPartMaterials()
     QHash<QString, int> dyeRegionOf;   // dyeable material → dye-colour slot (0..3)
     int nextDyeRegion = 0;
     QVector<float>  partMetal, partRough;
+    // The emissive map alone was being sent, with neither the authored multiplier nor the authored
+    // colour. The shader falls back to uEmisColor = white when no colour array arrives, and D4's
+    // EMISSIVE maps are mostly monochrome MASKS whose hue lives in the material's "emissive color"
+    // value — so every glowing rune, gem and rune-etched blade rendered white here while the same
+    // asset rendered gold in the Wardrobe, which does send both. 3 floats per part, as the widget
+    // expects.
+    QVector<float>  partEmisMul, partEmisCol;
     partTex.reserve(nParts); partNorm.reserve(nParts); partOrm.reserve(nParts);
     partEmis.reserve(nParts);
     // "Fill skin" (Settings ▸ Models): armor pieces carry a BLACK skin-placeholder material
@@ -8981,6 +9155,16 @@ void ModelsTab::applyPartMaterials()
         partNorm.append(norm);
         partOrm.append(orm);
         partEmis.append(emis);
+        partEmisMul.append(usedMat.isEmpty()
+                               ? 1.0f
+                               : MaterialDecode::materialScalar(d4, usedMat,
+                                                                "emissive multiplier", 1.0f));
+        {
+            const QColor ec = usedMat.isEmpty()
+                ? QColor(255, 255, 255)
+                : MaterialDecode::emissiveTint(d4, usedMat, emis, base);
+            partEmisCol << float(ec.redF()) << float(ec.greenF()) << float(ec.blueF());
+        }
         partDetailN.append(dN);
         partDetailR.append(dR);
         partTrans.append(tr);
@@ -9010,6 +9194,8 @@ void ModelsTab::applyPartMaterials()
     m_modelView->setPartNormals(partNorm);
     m_modelView->setPartOrm(partOrm);
     m_modelView->setPartEmissive(partEmis);
+    m_modelView->setPartEmissiveMult(partEmisMul);
+    m_modelView->setPartEmissiveColor(partEmisCol);
     m_modelView->setPartDetailNormals(partDetailN, {}, {});   // Models tab: single map → layer 0
     m_modelView->setPartDetailRoughs(partDetailR, {}, {});
     m_modelView->setPartTranslucency(partTrans);
@@ -10318,6 +10504,12 @@ void ModelsTab::addRowExportCopyActions(QMenu& menu, const QList<int>& snos)
                 vm->addAction(m_apprName.value(vs, QStringLiteral("appearance %1").arg(vs)),
                               this, [this, vs]() { selectModelBySno(vs); });
         }
+        // Asked here, not only on a part: this is where you are standing when you notice a model
+        // looks wrong, and requiring a load-then-drill first meant the answer was only reachable by
+        // someone who already knew which part to suspect.
+        menu.addAction(QStringLiteral("Explain this model's materials…"), this, [this, models]() {
+            showMaterialReport(QString(), models.first().second, models.first().first);
+        });
         menu.addAction(MenuText::kShowDeps, this, [this, models]() {
             showDependencies(models.first().first, models.first().second);
         });
@@ -10326,6 +10518,26 @@ void ModelsTab::addRowExportCopyActions(QMenu& menu, const QList<int>& snos)
 
 // Select a part in the OUTLINER without touching the camera. "Select Part" in the context menu
 // must not fly the view somewhere — framing is its own explicit action.
+// The PARTS table's current selection, as primitive indices.
+QList<int> ModelsTab::selectedPartRows() const
+{
+    QList<int> out;
+    if (!m_partsView || !m_partsModel || !m_partsView->selectionModel()) return out;
+    for (const QModelIndex& ix : m_partsView->selectionModel()->selectedRows(0))
+        if (QStandardItem* it = m_partsModel->item(ix.row(), 0))
+            out << it->data(Qt::UserRole).toInt();
+    return out;
+}
+
+int ModelsTab::partsRowFor(int part) const
+{
+    if (!m_partsModel || part < 0) return -1;
+    for (int r = 0; r < m_partsModel->rowCount(); ++r)
+        if (QStandardItem* it = m_partsModel->item(r, 0))
+            if (it->data(Qt::UserRole).toInt() == part) return r;
+    return -1;
+}
+
 void ModelsTab::selectPartInOutliner(int part)
 {
     if (!m_treeModel || !m_list || part < 0) return;

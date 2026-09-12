@@ -121,6 +121,16 @@ private:
     void updateStalenessWarning();   // game-vs-d4data build compare + missing TACT keys + tested-build
     void showHealthCheck();          // Help ▸ Health check — one screen: what works, what's stale
     void runPresetAudit();           // Help ▸ Audit bulk presets — match count per built-in preset
+    // Help ▸ Patch contents — what each observed game build ADDED, grouped by SNO type. Reads the
+    // build ledger SnoIndex already keeps; records nothing of its own.
+    void showPatchContents();
+    // Help ▸ Find SNO — an id or part of a name in, "what is this" out. Pure lookup over indexes
+    // that are already loaded; nothing is built, cached or written.
+    void showFindSno();
+    // Help ▸ Diagnostic output — repopulate the submenu from the probe files currently beside the
+    // exe, and open one in the shared report dialog.
+    void fillDiagnosticMenu(QMenu* m);
+    void showDiagnosticFile(const QString& path);
     // D4_DUMP_PRD=1 — measure the StoreProduct binary's child-array layout, write
     // data\prd_probe.txt, then exit. Needs StoreProductIndex ready, so finishReload may defer it
     // to readyChanged. Unattended: "Dump StoreProduct Layout.bat" waits on the process.

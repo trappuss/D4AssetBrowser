@@ -14,8 +14,10 @@ namespace Hardpoints {
 QString nameForHash(quint32 hash);
 
 // Parse `<appJsonPath>` (…/json/base/meta/Appearance/<name>.app.json), read
-// tStructure.ptBoneData[0].ptHardpoints, and append a ModelHardpoint per entry whose
-// nBoneIndex is valid for `geo.skeleton`. Records the parent bone's nameHash so the
+// tStructure.ptBoneData[0].ptHardpoints, and write a ModelHardpoint per entry whose
+// nBoneIndex is valid for `geo.skeleton`. CLEARS geo.hardpoints first — idempotent, so it is safe
+// to call on a geometry that already carries them (an export working from a copy of the live
+// preview does exactly that) without accumulating duplicates. Records the parent bone's nameHash so the
 // index survives later skeleton reorder/reduction (call resolveBoneIndices after retarget).
 // Returns the number appended (0 if the file/section is missing).
 int readInto(ModelGeometry& geo, const QString& appJsonPath);

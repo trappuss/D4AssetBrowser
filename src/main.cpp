@@ -178,7 +178,7 @@ int main(int argc, char** argv)
     LogBuffer::instance();   // construct on the GUI thread (queued log delivery)
     QApplication::setOrganizationName("D4AssetBrowser");
     QApplication::setApplicationName("D4AssetBrowser");
-    QApplication::setApplicationVersion("2.2.9");
+    QApplication::setApplicationVersion("2.3.0");
 
     // Portable: every QSettings() default-ctor writes to an INI in the beside-exe data/ folder
     // (no Windows registry). Must run before any QSettings use. Combined with AppPaths, the whole
@@ -249,6 +249,7 @@ int main(int argc, char** argv)
     // bump of any of them would otherwise orphan the old file forever, and tvfs_paths alone is
     // ~50 MB. Cheaper to add the line now than to remember at bump time.
     AppPaths::pruneOldCaches(QStringLiteral("wardrobe_anims_v"),  1,  QStringLiteral(".json"));
+    AppPaths::pruneOldCaches(QStringLiteral("stable_anims_v"),    2,  QStringLiteral(".json"));
     AppPaths::pruneOldCaches(QStringLiteral("latest_v"),          2,  QStringLiteral(".bin"));
     AppPaths::pruneOldCaches(QStringLiteral("build_history_v"),   1,  QStringLiteral(".bin"));
     AppPaths::pruneOldCaches(QStringLiteral("casc_index_v"),      1,  QStringLiteral(".bin"));

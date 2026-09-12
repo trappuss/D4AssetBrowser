@@ -610,7 +610,12 @@ void WardrobeTab2::buildLightingPanel()
     slider(QStringLiteral("el"),   QStringLiteral("Key U-D"),    0,  80,  25, QStringLiteral("Key elevation (degrees above the camera horizon)"));
     section(QStringLiteral("Surface"));
     slider(QStringLiteral("refl"),     QStringLiteral("Reflection %"), 0, 300, 100, QStringLiteral("Reflection / ambient-specular intensity (metal & gloss)"));
-    slider(QStringLiteral("sss"),      QStringLiteral("Subsurface %"), 0, 200,  15, QStringLiteral("Skin subsurface scattering strength (0 = matte/Lambert, 100 = full SSS)"));
+    // 24, not 15, to match the value the renderer actually defaults to when the key is unset
+    // (WardrobeTab2.cpp, setSssStrength). With the two disagreeing, a fresh profile rendered at 24
+    // while this slider read 15 — and the first nudge of the slider produced a visible JUMP that
+    // no user input accounts for. The renderer's value wins because it is the one that has been
+    // shipping as the look; changing that instead would have altered every fresh profile.
+    slider(QStringLiteral("sss"),      QStringLiteral("Subsurface %"), 0, 200,  24, QStringLiteral("Skin subsurface scattering strength (0 = matte/Lambert, 100 = full SSS)"));
     slider(QStringLiteral("skinwarm"), QStringLiteral("Skin warmth"),  0, 200, 100, QStringLiteral("Skin subsurface red-bleed hue"));
     slider(QStringLiteral("wetness"),  QStringLiteral("Wetness %"),    0, 100,   0, QStringLiteral("Rain-slick look: darkens the diffuse and sharpens reflections (D4 'Wetness Bias'). 0 = dry"));
     slider(QStringLiteral("snow"),     QStringLiteral("Snow %"),       0, 100,   0, QStringLiteral("Snow dusting on upward-facing surfaces — shoulders, head, ledges (D4 'Use Snowiness'). 0 = none"));
@@ -1153,9 +1158,15 @@ void WardrobeTab2::buildPhysicsPanel()
     showCol->setChecked(QSettings().value(QStringLiteral("wardrobe2/cloth/showColliders"), false).toBool());
     connect(showCol, &QCheckBox::toggled, this, [this](bool on) {
         QSettings().setValue(QStringLiteral("wardrobe2/cloth/showColliders"), on);
-        if (m_view) m_view->setShowColliders(on);
+        // m_overlaysOn, matching the Overlays copy of this same box and matching what the startup
+        // replay does (reapplyOverlays ANDs the master gate in). Without it this box could light
+        // the colliders up while the master guide toggle was off, and the next replay silently
+        // took them away again.
+        if (m_overlaysOn && m_view) m_view->setShowColliders(on);
     });
     pl->addWidget(showCol);
+    m_physChkColliders = showCol;
+    linkColliderToggles();   // keep this box and the Overlays one in lockstep (same setting)
 
     // Live capsule-axis cycler (X/Y/Z) — for dialing in the authored-capsule orientation
     // against the collision viz, since the long-axis convention isn't stored in the data.

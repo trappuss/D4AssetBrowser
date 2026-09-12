@@ -3,6 +3,35 @@
 Notable changes per release. The published GitHub releases are the canonical source;
 this file is the same content in one place.
 
+## 2.3.0
+
+### Fixed
+
+- **The Paladin wolf set's chest disappeared when HED was switched off.** A pauldron ornament material named `wolfHead` matched the head test, and the head grouping then took every part of the torso with it.
+- **A back trophy that crashed on load crashed again on every launch.** Crash recovery cleared a setting the Wardrobe never wrote, so the trophy was restored untouched each time.
+- **Loading a saved look could leave the previous skin tone on screen.** Skin tone and skin detail were stored by their menu label rather than their value, so a look saved with neither left the old one selected — and the next save recorded it as absent.
+- **The Subsurface slider read 15 on a fresh profile while the viewport rendered at 24.** Two defaults for one setting; the first nudge produced a jump nothing on screen accounted for.
+- **"Export model to last folder" on a look card named a folder it did not use**, and opened a file dialog anyway when that folder was unset.
+- **Hiding the collision model left the other copy of the checkbox showing the opposite.** Both panels drive one setting and were never mirrored; the Physics copy also ignored the master overlay toggle.
+- **Textures column layout was saved on every change and never read back.** Un-hiding NAME or COLLECTION lasted until you closed the app.
+- **Restore Defaults reset the Wardrobe viewport only.** Models and Stable kept whatever they had, and the Stable tab appeared nowhere in Settings at all.
+- **Basilisks and several mounts listed no animations.** Their clips are owned by a storefront appearance, not the base one the lookup assumed exists.
+- **13 of 48 pets saw none of their animation clips and 15 more saw only some.** The game names pet clips two ways — per appearance and per species — and only one of the two was ever matched.
+
+### Added
+
+- **Help ▸ Find SNO** — an id or part of a name in; group, name, collection, how many appearances use a material, and whether it arrived in this game build.
+- **Help ▸ Patch contents** — what each game build added since the tool first opened on it, grouped by asset type and named.
+- **Help ▸ Diagnostic output** — the probe files written beside the exe, newest first with size and age, readable without leaving the app.
+- **"Explain this material" now lists every appearance that uses it**, which is how you tell a piece's own material from one shared across a set or across both genders.
+- **Clear Stable memory** in Settings, and a Stable animations panel with its own toggle.
+- **Sort by SNO** in the Catalogue.
+
+### Build tooling
+
+- `verify-src.py` — three checks added: settings keys written and never read, combo boxes saved by their display label, and character-versus-equipment decided by a material name.
+- `Dump - Piece Roster.bat` — writes the material roster every equipped piece resolves, by both routes, with each part's classification.
+
 ## 2.2.9
 
 Rolls up 2.2.3 – 2.2.8, which were tagged but never published.

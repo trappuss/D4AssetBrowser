@@ -19,9 +19,11 @@
 #include <QGuiApplication>
 #include <QLocale>
 #include <QMenu>
+#include <QPair>
 #include <QPoint>
 #include <QString>
 #include <QStringList>
+#include <QVector>
 #include <QWidget>
 
 #include <functional>
@@ -50,14 +52,21 @@ inline const QString kCopyCollection = QStringLiteral("Copy collection name");
 // either restates the file name (gear) or is all zeros (monsters). Its material name is the only
 // human-readable label there is, and it is what the outliner shows. So the action says MATERIAL:
 // it was called "Copy part file name", which read as if it copied a file name for that part.
-inline const QString kCopyPartMaterial = QStringLiteral("Copy part material name");
+inline const QString kCopyMaterialName = QStringLiteral("Copy material name");
+// The piece the part hangs under — the parts panel's PARENT row (PalF_sets50_LEG), where the
+// material above is the CHILD row (PalM_sets50_LEG_mat). Both rows are things you want on the
+// clipboard, and the menu used to offer only the material, under a label ("Copy part material
+// name") that read as one run-on action for two different strings.
+inline const QString kCopyPartName     = QStringLiteral("Copy part name");
 
 // No ellipsis baked in: these get suffixes appended ("Export model (1,234 tris)"), and an ellipsis
 // stranded mid-label reads as a typo. Wrap the FINISHED string in prompts() instead.
 inline const QString kExportModel     = QStringLiteral("Export model");
 inline const QString kExportModelLast = QStringLiteral("Export model to last folder");
-inline const QString kExportPart      = QStringLiteral("Export part");
-inline const QString kExportPartLast  = QStringLiteral("Export part to last folder");
+// Built with verbParts() at the call site so the count lands in the noun: kExportPartVerb is
+// "Export", giving "Export part" or "Export 3 parts".
+inline const QString kExportPartVerb     = QStringLiteral("Export");
+inline const QString kExportPartLastVerb = QStringLiteral("Export");
 
 inline const QString kCopyImage    = QStringLiteral("Copy image");
 inline const QString kSaveImage    = QStringLiteral("Save image…");              // prompts
@@ -79,6 +88,20 @@ inline QString condensePath(const QString& path)
 inline QString withCount(const QString& label, int n)
 {
     return n > 0 ? QStringLiteral("%1 (%2 tris)").arg(label, QLocale().toString(n)) : label;
+}
+
+// "part" / "3 parts". One helper rather than a ternary at each of the seven sites, because seven
+// hand-written plurals is how "Export 1 parts" ships.
+inline QString parts(int n)
+{
+    return n == 1 ? QStringLiteral("part") : QStringLiteral("%1 parts").arg(QLocale().toString(n));
+}
+
+// "Export part" / "Export 3 parts". The verb stays put and only the noun changes, so a menu read
+// top to bottom keeps its column of verbs.
+inline QString verbParts(const QString& verb, int n)
+{
+    return QStringLiteral("%1 %2").arg(verb, parts(n));
 }
 
 inline QString withValue(const QString& label, const QString& value)
@@ -113,7 +136,21 @@ struct Info {
     // resolved ROSTER name, not MeshPrimitive::materialName, which is "Material_<n>" placeholder
     // text nobody ever sees on screen.
     QString partName;              // the menu title's right half
-    QString partFileName;          // the value "Copy part material name" copies
+    QString partMaterial;          // the value "Copy material name" copies
+    // The parts panel's PARENT row for this part — the equipped piece / outfit item it belongs to.
+    // Left empty by callers whose parts have no owning piece distinct from the model itself (the
+    // Models tab), so "Copy part name" simply does not appear there rather than copying the model
+    // name under a label that claims otherwise.
+    QString partOwner;             // the value "Copy part name" copies
+    // The SET this menu acts on. Empty means "just `part`" — every caller that has no concept of a
+    // multi-selection can ignore all three of these and keeps the single-part wording.
+    //
+    // It exists because the menu was describing the part under the cursor while the actions ran on
+    // the whole selection: "Export part (1,234 tris)…" then wrote eleven parts and 40,000 triangles.
+    // A label that under-reports what it is about to do is worse than no label.
+    QVector<int> selParts;         // acted-on parts; size drives every plural below
+    int          selTris = 0;      // their combined triangle count
+    QStringList  selMaterials;     // their material names, in selParts order, caller-deduped
     QString sourceFileName;        // source model's file name (Copy)
     QString sourceName;            // human/display name of the source (Copy)
     QString collection;            // collection / set name (Copy)
@@ -134,6 +171,11 @@ struct Actions {
     std::function<void()>     exportPart;          // this part only → prompt
     std::function<void()>     frame;               // point the camera at this part
     std::function<void()>     selectPart;          // select in the parts panel (no camera move)
+    // "Why does this look like that?" — the roster source, the material, which of its values are
+    // authored and which are stand-ins, and which texture definitions resolve. Lives on the shared
+    // menu rather than in one tab because every tab renders the same materials the same way, and
+    // the failures this answers were reported against three different tabs.
+    std::function<void()>     explainMaterial;
     std::function<void(bool)> setVisible;
     std::function<void()>     isolate;
     std::function<void()>     showAll;
@@ -165,11 +207,21 @@ inline void exec(QWidget* parent, const QPoint& globalPos, const Info& in, const
     const bool hasPart = in.part >= 0;
 
     // ── Title: which model, which part ────────────────────────────────────────────────────
+    // How many parts the actions below will touch. 0 when nothing is under the cursor.
+    const int nSel = !in.selParts.isEmpty() ? int(in.selParts.size()) : (hasPart ? 1 : 0);
+
     if (hasPart) {
-        QString part = in.partName.isEmpty() ? in.partFileName : in.partName;
-        if (part.isEmpty()) part = QStringLiteral("part %1").arg(in.part);
-        if (in.isSim) part += QStringLiteral("  [SIM]");
-        if (in.isFx)  part += QStringLiteral("  [FX]");
+        QString part;
+        if (nSel > 1) {
+            // The one material name is no longer the truth; say the count instead. The [SIM]/[FX]
+            // tags are dropped for the same reason — they describe the clicked part only.
+            part = QStringLiteral("%1 selected").arg(MenuText::parts(nSel));
+        } else {
+            part = in.partName.isEmpty() ? in.partMaterial : in.partName;
+            if (part.isEmpty()) part = QStringLiteral("part %1").arg(in.part);
+            if (in.isSim) part += QStringLiteral("  [SIM]");
+            if (in.isFx)  part += QStringLiteral("  [FX]");
+        }
         const QString title = in.sourceModel.isEmpty()
             ? part : QStringLiteral("%1  —  %2").arg(in.sourceModel, part);
         QAction* hdr = menu.addAction(title);
@@ -190,13 +242,18 @@ inline void exec(QWidget* parent, const QPoint& globalPos, const Info& in, const
                        parent, act.exportModel);
         anyExport = true;
     }
+    // Both the noun and the triangle count follow the selection. selTris is used whenever a set
+    // was supplied, because partTris is the CLICKED part's count and would under-report the rest.
+    const int partTris = (nSel > 1 && in.selTris > 0) ? in.selTris : in.partTris;
     if (hasPart && act.exportPartLastDir && !dir.isEmpty()) {
-        menu.addAction(withValue(MenuText::kExportPartLast, dir),
+        menu.addAction(withValue(MenuText::verbParts(MenuText::kExportPartLastVerb, nSel)
+                                     + QStringLiteral(" to last folder"), dir),
                        parent, act.exportPartLastDir);
         anyExport = true;
     }
     if (hasPart && act.exportPart) {
-        menu.addAction(prompts(withCount(MenuText::kExportPart, in.partTris)),
+        menu.addAction(prompts(withCount(MenuText::verbParts(MenuText::kExportPartVerb, nSel),
+                                         partTris)),
                        parent, act.exportPart);
         anyExport = true;
     }
@@ -205,44 +262,73 @@ inline void exec(QWidget* parent, const QPoint& globalPos, const Info& in, const
     // The whole block used to be gated on hasPart, so a right-click with no part under the cursor —
     // empty viewport space, or the outliner's ROOT row, which IS the loaded model — offered no way
     // to copy the model's own name or SNO even though all four values were sitting right there.
-    // Only "Copy part file name" is genuinely part-scoped.
+    // Only the two part-scoped entries — "Copy part name" and "Copy material name" — need a part.
     {
-        const bool anyCopy = (hasPart && !in.partFileName.isEmpty())
-                          || !in.sourceFileName.isEmpty() || in.sno > 0
-                          || !in.sourceName.isEmpty() || !in.collection.isEmpty();
-        if (anyCopy) {
+        // Deferred, so the block can be skipped when nothing survives the de-duplication below and
+        // the separator is not left dangling over an empty section.
+        QVector<QPair<QString, QString>> copies;   // label, value
+        QStringList seen;
+        auto addCopy = [&](const QString& label, const QString& value) {
+            // Same VALUE twice = the same clipboard result under two names, which is noise however
+            // the labels are worded. Every caller sets sourceFileName and sourceName from one
+            // string (the Wardrobe and Stable tabs from m_partSource, the Models tab from
+            // m_curName), so "Copy file name" and "Copy name" were a guaranteed duplicate pair in
+            // all six entry points — and with partOwner filled they would now be a triple. First
+            // label wins, because the list is ordered most-specific first.
+            if (value.isEmpty() || seen.contains(value, Qt::CaseSensitive)) return;
+            seen << value;
+            copies.append({withValue(label, value), value});
+        };
+        // Most specific first: the two parts-panel rows this part actually occupies — its own
+        // material (child row) and the piece it hangs under (parent row) — then the source values,
+        // which are the SAME four the browse-row menus copy and carry the same four labels.
+        if (hasPart) {
+            addCopy(MenuText::kCopyPartName, in.partOwner);
+            if (in.selMaterials.size() > 1) {
+                // One clipboard entry, newline-separated — the same shape "Copy all" uses on the
+                // list views, so pasting into a spreadsheet or a script gives one name per row.
+                const QString joined = in.selMaterials.join(QLatin1Char('\n'));
+                const QString label = QStringLiteral("Copy %1 material names")
+                                          .arg(QLocale().toString(int(in.selMaterials.size())));
+                // withValue() is skipped deliberately: a parenthesised preview of eleven names is
+                // unreadable, and the count already says what will land on the clipboard.
+                if (!joined.isEmpty() && !seen.contains(joined)) {
+                    seen << joined;
+                    copies.append({label, joined});
+                }
+            } else {
+                addCopy(MenuText::kCopyMaterialName, in.partMaterial);
+            }
+        }
+        addCopy(MenuText::kCopyFileName, in.sourceFileName);
+        if (in.sno > 0) addCopy(MenuText::kCopySno, QString::number(in.sno));
+        addCopy(MenuText::kCopyName,       in.sourceName);
+        addCopy(MenuText::kCopyCollection, in.collection);
+        if (!copies.isEmpty()) {
             if (anyExport) menu.addSeparator();
-            // The part's MATERIAL name stays distinct because it really is a different string from
-            // the model's. The other four are the SAME values the browse-row menus copy, so they
-            // carry the same four labels; "source" only ever meant "the model this part came
-            // from", which the disabled title above already says.
-            if (hasPart && !in.partFileName.isEmpty())
-                menu.addAction(withValue(MenuText::kCopyPartMaterial, in.partFileName),
-                               parent, [n = in.partFileName] { copyText(n); });
-            if (!in.sourceFileName.isEmpty())
-                menu.addAction(withValue(MenuText::kCopyFileName, in.sourceFileName),
-                               parent, [n = in.sourceFileName] { copyText(n); });
-            if (in.sno > 0)
-                menu.addAction(withValue(MenuText::kCopySno, QString::number(in.sno)),
-                               parent, [s = in.sno] { copyText(QString::number(s)); });
-            if (!in.sourceName.isEmpty())
-                menu.addAction(withValue(MenuText::kCopyName, in.sourceName),
-                               parent, [n = in.sourceName] { copyText(n); });
-            if (!in.collection.isEmpty())
-                menu.addAction(withValue(MenuText::kCopyCollection, in.collection),
-                               parent, [n = in.collection] { copyText(n); });
+            for (const auto& c : copies)
+                menu.addAction(c.first, parent, [v = c.second] { copyText(v); });
         }
     }
 
     // ── This part ─────────────────────────────────────────────────────────────────────────
     if (hasPart && (act.frame || act.selectPart || act.setVisible || act.isolate)) {
         menu.addSeparator();
-        if (act.frame)      menu.addAction(QStringLiteral("Frame part"), parent, act.frame);
-        if (act.selectPart) menu.addAction(QStringLiteral("Select part"), parent, act.selectPart);
+        if (act.frame)
+            menu.addAction(MenuText::verbParts(QStringLiteral("Frame"), nSel), parent, act.frame);
+        if (act.selectPart)
+            menu.addAction(MenuText::verbParts(QStringLiteral("Select"), nSel), parent, act.selectPart);
+        // Singular only. "Explain this material" answers a question about ONE material, and with a
+        // mixed selection there is no honest answer to give — offering it would mean silently
+        // picking one of them.
+        if (act.explainMaterial && nSel <= 1)
+            menu.addAction(QStringLiteral("Explain this material…"), parent, act.explainMaterial);
         if (act.setVisible)
-            menu.addAction(in.visible ? QStringLiteral("Hide part") : QStringLiteral("Show part"),
+            menu.addAction(MenuText::verbParts(in.visible ? QStringLiteral("Hide")
+                                                          : QStringLiteral("Show"), nSel),
                            parent, [act, v = in.visible] { act.setVisible(!v); });
-        if (act.isolate)    menu.addAction(QStringLiteral("Isolate part"), parent, act.isolate);
+        if (act.isolate)
+            menu.addAction(MenuText::verbParts(QStringLiteral("Isolate"), nSel), parent, act.isolate);
     }
 
     // ── All parts (works with nothing under the cursor too) ───────────────────────────────

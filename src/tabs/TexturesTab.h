@@ -95,6 +95,9 @@ public:
 
 signals:
     void revealModelRequested(int appSno);   // double-clicked an .app in Associated Models
+    // Shop art -> the product that sells it. The Catalogue derives art names FROM product names,
+    // so this is that derivation run backwards; group 110 = StoreProduct.
+    void revealBundleRequested(int storeProductSno);
     void exportSettingsRequested();           // Options… → open the shared Export settings dialog
 
 protected:

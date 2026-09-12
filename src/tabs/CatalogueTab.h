@@ -119,7 +119,7 @@ private:
     struct Written { int models = 0, textures = 0, icons = 0, frames = 0; bool skipped = false;
                      QStringList unresolved; };
     Written writeBundle(const StoreProductIndex::Product& b, const QString& parentDir,
-                        int nth, int total);
+                        int nth, int total, bool withDropCohort = true);
     // What the Export menu actually runs: the selected rows when there are any, else the bundle.
     void exportSelected(bool promptDir);
     // Rows — one or many — through the same ModelsTab/TexturesTab pipelines the bundle export uses,
@@ -184,7 +184,13 @@ private:
     // The payload name, looked up on demand for products recovered from CASC (which carry a raw
     // sno and no name). GUI thread only — it touches SnoIndex's lazy name cache.
     QString payloadNameOf(const StoreProductIndex::Product& p) const;
-    Resolved resolveBundle(const StoreProductIndex::Product& b) const;
+    // withDropCohort: for a TACT-locked product, also resolve every asset sharing its key. That
+    // is the only content a locked product HAS, so it is right for an export - and wrong for the
+    // detail pane, which would list a whole 1,116-asset drop under a header saying the contents
+    // are locked, and wrong for the second and subsequent products of one drop in a batch, which
+    // would each write an identical copy of it. Both callers say which they want.
+    Resolved resolveBundle(const StoreProductIndex::Product& b,
+                           bool withDropCohort = true) const;
     // Appearance SNOs for one transmog product, via the NAME CONVENTION. Item -> Actor ->
     // Appearance is deliberately not used: it resolves for every item and lands on the proxy body
     // mesh (all seven classes' chest items point at appearance 217477). See
@@ -256,8 +262,17 @@ private:
     QComboBox*    m_kindFilter = nullptr;
     QComboBox*    m_branchFilter = nullptr;
     QComboBox*    m_seasonFilter = nullptr;   // snoAssociatedSeason, by display name
-    QComboBox*    m_sortCombo   = nullptr;    // name / season / patch
+    QComboBox*    m_sortCombo   = nullptr;    // name / season / patch / sno asc / sno desc
     QCheckBox*    m_latestChk   = nullptr;    // only bundles new in this game build
+    QCheckBox*    m_showLoose     = nullptr;  // products that are neither a bundle nor in one
+    QComboBox*    m_dropFilter    = nullptr;  // one TACT key == one embargoed content drop
+    // TACT key (hex) -> the human label derived from that drop's own cohort. Kept because three
+    // places need the same answer — the combo, the list row and the detail pane — and deriving it
+    // three times is how they end up disagreeing about what a drop is called.
+    QHash<QString, QString> m_dropLabel;
+    QCheckBox*    m_onlyDecrypted = nullptr;  // hide TACT-locked bundles
+    QCheckBox*    m_onlyEncrypted = nullptr;  // show ONLY TACT-locked bundles (mutually exclusive)
+    QCheckBox*    m_hasIconChk    = nullptr;  // only bundles with shop art
     QCheckBox*    m_rememberChk = nullptr;    // persist search + filters + sort
     QHBoxLayout*  m_chipRow     = nullptr;    // removable active-filter pills
     bool          m_filtersRestored = false;  // restoreFilterState runs once, after the combos fill

@@ -72,7 +72,7 @@ public:
     // Context noun for the Export menu labels, e.g. "selected model(s)" / "selected texture(s)"
     // / "selected look" — count-aware where the tab knows it.
     virtual QString exportNoun() const { return QStringLiteral("selection"); }
-    // Rig-only animation export (no mesh) — Models tab only. The menu item is shown only when
+    // Rig-only animation export (no mesh) — Models, Wardrobe and Stable. The menu item is shown only when
     // hasAnimExport() is true, labelled by animExportLabel() (carries the planned-scope clip count).
     virtual bool    hasAnimExport() const { return false; }
     virtual QString animExportLabel() const { return QStringLiteral("Export animations only (.glb)…"); }

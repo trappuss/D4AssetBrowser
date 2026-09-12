@@ -23,6 +23,8 @@
 #include "model/Hardpoints.h"
 #include "model/Material.h"          // parseMaterialJson / MatTexture (raw-source count)
 #include "model/MaterialDecode.h"
+#include "model/MaterialReport.h"
+#include "util/TextReportDialog.h"
 #include "model/ModelParser.h"
 #include "model/Retarget.h"
 #include "tabs/HintBar.h"
@@ -37,6 +39,7 @@
 #include <QColorDialog>
 #include <QComboBox>
 #include <QDataStream>
+#include <QDateTime>
 
 #include <cmath>
 #include <QDir>
@@ -73,6 +76,7 @@
 #include <QSettings>
 #include <QShortcut>
 #include <QSignalBlocker>
+#include <QSizePolicy>
 #include <QSlider>
 #include <QSplitter>
 #include <QStandardPaths>
@@ -120,6 +124,38 @@ bool looksLikeFxFragment(const QString& lower)
     for (const char* bad : { "_fx", "burst", "projection", "sprint", "trail", "_proj", "_glow" })
         if (lower.contains(QLatin1String(bad))) return true;
     return false;
+}
+
+// The three viewport enums this tab persists are the RENDERER's contract values, not widget
+// positions — GLModelWidget::setEnvironment and setViewChannel document their own numbering, and
+// the Models and Wardrobe tabs store the identical values under their own prefixes. So the stored
+// int is right and needs no migration. What was missing is validation: a value outside the range
+// (a hand-edited INI, a profile written by a newer build) went straight to a shader uniform, while
+// setCurrentIndex() on that same int silently yielded -1 — a blank combo showing nothing while the
+// viewport rendered whatever the bad number meant. Read every one of them through these.
+int envOrDefault(int v)         { return (v >= 0 && v <= 3) ? v : 1; }   // 0 Studio 1 Outdoor 2 Dungeon 3 Night
+int lightPresetOrDefault(int v) { return (v >= 0 && v <= 2) ? v : 1; }   // 1 = Hero Direct
+int channelOrDefault(int v)     { return (v >= 0 && v <= 8) ? v : 0; }   // 0 shaded … 8 dye zones
+
+// Select the entry whose userData is `value`. The combos below carry their enum value as DATA
+// rather than relying on their position matching it: the binding was implicit, so inserting one
+// item would have silently re-pointed every saved value AND every setEnvironment/setViewChannel
+// call. findData is inert to order; falls back to `def`, then to the first row.
+void selectByValue(QComboBox* cb, int value, int def)
+{
+    if (!cb) return;
+    int i = cb->findData(value);
+    if (i < 0) i = cb->findData(def);
+    cb->setCurrentIndex(i < 0 ? 0 : i);
+}
+
+// The ONE place an Appearance .app.json path is built in this tab. Consolidated so the direct-JSON
+// read count verify-src tracks reflects real read SITES rather than repeated string building, and
+// so the eventual move to the CASC meta binary (which is what encrypted appearances need) has a
+// single path to change instead of four.
+QString apprJsonPath(const QString& d4, const QString& appr)
+{
+    return QStringLiteral("%1/json/base/meta/Appearance/%2.app.json").arg(d4, appr);
 }
 
 // Trailing "_token" of a lowercased appearance name.
@@ -242,7 +278,7 @@ StableTab2::StableTab2(QWidget* parent) : BrowserTab(parent)
                 pushUndo();
                 m_slotSel[i] = 0; m_slotName[i].clear(); m_slotDisp[i].clear();
                 m_slotDesc[i].clear(); m_slotLook[i] = 0;
-                refreshSlotCells(); fillGrid(); rebuildMount();
+                refreshSlotCells(); fillGrid(); scheduleRebuild();
             });
             aClear->setEnabled(sno > 0);
             if (sno > 0) {
@@ -332,9 +368,13 @@ StableTab2::StableTab2(QWidget* parent) : BrowserTab(parent)
 
     // (Saved "Stables" loadouts removed — not needed for a browser.)
 
-    // Animation player.
+    // Animation player. The clip LIST is registered as a right-sidebar PanelBox in buildSidebar()
+    // (so the strip can toggle it, as in the Wardrobe and Models tabs); the TRANSPORT is added
+    // under the viewport further down. Neither belongs in this left browser column, which is a
+    // picker — the list sat here with no toggle at all, and stable2/showAnims was read once and
+    // written by nothing, so there was no way to put it away.
     buildAnimPanel();
-    if (m_animPanel) ll->addWidget(m_animPanel);
+    if (m_resetBtn) ll->addWidget(m_resetBtn);   // whole-mount reset — never inside a hideable panel
 
     // Parts tree — created here, but LIVES in the right sidebar (wardrobe-parity PanelBox). Two
     // columns (Part · Tris) like the Wardrobe/Models PARTS panel.
@@ -349,11 +389,7 @@ StableTab2::StableTab2(QWidget* parent) : BrowserTab(parent)
     m_partTree->viewport()->setMouseTracking(true);
     m_partTree->setToolTip(QStringLiteral("Uncheck to hide a submesh · hover/select to highlight · Esc clears"));
     connect(m_partTree, &QTreeWidget::itemChanged, this, [this](QTreeWidgetItem*, int) { recomputePartVisibility(); });
-    connect(m_partTree, &QTreeWidget::itemSelectionChanged, this, [this] {
-        if (m_view) m_view->setHighlightParts(selectedParts());
-        const QList<int> sel = selectedParts();
-        updateTexTiles(sel.isEmpty() ? -1 : sel.first());   // fill the TEXTURE PREVIEW tiles
-    });
+    connect(m_partTree, &QTreeWidget::itemSelectionChanged, this, &StableTab2::syncPartSelection);
     connect(m_partTree, &QTreeWidget::itemEntered, this, [this](QTreeWidgetItem* it, int) {
         if (!m_view) return;
         QList<int> hot = selectedParts(); hot += primitivesOf(it);
@@ -455,11 +491,13 @@ StableTab2::StableTab2(QWidget* parent) : BrowserTab(parent)
         // shading balls (wardrobe parity — m_shadeMoreBtn + m_channelCombo). Wheel over the arrow
         // cycles the channel live; the ◆ glyph flags a non-default view. ──
         m_channelCombo = new QComboBox(center);
-        m_channelCombo->addItems({ QStringLiteral("Shaded"), QStringLiteral("Base Color"),
-                                   QStringLiteral("Normal"), QStringLiteral("Roughness"),
-                                   QStringLiteral("Metallic"), QStringLiteral("AO"),
-                                   QStringLiteral("Emissive"), QStringLiteral("Detail maps"),
-                                   QStringLiteral("Dye zones") });
+        {   // Value = GLModelWidget's own channel numbering, carried as data so the list can be
+            // reordered or extended without re-pointing a single stored value.
+            const char* const kChan[9] = { "Shaded", "Base Color", "Normal", "Roughness",
+                                           "Metallic", "AO", "Emissive", "Detail maps",
+                                           "Dye zones" };
+            for (int c = 0; c < 9; ++c) m_channelCombo->addItem(QString::fromLatin1(kChan[c]), c);
+        }
         m_channelCombo->setToolTip(QStringLiteral("View the lit result or one raw material channel (↑/↓ to scroll)"));
         m_channelCombo->setCursor(Qt::PointingHandCursor);
         m_channelCombo->setStyleSheet(QStringLiteral(
@@ -467,10 +505,12 @@ StableTab2::StableTab2(QWidget* parent) : BrowserTab(parent)
             "QComboBox:hover{border-color:#b0453c;}"
             "QComboBox QAbstractItemView{background:#2b2b2b;color:#dddddd;"
             "selection-background-color:#8a1414;selection-color:#ffffff;}"));
-        m_channelCombo->setCurrentIndex(QSettings().value(QStringLiteral("stable2/view/channel"), 0).toInt());
-        connect(m_channelCombo, &QComboBox::currentIndexChanged, this, [this](int i) {
-            QSettings().setValue(QStringLiteral("stable2/view/channel"), i);
-            if (m_view) m_view->setViewChannel(i);
+        selectByValue(m_channelCombo,
+                      channelOrDefault(QSettings().value(QStringLiteral("stable2/view/channel"), 0).toInt()), 0);
+        connect(m_channelCombo, &QComboBox::currentIndexChanged, this, [this](int) {
+            const int c = channelOrDefault(m_channelCombo->currentData().toInt());
+            QSettings().setValue(QStringLiteral("stable2/view/channel"), c);
+            if (m_view) m_view->setViewChannel(c);
         });
         auto* shadeMore = new QToolButton(center);
         m_shadeMoreBtn = shadeMore;
@@ -496,22 +536,28 @@ StableTab2::StableTab2(QWidget* parent) : BrowserTab(parent)
         tb->addWidget(shadeMore);
         auto syncChannelBtn = [this]() {
             if (!m_shadeMoreBtn || !m_channelCombo) return;
-            const int i = m_channelCombo->currentIndex();
-            m_shadeMoreBtn->setText(i == 0 ? QStringLiteral("⌄") : QStringLiteral("◆"));
+            // currentData(), not currentIndex(): the ◆ flags "not the default channel", which is
+            // channel VALUE 0 — position 0 only happens to be the same today.
+            const int c = channelOrDefault(m_channelCombo->currentData().toInt());
+            m_shadeMoreBtn->setText(c == 0 ? QStringLiteral("⌄") : QStringLiteral("◆"));
             m_shadeMoreBtn->setToolTip(QStringLiteral(
                 "Channel: %1\nScroll here to flip channels · click for the list").arg(m_channelCombo->currentText()));
         };
         syncChannelBtn();
         connect(m_channelCombo, &QComboBox::currentIndexChanged, this,
                 [syncChannelBtn](int) { syncChannelBtn(); });
+        // The ONLY path by which the saved channel reaches the renderer at startup — both
+        // currentIndexChanged lambdas are connected after the restore above, so neither fires
+        // during construction. Reads the DATA, so a reordered list still resolves.
         QTimer::singleShot(0, this, [this] {   // apply the saved channel on load
-            if (m_view) m_view->setViewChannel(m_channelCombo->currentIndex());
+            if (m_view) m_view->setViewChannel(channelOrDefault(m_channelCombo->currentData().toInt()));
         });
     }
     sep();
     // ── Overlays: Blender's split control (wardrobe parity). A SPHERE toggle (master on/off for
     // every guide) + an ARROW opening a persistent QFrame popup (grid / axes / skeleton / physics
-    // bones / per-bone axes / bone names). Keys under stable2/ovl/*. ──
+    // bones / per-bone axes / bone names). Mostly stable2/ovl/*; the axis gizmo and coloured grid
+    // axes are the APP-WIDE viewer/* keys every tab shares. ──
     {
         auto* ovBtn = new QToolButton(center);
         m_overlayBtn = ovBtn;
@@ -542,14 +588,18 @@ StableTab2::StableTab2(QWidget* parent) : BrowserTab(parent)
             opl->addWidget(l);
         };
         // Persist the key, push to GL, gate on the master (off → GL stays dark; re-applied on master on).
+        // `key` is the FULL settings key, not a suffix — as in the Wardrobe. Two of these overlays
+        // are APP-WIDE (viewer/axisGizmo, viewer/gridAxisColors): GLModelWidget seeds itself from
+        // those, and the Models and Wardrobe tabs write them, so a private stable2/ovl/ copy meant
+        // the axis gizmo silently disagreed between tabs and the shared toggle never reached here.
         auto addOverlay = [&](const QString& label, const QString& key, bool def, bool indent,
                               const QString& tip, std::function<void(bool)> apply) {
             auto* cb = new QCheckBox(label, m_overlayPanel);
             if (indent) cb->setStyleSheet(QStringLiteral("QCheckBox{color:#cccccc;margin-left:16px;}"));
             if (!tip.isEmpty()) cb->setToolTip(tip);
-            cb->setChecked(QSettings().value(QStringLiteral("stable2/ovl/") + key, def).toBool());
+            cb->setChecked(QSettings().value(key, def).toBool());
             connect(cb, &QCheckBox::toggled, this, [this, key, apply](bool on) {
-                QSettings().setValue(QStringLiteral("stable2/ovl/") + key, on);
+                QSettings().setValue(key, on);
                 if (m_overlaysOn) apply(on);
             });
             opl->addWidget(cb);
@@ -557,17 +607,17 @@ StableTab2::StableTab2(QWidget* parent) : BrowserTab(parent)
             return cb;
         };
         ovSection(QStringLiteral("Guides"));
-        addOverlay(QStringLiteral("Ground grid"), QStringLiteral("grid"), false, false,
+        addOverlay(QStringLiteral("Ground grid"), QStringLiteral("stable2/ovl/grid"), false, false,
                    QStringLiteral("Ground plane grid."),
                    [this](bool on) { if (m_view) m_view->setShowGrid(on); });
-        addOverlay(QStringLiteral("Axis gizmo"), QStringLiteral("axis"), true, false,
+        addOverlay(QStringLiteral("Axis gizmo"), QStringLiteral("viewer/axisGizmo"), true, false,
                    QStringLiteral("Clickable X/Y/Z orientation ball in the viewport corner."),
                    [this](bool on) { if (m_view) m_view->setShowAxisGizmo(on); });
-        addOverlay(QStringLiteral("Colored grid axes"), QStringLiteral("gridcolors"), true, true,
+        addOverlay(QStringLiteral("Colored grid axes"), QStringLiteral("viewer/gridAxisColors"), true, true,
                    QStringLiteral("Tint the grid's world axes: X red, Z blue."),
                    [this](bool on) { if (m_view) m_view->setGridAxisColors(on); });
         ovSection(QStringLiteral("Skeleton"));
-        addOverlay(QStringLiteral("Skeleton"), QStringLiteral("skel"), false, false,
+        addOverlay(QStringLiteral("Skeleton"), QStringLiteral("stable2/ovl/skel"), false, false,
                    QStringLiteral("Draw the bone hierarchy."),
                    [this](bool on) { if (m_view) m_view->setShowSkeleton(on); });
         {   // Collision model. Deliberately NOT via addOverlay: the Physics panel already owns a
@@ -588,23 +638,23 @@ StableTab2::StableTab2(QWidget* parent) : BrowserTab(parent)
             m_ovlChkColliders = cb;
             linkColliderToggles();
         }
-        addOverlay(QStringLiteral("Physics bones"), QStringLiteral("phys"), false, false,
+        addOverlay(QStringLiteral("Physics bones"), QStringLiteral("stable2/ovl/phys"), false, false,
                    QStringLiteral("Overlay the cloth/physics bones (anchored grey, simulated orange)."),
                    [this](bool on) { if (m_view) m_view->setShowPhysBones(on); });
-        addOverlay(QStringLiteral("Axis gizmos (per-bone)"), QStringLiteral("physaxes"), true, true,
+        addOverlay(QStringLiteral("Axis gizmos (per-bone)"), QStringLiteral("stable2/ovl/physaxes"), true, true,
                    QStringLiteral("Per-bone XYZ rotation gizmo (R/G/B)."),
                    [this](bool on) { if (m_view) m_view->setShowPhysAxes(on); });
-        addOverlay(QStringLiteral("Hardpoints"), QStringLiteral("hardpoints"), false, false,
+        addOverlay(QStringLiteral("Hardpoints"), QStringLiteral("stable2/ovl/hardpoints"), false, false,
                    QStringLiteral("Draw the mount's attach sockets (saddle, HP_trophy1/2/3, reins…) as "
                                   "labeled XYZ gizmos — where the trophy and rider snap on."),
                    [this](bool on) { if (m_view) m_view->setShowHardpoints(on); });
-        addOverlay(QStringLiteral("Bone names"), QStringLiteral("bnm"), false, false,
+        addOverlay(QStringLiteral("Bone names"), QStringLiteral("stable2/ovl/bnm"), false, false,
                    QStringLiteral("Label each bone at its position in the viewport."),
                    [this](bool on) { if (m_view) m_view->setShowBoneNames(on); });
-        addOverlay(QStringLiteral("Translated names"), QStringLiteral("bnmtrans"), false, true,
+        addOverlay(QStringLiteral("Translated names"), QStringLiteral("stable2/ovl/bnmtrans"), false, true,
                    QStringLiteral("Readable labels from verified D4 hardpoint/IK data; others keep bone_<hash>."),
                    [this](bool on) { if (m_view) m_view->setBoneNamesTranslated(on); });
-        addOverlay(QStringLiteral("Hide unnamed bones"), QStringLiteral("bnmhide"), false, true,
+        addOverlay(QStringLiteral("Hide unnamed bones"), QStringLiteral("stable2/ovl/bnmhide"), false, true,
                    QStringLiteral("Only label bones with a known/translated name."),
                    [this](bool on) { if (m_view) m_view->setBoneNamesHideUnknown(on); });
 
@@ -649,34 +699,48 @@ StableTab2::StableTab2(QWidget* parent) : BrowserTab(parent)
     m_view->setMinimumSize(360, 360);
     m_view->setFocusPolicy(Qt::StrongFocus);   // for the H-family hide hotkeys / Esc
     cl->addWidget(m_view, 1);
-    // Double-click a part in the viewport → select it in the PARTS tree (Blender-style), which
-    // drives the highlight + TEXTURE PREVIEW. Same part again / empty space clears (part == -1).
-    connect(m_view, &GLModelWidget::partFocused, this, [this](int part) {
+    // partFocused (double-click) is deliberately NOT connected here any more. It used to be the
+    // only way to select a part from the viewport; a single left-click owns that now, and the
+    // first click of a double-click has already done it. Re-selecting on the double-click achieved
+    // nothing on a plain one and destroyed the selection on a Ctrl one. The camera move itself
+    // lives in GLModelWidget, gated on viewer/framePartOnPick, so double-click still frames.
+    // Single left-click → select in the PARTS tree; Ctrl or Shift adds or toggles; empty space
+    // clears. See the Wardrobe's copy of this for why Shift is additive rather than a range.
+    connect(m_view, &GLModelWidget::partClicked, this, [this](int part, Qt::KeyboardModifiers mods) {
         if (!m_partTree) return;
-        QTreeWidgetItem* hit = nullptr;
-        for (int r = 0; r < m_partTree->topLevelItemCount() && !hit; ++r) {
-            QTreeWidgetItem* root = m_partTree->topLevelItem(r);
-            for (int c = 0; c < root->childCount(); ++c)
-                if (root->child(c)->data(0, Qt::UserRole).toInt() == part) { hit = root->child(c); break; }
+        const bool add = mods & (Qt::ControlModifier | Qt::ShiftModifier);
+        QTreeWidgetItem* hit = itemForPart(part);
+        // One sync, not two — the selection handler here rebuilds the TEXTURE PREVIEW tiles, which
+        // is six smooth QImage rescales, so a plain click firing it twice is worth avoiding.
+        {
+            const bool was = m_partTree->blockSignals(true);
+            if (!add) m_partTree->clearSelection();
+            if (hit) {
+                if (add && hit->isSelected()) {
+                    hit->setSelected(false);
+                } else {
+                    if (hit->parent()) hit->parent()->setExpanded(true);
+                    hit->setSelected(true);
+                    m_partTree->scrollToItem(hit);
+                }
+            }
+            m_partTree->blockSignals(was);
         }
-        const bool same = hit && hit->isSelected() && m_partTree->selectedItems().size() == 1;
-        m_partTree->clearSelection();   // selectionChanged → highlight + tiles
-        if (hit && !same) {
-            if (hit->parent()) hit->parent()->setExpanded(true);
-            hit->setSelected(true);
-            m_partTree->scrollToItem(hit);
-        }
+        syncPartSelection();   // the one sync the blocked edit above deliberately suppressed
     });
     // Right-click a part in the viewport → hide/show it + copy its material name.
     connect(m_view, &GLModelWidget::partRightClicked, this,
             [this](int part, const QPoint& gp) { showPartContextMenu(part, gp); });
+    // Transport (Play · scrub · speed · loop) under the viewport, where the Models and Wardrobe
+    // tabs put theirs. It hides itself until a clip is actually playing.
+    if (m_timeline) cl->addWidget(m_timeline);
     buildVpStrip();   // Reset · Camera · Lighting · Fullscreen pinned to the viewport edge
 
     left->setMinimumWidth(230);
     left->setMaximumWidth(500);   // a picker column, not a canvas — bounds the responsive card grid
     split->addWidget(left);
     split->addWidget(center);
-    buildSidebar(split);   // wardrobe-parity right sidebar: PARTS · INFO PanelBoxes
+    buildSidebar(split);   // wardrobe-parity right sidebar: PARTS · MATERIALS · TEXTURES · INFO · ANIMATIONS
     m_mainSplit = split;
     split->setStretchFactor(0, 0);
     split->setStretchFactor(1, 1);
@@ -807,7 +871,7 @@ void StableTab2::positionVpStrip()
     m_vpStrip->raise();
 }
 
-// ── Right sidebar: PanelBox stack (PARTS · INFO), wardrobe-style — a vertical icon strip of
+// ── Right sidebar: PanelBox stack (PARTS · MATERIALS · TEXTURES · INFO · ANIMATIONS), wardrobe-style — a vertical icon strip of
 // checkable toggles beside a QSplitter of titled panels; shown/hidden state persists. ─────────
 void StableTab2::buildSidebar(QSplitter* mainSplit)
 {
@@ -815,7 +879,8 @@ void StableTab2::buildSidebar(QSplitter* mainSplit)
     auto* sb = new QHBoxLayout(m_sidebarW);
     sb->setContentsMargins(2, 6, 4, 6);
     sb->setSpacing(3);
-    auto* stripW = new QWidget(m_sidebarW);
+    m_rstripW = new QWidget(m_sidebarW);
+    QWidget* stripW = m_rstripW;
     auto* stripLay = new QVBoxLayout(stripW);
     stripLay->setContentsMargins(0, 0, 0, 0);
     stripLay->setSpacing(3);
@@ -824,15 +889,20 @@ void StableTab2::buildSidebar(QSplitter* mainSplit)
     sb->addWidget(stripW);
     sb->addWidget(m_rsplit, 1);
 
-    auto section = [&](const QString& title, QWidget* content, const QPixmap& icon,
-                       const QString& tip, bool defOn) {
+    // `id` is the STABLE token the layout is stored under — never the title, which is a label and
+    // may grow a live count later. They happen to be equal today; keeping them separate is what
+    // stops a cosmetic rename from orphaning every saved layout.
+    auto section = [&](const QString& id, const QString& title, QWidget* content,
+                       const QPixmap& icon, const QString& tip, bool defOn) {
         const int page = m_rsections.size();
         auto* box = new PanelBox(title, content, m_rsplit);
         box->hide();
-        box->up->hide(); box->down->hide();   // four panels — reorder buttons are noise
         m_rsplit->addWidget(box);
         m_rsections.append(box);
-        m_rkeys.append(QStringLiteral("stable2/panel/") + title);
+        m_rids.append(id);
+        m_rdefOn.append(defOn);
+        connect(box->up,   &QToolButton::clicked, this, [this, page] { moveSidePanel(page, -1); });
+        connect(box->down, &QToolButton::clicked, this, [this, page] { moveSidePanel(page, +1); });
         auto* b = new QToolButton(stripW);
         b->setIcon(QIcon(icon));               // shared outliner glyphs, like the Models sidebar
         b->setIconSize(QSize(16, 16));
@@ -850,8 +920,10 @@ void StableTab2::buildSidebar(QSplitter* mainSplit)
         connect(box->close, &QToolButton::clicked, this, [this, page] {
             if (page < m_rpageBtns.size()) m_rpageBtns[page]->setChecked(false);
         });
-        // Restore the saved state (defaults keep both panels up like the old fixed layout).
-        b->setChecked(QSettings().value(m_rkeys[page], defOn).toBool());
+        // NO restore here: which panels are up is now an ORDERED list replayed once after every
+        // registration (see the block at the end of this function). Restoring per-section would
+        // fix the order to registration order, which is the thing the reorder buttons exist to
+        // change.
     };
 
     // MATERIALS panel — # · material · tris table; selecting a row highlights that part.
@@ -904,17 +976,137 @@ void StableTab2::buildSidebar(QSplitter* mainSplit)
     iv->addWidget(m_status);
 
     using K = ModelOutlinerModel;
-    section(QStringLiteral("PARTS"), m_partTree, K::kindIcon(K::Part),
+    section(QStringLiteral("PARTS"), QStringLiteral("PARTS"), m_partTree, K::kindIcon(K::Part),
             QStringLiteral("Parts — submesh visibility (uncheck to hide, hover to highlight)"), true);
-    section(QStringLiteral("MATERIALS"), m_matTable, K::kindIcon(K::Material),
+    section(QStringLiteral("MATERIALS"), QStringLiteral("MATERIALS"), m_matTable, K::kindIcon(K::Material),
             QStringLiteral("Materials — one row per submesh (select to highlight)"), true);
-    section(QStringLiteral("TEXTURES"), texW, K::kindIcon(K::TexGroup),
+    section(QStringLiteral("TEXTURES"), QStringLiteral("TEXTURES"), texW, K::kindIcon(K::TexGroup),
             QStringLiteral("Texture preview — PBR channels of the selected part"), false);
-    section(QStringLiteral("INFO"), infoW, K::kindIcon(K::ValueGroup),
+    section(QStringLiteral("INFO"), QStringLiteral("INFO"), infoW, K::kindIcon(K::ValueGroup),
             QStringLiteral("Info — assembly stats for the current mount"), false);
+    // ANIMATIONS — the clip list, in the right column like the Models and Wardrobe tabs (the
+    // transport stays under the viewport). Defaults ON: it was always visible before the move, so
+    // anything else would read as the panel having gone missing.
+    if (m_animPanel)
+        section(QStringLiteral("ANIMATIONS"), QStringLiteral("ANIMATIONS"), m_animPanel, K::kindIcon(K::Anim),
+                QStringLiteral("Animations — the mount's clip list (search, select to play)"), true);
     stripLay->addStretch(1);
 
+    // ── Replay the layout: which panels are up, in what ORDER, at what heights ──────────────────
+    // Names + heights rather than QSplitter::saveState(), which is positional — hidden panels
+    // still occupy splitter slots, so index N would mean a different panel between runs.
+    {
+        QSettings st;
+        QStringList shown;
+        if (st.contains(QStringLiteral("stable2/panels/shown"))) {
+            shown = st.value(QStringLiteral("stable2/panels/shown")).toStringList();
+        } else {
+            // Migrate the old per-panel booleans once. They were a second store for the same
+            // state and carried no order at all, so registration order is the only reading.
+            for (int i = 0; i < m_rids.size(); ++i) {
+                const QString legacy = QStringLiteral("stable2/panel/") + m_rids[i];
+                if (st.value(legacy, m_rdefOn.value(i)).toBool()) shown << m_rids[i];
+                st.remove(legacy);   // migrated; leaving it is a dead key
+            }
+            // Persist the migrated list HERE. saveSidePanelLayout() is suppressed for the whole
+            // replay below, and after it only a strip toggle, a reorder or a handle drag writes —
+            // so a user who upgrades and never touches the sidebar would have had their layout
+            // read from legacy keys once, those keys deleted, and every later launch fall back to
+            // defaults with nothing left to recover from.
+            st.setValue(QStringLiteral("stable2/panels/shown"), shown);
+        }
+        const QStringList heights = st.value(QStringLiteral("stable2/panels/sizes")).toStringList();
+        const int shownCount = [&] {   // how many of `shown` this build still has
+            int n = 0;
+            for (const QString& id : shown) if (m_rids.indexOf(id) >= 0) ++n;
+            return n;
+        }();
+
+        m_panelRestore = true;   // don't let these toggles write a half-applied layout back out
+        int slot = 0;
+        for (const QString& id : shown) {
+            const int page = m_rids.indexOf(id);
+            if (page < 0) continue;              // a panel this build no longer has
+            m_rsplit->insertWidget(slot++, m_rsections[page]);
+            m_rpageBtns[page]->setChecked(true); // → showSidePanel(page, true)
+        }
+        m_panelRestore = false;
+        // Compare against the number of SHOWN panels — the same quantity saveSidePanelLayout()
+        // produced. m_rsplit->count() is every registered panel, because a hidden PanelBox keeps
+        // its splitter slot, so the two match only when all five are up: with the shipped defaults
+        // (three up) the guard never fired and stable2/panels/sizes was write-only.
+        //
+        // And patch the LIVE full-length size list rather than building one from `heights`: setSizes
+        // expects one entry per splitter child, so a short list would size only the leading slots.
+        if (!heights.isEmpty() && heights.size() == shownCount) {
+            QList<int> sizes = m_rsplit->sizes();
+            int k = 0;
+            for (int i = 0; i < m_rsplit->count() && k < heights.size(); ++i)
+                if (!m_rsplit->widget(i)->isHidden()) sizes[i] = heights[k++].toInt();
+            m_rsplit->setSizes(sizes);
+        }
+        updateSidebarCollapse();
+    }
+    connect(m_rsplit, &QSplitter::splitterMoved, this,
+            [this](int, int) { saveSidePanelLayout(); });
+
     mainSplit->addWidget(m_sidebarW);
+}
+
+// Move one panel up or down among the panels that are UP (hidden ones keep their splitter slots
+// but must not be counted, or a ▲ would appear to do nothing while it swapped two invisibles).
+void StableTab2::moveSidePanel(int page, int delta)
+{
+    if (!m_rsplit || page < 0 || page >= m_rsections.size()) return;
+    PanelBox* box = m_rsections[page];
+    QVector<int> vis;   // isHidden, not isVisible: the latter is false for every child while the
+                        // tab itself is unshown, which would make this a no-op on a background tab
+    for (int i = 0; i < m_rsplit->count(); ++i)
+        if (!m_rsplit->widget(i)->isHidden()) vis << i;
+    const int cur = vis.indexOf(m_rsplit->indexOf(box));
+    const int tgt = cur + delta;
+    if (cur < 0 || tgt < 0 || tgt >= vis.size()) return;   // already at an end
+    const QList<int> sizes = m_rsplit->sizes();
+    m_rsplit->insertWidget(vis[tgt], box);                 // moves the existing child
+    m_rsplit->setSizes(sizes);                             // insertWidget resets sizes — restore
+    saveSidePanelLayout();
+}
+
+// Which panels are up, in what order, at what heights.
+void StableTab2::saveSidePanelLayout()
+{
+    if (!m_rsplit || m_panelRestore) return;   // never write while the replay above is running
+    const QList<int> sizes = m_rsplit->sizes();
+    QStringList shown, heights;
+    for (int i = 0; i < m_rsplit->count(); ++i) {
+        QWidget* w = m_rsplit->widget(i);
+        if (w->isHidden()) continue;
+        const int page = m_rsections.indexOf(static_cast<PanelBox*>(w));
+        if (page < 0) continue;
+        shown   << m_rids.value(page);
+        heights << QString::number(sizes.value(i));
+    }
+    QSettings s;
+    s.setValue(QStringLiteral("stable2/panels/shown"), shown);
+    s.setValue(QStringLiteral("stable2/panels/sizes"), heights);
+}
+
+// With no panels up the column shrinks to just the icon strip — which must stay reachable, since
+// it is the only way to bring a panel back. Hiding the column outright is a different thing
+// (setSideCollapsed), so these widths only ever apply while it is visible.
+void StableTab2::updateSidebarCollapse()
+{
+    if (!m_sidebarW || !m_rstripW) return;
+    bool any = false;
+    for (PanelBox* b : m_rsections)
+        if (b && !b->isHidden()) { any = true; break; }
+    if (any) {
+        m_sidebarW->setMinimumWidth(230);
+        m_sidebarW->setMaximumWidth(QWIDGETSIZE_MAX);
+    } else {
+        m_sidebarW->setMinimumWidth(0);
+        m_sidebarW->setMaximumWidth(m_rstripW->sizeHint().width() + 10);
+    }
 }
 
 void StableTab2::showSidePanel(int page, bool on)
@@ -924,9 +1116,8 @@ void StableTab2::showSidePanel(int page, bool on)
     const bool was = !box->isHidden();
     box->setVisible(on);
     if (on && !was) panelBoxArrive(m_rsplit, box);
-    QSettings().setValue(m_rkeys[page], on);
-    // The sidebar itself stays up even with every panel hidden — the icon strip must remain
-    // reachable to bring panels back (fullscreen is what hides the whole pane).
+    saveSidePanelLayout();     // one store for "which panels, in what order, how tall"
+    updateSidebarCollapse();   // last panel down → the column shrinks to the strip
 }
 
 void StableTab2::toggleFullscreen(bool on)
@@ -936,8 +1127,78 @@ void StableTab2::toggleFullscreen(bool on)
         m_mainSplit->widget(0)->setVisible(!on);   // left controls
     if (m_sidebarW) m_sidebarW->setVisible(!on && !m_sideCollapsed);   // honor an existing collapse
     if (m_toolbarW) m_toolbarW->setVisible(!on);   // toolbar row
+    // The transport lived in the left column before it moved under the viewport, so fullscreen hid
+    // it for free. It is chrome; keep hiding it rather than letting the move change what fullscreen
+    // means. (Only re-show it if a clip is actually loaded — that is its own resting state.)
+    if (m_timeline) m_timeline->setVisible(!on && m_curAnim.valid);
     if (m_fsEsc) m_fsEsc->setEnabled(on);
     positionVpStrip();   // the viewport just changed size
+}
+
+// Coalesce rapid interactive changes into ONE rebuild. rebuildMount() parses up to three
+// appearances, merges them, BC-decodes every texture and uploads it — all on the GUI thread — so
+// clicking down the card grid used to pay that once per card the pointer passed through. A 35 ms
+// single-shot restart means only the selection the user settles on is ever built.
+//
+// No setting gates this: an unconditional 35 ms debounce is imperceptible, and a QSettings flag
+// with no UI to write it would be exactly the dead key this tab has been carrying elsewhere.
+//
+// Deliberately NOT used by the startup restore or by undo(): both run code on the very next line
+// that assumes the rebuild has already happened (restoreCameraState() re-frames the new model;
+// undo clears m_restoring, and a deferred rebuild would then see it false and re-snapshot).
+void StableTab2::scheduleRebuild()
+{
+    if (!m_rebuildTimer) {
+        m_rebuildTimer = new QTimer(this);
+        m_rebuildTimer->setSingleShot(true);
+        m_rebuildTimer->setInterval(35);
+        connect(m_rebuildTimer, &QTimer::timeout, this, [this] { rebuildMount(); });
+    }
+    m_rebuildTimer->start();   // restart on each change
+}
+
+// Reload / game-build change. Everything below is keyed to the BUILD and would otherwise be
+// answered from the previous one. This used to clear only the material-decode caches, which was
+// not enough on three counts:
+//   m_petReady   ensurePetIndex() early-returns on it, and MainWindow DELETES stable_index_v6.bin
+//                on a fingerprint change (that cache carries no signature) — so the roster was
+//                never rebuilt and the deleted cache's contents stayed on screen all session
+//   m_loaded     refresh() early-returns on it, so the tab never repopulated at all
+//   m_petGen     bumped so a scan already IN FLIGHT discards itself instead of installing the old
+//                install's roster over the new one (the pattern BackTrophyIndex.h documents)
+//
+// The rendered card portraits are disk-backed as well as in-memory, and queueThumb() reads the
+// disk copy first — so dropping m_thumbs alone would force a round-trip and hand back the same
+// stale image. The directory goes too. (Nothing else clears it: MainWindow's fingerprint cleanup
+// covers stable_index_v*.bin and tex_info_v*.bin only.)
+void StableTab2::reset()
+{
+    m_cBase.clear(); m_cNorm.clear(); m_cOrm.clear();
+    m_cEmis.clear(); m_cMask.clear(); m_cTrans.clear();
+    m_clipTok.clear();
+    m_clipDiskLoaded = false;   // re-attempt the load; a stale signature rejects itself
+
+    ++m_petGen;
+    m_petReady = false; m_petBuilding = false;
+    m_mounts.clear(); m_armorItems.clear(); m_trophyItems.clear(); m_petItems.clear();
+    m_pets.clear(); m_iconByApp.clear(); m_gridEntries.clear();
+    m_themesBuilt = false; m_themeArmor.clear(); m_themeTrophy.clear();
+    m_atlasBuilt = false; m_atlasIdx.clear();
+
+    m_thumbs.clear(); m_thumbQueue.clear(); m_thumbQueued.clear(); m_thumbAppr.clear();
+    if (m_thumbTimer) m_thumbTimer->stop();
+    // A rebuild queued against the OLD build must not fire after the reset.
+    if (m_rebuildTimer) m_rebuildTimer->stop();
+    QDir(AppPaths::dataDir() + QStringLiteral("/stable_icons")).removeRecursively();
+
+    // The assembled mount belongs to the old build too. hasExportSelection() reads m_lastGeo, so
+    // leaving it would keep the Export menu enabled and writing the PRE-reload mesh; and an undo
+    // snapshot holds appearance SNOs that may not resolve any more.
+    m_lastGeo = ModelGeometry();
+    m_exportMats.clear();
+    m_undo.clear();
+
+    m_loaded = false;
 }
 
 // ── Refresh / discovery ───────────────────────────────────────────────────────
@@ -951,10 +1212,18 @@ void StableTab2::refresh()
     const QString d4 = Config::d4dataDir();
     AppearanceMeta::instance().ensureBuilt(d4, m_index, m_reader);
     IconIndex::instance().ensureBuilt(d4, m_reader);
-    connect(&IconIndex::instance(), &IconIndex::readyChanged, this,
-            [this] { refreshSlotCells(); fillGrid(); });
-    connect(&AppearanceMeta::instance(), &AppearanceMeta::readyChanged, this,
-            [this] { refreshSlotCells(); fillGrid(); });
+    // ONCE for the life of the tab, not once per refresh(). reset() now clears m_loaded so the
+    // tab repopulates on a new game build, which means refresh() runs again — and these are
+    // lambdas on two SINGLETONS that outlive the tab, so Qt::UniqueConnection cannot dedupe them.
+    // Without this flag every reload appended another pair and each readyChanged then ran the
+    // full fillGrid() one more time than the last.
+    if (!m_signalsWired) {
+        m_signalsWired = true;
+        connect(&IconIndex::instance(), &IconIndex::readyChanged, this,
+                [this] { refreshSlotCells(); fillGrid(); });
+        connect(&AppearanceMeta::instance(), &AppearanceMeta::readyChanged, this,
+                [this] { refreshSlotCells(); fillGrid(); });
+    }
     restoreCurrent();        // BEFORE the index: a cache-hit scan auto-selects + saves, which
     ensurePetIndex();        // would otherwise clobber the persisted selection being restored
     selectSlot(SlotMount);
@@ -978,7 +1247,7 @@ void StableTab2::refresh()
         }
     }
     if (m_view) {
-        m_view->setEnvironment(QSettings().value(QStringLiteral("stable2/env"), 1).toInt());   // default Outdoor
+        m_view->setEnvironment(envOrDefault(QSettings().value(QStringLiteral("stable2/env"), 1).toInt()));
         applyLightRig();
         applyGraphics();   // IBL/shadows/SSAO/tonemap/features from stable2/gfx/*
         applyFur();        // fur/mane shell + mesh-FX settings from stable2/fur/* · stable2/fx/*
@@ -988,11 +1257,12 @@ void StableTab2::refresh()
         QSettings ov;
         const bool om = m_overlaysOn;
         m_view->setShowGrid(om && ov.value(QStringLiteral("stable2/ovl/grid"), false).toBool());
-        m_view->setShowAxisGizmo(om && ov.value(QStringLiteral("stable2/ovl/axis"), true).toBool());
-        m_view->setGridAxisColors(om && ov.value(QStringLiteral("stable2/ovl/gridcolors"), true).toBool());
+        m_view->setShowAxisGizmo(om && ov.value(QStringLiteral("viewer/axisGizmo"), true).toBool());
+        m_view->setGridAxisColors(om && ov.value(QStringLiteral("viewer/gridAxisColors"), true).toBool());
         m_view->setShowSkeleton(om && ov.value(QStringLiteral("stable2/ovl/skel"), false).toBool());
         m_view->setShowPhysBones(om && ov.value(QStringLiteral("stable2/ovl/phys"), false).toBool());
         m_view->setShowPhysAxes(om && ov.value(QStringLiteral("stable2/ovl/physaxes"), true).toBool());
+        m_view->setShowHardpoints(om && ov.value(QStringLiteral("stable2/ovl/hardpoints"), false).toBool());
         m_view->setShowBoneNames(om && ov.value(QStringLiteral("stable2/ovl/bnm"), false).toBool());
         m_view->setBoneNamesTranslated(ov.value(QStringLiteral("stable2/ovl/bnmtrans"), false).toBool());
         m_view->setBoneNamesHideUnknown(ov.value(QStringLiteral("stable2/ovl/bnmhide"), false).toBool());
@@ -1018,6 +1288,7 @@ void StableTab2::ensurePetIndex()
 {
     if (m_petReady || m_petBuilding || !m_index) return;
     m_petBuilding = true;
+    const int gen = m_petGen;   // reset() bumps this; a stale build must not install (see below)
     const QString cacheBase = AppPaths::dataDir();
     const QString cachePath = cacheBase + QStringLiteral("/stable_index_v6.bin");
     constexpr quint32 kMagic = 0x7E410061u;   // v6: unk_75d565b inventory-icon handles
@@ -1065,7 +1336,7 @@ void StableTab2::ensurePetIndex()
     QHash<QString, int> appByName;
     for (const SnoEntry& e : m_index->entries(kGroupAppearance)) appByName.insert(e.name.toLower(), e.snoId);
 
-    std::thread([this, d4, cacheBase, cachePath, kMagic, appByName, writeVec]() {
+    std::thread([this, gen, d4, cacheBase, cachePath, kMagic, appByName, writeVec]() {
         static const QRegularExpression rxType(QStringLiteral("\"snoItemType\"\\s*:\\s*\\{[^}]*?/ItemType/([^.\"/]+)"));
         static const QRegularExpression rxActor(QStringLiteral("\"snoActor\"\\s*:\\s*\\{[^}]*?/Actor/([^.\"/]+)"));
         static const QRegularExpression rxMount(QStringLiteral("\"snoMount\"\\s*:\\s*\\{[^}]*?/Actor/([^.\"/]+)"));
@@ -1206,15 +1477,31 @@ void StableTab2::ensurePetIndex()
         QVector<QPair<QString, int>> petPairs;
         for (const StableEntry& e : pets) petPairs.append({ e.name, e.apprSno });
 
-        QDir().mkpath(cacheBase);
-        QFile out(cachePath);
-        if (out.open(QIODevice::WriteOnly)) {
-            QDataStream ds(&out);
-            ds << kMagic << petPairs << icons;
-            writeVec(ds, mounts); writeVec(ds, armor); writeVec(ds, trophies); writeVec(ds, pets);
-            out.flush();
-        }
-        QMetaObject::invokeMethod(this, [this, petPairs, icons, mounts, armor, trophies, pets]() mutable {
+        QMetaObject::invokeMethod(this, [this, gen, cacheBase, cachePath, kMagic, writeVec,
+                                         petPairs, icons, mounts, armor, trophies, pets]() mutable {
+            // The data dir changed under this scan — discard it. Deliberately does NOT clear
+            // m_petBuilding: reset() already did, and a newer build may be running by now, so
+            // clearing it here would let a third start alongside it.
+            if (gen != m_petGen) return;
+            // The cache is WRITTEN HERE, on the GUI thread, after the generation check — not on
+            // the worker before it. This cache carries no build signature, so MainWindow deletes
+            // it on a fingerprint change; a stale worker that wrote it after that deletion would
+            // put the OLD build's roster back on disk, where the next launch would load it happily
+            // and forever. Writing past the check also serialises the two workers reset() can
+            // leave running, and temp+rename keeps a torn file from ever being the real one.
+            QDir().mkpath(cacheBase);
+            const QString tmp = cachePath + QStringLiteral(".tmp");
+            QFile out(tmp);
+            if (out.open(QIODevice::WriteOnly)) {
+                QDataStream ds(&out);
+                ds << kMagic << petPairs << icons;
+                writeVec(ds, mounts); writeVec(ds, armor); writeVec(ds, trophies); writeVec(ds, pets);
+                out.flush();
+                const bool ok = ds.status() == QDataStream::Ok;
+                out.close();
+                if (ok) { QFile::remove(cachePath); QFile::rename(tmp, cachePath); }
+                else    { QFile::remove(tmp); }
+            }
             m_pets = std::move(petPairs); m_iconByApp = std::move(icons);
             m_mounts = std::move(mounts); m_armorItems = std::move(armor);
             m_trophyItems = std::move(trophies); m_petItems = std::move(pets);
@@ -1502,7 +1789,7 @@ void StableTab2::fillGrid()
                     pushUndo();
                     m_slotSel[slot] = 0; m_slotName[slot].clear(); m_slotDisp[slot].clear();
                     m_slotDesc[slot].clear(); m_slotLook[slot] = 0;
-                    refreshSlotCells(); fillGrid(); rebuildMount();
+                    refreshSlotCells(); fillGrid(); scheduleRebuild();
                 });
                 a->setEnabled(m_slotSel[slot] > 0);
                 menu.exec(none->mapToGlobal(p));
@@ -1656,7 +1943,7 @@ void StableTab2::fillGrid()
                 }
             }
             refreshSlotCells();
-            rebuildMount();
+            scheduleRebuild();
         });
         return;
     }
@@ -1716,7 +2003,7 @@ void StableTab2::fillGrid()
             if (pet) { m_slotSel[SlotTrophy] = 0; m_slotName[SlotTrophy].clear(); }
         }
         refreshSlotCells();
-        rebuildMount();
+        scheduleRebuild();
     });
 }
 
@@ -1730,8 +2017,7 @@ static QString seatTrophyOnMount(ModelGeometry& trophy, const QVector<ModelJoint
 {
     if (mountSkel.isEmpty() || trophy.primitives.isEmpty() || d4.isEmpty() || mountAppr.isEmpty())
         return QString();
-    const auto hpMap = ModelAttach::loadHardpointMap(
-        d4 + QStringLiteral("/json/base/meta/Appearance/") + mountAppr + QStringLiteral(".app.json"));
+    const auto hpMap = ModelAttach::loadHardpointMap(apprJsonPath(d4, mountAppr));
     if (hpMap.isEmpty()) return QString();
     quint32 authored = 0;
     if (!trophyAppr.isEmpty()) {
@@ -1763,11 +2049,19 @@ static QString seatTrophyOnMount(ModelGeometry& trophy, const QVector<ModelJoint
 // Material roster for a specific colour-variant LOOK. Mount colour variants share one base
 // appearance; the mount actor's tDefaultLook.dwLookHash names the look, which selects a
 // different material per sub-object (ptSOAs[lookIndex]). lookHash 0 (or not found) = default.
-static QStringList rosterForLook(const QString& d4, const QString& appName, quint32 lookHash)
+// reader/meta/sno/idx are carried through purely so the three fallbacks below can reach the meta
+// binary: a look table only exists in the .app.json, so an appearance without one has no looks to
+// choose between and wants its default roster — which for encrypted content lives in the binary.
+static QStringList rosterForLook(CascReader* reader, const QString& d4, const QString& appName,
+                                 const QByteArray& meta, int sno, const SnoIndex* idx,
+                                 quint32 lookHash)
 {
-    if (!lookHash) return MaterialDecode::appearanceRoster(d4, appName);
-    QFile f(QStringLiteral("%1/json/base/meta/Appearance/%2.app.json").arg(d4, appName));
-    if (!f.open(QIODevice::ReadOnly)) return MaterialDecode::appearanceRoster(d4, appName);
+    const auto dflt = [&] {
+        return MaterialDecode::appearanceRosterAny(reader, d4, appName, meta, sno, idx);
+    };
+    if (!lookHash) return dflt();
+    QFile f(apprJsonPath(d4, appName));
+    if (!f.open(QIODevice::ReadOnly)) return dflt();
     const QJsonObject root = QJsonDocument::fromJson(f.readAll()).object();
     // Find the look's SOA index by matching szLookName (a hash) against dwLookHash.
     int lookIdx = -1;
@@ -1777,7 +2071,7 @@ static QStringList rosterForLook(const QString& d4, const QString& appName, quin
                                       .value(QStringLiteral("szLookName")).toVariant().toULongLong());
         if (h == lookHash) { lookIdx = i; break; }
     }
-    if (lookIdx <= 0) return MaterialDecode::appearanceRoster(d4, appName);   // default look
+    if (lookIdx <= 0) return dflt();   // default look
     QStringList out;
     for (const QJsonValue& mv : root.value(QStringLiteral("ptAppearanceMaterials")).toArray()) {
         const QJsonArray soas = mv.toObject().value(QStringLiteral("ptSOAs")).toArray();
@@ -1803,7 +2097,7 @@ static QStringList rosterForLook(const QString& d4, const QString& appName, quin
 static int baseBoneCountFor(const QString& d4, const QString& appr)
 {
     if (d4.isEmpty() || appr.isEmpty()) return 0;
-    QFile f(d4 + QStringLiteral("/json/base/meta/Appearance/") + appr + QStringLiteral(".app.json"));
+    QFile f(apprJsonPath(d4, appr));
     if (!f.open(QIODevice::ReadOnly)) return 0;
     const QJsonObject root = QJsonDocument::fromJson(f.readAll()).object();
     const QJsonArray bd = root.value(QStringLiteral("tStructure")).toObject()
@@ -1844,6 +2138,11 @@ static bool stableShaderIsFx(const QString& sm)
 // ── Assemble + texture ─────────────────────────────────────────────────────────
 void StableTab2::rebuildMount()
 {
+    // Cancel any pending debounce. Every synchronous caller (undo, equip theme, equip, reset-to-
+    // default, the startup restore) would otherwise be followed 35 ms later by a redundant rebuild
+    // of the state it just built. Here rather than at each call site so a new caller cannot forget.
+    if (m_rebuildTimer) m_rebuildTimer->stop();
+
     if (!m_view) return;
     if (!m_reader || !m_reader->isReady()) { if (m_status) m_status->setText(QStringLiteral("CASC not ready.")); return; }
     QElapsedTimer buildT; buildT.start();   // stage timing → "stable: rebuild …" log line
@@ -1877,7 +2176,8 @@ void StableTab2::rebuildMount()
         const int bbc = baseBoneCountFor(d4, m_slotName[s]);
         if (bbc > 0 && bbc < geo.skeleton.size()) geo.nBaseBones = bbc;
         // Colour-variant look: mounts sharing one base mesh differ only by the look's materials.
-        const QStringList roster = rosterForLook(d4, m_slotName[s], m_slotLook[s]);
+        const QStringList roster = rosterForLook(m_reader, d4, m_slotName[s], meta, sno, m_index,
+                                                m_slotLook[s]);
         for (MeshPrimitive& p : geo.primitives) p.materialName = roster.value(p.materialIndex);
         if (s == SlotMount) mountSkel = geo.skeleton;
         if (s == SlotTrophy) {
@@ -1953,8 +2253,7 @@ void StableTab2::rebuildMount()
     // The mount is the first merged piece, so its bone indices are unchanged in the merged skeleton.
     m_lastGeo.hardpoints.clear();
     if (!m_slotName[SlotMount].isEmpty())
-        Hardpoints::readInto(m_lastGeo, d4 + QStringLiteral("/json/base/meta/Appearance/")
-                                             + m_slotName[SlotMount] + QStringLiteral(".app.json"));
+        Hardpoints::readInto(m_lastGeo, apprJsonPath(d4, m_slotName[SlotMount]));
     m_view->setHardpoints(m_lastGeo.hardpoints);
 
     const int n = geo.primitives.size();
@@ -1962,6 +2261,10 @@ void StableTab2::rebuildMount()
     QVector<QImage> detN[3], detR[3];
     for (int k = 0; k < 3; ++k) { detN[k].resize(n); detR[k].resize(n); }
     QVector<float> metal(n), rough(n), emisMul(n, 1.0f), dNInt(n, 1.0f), dRInt(n, 1.0f), dROff(n, 0.0f);
+    // 3 floats per part. Never filled before, so the widget fell back to white and a monochrome
+    // EMISSIVE mask — which is what D4 mostly authors — lost its colour entirely. emisMul was
+    // filled with a hard 1.0 for the same reason: nothing read the material's authored value.
+    QVector<float> emisCol(n * 3, 1.0f);
     QVector<QVector3D> dScale(n, QVector3D(8, 8, 8));
     QVector<int> dMetalLayer(n, -1);
     QVector<int> hair(n, 0), skin(n, 0), cloth(n, 0);
@@ -2075,7 +2378,17 @@ void StableTab2::rebuildMount()
         em.name = m;
         em.baseColor = base; em.normal = nrm; em.orm = orw;
         em.hasMetal = true; em.metal = mt; em.hasRough = true; em.rough = rg;
-        if (!emi.isNull()) { em.emissive = emi; em.hasEmissive = true; em.emisMult = 1.0f; }
+        emisMul[i] = MaterialDecode::materialScalar(d4, m, "emissive multiplier", 1.0f);
+        {
+            const QColor ec = MaterialDecode::emissiveTint(d4, m, emi, base);
+            emisCol[i*3+0] = float(ec.redF());
+            emisCol[i*3+1] = float(ec.greenF());
+            emisCol[i*3+2] = float(ec.blueF());
+        }
+        if (!emi.isNull()) {
+            em.emissive = emi; em.hasEmissive = true; em.emisMult = emisMul[i];
+            em.emisR = emisCol[i*3+0]; em.emisG = emisCol[i*3+1]; em.emisB = emisCol[i*3+2];
+        }
         const bool cut = hasCutout(base);
         em.alphaCutout = cut;
         em.alphaCutoff = 0.35f;
@@ -2091,6 +2404,7 @@ void StableTab2::rebuildMount()
     m_view->setPartMask(mask);
     m_view->setPartTranslucency(trans);
     m_view->setPartEmissiveMult(emisMul);
+    m_view->setPartEmissiveColor(emisCol);
     m_view->setPartDetailNormals(detN[0], detN[1], detN[2]);
     m_view->setPartDetailRoughs(detR[0], detR[1], detR[2]);
     m_view->setPartDetailIntensity(dNInt, dRInt);
@@ -2105,7 +2419,7 @@ void StableTab2::rebuildMount()
 
     rebuildPartList();
     recomputePartVisibility();
-    m_view->setEnvironment(QSettings().value(QStringLiteral("stable2/env"), 1).toInt());
+    m_view->setEnvironment(envOrDefault(QSettings().value(QStringLiteral("stable2/env"), 1).toInt()));
     applyLightRig();
     // New geometry means a new rig and a rebuilt cloth sim. Re-push EVERY overlay (this also calls
     // applyClothParams for the mane/tail/cloth sim), so toggles survive a mount swap.
@@ -2114,7 +2428,7 @@ void StableTab2::rebuildMount()
     // Auto-play the model's nav-idle (like in-game). If a clip was already playing and the new rig
     // still has it (gear/look swap), keep that instead of resetting to idle.
     {
-        const QStringList rows = m_animCache.value(animCarrierSno());
+        const QStringList rows = currentClipRows();
         auto clipOf = [](const QString& r) { return r.section(QStringLiteral("  ·  "), 0, 0); };
         QString toPlay;
         if (!prevAnim.isEmpty())
@@ -2155,7 +2469,10 @@ void StableTab2::saveCurrent()
 
 void StableTab2::saveCameraState()
 {
-    if (!m_view) return;
+    // The Camera panel's "Remember camera on relaunch" box wrote stable2/rememberCam and NOTHING
+    // read it, so the camera was always saved and always restored and the checkbox did nothing.
+    // Gated in both directions now, as the Wardrobe does.
+    if (!m_view || !QSettings().value(QStringLiteral("stable2/rememberCam"), true).toBool()) return;
     const GLModelWidget::CamState c = m_view->cameraState();
     if (!c.valid) return;
     QSettings s;
@@ -2173,6 +2490,7 @@ void StableTab2::restoreCameraState()
 {
     if (!m_view) return;
     QSettings s;
+    if (!s.value(QStringLiteral("stable2/rememberCam"), true).toBool()) return;
     if (!s.contains(QStringLiteral("stable2/cam/yaw"))) return;
     GLModelWidget::CamState c;
     c.yaw = s.value(QStringLiteral("stable2/cam/yaw")).toFloat();
@@ -2370,12 +2688,6 @@ void StableTab2::buildThemeMap()
     }
 }
 
-bool StableTab2::hasTheme(const QString& mountAppr)
-{
-    buildThemeMap();
-    const QString key = mountAppr.toLower();
-    return m_themeArmor.contains(key) || m_themeTrophy.contains(key);
-}
 
 // Equip a mount together with the matching Mount Armor + Trophy from its bundle. Basilisks take
 // no armor (armor slot left empty); the first bundled trophy is used.
@@ -2516,7 +2828,8 @@ void StableTab2::exportAppearanceModel(int sno, const QString& appr, bool toLast
     }
     const int bbc = baseBoneCountFor(d4, appr);
     if (bbc > 0 && bbc < geo.skeleton.size()) geo.nBaseBones = bbc;
-    const QStringList roster = MaterialDecode::appearanceRoster(d4, appr);
+    const QStringList roster =
+        MaterialDecode::appearanceRosterAny(m_reader, d4, appr, meta, sno, m_index);
     for (MeshPrimitive& p : geo.primitives) {
         const QString rn = roster.value(p.materialIndex);
         if (!rn.isEmpty()) p.materialName = rn;
@@ -2539,7 +2852,20 @@ void StableTab2::exportAppearanceModel(int sno, const QString& appr, bool toLast
             float mt = 0, rg = 1; MaterialDecode::factors(m_reader, d4, m, mt, rg);
             em.hasMetal = true; em.metal = mt; em.hasRough = true; em.rough = rg;
             const QImage emi = MaterialDecode::byRole(m_reader, d4, m, "EMISSIVE");
-            if (!emi.isNull()) { em.emissive = emi; em.hasEmissive = true; em.emisMult = 1.0f; }
+            // The material's OWN multiplier, not a hard 1.0. glTF writes emissiveStrength from
+            // this, so a hard-coded 1.0 silently flattened every authored glow in the export the
+            // same way the missing colour flattened it in the viewport.
+            if (!emi.isNull()) {
+                em.emissive = emi; em.hasEmissive = true;
+                em.emisMult = MaterialDecode::materialScalar(d4, m, "emissive multiplier", 1.0f);
+                // The colour too, from the same helper the viewport uses. This path set NEITHER
+                // before, so a mount's glow exported with emissiveFactor [0,0,0] — the map present
+                // and multiplied to black. Three tabs had three different answers here.
+                const QColor ec = MaterialDecode::emissiveTint(d4, m, emi, em.baseColor);
+                em.emisR = float(ec.redF());
+                em.emisG = float(ec.greenF());
+                em.emisB = float(ec.blueF());
+            }
             // The third export path that was ignoring export/bakeDetail. exportMount and the Models
             // roster builder were both wired up when the bake became shared; this one — right-click
             // ▸ Export model on a stable item — builds its own materials and was missed, so the
@@ -2563,57 +2889,31 @@ void StableTab2::exportAppearanceModel(int sno, const QString& appr, bool toLast
     if (!path.endsWith(QStringLiteral(".glb"), Qt::CaseInsensitive)) path += QStringLiteral(".glb");
 
     // Animations per Settings ▸ Export (matches the count shown in the menu): all of the item's
-    // clips, or just the one playing in preview.
-    QVector<AnimParser::DecodedAnim> anims; QStringList animNames; int nAnim = 0;
-    if (QSettings().value(QStringLiteral("export/includeAnim"), false).toBool() && !geo.skeleton.isEmpty()) {
-        int carrier = 0; QString tok;
-        const bool pet = appr.toLower().startsWith(QLatin1String("cmp_")) || appr.toLower().contains(QLatin1String("companion"));
-        if (pet) { tok = appr.section(QLatin1Char('_'), 0, 1).toLower(); carrier = sno; }
-        else { tok = catOf(appr.toLower());
-               const QString want = QStringLiteral("mnt_base00_") + tok;
-               if (m_index) for (const SnoEntry& e : m_index->entries(kGroupAppearance))
-                   if (e.name.toLower() == want) { carrier = e.snoId; break; } }
-        if (carrier > 0 && !m_animCache.contains(carrier)) m_animCache.insert(carrier, discoverClips(carrier, tok));
-        QStringList want;
-        auto clipOf = [](const QString& r) { return r.section(QStringLiteral("  ·  "), 0, 0); };
-        // Mount/pet clips are discovered off the CARRIER actor, which is the animated rig itself —
-        // so `original`, `sets` and `base` name the same set here \u2014 any of them means "all its clips".
-        const AnimExportScope asc = AnimExportScope::load();
-        if (asc.original || asc.sets || asc.base) {
-            for (const QString& r : m_animCache.value(carrier)) want << clipOf(r);
-        } else {
-            QString c = appr.compare(m_slotName[SlotMount], Qt::CaseInsensitive) == 0 ? m_playingAnim : QString();
-            if (c.isEmpty())
-                for (const QString& r : m_animCache.value(carrier))
-                    if (clipOf(r).toLower().contains(QLatin1String("nav_idle"))) { c = clipOf(r); break; }
-            if (!c.isEmpty()) want << c;
-        }
-        QHash<quint32, AnimParser::RestTRS> rest;
-        for (const ModelJoint& j : geo.skeleton) { AnimParser::RestTRS t; t.q = j.restQ; t.t = j.restT; t.s = j.restS; rest.insert(j.nameHash, t); }
-        for (const QString& nm : want) {
-            QFile jf(d4 + QStringLiteral("/json/base/meta/Anim/") + nm + QStringLiteral(".ani.json"));
-            if (!jf.open(QIODevice::ReadOnly)) continue;
-            const QJsonObject root = QJsonDocument::fromJson(jf.readAll()).object();
-            const int animSno = root.value(QStringLiteral("__snoID__")).toInt();
-            const QJsonArray perms = root.value(QStringLiteral("ptPermutations")).toArray();
-            if (animSno <= 0 || perms.isEmpty()) continue;
-            const QJsonObject perm = perms.first().toObject();
-            const int offset = perm.value(QStringLiteral("ptPayloadData")).toObject().value(QStringLiteral("value")).toObject().value(QStringLiteral("dataOffset")).toInt();
-            const int frames = perm.value(QStringLiteral("nKeyframeCount")).toInt();
-            const int comp = perm.value(QStringLiteral("flCompression")).toInt();
-            const float fps = float(perm.value(QStringLiteral("flFrameRate")).toDouble(30.0));
-            if (frames <= 0) continue;
-            const QByteArray ap = m_reader->readPayloadBySno(quint64(animSno));
-            if (ap.isEmpty()) continue;
-            AnimParser::DecodedAnim a;
-            const bool okA = seh::runGuarded("stableExportAnim", [&]() { a = AnimParser::decode(ap, offset, frames, comp, fps, rest); });
-            if (okA && a.valid) { anims << a; animNames << nm; ++nAnim; }
-        }
+    // clips, or just the one playing in preview. Both the CHOOSING and the DECODING are shared with
+    // every other export path now. This site used to re-derive the carrier inline with no fallback,
+    // so a species that does not name its rig mnt_base00_<tok> exported zero clips while the panel
+    // beside it listed them.
+    QVector<AnimParser::DecodedAnim> anims; QStringList animNames;
+    if (QSettings().value(QStringLiteral("export/includeAnim"), false).toBool()) {
+        const bool pet = appr.toLower().startsWith(QLatin1String("cmp_"))
+                      || appr.toLower().contains(QLatin1String("companion"));
+        collectExportAnims(geo, exportClipNames(appr, sno, pet), anims, animNames);
     }
+    const int nAnim = anims.size();
 
     ModelExporter::Options opt = ModelExporter::optionsFromSettings();
+    // Hardpoint empties + bone naming + the re-index after any rename. All three were missing from
+    // every Stable export path: a mount exported with no HP_saddle/HP_trophy* sockets in Blender,
+    // and with raw bone_<hash> names unless "Blender friendly" happened to be on. Same block the
+    // Wardrobe uses, in the same order — readInto BEFORE retarget, resolveBoneIndices AFTER any
+    // rename, because a hardpoint stores a bone INDEX that a rename or reduction invalidates.
+    if (QSettings().value(QStringLiteral("export/hardpointEmpties"), false).toBool())
+        Hardpoints::readInto(geo, apprJsonPath(d4, appr));
     Retarget::applyFromSettings(geo);
     if (opt.blenderFriendly) GLModelWidget::blenderizeSkeletonNames(geo.skeleton);
+    else if (QSettings().value(QStringLiteral("export/boneNamesTranslated"), false).toBool())
+        GLModelWidget::translateSkeletonNames(geo.skeleton);
+    Hardpoints::resolveBoneIndices(geo);
     const bool wrote = ModelExporter::exportGlb(geo, path, mats, anims, animNames, opt);
     QSettings().setValue(QStringLiteral("stable2/exportDir"), QFileInfo(path).absolutePath());
 
@@ -2868,6 +3168,28 @@ QList<int> StableTab2::primitivesOf(QTreeWidgetItem* it) const
     return out;
 }
 
+// The parts-tree row for a merged primitive index, or null. Mirrors the Wardrobe's — it was a
+// lambda local to showPartContextMenu until the viewport's click-select needed the same lookup.
+void StableTab2::syncPartSelection()
+{
+    // selectedParts() walks the whole tree, so it is called ONCE and reused — it was being called
+    // twice here for the two consumers.
+    const QList<int> sel = selectedParts();
+    if (m_view) m_view->setHighlightParts(sel);
+    updateTexTiles(sel.isEmpty() ? -1 : sel.first());   // fill the TEXTURE PREVIEW tiles
+}
+
+QTreeWidgetItem* StableTab2::itemForPart(int part) const
+{
+    if (!m_partTree || part < 0) return nullptr;
+    for (int r = 0; r < m_partTree->topLevelItemCount(); ++r) {
+        QTreeWidgetItem* root = m_partTree->topLevelItem(r);
+        for (int c = 0; c < root->childCount(); ++c)
+            if (root->child(c)->data(0, Qt::UserRole).toInt() == part) return root->child(c);
+    }
+    return nullptr;
+}
+
 QList<int> StableTab2::selectedParts() const
 {
     QList<int> out;
@@ -2953,218 +3275,26 @@ bool StableTab2::eventFilter(QObject* obj, QEvent* ev)
     return BrowserTab::eventFilter(obj, ev);
 }
 
-#if 0   // ── Saved "Stables" loadouts removed (not needed for a browser) ────────────────────────
-static QStringList stableLookKeys()
-{
-    QStringList keys{ QStringLiteral("species"),
-                      QStringLiteral("mountSno"), QStringLiteral("bardingSno"), QStringLiteral("trophySno"),
-                      QStringLiteral("mountName"), QStringLiteral("bardingName"), QStringLiteral("trophyName"),
-                      QStringLiteral("mountType"), QStringLiteral("env") };
-    for (int i = 0; i < 3; ++i)
-        keys << QStringLiteral("look%1").arg(i) << QStringLiteral("disp%1").arg(i)
-             << QStringLiteral("desc%1").arg(i);
-    return keys;
-}
-
-void StableTab2::buildEnsemblePanel()
-{
-    m_ensemblePanel = new QWidget;
-    auto* v = new QVBoxLayout(m_ensemblePanel);
-    v->setContentsMargins(0, 0, 0, 0); v->setSpacing(4);
-
-    // Collapsible header (▾ / ▸) so the panel can be tucked away.
-    const bool shown = QSettings().value(QStringLiteral("stable2/showStables"), true).toBool();
-    auto* hdr = new QHBoxLayout();
-    auto* toggle = new QToolButton;
-    toggle->setAutoRaise(true);
-    toggle->setCheckable(true);
-    toggle->setChecked(shown);
-    toggle->setArrowType(shown ? Qt::DownArrow : Qt::RightArrow);
-    hdr->addWidget(toggle);
-    hdr->addWidget(new QLabel(QStringLiteral("STABLES")));
-    hdr->addStretch(1);
-    v->addLayout(hdr);
-
-    auto* body = new QWidget;
-    auto* bl = new QVBoxLayout(body);
-    bl->setContentsMargins(0, 0, 0, 0); bl->setSpacing(4);
-    m_ensembleList = new QListWidget;
-    m_ensembleList->setMaximumHeight(140);
-    m_ensembleList->setIconSize(QSize(140, 30));
-    m_ensembleList->setToolTip(QStringLiteral("Saved mount looks (mount + barding + trophy). Double-click to load."));
-    bl->addWidget(m_ensembleList);
-    auto* row = new QHBoxLayout();
-    auto* saveB = new QPushButton(QStringLiteral("Save"));
-    auto* overB = new QPushButton(QStringLiteral("Overwrite"));
-    auto* delB = new QPushButton(QStringLiteral("Delete"));
-    auto* renB = new QPushButton(QStringLiteral("Rename"));
-    for (QPushButton* b : { saveB, overB, delB, renB }) row->addWidget(b);
-    bl->addLayout(row);
-    v->addWidget(body);
-    body->setVisible(shown);
-    connect(toggle, &QToolButton::toggled, this, [body, toggle](bool on) {
-        body->setVisible(on);
-        toggle->setArrowType(on ? Qt::DownArrow : Qt::RightArrow);
-        QSettings().setValue(QStringLiteral("stable2/showStables"), on);
-    });
-
-    connect(m_ensembleList, &QListWidget::itemDoubleClicked, this, [this](QListWidgetItem* it) {
-        if (it) loadStable(it->data(Qt::UserRole).toString());
-    });
-    connect(saveB, &QPushButton::clicked, this, [this] {
-        bool ok = false;
-        const QString nm = QInputDialog::getText(this, QStringLiteral("Save stable"),
-                               QStringLiteral("Name:"), QLineEdit::Normal, QString(), &ok).trimmed();
-        if (ok && !nm.isEmpty()) saveStable(nm);
-    });
-    connect(overB, &QPushButton::clicked, this, [this] {
-        if (auto* it = m_ensembleList->currentItem()) saveStable(it->data(Qt::UserRole).toString());
-        else if (m_status) m_status->setText(QStringLiteral("Select a stable to overwrite."));
-    });
-    connect(delB, &QPushButton::clicked, this, [this] {
-        if (auto* it = m_ensembleList->currentItem()) deleteStable(it->data(Qt::UserRole).toString());
-    });
-    connect(renB, &QPushButton::clicked, this, [this] {
-        auto* it = m_ensembleList->currentItem();
-        if (!it) return;
-        const QString old = it->data(Qt::UserRole).toString();
-        bool ok = false;
-        const QString nm = QInputDialog::getText(this, QStringLiteral("Rename stable"),
-                               QStringLiteral("New name:"), QLineEdit::Normal, old, &ok).trimmed();
-        if (ok && !nm.isEmpty()) renameStable(old, nm);
-    });
-    refreshEnsembles();
-}
-
-QPixmap StableTab2::stableIconStrip(const QString& pfx) const
-{
-    QSettings s;
-    QVector<QImage> icons;
-    for (const QString& key : { QStringLiteral("mountSno"), QStringLiteral("bardingSno"), QStringLiteral("trophySno") }) {
-        const int sno = s.value(pfx + key).toInt();
-        if (sno <= 0) continue;
-        const QImage ic = slotIcon(sno);
-        if (!ic.isNull()) icons << ic;
-    }
-    if (icons.isEmpty()) return QPixmap();
-    const int isz = 28, pad = 2;
-    QImage strip(icons.size() * (isz + pad), isz, QImage::Format_RGBA8888);
-    strip.fill(Qt::transparent);
-    QPainter p(&strip);
-    for (int i = 0; i < icons.size(); ++i) p.drawImage(QRect(i * (isz + pad), 0, isz, isz), icons[i]);
-    p.end();
-    return QPixmap::fromImage(strip);
-}
-
-void StableTab2::refreshEnsembles()
-{
-    if (!m_ensembleList) return;
-    m_ensembleList->blockSignals(true);
-    m_ensembleList->clear();
-    for (const QString& name : QSettings().value(QStringLiteral("stable2/lookNames")).toStringList()) {
-        const QString pfx = QStringLiteral("stable2/looks/%1/").arg(name);
-        const QPixmap strip = stableIconStrip(pfx);
-        auto* it = strip.isNull() ? new QListWidgetItem(name, m_ensembleList)
-                                  : new QListWidgetItem(QIcon(strip), name, m_ensembleList);
-        it->setData(Qt::UserRole, name);
-        it->setToolTip(QStringLiteral("Double-click to load '%1'").arg(name));
-    }
-    m_ensembleList->blockSignals(false);
-}
-
-void StableTab2::saveStable(const QString& name)
-{
-    if (name.trimmed().isEmpty()) return;
-    QSettings s;
-    const QString pfx = QStringLiteral("stable2/looks/%1/").arg(name);
-    s.setValue(pfx + QStringLiteral("species"), m_species->currentData());
-    s.setValue(pfx + QStringLiteral("mountSno"), m_slotSel[SlotMount]);
-    s.setValue(pfx + QStringLiteral("bardingSno"), m_slotSel[SlotBarding]);
-    s.setValue(pfx + QStringLiteral("trophySno"), m_slotSel[SlotTrophy]);
-    s.setValue(pfx + QStringLiteral("mountName"), m_slotName[SlotMount]);
-    s.setValue(pfx + QStringLiteral("bardingName"), m_slotName[SlotBarding]);
-    s.setValue(pfx + QStringLiteral("trophyName"), m_slotName[SlotTrophy]);
-    for (int i = 0; i < SlotCount; ++i) {
-        s.setValue(pfx + QStringLiteral("look%1").arg(i), m_slotLook[i]);
-        s.setValue(pfx + QStringLiteral("disp%1").arg(i), m_slotDisp[i]);
-        s.setValue(pfx + QStringLiteral("desc%1").arg(i), m_slotDesc[i]);
-    }
-    s.setValue(pfx + QStringLiteral("mountType"), m_mountType);
-    s.setValue(pfx + QStringLiteral("env"), m_env->currentIndex());
-    QStringList names = s.value(QStringLiteral("stable2/lookNames")).toStringList();
-    if (!names.contains(name)) { names << name; names.sort(); s.setValue(QStringLiteral("stable2/lookNames"), names); }
-    refreshEnsembles();
-    if (m_status) m_status->setText(QStringLiteral("Saved stable '%1'").arg(name));
-}
-
-void StableTab2::loadStable(const QString& name)
-{
-    if (name.isEmpty()) return;
-    QSettings s;
-    const QString pfx = QStringLiteral("stable2/looks/%1/").arg(name);
-    if (!s.contains(pfx + QStringLiteral("mountSno"))) return;
-    const QString sp = s.value(pfx + QStringLiteral("species")).toString();
-    { QSignalBlocker b(m_species); const int i = m_species->findData(sp); if (i >= 0) m_species->setCurrentIndex(i); }
-    m_slotSel[SlotMount] = s.value(pfx + QStringLiteral("mountSno")).toInt();
-    m_slotSel[SlotBarding] = s.value(pfx + QStringLiteral("bardingSno")).toInt();
-    m_slotSel[SlotTrophy] = s.value(pfx + QStringLiteral("trophySno")).toInt();
-    m_slotName[SlotMount] = s.value(pfx + QStringLiteral("mountName")).toString();
-    m_slotName[SlotBarding] = s.value(pfx + QStringLiteral("bardingName")).toString();
-    m_slotName[SlotTrophy] = s.value(pfx + QStringLiteral("trophyName")).toString();
-    // Colour-look + type + display strings (default to 0/-1/empty for stables saved before
-    // these existed — stale values from the previous selection must never leak in).
-    for (int i = 0; i < SlotCount; ++i) {
-        m_slotLook[i] = s.value(pfx + QStringLiteral("look%1").arg(i), 0u).toUInt();
-        m_slotDisp[i] = s.value(pfx + QStringLiteral("disp%1").arg(i)).toString();
-        m_slotDesc[i] = s.value(pfx + QStringLiteral("desc%1").arg(i)).toString();
-    }
-    m_mountType = s.value(pfx + QStringLiteral("mountType"), -1).toInt();
-    { QSignalBlocker b(m_env); m_env->setCurrentIndex(s.value(pfx + QStringLiteral("env"), m_env->currentIndex()).toInt()); }
-    refreshSlotCells();
-    selectSlot(SlotMount);
-    rebuildMount();
-    if (m_status) m_status->setText(QStringLiteral("Loaded stable '%1'").arg(name));
-}
-
-void StableTab2::deleteStable(const QString& name)
-{
-    if (name.isEmpty()) return;
-    QSettings s;
-    s.remove(QStringLiteral("stable2/looks/%1").arg(name));
-    QStringList names = s.value(QStringLiteral("stable2/lookNames")).toStringList();
-    names.removeAll(name);
-    s.setValue(QStringLiteral("stable2/lookNames"), names);
-    refreshEnsembles();
-    if (m_status) m_status->setText(QStringLiteral("Deleted stable '%1'").arg(name));
-}
-
-void StableTab2::renameStable(const QString& oldName, const QString& newName)
-{
-    const QString nn = newName.trimmed();
-    if (oldName.isEmpty() || nn.isEmpty() || oldName == nn) return;
-    QSettings s;
-    const QString op = QStringLiteral("stable2/looks/%1/").arg(oldName);
-    const QString np = QStringLiteral("stable2/looks/%1/").arg(nn);
-    for (const QString& k : stableLookKeys()) s.setValue(np + k, s.value(op + k));
-    s.remove(QStringLiteral("stable2/looks/%1").arg(oldName));
-    QStringList names = s.value(QStringLiteral("stable2/lookNames")).toStringList();
-    names.removeAll(oldName);
-    if (!names.contains(nn)) names << nn;
-    names.sort();
-    s.setValue(QStringLiteral("stable2/lookNames"), names);
-    refreshEnsembles();
-}
-#endif   // Saved "Stables" loadouts removed
+// (Saved "Stables" loadouts were removed here — a browser does not need saved loadouts.
+//  The disabled implementation lived in this file until it was deleted; recover it from
+//  git history rather than rewriting it if the Stable tab ever wants ensembles again.)
 
 // ── Animations ──────────────────────────────────────────────────────────────────
 void StableTab2::buildAnimPanel()
 {
     m_animPanel = new QWidget;
+    // PanelBox reads the CONTENT's own vertical policy to decide whether to let it fill the panel
+    // or wrap it in a scroll area under a trailing stretch. A bare QWidget is Preferred, and a
+    // widget does not inherit Expanding from its children — without this the clip list would stop
+    // growing partway down a dragged panel and scroll inside a scroll area. WardrobeTab2 sets the
+    // same policy on its equivalent for the same reason.
+    m_animPanel->setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Expanding);
     auto* v = new QVBoxLayout(m_animPanel);
     v->setContentsMargins(0, 0, 0, 0); v->setSpacing(3);
-    v->addWidget(new QLabel(QStringLiteral("ANIMATIONS")));
+    // No title label: the PanelBox header supplies "ANIMATIONS" once this is in the sidebar.
 
-    m_timeline = new QWidget(m_animPanel);
+    // Parentless — the caller adds it under the viewport, not into this panel.
+    m_timeline = new QWidget;
     auto* tl = new QHBoxLayout(m_timeline);
     tl->setContentsMargins(0, 0, 0, 0); tl->setSpacing(4);
     m_playBtn = new QPushButton(QStringLiteral("Play"));
@@ -3175,7 +3305,6 @@ void StableTab2::buildAnimPanel()
     m_loopCheck = new QCheckBox(QStringLiteral("Loop"));
     m_loopCheck->setChecked(true);
     tl->addWidget(m_playBtn); tl->addWidget(m_animSlider, 1); tl->addWidget(m_speedCombo); tl->addWidget(m_loopCheck);
-    v->addWidget(m_timeline);
     m_timeline->setVisible(false);
 
     m_animSearch = new QLineEdit;
@@ -3183,8 +3312,14 @@ void StableTab2::buildAnimPanel()
     m_animSearch->setClearButtonEnabled(true);
     v->addWidget(m_animSearch);
     m_anims = new QListWidget;
+    // Extended selection, as in the Models and Wardrobe animation panels. Left at the default
+    // SingleSelection this list could never hand the animation-library export more than one clip,
+    // and fillAnimList's setCurrentItem always leaves exactly one row selected — so the export
+    // would have silently shipped the playing clip and called it a library.
+    m_anims->setSelectionMode(QAbstractItemView::ExtendedSelection);
+    // Minimum only. A MAXIMUM height on PanelBox content is the one thing its header tells you
+    // never to do: inside a splitter it turns extra dragged height into dead space.
     m_anims->setMinimumHeight(220);
-    m_anims->setMaximumHeight(420);
     v->addWidget(m_anims, 1);
     // Play + Copy file name, then the shared Copy/Copy all. This list could only be played by
     // LEFT-clicking a row (:3142) while its context menu offered copy alone — the Models and
@@ -3214,11 +3349,14 @@ void StableTab2::buildAnimPanel()
         menu.exec(m_anims->viewport()->mapToGlobal(p));
     });
 
-    auto* resetBtn = new QPushButton(QStringLiteral("Reset to default"));
-    resetBtn->setToolTip(QStringLiteral("Reset to the base horse mount with no armor or trophy, "
-                                        "playing the default idle (1× speed, looping)."));
-    v->addWidget(resetBtn);
-    connect(resetBtn, &QPushButton::clicked, this, [this] { resetAnimToDefault(); });
+    // NOT an animation control despite living next to them: it resets the whole mount selection
+    // (base horse, no barding, no trophy) and only then the clip. It stays in the always-visible
+    // left picker column — the caller adds it — because the ANIMATIONS panel can now be toggled
+    // off, and this is the only way back to a known-good mount.
+    m_resetBtn = new QPushButton(QStringLiteral("Reset to default"));
+    m_resetBtn->setToolTip(QStringLiteral("Reset to the base horse mount with no armor or trophy, "
+                                          "playing the default idle (1× speed, looping)."));
+    connect(m_resetBtn, &QPushButton::clicked, this, [this] { resetAnimToDefault(); });
 
     m_animTimer = new QTimer(this);
     connect(m_animTimer, &QTimer::timeout, this, &StableTab2::tickAnimation);
@@ -3235,75 +3373,580 @@ void StableTab2::buildAnimPanel()
     connect(m_animSearch, &QLineEdit::textChanged, this, [this] { fillAnimList(); });
 }
 
-// The appearance SNO that owns the clips. For a mount that is ALWAYS the species base
-// mount mnt_base00_<species> — every horse skin plays the horse base's animation set — so
-// a specific skin (mnt_base00_horse26) still sources its clips from mnt_base00_horse. For a
-// pet, the pet's own appearance owns its clips.
-int StableTab2::animCarrierSno() const
+// Species token used to narrow the Anim/ scan: a pet's own name prefix, else the mount's species
+// (the authoritative eMountType token when the caller has one, otherwise the name's trailing token).
+QString StableTab2::animTokenFor(const QString& appr, bool pet, const QString& catHint)
 {
-    if (petMode()) return m_slotSel[SlotMount];
-    if (!m_index) return m_slotSel[SlotMount];
-    const QString cat = mountCategory();
-    if (cat.isEmpty()) return m_slotSel[SlotMount];
-    const QString want = QStringLiteral("mnt_base00_") + cat;
-    int anyBase = 0;
-    for (const SnoEntry& e : m_index->entries(kGroupAppearance)) {
-        const QString lower = e.name.toLower();
-        if (lower == want) return e.snoId;                                   // base00 (preferred)
-        if (!anyBase && lower.startsWith(QLatin1String("mnt_base")) && catOf(lower) == cat)
-            anyBase = e.snoId;                                               // fallback: any base of the species
-    }
-    return anyBase ? anyBase : m_slotSel[SlotMount];
+    if (!pet) return catHint.isEmpty() ? catOf(appr.toLower()) : catHint;
+
+    // A pet's token is its SPECIES — the LAST segment of cmp_<variant>_<species>, not the first
+    // two. Measured against CoreTOC (48 companion appearances, 45,681 clips): the game names pet
+    // clips two ways, and the old first-two-segments token could only ever see one of them.
+    //
+    //   stem-named     cmp_stor100_murloc_idle      belongs to that one appearance   (28 of 48)
+    //   species-named  CMP_dogLarge_nav_idle        shared by every dogLarge variant (the rest)
+    //
+    // The species-named family carries no variant at all, so `cmp_stor105` matched none of it and
+    // the filename filter in clipBuckets threw every one of those clips away before ownership was
+    // ever consulted. 13 of 48 pets could not see a single one of their clips; 15 saw only some.
+    // The species token sees 100% of both families for all 48, with nothing extra.
+    const QString lower = appr.toLower();
+    // catOf, as the mount side uses, so a future cmp_base000_dogLarge2 still resolves to
+    // "doglarge" instead of missing the whole CMP_dogLarge_* family — which is this very bug,
+    // reintroduced by variant numbering. isSpeciesTok is the existing test for "is this a real
+    // species token, not a structural segment"; it rejects base/amor/armor/trophy/mnt and anything
+    // under three characters or starting with a digit. Falling back to the WHOLE name is safe: it
+    // is long and specific, so clipBuckets' filter collapses to mnt/mount only and finds nothing
+    // rather than everything.
+    const QString last = catOf(lower);
+    return isSpeciesTok(last) ? last : lower;
 }
 
-void StableTab2::populateAnims()
+// Scan Anim/*.ani.json once (narrowed by the species/mount token) and bucket every clip under the
+// appearance that OWNS it. Rows are "<name>  ·  <frames> frames", sorted within each bucket.
+//
+// Bucketing FIRST and choosing the carrier after is the whole point. The previous code asked
+// "which clips belong to mnt_base00_<species>", which silently returns nothing for a species that
+// does not use that name — Basilisks own their clips through mnt_stor001_chimera and there is no
+// mnt_base00_chimera in the data at all. A scan that answers "who owns clips here" cannot fail
+// that way, and costs one directory walk per token instead of one per carrier guess.
+// Does this clip row NAME the token as a whole segment? A bare substring test is unsafe here and
+// the reason is structural: clipBuckets admits any file carrying "mnt"/"mount" regardless of token,
+// so the bucket set for EVERY token — every pet species included — already holds the entire mount
+// corpus. Species tokens are short, so unanchored matching hands "deer" every reindeer clip, "fox"
+// every foxglove, "bird" every blackbird. Segment boundaries are '_' or the ends of the name.
+bool rowNamesToken(const QString& row, const QString& tok)
 {
-    if (!m_anims) return;
-    const int carrier = animCarrierSno();
-    if (carrier <= 0 || m_lastGeo.skeleton.isEmpty()) {
-        m_anims->clear();
-        if (m_animPanel) m_animPanel->setVisible(false);
-        return;
+    if (tok.isEmpty()) return false;
+    const QString name = row.section(QStringLiteral("  ·  "), 0, 0).toLower();
+    for (int from = 0;;) {
+        const int i = name.indexOf(tok, from);
+        if (i < 0) return false;
+        const int end = i + tok.size();
+        const bool leftOk  = (i == 0)            || name.at(i - 1) == QLatin1Char('_');
+        const bool rightOk = (end == name.size()) || name.at(end)  == QLatin1Char('_');
+        if (leftOk && rightOk) return true;
+        from = i + 1;
     }
-    if (m_animPanel) m_animPanel->setVisible(QSettings().value(QStringLiteral("stable2/showAnims"), true).toBool());
-
-    if (!m_animCache.contains(carrier)) {
-        const QString tok = petMode() ? m_slotName[SlotMount].section(QLatin1Char('_'), 0, 1).toLower()
-                                      : mountCategory();
-        m_animCache.insert(carrier, discoverClips(carrier, tok));
-    }
-    fillAnimList();
 }
 
-// Scan Anim/*.ani.json (narrowed by the species/mount token) for the clips owned by `carrier`.
-// Returns "<name>  ·  <frames> frames" rows, sorted. Shared by populateAnims + exportMenuSuffix.
-QStringList StableTab2::discoverClips(int carrier, const QString& tok)
+// Signature for the clip cache: the d4data build stamp plus the Anim directory's own mtime.
+// Deliberately NOT a file count — counting IS the expensive operation this cache exists to avoid,
+// so a count-based signature would pay the very cost it removes. Both inputs are one stat, and both
+// move when the snapshot updates (git rewrites the tree).
+QString StableTab2::animCacheSig()
 {
-    QStringList rows;
-    if (carrier <= 0) return rows;
+    const QString d4 = Config::d4dataDir();
+    const QString bvPath = d4 + QStringLiteral("/buildVersion.txt");
+    QString bv;
+    QFile bf(bvPath);
+    if (bf.open(QIODevice::ReadOnly | QIODevice::Text)) bv = QString::fromUtf8(bf.readAll()).trimmed();
+    // buildVersion.txt's MTIME as well as its contents: a directory's mtime moves when entries are
+    // added, removed or renamed, but NOT when an existing .ani.json is rewritten in place. A
+    // re-dump that truncates in place and leaves the stamp alone would otherwise be invisible, and
+    // nothing else deletes this cache (MainWindow's fingerprint sweep covers stable_index_v*.bin
+    // and tex_info_v*.bin only), so the signature is the only defence. One extra stat.
+    return QStringLiteral("%1|%2|%3").arg(bv)
+               .arg(QFileInfo(d4 + QStringLiteral("/json/base/meta/Anim")).lastModified().toMSecsSinceEpoch())
+               .arg(QFileInfo(bvPath).lastModified().toMSecsSinceEpoch());
+}
+
+// Fill m_clipTok from disk, once per session. The scan this replaces walks 45,549 files, and it ran
+// once per SPECIES TOKEN rather than once per session — browsing a horse, a cat, a Basilisk and two
+// pets was five full walks on the GUI thread, each a hard freeze, repeated every launch. Rows are
+// short strings, so every token together is a couple of hundred KB.
+void StableTab2::loadClipCache()
+{
+    if (m_clipDiskLoaded) return;
+    m_clipDiskLoaded = true;
+    QFile cf(AppPaths::file(QStringLiteral("stable_anims_v2.json")));
+    if (!cf.open(QIODevice::ReadOnly)) return;
+    const QJsonObject root = QJsonDocument::fromJson(cf.readAll()).object();
+    if (root.value(QStringLiteral("sig")).toString() != animCacheSig()) return;
+    const QJsonObject toks = root.value(QStringLiteral("tokens")).toObject();
+    for (auto t = toks.constBegin(); t != toks.constEnd(); ++t) {
+        QHash<int, QStringList> buckets;
+        const QJsonObject owners = t.value().toObject();
+        for (auto o = owners.constBegin(); o != owners.constEnd(); ++o) {
+            const int sno = o.key().toInt();
+            if (sno <= 0) continue;               // a key that is not a sno is a corrupt file
+            QStringList rows;
+            for (const QJsonValue& v : o.value().toArray()) rows << v.toString();
+            if (!rows.isEmpty()) buckets.insert(sno, rows);
+        }
+        if (!buckets.isEmpty()) m_clipTok.insert(t.key(), buckets);
+    }
+    if (!m_clipTok.isEmpty())
+        qInfo("stable anims: %d token(s) from disk cache — Anim folder not scanned",
+              int(m_clipTok.size()));
+}
+
+// Written after each newly scanned token rather than at shutdown: the whole point is that a crash
+// or a kill mid-session must not cost the walk again, and the file is small enough that rewriting
+// it a handful of times per session is free.
+void StableTab2::saveClipCache()
+{
+    QJsonObject toks;
+    for (auto t = m_clipTok.constBegin(); t != m_clipTok.constEnd(); ++t) {
+        QJsonObject owners;
+        for (auto o = t.value().constBegin(); o != t.value().constEnd(); ++o) {
+            QJsonArray rows;
+            for (const QString& r : o.value()) rows.append(r);
+            owners.insert(QString::number(o.key()), rows);
+        }
+        toks.insert(t.key(), owners);
+    }
+    QJsonObject root;
+    root.insert(QStringLiteral("sig"), animCacheSig());
+    root.insert(QStringLiteral("tokens"), toks);
+    // Temp + rename, and mkpath first — the same standard stable_index_v6.bin now holds. Writing
+    // in place would destroy the previous good cache on a crash mid-write (a torn file always
+    // fails the signature check, so it is never mis-loaded — but it is needlessly lost), and
+    // AppPaths::file() does not create the directory.
+    const QString path = AppPaths::file(QStringLiteral("stable_anims_v2.json"));
+    QDir().mkpath(AppPaths::dataDir());
+    const QString tmp = path + QStringLiteral(".tmp");
+    QFile wf(tmp);
+    if (!wf.open(QIODevice::WriteOnly | QIODevice::Truncate)) return;
+    const QByteArray blob = QJsonDocument(root).toJson(QJsonDocument::Compact);
+    const bool ok = wf.write(blob) == blob.size();
+    wf.close();
+    if (ok) { QFile::remove(path); QFile::rename(tmp, path); }
+    else    { QFile::remove(tmp); }
+}
+
+const QHash<int, QStringList>& StableTab2::clipBuckets(const QString& tok)
+{
+    // No token means the species is unknown. Fail closed rather than walking the whole Anim tree
+    // for a filter that cannot narrow anything: an unknown family must expand NOTHING.
+    static const QHash<int, QStringList> kNone;
+    if (tok.isEmpty()) return kNone;
+    loadClipCache();   // once per session; the lookup below then usually hits
+    const auto cached = m_clipTok.constFind(tok);
+    if (cached != m_clipTok.constEnd()) return cached.value();
+
+    QHash<int, QStringList> buckets;
     const QString d4 = Config::d4dataDir();
     static const QRegularExpression rxApp(
         QStringLiteral("\"snoAppearance\":\\s*\\{[^{}]*?\"__raw__\":\\s*(\\d+)"));
     static const QRegularExpression rxFrames(QStringLiteral("\"nKeyframeCount\":\\s*(\\d+)"));
-    QDirIterator it(d4 + QStringLiteral("/json/base/meta/Anim"),
+    QDirIterator di(d4 + QStringLiteral("/json/base/meta/Anim"),
                     QStringList{ QStringLiteral("*.ani.json") }, QDir::Files);
-    while (it.hasNext()) {
-        const QString fp = it.next();
-        const QString base = it.fileName();
+    while (di.hasNext()) {
+        const QString fp = di.next();
+        const QString base = di.fileName();
         const QString low = base.toLower();
+        // tok is never empty here — clipBuckets returns kNone for an empty token before this loop.
         if (!(low.contains(QLatin1String("mnt")) || low.contains(QLatin1String("mount"))
-              || (!tok.isEmpty() && low.contains(tok)))) continue;
+              || low.contains(tok))) continue;
         QFile jf(fp);
         if (!jf.open(QIODevice::ReadOnly)) continue;
         const QString raw = QString::fromUtf8(jf.readAll());
         const auto m = rxApp.match(raw);
-        if (!m.hasMatch() || m.captured(1).toInt() != carrier) continue;
+        if (!m.hasMatch()) continue;
+        const int owner = m.captured(1).toInt();
+        if (owner <= 0) continue;
         const QString nm = base.left(base.size() - 9);   // strip ".ani.json"
         const auto fm = rxFrames.match(raw);
-        rows << (fm.hasMatch() ? QStringLiteral("%1  ·  %2 frames").arg(nm, fm.captured(1)) : nm);
+        // operator[] inserting a default is intended here — a first clip creates its owner's bucket.
+        buckets[owner] << (fm.hasMatch()
+                               ? QStringLiteral("%1  ·  %2 frames").arg(nm, fm.captured(1)) : nm);
     }
-    rows.sort();
-    return rows;
+    for (auto b = buckets.begin(); b != buckets.end(); ++b) b.value().sort();
+    const QHash<int, QStringList>& out = *m_clipTok.insert(tok, buckets);
+    saveClipCache();   // reads m_clipTok only — never inserts, so `out` stays valid
+    return out;
+}
+
+// The appearance SNO that owns this item's clips — resolved in stages for both families. For a mount it is the
+// species' clip-owning base, chosen by MEASUREMENT rather than by name: the conventional
+// mnt_base00_<species> wins when it actually owns clips, then any mnt_base* of that species, and
+// failing both, whichever appearance of the species owns the most clips. A name that owns nothing
+// is not a carrier however it is spelled, which is what makes this survive the next species.
+int StableTab2::animCarrierFor(const QString& appr, int apprSno, bool pet, const QString& catHint)
+{
+    const QString tok = animTokenFor(appr, pet, catHint);
+    // Both guards come BEFORE clipBuckets(): that call walks ~45k Anim files, and with no index
+    // every branch below is unreachable, so the old pure-lookup early-outs have to stay early.
+    if (tok.isEmpty() || !m_index) return apprSno;
+    const QHash<int, QStringList>& buckets = clipBuckets(tok);
+    if (buckets.isEmpty()) return apprSno;
+
+    // ── Stage 1: the family's conventional owner, IF it actually owns clips ──────────────────────
+    // The two families differ here, and not arbitrarily — it is what the shipped data does.
+    //
+    //   PETS   author clips per APPEARANCE (cmp_stor100_murloc_idle), so the pet's own appearance
+    //          is the right first answer: 28 of 48 companions ship a full set named after their
+    //          own stem.
+    //   MOUNTS do the opposite. Every horse skin plays the base rig's clips, and what a skin owns
+    //          in its OWN name is a handful of FX extras — mnt_stor052_horse_wings_flap,
+    //          mnt_amor124_cat_stor_wings_idle. Preferring "its own" for a mount would hand the
+    //          user one wing-flap in place of thirty gaits, so the base rig is asked first.
+    if (pet) {
+        if (!buckets.value(apprSno).isEmpty()) return apprSno;
+    } else {
+        int exact = 0, anyBase = 0;
+        const QString want = QStringLiteral("mnt_base00_") + tok;
+        for (const SnoEntry& e : m_index->entries(kGroupAppearance)) {
+            const QString lower = e.name.toLower();
+            if (lower == want) { exact = e.snoId; if (anyBase) break; continue; }
+            if (!anyBase && lower.startsWith(QLatin1String("mnt_base")) && catOf(lower) == tok) {
+                anyBase = e.snoId;
+                if (exact) break;
+            }
+        }
+        if (exact   > 0 && !buckets.value(exact).isEmpty())   return exact;     // the convention, verified
+        if (anyBase > 0 && !buckets.value(anyBase).isEmpty()) return anyBase;   // any base of the species
+    }
+
+    // ── Stage 2: the family's base rig for a pet whose own appearance owns nothing ───────────────
+    if (pet) {
+        for (const SnoEntry& e : m_index->entries(kGroupAppearance)) {
+            const QString lower = e.name.toLower();
+            if (!lower.startsWith(QLatin1String("cmp_base"))) continue;
+            if (catOf(lower) != tok) continue;   // same derivation animTokenFor uses
+            if (!buckets.value(e.snoId).isEmpty()) return e.snoId;
+        }
+    }
+
+    // ── Stage 3: measured — the appearance whose clips are MOSTLY about this species ─────────────
+    // The owner's own name is deliberately not consulted: nameForSno returns an EMPTY string for a
+    // record whose name is encrypted, so a name test silently skips exactly the owners that are
+    // hardest to reach any other way. The clips themselves say who they belong to.
+    //
+    // Two gates, because "owns the most clips mentioning the token" on its own is far too weak.
+    // The bucket set holds the whole mount corpus (see rowNamesToken), so without them a pet whose
+    // species genuinely owns nothing gets handed some NPC or merc rig, and a populated-but-wrong
+    // list is worse than an empty one: it decodes into the .glb as silently wrong animation, where
+    // an empty one shows the list's honest "(no clips)" row. Fail closed, as everywhere else here.
+    //
+    //   · the token must appear as a whole SEGMENT of the clip name, not as a substring
+    //   · those clips must be the MAJORITY of what that owner owns — a rig with 400 clips of which
+    //     12 mention your species is not your carrier; one with 20 of which 20 do, is
+    int best = 0, bestN = 0, bestTotal = 0;
+    for (auto b = buckets.constBegin(); b != buckets.constEnd(); ++b) {
+        const int total = int(b.value().size());
+        int n = 0;
+        for (const QString& row : b.value())
+            if (rowNamesToken(row, tok)) ++n;
+        if (n == 0 || n * 2 < total) continue;          // not predominantly this species
+        // Deterministic tiebreak. QHash iteration order is randomised per process, so first-seen
+        // wins would make the carrier — and therefore the exported clip set — differ between
+        // launches of the same build on the same data.
+        if (n > bestN || (n == bestN && (total > bestTotal
+                                         || (total == bestTotal && b.key() < best)))) {
+            best = b.key(); bestN = n; bestTotal = total;
+        }
+    }
+    return best > 0 ? best : apprSno;
+}
+
+int StableTab2::animCarrierSno()
+{
+    const int sno = m_slotSel[SlotMount];
+    if (sno <= 0) return sno;
+    const bool pet = petMode();
+    return animCarrierFor(m_slotName[SlotMount], sno, pet, pet ? QString() : mountCategory());
+}
+
+// Clip rows for the live selection — the ONE row source. Preview list, auto-play, the export menu
+// count and the export itself all ask this, so the set the user is looking at is the set that ships.
+QStringList StableTab2::currentClipRows()
+{
+    const int sno = m_slotSel[SlotMount];
+    // No rig means no clip can play, and resolving a carrier walks ~45k Anim files — so the guard
+    // belongs HERE, at the one place every consumer goes through, not in each caller.
+    if (sno <= 0 || m_lastGeo.skeleton.isEmpty()) return QStringList();
+    const bool pet = petMode();
+    const QString tok = animTokenFor(m_slotName[SlotMount], pet, pet ? QString() : mountCategory());
+    // Resolve FIRST, then take the bucket reference. animCarrierSno() calls clipBuckets() itself,
+    // and an insert there can rehash m_clipTok — a reference taken before it would dangle.
+    const int carrier = animCarrierSno();
+    if (!m_index) return QStringList();   // as in animCarrierFor: no index, no scan
+    return clipBuckets(tok).value(carrier);
+}
+
+// The species hint to resolve `appr` with: the authoritative eMountType token when `appr` is the
+// mount currently selected (the panel's own answer), empty otherwise so it falls back to the name.
+QString StableTab2::hintForAppr(const QString& appr, bool pet) const
+{
+    // petMode() as well as the caller's flag: the two are derived differently (item scan vs name
+    // heuristic) and can disagree, and mountCategory() answers "pet" for a companion — feeding
+    // that to the mount path would send it hunting for mnt_base00_pet.
+    if (pet || petMode() || appr.isEmpty()) return QString();
+    return appr.compare(m_slotName[SlotMount], Qt::CaseInsensitive) == 0 ? mountCategory() : QString();
+}
+
+// The clips an export should carry for `appr`, per Settings ▸ Export scope. Mount and pet clips are
+// discovered off the CARRIER, which IS the animated rig, so `original`, `sets` and `base` all name
+// the same set here — any of them means "every clip this rig owns". Otherwise it is the clip
+// playing in preview, falling back to the rig's nav-idle.
+QStringList StableTab2::exportClipNames(const QString& appr, int apprSno, bool pet)
+{
+    // When `appr` IS the live selection, use the same authoritative eMountType hint the ANIMATIONS
+    // panel uses. mountCategory() and catOf(name) can disagree, and resolving the export against a
+    // different token than the panel reintroduces the exact "panel lists N, export writes 0" split
+    // this whole change exists to remove.
+    const QString hint = hintForAppr(appr, pet);
+    const QString tok = animTokenFor(appr, pet, hint);
+    const int carrier = animCarrierFor(appr, apprSno, pet, hint);
+    if (carrier <= 0 || !m_index) return QStringList();   // as in animCarrierFor: no index, no scan
+    const QStringList rows = clipBuckets(tok).value(carrier);
+    auto clipOf = [](const QString& r) { return r.section(QStringLiteral("  ·  "), 0, 0); };
+    QStringList want;
+    const AnimExportScope asc = AnimExportScope::load();
+    if (asc.original || asc.sets || asc.base) {
+        for (const QString& r : rows) want << clipOf(r);
+        return want;
+    }
+    QString c = appr.compare(m_slotName[SlotMount], Qt::CaseInsensitive) == 0 ? m_playingAnim : QString();
+    if (c.isEmpty())
+        for (const QString& r : rows)
+            if (clipOf(r).toLower().contains(QLatin1String("nav_idle"))) { c = clipOf(r); break; }
+    if (!c.isEmpty()) want << c;
+    return want;
+}
+
+// Decode named clips against `geo`'s rest pose. The ONE decoder every Stable export path uses, so
+// every path ships the same set for the same settings. Unreadable, empty-payload and zero-frame
+// clips are skipped, so the menu's count is an UPPER BOUND on what lands in the file, not a
+// promise. Each decode stays inside an SEH guard because a malformed payload faults rather than
+// returning an error.
+void StableTab2::collectExportAnims(const ModelGeometry& geo, const QStringList& clipNames,
+                                    QVector<AnimParser::DecodedAnim>& anims, QStringList& names)
+{
+    if (geo.skeleton.isEmpty() || clipNames.isEmpty() || !m_reader) return;
+    const QString d4 = Config::d4dataDir();
+    QHash<quint32, AnimParser::RestTRS> rest;
+    for (const ModelJoint& j : geo.skeleton) {
+        AnimParser::RestTRS t; t.q = j.restQ; t.t = j.restT; t.s = j.restS;
+        rest.insert(j.nameHash, t);
+    }
+    for (const QString& nm : clipNames) {
+        QFile jf(d4 + QStringLiteral("/json/base/meta/Anim/") + nm + QStringLiteral(".ani.json"));
+        if (!jf.open(QIODevice::ReadOnly)) continue;
+        const QJsonObject root = QJsonDocument::fromJson(jf.readAll()).object();
+        const int animSno = root.value(QStringLiteral("__snoID__")).toInt();
+        const QJsonArray perms = root.value(QStringLiteral("ptPermutations")).toArray();
+        if (animSno <= 0 || perms.isEmpty()) continue;
+        const QJsonObject perm = perms.first().toObject();
+        const int offset = perm.value(QStringLiteral("ptPayloadData")).toObject()
+                               .value(QStringLiteral("value")).toObject()
+                               .value(QStringLiteral("dataOffset")).toInt();
+        const int frames = perm.value(QStringLiteral("nKeyframeCount")).toInt();
+        const int comp = perm.value(QStringLiteral("flCompression")).toInt();
+        const float fps = float(perm.value(QStringLiteral("flFrameRate")).toDouble(30.0));
+        if (frames <= 0) continue;
+        const QByteArray ap = m_reader->readPayloadBySno(quint64(animSno));
+        if (ap.isEmpty()) continue;
+        AnimParser::DecodedAnim a;
+        const bool okA = seh::runGuarded("stableExportAnim",
+                                         [&]() { a = AnimParser::decode(ap, offset, frames, comp, fps, rest); });
+        if (okA && a.valid) { anims << a; names << nm; }
+    }
+}
+
+// Export-menu hook: the anim-library export is offered as the menu's contextual "anim export"
+// action, enabled once a mount is assembled.
+bool StableTab2::hasAnimExport() const { return hasExportSelection() && !m_lastGeo.skeleton.isEmpty(); }
+
+// Says which clip set the action will write, so the menu cannot promise a "library" and deliver
+// one clip. Reports the SELECTION when there is a real one, else names the configured scope —
+// which is exactly what exportAnimLibrary will use. Deliberately performs no Anim/ scan; it is not
+// otherwise side-effect free, since AnimExportScope::load() may run its one-shot settings
+// migration, and this is called every time the Export menu opens.
+QString StableTab2::animExportLabel() const
+{
+    const int n = m_anims ? int(m_anims->selectedItems().size()) : 0;
+    if (n > 1)
+        return QStringLiteral("Export animation library (%1 selected clips, .glb)…").arg(n);
+    const AnimExportScope asc = AnimExportScope::load();
+    return (asc.original || asc.sets || asc.base)
+               ? QStringLiteral("Export animation library (all clips, .glb)…")
+               : QStringLiteral("Export animation library (playing clip, .glb)…");
+}
+void StableTab2::exportAnimations()    { exportAnimLibrary(); }
+
+// Export the RIG + clips only (no mesh) — a clip library to append onto an already-imported mount
+// in Blender. The clip set is whatever the ANIMATIONS list has selected; with no selection it falls
+// back to the Settings ▸ Export scope, so the action does something sensible either way.
+void StableTab2::exportAnimLibrary()
+{
+    if (m_lastGeo.skeleton.isEmpty()) {
+        QMessageBox::information(this, QStringLiteral("Animation library"),
+            QStringLiteral("Assemble a mount first (the rig comes from the equipped mount)."));
+        return;
+    }
+    // Only an explicit MULTI-selection overrides the Settings ▸ Export scope. fillAnimList always
+    // leaves the playing row selected, so treating one selected row as a deliberate choice would
+    // make this export ship a single clip and call it a library — the fallback below would never
+    // run at all.
+    QStringList want;
+    if (m_anims && m_anims->selectedItems().size() > 1)
+        for (QListWidgetItem* it : m_anims->selectedItems()) {
+            // The "(no clips found)" placeholder carries no UserRole.
+            const QString nm = it->data(Qt::UserRole).toString();
+            if (!nm.isEmpty()) want << nm;
+        }
+    if (want.isEmpty())
+        want = exportClipNames(m_slotName[SlotMount], m_slotSel[SlotMount], petMode());
+
+    QVector<AnimParser::DecodedAnim> anims; QStringList names;
+    collectExportAnims(m_lastGeo, want, anims, names);
+    if (anims.isEmpty()) {
+        QMessageBox::information(this, QStringLiteral("Animation library"),
+            QStringLiteral("No animations to export. Ctrl-select TWO or more clips in the "
+                           "ANIMATIONS list to choose exactly those, or play one and let the "
+                           "Settings ▸ Export scope decide."));
+        return;
+    }
+
+    QString base = m_slotName[SlotMount];
+    if (base.isEmpty()) base = QStringLiteral("mount");
+    const QString dir = QSettings().value(QStringLiteral("stable2/exportDir"), QDir::homePath()).toString();
+    QString path = QFileDialog::getSaveFileName(this, QStringLiteral("Export animation library"),
+                       dir + QStringLiteral("/") + base + QStringLiteral("_anims.glb"),
+                       QStringLiteral("glTF Binary (*.glb)"));
+    if (path.isEmpty()) return;
+    if (!path.endsWith(QStringLiteral(".glb"), Qt::CaseInsensitive)) path += QStringLiteral(".glb");
+
+    ModelGeometry geo;                    // rig only — no primitives
+    geo.valid = true;
+    geo.skeleton = m_lastGeo.skeleton;
+    geo.nBaseBones = m_lastGeo.nBaseBones;
+    const ModelExporter::Options opt = ModelExporter::optionsFromSettings();
+    if (QSettings().value(QStringLiteral("export/hardpointEmpties"), false).toBool())
+        Hardpoints::readInto(geo, apprJsonPath(Config::d4dataDir(), m_slotName[SlotMount]));
+    // No retarget on a clip library: remapping or collapsing bones would drop the very bones the
+    // clips drive, which is the one thing this export exists to preserve. Renaming is still fine —
+    // it does not change the bone SET — and the re-index after it is what keeps the hardpoint
+    // empties pointing at the right bones.
+    if (opt.blenderFriendly) GLModelWidget::blenderizeSkeletonNames(geo.skeleton);
+    else if (QSettings().value(QStringLiteral("export/boneNamesTranslated"), false).toBool())
+        GLModelWidget::translateSkeletonNames(geo.skeleton);
+    Hardpoints::resolveBoneIndices(geo);
+    const bool ok = ModelExporter::exportGlb(geo, path, {}, anims, names, opt);
+    const QString folder = QFileInfo(path).absolutePath();
+    QSettings().setValue(QStringLiteral("stable2/exportDir"), folder);
+    if (ok)
+        ExportNotifier::instance().notify(
+            QStringLiteral("Exported %1 animation clip(s), rig only").arg(anims.size()), folder);
+    else
+        QMessageBox::warning(this, QStringLiteral("Animation library"), QStringLiteral("Export failed."));
+}
+
+// D4_DUMP_MNTTROPHYANIM=1 — one-shot: do mount TROPHY appearances own animation clips at all?
+//
+// This exists because the question gates a real feature and cannot be answered by inspection.
+// Stable seats trophies with ModelAttach::seat, which bakes their verts and CLEARS their skeleton.
+// That is deliberate: seatTrophyOnMount records that the rig-preserving path (attachSubRig) had
+// positioning issues and was reverted, so trophies are static on purpose, not by omission. Giving
+// a trophy its own clip means reopening that placement problem — worth doing only if trophies own
+// clips to play. One run with the variable set answers it from the shipped data instead of a guess.
+//
+// Bounded (40 lines) and one-shot per session, but NOT free: "trophy" is its own cache key, never
+// one of the species tokens the panel uses, so this forces an EXTRA full walk of json/base/meta/Anim
+// and leaves a permanent bucket set behind. That is fine behind an env gate and is the reason it
+// stays behind one — do not ungate it.
+void StableTab2::dumpMountTrophyAnims()
+{
+    static bool done = false;
+    if (done || !m_index || !qEnvironmentVariableIsSet("D4_DUMP_MNTTROPHYANIM")) return;
+    done = true;
+    // "trophy" widens the filename filter to mnt/mount clips PLUS anything else carrying the word,
+    // so a trophy clip that breaks the mnt_ naming still lands in a bucket.
+    // Second site to bind a clipBuckets reference (see the warning on its declaration): nothing in
+    // the loop below may call clipBuckets, or this dangles the moment a new token inserts.
+    const QHash<int, QStringList>& buckets = clipBuckets(QStringLiteral("trophy"));
+    int total = 0, withClips = 0, shown = 0;
+    for (const SnoEntry& e : m_index->entries(kGroupAppearance)) {
+        const QString lower = e.name.toLower();
+        if (!lower.startsWith(QLatin1String("mnt_")) || !lower.contains(QLatin1String("trophy")))
+            continue;
+        ++total;
+        const QStringList rows = buckets.value(e.snoId);
+        if (rows.isEmpty()) continue;
+        ++withClips;
+        if (shown++ < 40)
+            qInfo("[mnttrophyanim] %s (sno %d): %d clip(s) — %s",
+                  qPrintable(e.name), e.snoId, int(rows.size()),
+                  qPrintable(rows.first().section(QStringLiteral("  ·  "), 0, 0)));
+    }
+    qInfo("[mnttrophyanim] %d of %d mount trophy appearances own clips%s",
+          withClips, total,
+          withClips == 0 ? "  — nothing to animate; leave trophies seated static" : "");
+}
+
+// D4_DUMP_PETANIM=1 — one-shot audit: does every companion resolve to a carrier that owns clips?
+//
+// The pet path was the mount bug in a second costume. Its token was the first two segments of the
+// appearance name (cmp_stor105), which the game's own clip naming does not use for the shared
+// family (CMP_dogLarge_nav_idle), so 13 of 48 companions could not see one of their clips and 15
+// saw only part of the set. Measured against CoreTOC before the fix; this reports what the FIXED
+// resolution actually finds on the user's own snapshot, which is the half a name study cannot
+// answer — which appearance each clip says it belongs to.
+//
+// EXPENSIVE by construction, and more so than its trophy sibling: one Anim/ walk per distinct
+// species token the first time it runs (~27 species on a cold cache), on the GUI thread, each one
+// permanently added to stable_anims_v2.json — which saveClipCache rewrites once per token as it
+// grows. A cold run is a multi-minute freeze. That is why it is env-gated and one-shot, why it
+// says so in the log, and why it must not be ungated.
+void StableTab2::dumpPetAnims()
+{
+    static bool done = false;
+    if (done || !m_index || !qEnvironmentVariableIsSet("D4_DUMP_PETANIM")) return;
+    done = true;
+    qInfo("[petanim] auditing companion clip resolution — this walks Anim/ once per species, "
+          "so the first run is slow by design");
+
+    // The TAB's pets, not a name scan, when the item index is ready: a companion is found through
+    // CompanionItem -> snoCompanion -> Actor -> Appearance, and nothing makes that appearance's
+    // name start with cmp_. Auditing the name scan alone could report "48 of 48 fine" while a real
+    // companion is broken. Falls back to the name scan only before the scan lands.
+    QVector<QPair<int, QString>> petAppr;
+    if (m_petReady && !m_petItems.isEmpty()) {
+        for (const StableEntry& e : m_petItems)
+            if (e.apprSno > 0) petAppr.append({ e.apprSno, e.appr });
+    } else {
+        for (const SnoEntry& e : m_index->entries(kGroupAppearance)) {
+            const QString lower = e.name.toLower();
+            if (lower.startsWith(QLatin1String("cmp_base")) || lower.startsWith(QLatin1String("cmp_stor")))
+                petAppr.append({ e.snoId, e.name });
+        }
+        qInfo("[petanim] item scan not ready — auditing the cmp_* NAME scan instead, which is not "
+              "necessarily the tab's pet set");
+    }
+
+    int withClips = 0, shown = 0;
+    for (const auto& pa : petAppr) {
+        const QString tok = animTokenFor(pa.second, /*pet=*/true, QString());
+        const int carrier = animCarrierFor(pa.second, pa.first, /*pet=*/true, QString());
+        // Fresh call, and the result is COPIED — never hold a clipBuckets reference across a loop
+        // that calls clipBuckets again (see the warning on its declaration).
+        const QStringList rows = clipBuckets(tok).value(carrier);
+        if (!rows.isEmpty()) ++withClips;
+        if (shown++ < 60)
+            qInfo("[petanim] %-30s tok=%-16s carrier=%-8d clips=%-3d %s",
+                  qPrintable(pa.second), qPrintable(tok), carrier, int(rows.size()),
+                  carrier == pa.first ? "(own)" : "(shared rig)");
+    }
+    qInfo("[petanim] %d of %d companion appearance(s) resolve to a carrier that owns clips",
+          withClips, int(petAppr.size()));
+}
+
+void StableTab2::populateAnims()
+{
+    dumpMountTrophyAnims();   // D4_DUMP_MNTTROPHYANIM=1 (one-shot, no cost otherwise)
+    dumpPetAnims();           // D4_DUMP_PETANIM=1 (one-shot, no cost otherwise)
+    if (!m_anims) return;
+    // Deliberately does NOT touch m_animPanel's visibility. That belongs to the sidebar strip
+    // toggle alone — a refresh path that also sets it would silently reopen a panel the user
+    // closed, which is the same failure the overlay master gate exists to prevent. The panel is
+    // permanently mounted now, so a rig with no clips falls THROUGH to fillAnimList and gets its
+    // "(no clips)" row: returning early here would leave a titled, empty, unexplained box.
+    // currentClipRows() skips the Anim/ scan when there is no rig, so this costs nothing.
+    if (m_lastGeo.skeleton.isEmpty() && m_timeline) m_timeline->setVisible(false);
+    fillAnimList();
 }
 
 // Human summary of what an export of `appr` will include, per Settings ▸ Export (parsed on open,
@@ -3316,20 +3959,15 @@ QString StableTab2::exportMenuSuffix(const QString& appr, bool pet)
     QStringList parts; parts << QStringLiteral("1 model");
     const QString d4 = Config::d4dataDir();
     if (s.value(QStringLiteral("export/includeAnim"), false).toBool()) {
-        // Resolve the clip-owning carrier for this item (mount → species base; pet → itself).
-        int carrier = 0; QString tok;
-        if (pet) {
-            tok = appr.section(QLatin1Char('_'), 0, 1).toLower();
-            if (m_index) for (const SnoEntry& e : m_index->entries(kGroupAppearance))
-                if (e.name.compare(appr, Qt::CaseInsensitive) == 0) { carrier = e.snoId; break; }
-        } else {
-            tok = catOf(appr.toLower());
-            const QString want = QStringLiteral("mnt_base00_") + tok;
-            if (m_index) for (const SnoEntry& e : m_index->entries(kGroupAppearance))
-                if (e.name.toLower() == want) { carrier = e.snoId; break; }
-        }
-        if (carrier > 0 && !m_animCache.contains(carrier)) m_animCache.insert(carrier, discoverClips(carrier, tok));
-        const QStringList clips = carrier > 0 ? m_animCache.value(carrier) : QStringList();
+        // Resolve the clip-owning carrier for this item through the SAME helper the preview list
+        // and the exporter use — staged resolution for both families, never an assumption.
+        // This had its own inline copy with no fallback, so the count shown in the menu could
+        // disagree with what the export actually wrote.
+        const int selfSno = m_index ? m_index->snoForName(kGroupAppearance, appr) : 0;
+        const QString hint = hintForAppr(appr, pet);
+        const QString tok = animTokenFor(appr, pet, hint);
+        const int carrier = animCarrierFor(appr, selfSno, pet, hint);
+        const QStringList clips = carrier > 0 ? clipBuckets(tok).value(carrier) : QStringList();
         const AnimExportScope asc = AnimExportScope::load();   // as in exportOne: carrier == the rig
         if (asc.original || asc.sets || asc.base) {
             parts << QStringLiteral("%1 animation%2").arg(clips.size()).arg(clips.size() == 1 ? QString() : QStringLiteral("s"));
@@ -3359,7 +3997,7 @@ QString StableTab2::exportMenuSuffix(const QString& appr, bool pet)
 void StableTab2::fillAnimList()
 {
     if (!m_anims) return;
-    const QStringList rows = m_animCache.value(animCarrierSno());
+    const QStringList rows = currentClipRows();
     const QString search = m_animSearch ? m_animSearch->text().trimmed().toLower() : QString();
     m_anims->blockSignals(true);
     m_anims->clear();
@@ -3581,12 +4219,15 @@ void StableTab2::buildLightingPanel()
     auto* envRow = new QHBoxLayout();
     envRow->addWidget(new QLabel(QStringLiteral("Environment"), m_lightPanel));
     auto* env = new QComboBox(m_lightPanel);
-    env->addItems({ QStringLiteral("Studio"), QStringLiteral("Outdoor"),
-                    QStringLiteral("Dungeon"), QStringLiteral("Night") });
-    env->setCurrentIndex(s.value(QStringLiteral("stable2/env"), 1).toInt());
-    connect(env, &QComboBox::currentIndexChanged, this, [this](int i) {
-        QSettings().setValue(QStringLiteral("stable2/env"), i);
-        if (m_view) m_view->setEnvironment(i);
+    {   // Value = GLModelWidget::setEnvironment's own numbering (0 Studio 1 Outdoor 2 Dungeon 3 Night).
+        const char* const kEnv[4] = { "Studio", "Outdoor", "Dungeon", "Night" };
+        for (int e = 0; e < 4; ++e) env->addItem(QString::fromLatin1(kEnv[e]), e);
+    }
+    selectByValue(env, envOrDefault(s.value(QStringLiteral("stable2/env"), 1).toInt()), 1);
+    connect(env, &QComboBox::currentIndexChanged, this, [this, env](int) {
+        const int e = envOrDefault(env->currentData().toInt());
+        QSettings().setValue(QStringLiteral("stable2/env"), e);
+        if (m_view) m_view->setEnvironment(e);
     });
     envRow->addWidget(env, 1);
     pl->addLayout(envRow);
@@ -3595,12 +4236,16 @@ void StableTab2::buildLightingPanel()
     auto* preRow = new QHBoxLayout();
     preRow->addWidget(new QLabel(QStringLiteral("Preset"), m_lightPanel));
     auto* preset = new QComboBox(m_lightPanel);
-    preset->addItems({ QStringLiteral("D4 Wardrobe (campfire)"),
-                       QStringLiteral("Hero Direct (neutral)"),
-                       QStringLiteral("Studio (cool 3-point)") });
-    preset->setCurrentIndex(s.value(QStringLiteral("stable2/light/preset"), 1).toInt());
-    connect(preset, &QComboBox::currentIndexChanged, this, [this](int i) {
-        QSettings().setValue(QStringLiteral("stable2/light/preset"), i); applyLightRig();
+    {   // Value = the rig's own preset numbering, carried as data (see selectByValue).
+        const char* const kPre[3] = { "D4 Wardrobe (campfire)", "Hero Direct (neutral)",
+                                      "Studio (cool 3-point)" };
+        for (int i = 0; i < 3; ++i) preset->addItem(QString::fromLatin1(kPre[i]), i);
+    }
+    selectByValue(preset, lightPresetOrDefault(s.value(QStringLiteral("stable2/light/preset"), 1).toInt()), 1);
+    connect(preset, &QComboBox::currentIndexChanged, this, [this, preset](int) {
+        QSettings().setValue(QStringLiteral("stable2/light/preset"),
+                             lightPresetOrDefault(preset->currentData().toInt()));
+        applyLightRig();
     });
     preRow->addWidget(preset, 1);
     pl->addLayout(preRow);
@@ -3709,7 +4354,7 @@ void StableTab2::applyLightRig()
     if (!m_view) return;
     QSettings s;
     GLModelWidget::LightRig r;
-    r.preset       = s.value(QStringLiteral("stable2/light/preset"), 1).toInt();   // default: Hero Direct
+    r.preset       = lightPresetOrDefault(s.value(QStringLiteral("stable2/light/preset"), 1).toInt());
     r.keyInt       = s.value(QStringLiteral("stable2/light/key"),  100).toInt() / 100.0f;
     r.rimInt       = s.value(QStringLiteral("stable2/light/rim"),  100).toInt() / 100.0f;
     r.fillInt      = s.value(QStringLiteral("stable2/light/fill"), 100).toInt() / 100.0f;
@@ -3763,11 +4408,14 @@ void StableTab2::buildCameraPanel()
     fovRow->addWidget(new QLabel(QStringLiteral("FOV"), m_camPanel));
     auto* fovSlider = new QSlider(Qt::Horizontal, m_camPanel);
     fovSlider->setRange(10, 100);
-    fovSlider->setValue(s.value(QStringLiteral("stable2/fov"), 45).toInt());
+    // Seeded from the LIVE viewport, not from a settings key of its own. stable2/cam/fov already
+    // carries this state and restoreCameraState() has already applied it; a second key meant two
+    // answers to one question, and because this panel is built lazily its copy was never applied
+    // at startup at all — whichever ran last won.
+    fovSlider->setValue(m_view ? qBound(10, int(m_view->cameraState().fov + 0.5f), 100) : 45);
     fovSlider->setToolTip(QStringLiteral("Camera field of view (degrees)"));
     connect(fovSlider, &QSlider::valueChanged, this, [this](int vv) {
-        QSettings().setValue(QStringLiteral("stable2/fov"), vv);
-        if (m_view) m_view->setFov(float(vv));
+        if (m_view) m_view->setFov(float(vv));   // persisted by saveCameraState(), one key
     });
     fovRow->addWidget(fovSlider, 1);
     pl->addLayout(fovRow);
@@ -3828,10 +4476,10 @@ void StableTab2::buildCameraPanel()
 
     // Orthographic projection.
     auto* orthoChk = new QCheckBox(QStringLiteral("Orthographic projection"), m_camPanel);
-    orthoChk->setChecked(s.value(QStringLiteral("stable2/ortho"), false).toBool());
+    // As with FOV: the live viewport is the source, stable2/cam/ortho the single persisted copy.
+    orthoChk->setChecked(m_view && m_view->cameraState().ortho);
     connect(orthoChk, &QCheckBox::toggled, this, [this](bool on) {
-        QSettings().setValue(QStringLiteral("stable2/ortho"), on);
-        if (m_view) m_view->setOrthographic(on);
+        if (m_view) m_view->setOrthographic(on);   // persisted by saveCameraState(), one key
     });
     pl->addWidget(orthoChk);
 
@@ -4508,25 +5156,57 @@ void StableTab2::applyClothParams()
 // Anything needing overlays refreshed calls THIS — never setShow*() directly, or the master gate
 // gets bypassed.
 // ONE part menu, shown from BOTH the 3D viewport and the PARTS PANEL.
+// "Why does this part look the way it does" for one mount part, in the same read-only pane the
+// Wardrobe uses. Pure: it decodes no pixels and writes nothing, so it is safe on any part however
+// broken — which is the point, since the parts worth asking about are the broken ones.
+void StableTab2::showMaterialReport(const QString& materialName, const QString& apprName,
+                                    int apprSno)
+{
+    TextReport::show(this,
+                     materialName.isEmpty()
+                         ? QStringLiteral("Explain materials — %1")
+                               .arg(apprName.isEmpty() ? QStringLiteral("piece") : apprName)
+                         : QStringLiteral("Explain material — %1").arg(materialName),
+                     MaterialReport::explain(m_reader, m_index, Config::d4dataDir(),
+                                             apprName, apprSno, materialName));
+}
+
 void StableTab2::showPartContextMenu(int part, const QPoint& gp, int groupPart)
 {
         if (!m_partTree) return;
-        auto itemForPart = [this](int p) -> QTreeWidgetItem* {
-            for (int r = 0; r < m_partTree->topLevelItemCount(); ++r) {
-                QTreeWidgetItem* root = m_partTree->topLevelItem(r);
-                for (int c = 0; c < root->childCount(); ++c)
-                    if (root->child(c)->data(0, Qt::UserRole).toInt() == p) return root->child(c);
-            }
-            return nullptr;
-        };
         auto setAll = [this](Qt::CheckState st) {
             for (int r = 0; r < m_partTree->topLevelItemCount(); ++r) {
                 QTreeWidgetItem* root = m_partTree->topLevelItem(r);
                 for (int c = 0; c < root->childCount(); ++c) root->child(c)->setCheckState(0, st);
             }
         };
-        // Right-click SELECTS (blue outline); the camera only moves via "Frame Part".
-        if (m_view) m_view->setPickedPart(part);
+
+        // What this menu ACTS ON — see the Wardrobe's copy for the reasoning. Right-clicking
+        // inside the selection acts on all of it; outside replaces it. The set is both what runs
+        // and what turns blue.
+        QList<int> sel = selectedParts();
+        QList<int> acted;
+        if (part >= 0) {
+            if (sel.contains(part)) {
+                acted = sel;
+            } else {
+                acted = QList<int>{part};
+                m_partTree->clearSelection();
+                if (QTreeWidgetItem* it = itemForPart(part)) {
+                    if (it->parent()) it->parent()->setExpanded(true);
+                    it->setSelected(true);
+                }
+            }
+        }
+        std::sort(acted.begin(), acted.end());
+        acted.erase(std::unique(acted.begin(), acted.end()), acted.end());
+        // Spanning more than one equipped piece? Then naming one of them in the title is the same
+        // under-reporting the count exists to fix — see the Wardrobe's copy.
+        bool oneSource = true;
+        for (int p : acted)
+            if (m_partSource.value(p) != m_partSource.value(acted.first())) { oneSource = false; break; }
+        // Right-click SELECTS (blue outline); the camera only moves via "Frame part".
+        if (m_view) m_view->setPickedParts(acted);
         ViewportPartMenu::Info in;
         ViewportPartMenu::Actions act;
         QTreeWidgetItem* item = nullptr;
@@ -4542,37 +5222,91 @@ void StableTab2::showPartContextMenu(int part, const QPoint& gp, int groupPart)
         }
         in.sourceModel   = (srcPart >= 0 && srcPart < m_partSource.size() && !m_partSource[srcPart].isEmpty())
                              ? m_partSource[srcPart] : QStringLiteral("Mount");
+        if (acted.size() > 1 && !oneSource) in.sourceModel.clear();
         in.modelTris     = modelTris;
         in.lastExportDir = QSettings().value(QStringLiteral("stable2/exportDir")).toString();
+        // Keyed on srcPart, not part — same reason as the Wardrobe: srcPart resolves a group-header
+        // right-click to that group's equipped piece, so the Copy section works there too.
+        if (srcPart >= 0) {
+            in.sourceFileName = m_partSource.value(srcPart);   // the equipped piece this part came from
+            in.sourceName     = m_partSource.value(srcPart);
+            in.sno            = m_partSourceSno.value(srcPart, 0);
+            in.collection     = AppearanceMeta::instance().collectionFor(in.sno);
+        }
         if (part >= 0 && part < m_lastGeo.primitives.size()) {
             item = itemForPart(part);
             in.part         = part;
             // As in the Wardrobe: the merge pipeline puts the real material name on the primitive.
             in.partName     = m_lastGeo.primitives[part].materialName;
-            in.partFileName = in.partName;
-            in.sourceFileName = m_partSource.value(part);   // the equipped piece this part came from
-            in.sourceName     = m_partSource.value(part);
-            in.sno            = m_partSourceSno.value(part, 0);
-            in.collection     = AppearanceMeta::instance().collectionFor(in.sno);
+            in.partMaterial = in.partName;
+            in.partOwner    = m_partSource.value(part);      // parts-panel PARENT row (see Wardrobe)
             in.partTris     = m_view ? m_view->partTriangles(part) : 0;
             in.visible      = !item || item->checkState(0) == Qt::Checked;
             in.isSim        = part < m_partSim.size() && m_partSim[part];
             in.isFx         = part < m_partFx.size()  && m_partFx[part];
-            act.setVisible  = [item](bool on) { if (item) item->setCheckState(0, on ? Qt::Checked : Qt::Unchecked); };
-            act.isolate     = [setAll, item] { setAll(Qt::Unchecked); if (item) item->setCheckState(0, Qt::Checked); };
-            act.selectPart  = [this, item] {
-                if (!item || !m_partTree) return;
-                m_partTree->setCurrentItem(item); m_partTree->scrollToItem(item);
+            // Per PART, and per the equipped piece that part came from — the merged mount spans up
+            // to three appearances, so the report has to be told which one it is being asked about.
+            {
+                const QString mn = in.partName;
+                const QString an = m_partSource.value(part);
+                const int     as = m_partSourceSno.value(part, 0);
+                act.explainMaterial = [this, mn, an, as] { showMaterialReport(mn, an, as); };
+            }
+            // Everything below runs on `acted`, which for a single pick is exactly {part}.
+            const QVector<int> actedV(acted.begin(), acted.end());
+            if (acted.size() > 1) {
+                in.selParts = actedV;
+                int t = 0;
+                QStringList mats;
+                for (int p : acted) {
+                    t += m_view ? m_view->partTriangles(p) : 0;
+                    const QString mn = (p < m_lastGeo.primitives.size())
+                                           ? m_lastGeo.primitives[p].materialName : QString();
+                    if (!mn.isEmpty() && !mats.contains(mn)) mats << mn;
+                }
+                in.selTris = t;
+                in.selMaterials = mats;
+            }
+            // Signals blocked, then ONE recompute — see the Wardrobe's copy.
+            act.setVisible  = [this, acted](bool on) {
+                const bool was = m_partTree->blockSignals(true);
+                for (int p : acted)
+                    if (QTreeWidgetItem* it = itemForPart(p))
+                        it->setCheckState(0, on ? Qt::Checked : Qt::Unchecked);
+                m_partTree->blockSignals(was);
+                recomputePartVisibility();
             };
-            act.frame       = [this, part] {
+            act.isolate     = [this, setAll, acted] {
+                const bool was = m_partTree->blockSignals(true);
+                setAll(Qt::Unchecked);
+                for (int p : acted)
+                    if (QTreeWidgetItem* it = itemForPart(p)) it->setCheckState(0, Qt::Checked);
+                m_partTree->blockSignals(was);
+                recomputePartVisibility();
+            };
+            act.selectPart  = [this, acted] {
+                if (!m_partTree) return;
+                m_partTree->clearSelection();
+                QTreeWidgetItem* first = nullptr;
+                for (int p : acted)
+                    if (QTreeWidgetItem* it = itemForPart(p)) {
+                        if (it->parent()) it->parent()->setExpanded(true);
+                        it->setSelected(true);
+                        if (!first) first = it;
+                    }
+                if (first) { m_partTree->setCurrentItem(first); m_partTree->scrollToItem(first); }
+            };
+            act.frame       = [this, actedV] {
                 if (!m_view) return;
                 QVector3D c; float r;
-                if (m_view->partsBounds(QVector<int>{part}, c, r))
+                if (m_view->partsBounds(actedV, c, r))
                     m_view->frameRegionKeepRotation(c, r, /*animate=*/true);
             };
-            const QString pn = in.partName.isEmpty() ? QStringLiteral("part") : in.partName;
-            act.exportPart        = [this, part, pn] { exportMount(QVector<int>{part}, pn, false); };
-            act.exportPartLastDir = [this, part, pn] { exportMount(QVector<int>{part}, pn, true); };
+            const QString pn = acted.size() > 1
+                ? (in.sourceModel.isEmpty() ? QStringLiteral("parts") : in.sourceModel)
+                : (in.partName.isEmpty() ? QStringLiteral("part") : in.partName);
+            act.exportPart        = [this, actedV, pn] { exportMount(actedV, pn, false); };
+            act.exportPartLastDir = [this, actedV, pn] { exportMount(actedV, pn, true); };
         }
         if (modelParts.isEmpty()) {                       // empty space → the whole assembled mount
             act.exportModel        = [this] { exportMount(); };
@@ -4694,8 +5428,16 @@ void StableTab2::exportMount(const QVector<int>& keep, const QString& label, boo
     QVector<int> keepEff = keep;
     if (keepEff.isEmpty() && m_view) {          // whole-mount export honours the parts tree, as
         const int n = m_lastGeo.primitives.size();   // Models tab does — unchecking a part in the
-        for (int i = 0; i < n; ++i)                  // panel now affects the .glb, not just the view
-            if (m_view->partVisible(i)) keepEff << i;
+        // Settings ▸ Export ▸ "Export FX / simulation meshes" only WIDENS what the viewport shows:
+        // FX and sim-cage parts are hidden by their own toolbar toggles, not by the user picking
+        // parts, so re-including them overrides that specific reason for hiding and nothing else.
+        // Stable read neither flag before, while the Settings tooltip claimed it covered this tab.
+        const bool wantFx = QSettings().value(QStringLiteral("export/exportFxSim"), false).toBool();
+        for (int i = 0; i < n; ++i) {                // panel now affects the .glb, not just the view
+            if (m_view->partVisible(i)) { keepEff << i; continue; }
+            if (wantFx && ((i < m_partFx.size() && m_partFx[i]) || (i < m_partSim.size() && m_partSim[i])))
+                keepEff << i;
+        }
         if (keepEff.isEmpty()) {
             QMessageBox::information(this, QStringLiteral("Export"),
                 QStringLiteral("Every part is hidden — nothing to export."));
@@ -4718,10 +5460,25 @@ void StableTab2::exportMount(const QVector<int>& keep, const QString& label, boo
     }
     if (path.isEmpty()) return;
     if (!path.endsWith(QStringLiteral(".glb"), Qt::CaseInsensitive)) path += QStringLiteral(".glb");
-    // Include the currently-playing clip so the exported mount is animated in Blender.
+    // Animations per Settings ▸ Export — the same scope the export menu's suffix counts. The
+    // WHOLE-mount export used to ship only the playing clip regardless of the setting, so a menu
+    // reading "+ 24 animations" wrote one; the menu was not wrong, this path was.
+    //
+    // Scoped to the whole mount deliberately. Clips are skeleton-level, so nothing downstream
+    // trims them to `keepEff` — attaching the full library to a single right-clicked strap would
+    // turn a one-primitive export into a multi-megabyte one with a decode stall to match.
     QVector<AnimParser::DecodedAnim> anims;
     QStringList animNames;
-    if (m_curAnim.valid && !m_lastGeo.skeleton.isEmpty()) {
+    // NB: `keep`, not `keepEff` — keepEff is back-filled with every visible part for a whole-mount
+    // export, so it is almost never empty and gating on it would silently disable animations
+    // everywhere. The caller's own empty `keep` is what means "the whole mount".
+    if (keep.isEmpty() && QSettings().value(QStringLiteral("export/includeAnim"), false).toBool())
+        collectExportAnims(m_lastGeo,
+                           exportClipNames(m_slotName[SlotMount], m_slotSel[SlotMount], petMode()),
+                           anims, animNames);
+    // Fall back to the live clip so "export what you are looking at" still holds with the setting
+    // off, or when the scope resolved to nothing.
+    if (anims.isEmpty() && m_curAnim.valid && !m_lastGeo.skeleton.isEmpty()) {
         anims << m_curAnim;
         animNames << (m_playingAnim.isEmpty() ? QStringLiteral("clip") : m_playingAnim);
     }
@@ -4754,7 +5511,17 @@ void StableTab2::exportMount(const QVector<int>& keep, const QString& label, boo
     // Cached by material NAME, which is safe here because every ExportMaterial with a given name
     // took its normal/ORM from the same per-material cache above — so one decode+bake per distinct
     // material, not one per primitive.
-    if (QSettings().value(QStringLiteral("export/bakeDetail"), false).toBool()) {
+    // Settings ▸ Export ▸ "Include textures". Stable shipped m_exportMats wholesale and ignored it,
+    // so unticking the box changed nothing here. Dropping the four images (rather than the whole
+    // ExportMaterial) keeps names, double-sidedness, alpha mode and the scalar metal/rough/emissive
+    // factors, which is what an untextured export is FOR — a correctly-shaded grey model, not an
+    // unshaded one. Runs before the detail bake so a skipped texture is never decoded and baked.
+    if (!QSettings().value(QStringLiteral("export/includeTex"), true).toBool())
+        for (ModelExporter::ExportMaterial& em : mats) {
+            em.baseColor = QImage(); em.normal = QImage();
+            em.orm = QImage();       em.emissive = QImage();
+        }
+    else if (QSettings().value(QStringLiteral("export/bakeDetail"), false).toBool()) {
         const QString d4 = Config::d4dataDir();
         QHash<QString, QImage> bakedN, bakedO;   // two hashes rather than QPair: <QPair> is not included here
         for (ModelExporter::ExportMaterial& em : mats) {
@@ -4766,16 +5533,23 @@ void StableTab2::exportMount(const QVector<int>& keep, const QString& label, boo
             bakedO.insert(em.name, em.orm);
         }
     }
+    // Hardpoint empties + bone naming + the post-rename re-index — see exportAppearanceModel. This
+    // path had none of them, so a mount exported without its saddle/trophy sockets.
+    if (QSettings().value(QStringLiteral("export/hardpointEmpties"), false).toBool())
+        Hardpoints::readInto(geoCopy, apprJsonPath(Config::d4dataDir(), m_slotName[SlotMount]));
     Retarget::applyFromSettings(geoCopy);
     if (opt.blenderFriendly)
         GLModelWidget::blenderizeSkeletonNames(geoCopy.skeleton);
+    else if (QSettings().value(QStringLiteral("export/boneNamesTranslated"), false).toBool())
+        GLModelWidget::translateSkeletonNames(geoCopy.skeleton);
+    Hardpoints::resolveBoneIndices(geoCopy);
     const bool ok = ModelExporter::exportGlb(geoCopy, path, mats, anims, animNames, opt);
     const QString folder = QFileInfo(path).absolutePath();
     QSettings().setValue(QStringLiteral("stable2/exportDir"), folder);
     if (ok)
         ExportNotifier::instance().notify(
             QStringLiteral("Exported %1%2%3").arg(QFileInfo(path).fileName(),
-                anims.isEmpty() ? QString() : QStringLiteral("  (with animation: %1)").arg(animNames.first()),
+                anims.isEmpty() ? QString() : QStringLiteral("  (with %1 animation%2)").arg(animNames.size()).arg(animNames.size() == 1 ? QString() : QStringLiteral("s")),
                 ExportNotifier::glbOptionsLine(opt)),
             folder);
     else

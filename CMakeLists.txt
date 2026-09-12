@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.21)
 
 project(D4AssetBrowser
-    VERSION 2.2.9
+    VERSION 2.3.0
     DESCRIPTION "Native C++/Qt6 Diablo IV asset browser (d4analyzer code stack)"
     LANGUAGES CXX)
 
@@ -54,6 +54,7 @@ qt_add_executable(D4AssetBrowser WIN32
     src/app/SettingsDialog.h    src/app/SettingsDialog.cpp
     src/app/ExportCapture.h     src/app/ExportCapture.cpp
     src/app/ExportNotifier.h
+    src/app/ViewportSettings.h
     src/app/LogConsole.h        src/app/LogConsole.cpp
     src/app/SehGuard.h          src/app/SehGuard.cpp
 
@@ -99,6 +100,7 @@ qt_add_executable(D4AssetBrowser WIN32
     src/model/Attachments.h     src/model/Attachments.cpp
     src/model/FormatProbe.h     src/model/FormatProbe.cpp
     src/model/MaterialDecode.h  src/model/MaterialDecode.cpp
+    src/model/MaterialReport.h  src/model/MaterialReport.cpp
 
     src/deps/D4DataDownloader.h src/deps/D4DataDownloader.cpp
     src/deps/DependencyDialog.h src/deps/DependencyDialog.cpp
@@ -106,6 +108,7 @@ qt_add_executable(D4AssetBrowser WIN32
 
     src/util/CsvCopy.h          src/util/CsvCopy.cpp
     src/util/ProcQuiet.h
+    src/util/TextReportDialog.h
 
     src/tabs/BrowserTab.h
     src/tabs/PanelBox.h
@@ -139,6 +142,12 @@ if(MSVC)
     # Multi-processor compilation: let each cl.exe invocation use all cores (helps full/clean builds;
     # Ninja already parallelises across files, this parallelises within).
     target_compile_options(D4AssetBrowser PRIVATE /MP)
+    # /bigobj — the COFF object format allows 65,279 sections and ModelsTab.cpp now needs more.
+    # This is a FORMAT limit, not a symptom of anything wrong with the file: every inline function,
+    # template instantiation and COMDAT gets its own section, and a 9,000-line translation unit
+    # against Qt reaches it eventually. Applied to the whole target rather than the one file that
+    # tripped first, because the next one to cross it should not fail the build to find out.
+    target_compile_options(D4AssetBrowser PRIVATE /bigobj)
     # The PCH force-includes QtGui/QtWidgets (→ windows.h) into every TU; NOMINMAX stops windows.h's
     # min/max macros from clobbering std::min/std::max anywhere.
     target_compile_definitions(D4AssetBrowser PRIVATE NOMINMAX)

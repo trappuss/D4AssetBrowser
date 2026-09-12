@@ -65,8 +65,15 @@ public:
     // textures you are inspecting, and is invisible when the part is behind other geometry.
     void    setHighlightPart(int i);              // -1 = none; RED outline (parts-list selection)
     void    setHighlightParts(const QList<int>& parts);   // RED outline over a set
-    void    setPickedPart(int i);                 // -1 = none; BLUE outline (right-clicked part)
-    int     pickedPart() const { return m_pickedPart; }
+    // BLUE outline — what the part context menu is about to act on. A SET, not one part: with a
+    // multi-selection, right-clicking any member acts on all of them, and the outline has to say
+    // so before the menu is read. Anything else lies about the scope of "Export part".
+    void    setPickedParts(const QList<int>& parts);
+    void    setPickedPart(int i);                 // -1 = none; convenience for the single-part case
+    // First picked part, or -1. No caller today — kept as the read side of setPickedPart, which
+    // several places do use, so the pair stays symmetric.
+    int     pickedPart() const;
+    const QSet<int>& pickedParts() const { return m_picked; }
     // Per-part base-colour textures (index = part = source primitive). Null image →
     // that part renders flat grey. Uploaded to GL on the next paint.
     void    setPartTextures(const QVector<QImage>& baseColor);
@@ -378,7 +385,11 @@ public:
     int      pickPart(const QPoint& posPx) const;
     // View-settings toggles (from the View ▾ menu).
     void setShowTextures(bool on);
-    void setViewChannel(int c);   // 0 shaded · 1 base · 2 normal · 3 rough · 4 metal · 5 AO · 6 emissive
+    // 0 shaded · 1 base · 2 normal · 3 rough · 4 metal · 5 AO · 6 emissive · 7 detail-map select ·
+    // 8 dye/material-mask zones. Not validated here — the value goes straight to a shader uniform,
+    // so an out-of-range one renders as `shaded` by falling off the branch chain while every combo
+    // showing it reads -1. Callers validate; see StableTab2's channelOrDefault().
+    void setViewChannel(int c);
     void setWireframe(bool on);
     void setShowGrid(bool on);
     void setShowSkeleton(bool on);
@@ -415,6 +426,10 @@ public:
 signals:
     void partFocused(int part);   // double-click focus → the picked draw-part (or -1 on a miss)
     void partRightClicked(int part, const QPoint& globalPos);   // right-click (no drag) → picked part + menu anchor
+    // Left-click (no drag) → select in the parts panel. `mods` carries Ctrl/Shift so the listener
+    // can add-or-toggle rather than replace; `part` is -1 on a miss, which means "clear".
+    // Separate from partFocused (double-click), which additionally frames the camera.
+    void partClicked(int part, Qt::KeyboardModifiers mods);
 
 protected:
     void initializeGL() override;
@@ -444,7 +459,7 @@ private:
     struct Part { int offset = 0; int count = 0; bool visible = true; QString name; };
     QVector<Part>       m_parts;
     QSet<int>           m_highlight;      // red outline
-    int                 m_pickedPart = -1;  // blue outline — the part the user right-clicked
+    QSet<int>           m_picked;         // blue outline — what the context menu will act on
     QVector<int>        m_followParts;   // parts the camera keeps centred each anim frame (Camera Snap+follow)
 
     // Skinning data (kept so animation can re-deform the bind pose on the CPU).
@@ -830,6 +845,12 @@ private:
     float     m_tgtYaw = 0.0f, m_tgtPitch = 0.0f, m_tgtDist = 0.0f;
     QPoint    m_lastPos;
     QPoint    m_rightPressPx;   // where a right-button press began (to tell a click from a pan-drag)
+    QPoint    m_leftPressPx;    // same, for the left button — a left-DRAG orbits, a left-click selects
+    // Qt delivers press, release, DoubleClick, release — so a double-click would emit partClicked
+    // TWICE, once either side of partFocused. With Ctrl held that is select-then-toggle-off, which
+    // ends with the part deselected and the rest of the selection gone. The double-click sets this
+    // and the second release consumes it.
+    bool      m_swallowLeftClick = false;
 
     QString m_error;
 };

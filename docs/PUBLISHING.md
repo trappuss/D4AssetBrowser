@@ -1,144 +1,115 @@
-# Publishing releases on GitHub
+# Cutting a release
 
-This project ships as a **portable Windows folder**. You can build it locally
-(`package-release.bat`) or let GitHub build and publish it for you when you push
-a version tag (the `.github/workflows/release.yml` workflow).
+The repository is **`trappuss/D4AssetBrowser`**. Tags are **bare numbers** — `2.3.0`, no `v`
+prefix. Both of those have been wrong in this file before and the mistakes cost real time, so they
+are stated first.
 
-Below is the one-time setup, then the repeatable "cut a release" flow.
-
----
-
-## 0. One-time prerequisites
-
-- A **GitHub account** — https://github.com/join
-- **GitHub Desktop** (easiest, GUI) — https://desktop.github.com
-  *or* the **git** command line — https://git-scm.com/download/win
-
-The rest of this guide shows GitHub Desktop first (recommended), with the
-equivalent git commands after.
+`github.bat` in the project root is the front end for all of this: a menu over git that already
+knows the remote and the branch. It will refuse to run if `.git` is missing and it never runs
+`git init` — this repository has 160-plus commits of history and re-initialising it would throw
+them away.
 
 ---
 
-## 1. Create the repository on GitHub
+## The order things must happen in
 
-1. Go to https://github.com/new
-2. **Repository name:** `Diablo4AssetBrowser` (anything you like).
-3. **Visibility:** Public or Private — either works. (Public = anyone can
-   download your Releases.)
-4. Leave "Add a README / .gitignore / license" **unchecked** — this project
-   already has them.
-5. Click **Create repository**. Keep that page open; you'll need the URL
-   (e.g. `https://github.com/YOURNAME/Diablo4AssetBrowser.git`).
+1. **Bump the version** — `Release - Set Version.bat`
+2. **Build** — `rebuild.bat` (runs `verify-src.py` first and stops if it fails)
+3. **Smoke-test the zip** — `Test - Release Smoke.bat`
+4. **Commit and push** — `github.bat`
+5. **Tag** — `github.bat`, bare number
+6. **Write the release notes** — the workflow attaches the zip; the notes are yours to paste
+
+Steps 2 and 3 are the ones people skip. A release cut from unbuilt source is a zip that does not
+match its notes, and there is no way to un-publish it cleanly.
 
 ---
 
-## 2. Push the project
+## 1. Version
 
-### Option A — GitHub Desktop (GUI)
+`Release - Set Version.bat` takes the new number and updates **five places in four files**, then
+reads them all back from disk to prove it:
 
-1. Open GitHub Desktop → **File ▸ Add local repository…**
-2. Choose this project folder
-   (`…\Diablo4AssetBrowser Native`).
-3. If it says "this directory is not a Git repository", click
-   **create a repository** → **Create repository**.
-4. Click **Publish repository** (top bar). Pick the account/name, choose
-   Public/Private, click **Publish**.
-   - GitHub Desktop respects `.gitignore`, so `build/`, `data/`, `dist/`,
-     `_backups/`, etc. are **not** uploaded — only the source.
+| File | What holds the version |
+|---|---|
+| `src/main.cpp` | the `setApplicationVersion` call — **authoritative**; the release zip is named from it |
+| `CMakeLists.txt` | the `project(... VERSION ...)` line |
+| `vcpkg.json` | the `version` field |
+| `res/app.rc` | `VER_NUM` (comma-separated, and the trailing build field must survive) |
+| `res/app.rc` | `VER_STR` (dotted) |
 
-### Option B — git command line
+The two `app.rc` entries are what Windows shows under **Properties ▸ Details**. Hand-editing is
+possible but has to touch all five; the bat exists because four-out-of-five is silent and the zip
+still builds.
 
-Open a terminal **in the project folder** and run:
+## 2. Build
 
 ```bat
-git init
-git add .
-git commit -m "Diablo IV Asset Browser v2.1.0"
-git branch -M main
-git remote add origin https://github.com/YOURNAME/Diablo4AssetBrowser.git
-git push -u origin main
+rebuild.bat
 ```
 
-(Replace the URL with your repo's.)
+`verify-src.py` runs first and the build stops if it reports anything. It is not a linter in the
+usual sense — every check in it exists because the defect it catches shipped at least once. Read
+`docs/HYGIENE_TOOLING.md` if a check fires and the reason is not obvious.
 
-> First push only: if git asks you to sign in, a browser window will handle it.
+Check `build_errors.txt` is empty and `build_log.txt` ends clean before going further.
 
----
-
-## 3. First build (check it works)
-
-Builds use a **prebuilt Qt** (downloaded, not compiled) plus vcpkg for a few
-small libraries, so a run takes only **a few minutes** — the first one too.
-
-To kick off a test build without making a release yet:
-
-1. On your repo page, click the **Actions** tab.
-2. In the left list, click **Release**.
-3. Click **Run workflow ▸ Run workflow** (uses the `main` branch).
-4. Wait for it to go green. Then open the finished run and download the
-   **`D4AssetBrowser-portable`** artifact (bottom of the page) to test the zip.
-
-If it fails, open the failed step to see the log, and send it to me.
-
----
-
-## 4. Cut a release (this is the repeatable part)
-
-A release is triggered by pushing a **tag** that starts with `v`.
-
-### Option A — GitHub Desktop
-
-1. **History** tab → right-click your latest commit → **Create Tag…**
-2. Name it `v2.1.0` (match the app version) → **Create Tag**.
-3. **Repository ▸ Push** (make sure "push tags" happens — Desktop pushes tags
-   with the branch).
-
-### Option B — git command line
+## 3. Smoke test
 
 ```bat
-git tag v2.1.0
-git push origin v2.1.0
+Test - Release Smoke.bat
 ```
 
-### What happens next
+This tests **the packaged zip**, not the build tree — which is the point. A build that runs from
+`build\release\` and dies from the zip is missing a runtime DLL or a Qt plugin, and that is exactly
+what this catches.
 
-- The **Release** workflow runs, builds the portable folder, and **creates a
-  GitHub Release** for that tag with **`D4AssetBrowser.zip`** attached and
-  auto-generated notes.
-- Watch it under the **Actions** tab; when green, find it under the
-  **Releases** section (right side of the repo home, or `/releases`).
+`package-release.bat` builds the portable folder on its own if you want the zip without the tests.
+
+## 4. Commit and push
+
+```bat
+github.bat
+```
+
+Use the menu. Two standing rules for this repository:
+
+- **Never run git against this folder from a mounted or bridged filesystem.** It leaves
+  `.git\index.lock` behind and every subsequent git command on Windows then refuses to run.
+- **Do not add a `.gitattributes`.** Line endings here are mixed and already committed that way
+  across the history; a `text=auto` rule would renormalise the whole tree in one commit and make
+  every future diff unreadable.
+
+## 5. Tag
+
+A tag starting with a digit triggers `.github/workflows/release.yml`, which builds the portable
+folder and creates the GitHub Release with `D4AssetBrowser.zip` attached.
+
+Tag from `github.bat`. The tag is the bare version — `2.3.0` — and must match
+`setApplicationVersion` exactly, because that is what names the zip inside the release.
+
+Watch it under **Actions**. When it is green the release is under **Releases**.
+
+## 6. Release notes
+
+The workflow's auto-generated notes are a commit list and are not what anyone wants to read. Paste
+the notes written for the version instead — the house style is symptom first in bold, cause in one
+plain sentence, `Fixed` before `Added`, `Build tooling` last and short, no compare link.
+
+`CHANGELOG.md` carries the same content in one place. Keep the two identical; the release page is
+canonical and the file is the offline copy.
 
 ---
 
-## 5. Where people download it
+## If the build fails in CI but works locally
 
-Your repo home page → **Releases** (right sidebar) → the version → the
-**`D4AssetBrowser.zip`** asset. That's the whole shippable product: unzip and
-run `D4AssetBrowser.exe`.
+Qt is downloaded prebuilt in CI (`jurplel/install-qt-action`) rather than compiled, so a CI-only
+failure is usually the Qt version rather than the code. Bump `version:` in
+`.github/workflows/release.yml`. Local builds use vcpkg for everything, which is why the first
+local build is the slow one and CI is not.
 
----
+## What never goes in the repository
 
-## 6. Shipping a new version later
-
-1. Make your code changes and commit/push them (steps 2/Option).
-2. Bump the version in three spots (keep them in sync):
-   - `CMakeLists.txt` → `project(... VERSION 2.2.0 ...)`
-   - `vcpkg.json` → `"version": "2.2.0"`
-   - `src/main.cpp` → `setApplicationVersion("2.2.0")`
-   - (optional) `RELEASE_README.txt` header.
-3. Commit, then tag `v2.2.0` and push the tag (step 4). New Release appears.
-
----
-
-## Notes & gotchas
-
-- **Don't commit `data/`, `build/`, `dist/`, `_backups/`, or `d4data`** — the
-  `.gitignore` already excludes them. `d4data` and the game files are large and
-  not yours to redistribute; users download `d4data` themselves on first run.
-- **CI builds are fast** — Qt is downloaded prebuilt (via `jurplel/install-qt-action`),
-  not compiled. If Qt ever fails to install for a version, bump the `version:`
-  in `.github/workflows/release.yml` (e.g. `6.7.3` → `6.8.1`).
-- **Local** builds still use vcpkg for everything (including Qt) via
-  `package-release.bat` — that first local build is the slow one; CI is not.
-- **Private repo Releases** are only downloadable by people you share access
-  with. Make the repo Public if you want an open download page.
+`data/`, `build/`, `dist/`, `_backups/` and `d4data` are all excluded by `.gitignore` and must stay
+that way. The game files are large and not ours to redistribute — users download `d4data`
+themselves on first run, and TACT keys are fetched, never shipped.

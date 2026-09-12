@@ -87,6 +87,53 @@ inline int kTextureGroup() {
 // misses per bundle.
 const char* const kUiSuffixes[] = { "", "_details", "_background", "_WebImage", "_icons" };
 
+// ── Where a product's shop art lives, by NAME ───────────────────────────────────────────────────
+// The art is named after the product, so this is derived rather than guessed - but the SHAPE
+// depends on what kind of product it is, and assuming a single shape was hiding whole populations.
+// Read off the game's own names:
+//
+//   Bundle_HArmor_pal_stor171    ->  2DUI_Bundle_HArmor_pal_stor171
+//   AddOn_CollectionPack_Slayer  ->  2DUI_Bundle_AddOn_CollectionPack_Slayer_WebImage
+//   Accessory_glo_stor007        ->  2DInventory_Bundle_Accessory_glo_stor007
+//   Catalog_S12_IP_Collab        ->  2DInventory_Catalog_S12_IP_Collab      <- no Bundle_ infix
+//
+// Only the first two forms were ever tried. Every one of the 337 loose products is named
+// Scythe_stor007 / mnt_amor103_horse_stor and never Bundle_*, so each resolved to
+// "2dui_bundle_scythe_stor007" and missed: "Has icon" deleted the entire loose population, and the
+// thumbnail pass cached a null pixmap for each so they stayed blank for the rest of the session.
+//
+// ORDER IS PART OF THE CONTRACT - the caller takes the first hit as the preview - so the two new
+// forms are APPENDED. Nothing that resolved before resolves differently now; names that found
+// nothing at all get a second chance.
+inline QStringList uiArtCandidates(const QString& productName)
+{
+    QString bare = productName;
+    if (bare.startsWith(QLatin1String("Bundle_"), Qt::CaseInsensitive)) bare = bare.mid(7);
+    QStringList out;
+    for (const char* sfx : kUiSuffixes)
+        out << QStringLiteral("2DUI_Bundle_") + bare + QString::fromLatin1(sfx);
+    out << QStringLiteral("2DInventory_Bundle_") + bare;
+    for (const char* sfx : kUiSuffixes)
+        out << QStringLiteral("2DUI_") + bare + QString::fromLatin1(sfx);
+    out << QStringLiteral("2DInventory_") + bare;
+    return out;
+}
+
+// ── What a product's contents ARE ───────────────────────────────────────────────────────────────
+// A product with no children is not an empty bundle. It is a single item, and the shop sells 337
+// of them that way - Scythe_stor007, mnt_amor103_horse_stor - none of which any amount of drilling
+// into bundles will ever reach. Answering "its contents are itself" in ONE place makes the strip,
+// the contents tree, the hover card and the exporter all handle it unchanged, instead of each
+// growing its own leaf special case.
+//
+// Locked products are deliberately excluded: their children are unreadable, and saying the product
+// is its own content would be inventing one rather than reporting one.
+inline QVector<int> contentSnos(const StoreProductIndex::Product& b)
+{
+    if (!b.children.isEmpty() || b.encrypted) return b.children;
+    return QVector<int>{ b.sno };
+}
+
 QString settingsLastDir()
 {
     return QSettings().value(QStringLiteral("catalogue/lastDir")).toString();
@@ -208,6 +255,11 @@ void CatalogueTab::buildUi()
     m_sortCombo->addItem(QStringLiteral("Sort: Name"),   QStringLiteral("name"));
     m_sortCombo->addItem(QStringLiteral("Sort: Season"), QStringLiteral("season"));
     m_sortCombo->addItem(QStringLiteral("Sort: Patch"),  QStringLiteral("patch"));
+    // Both directions, as the Wardrobe's clip sort does for its numeric column: ascending is
+    // what someone hunting a specific id wants, descending is roughly newest-first (a higher
+    // sno is later content), which is the reading the Season and Patch sorts already take.
+    m_sortCombo->addItem(QStringLiteral("Sort: SNO ↑"), QStringLiteral("sno"));
+    m_sortCombo->addItem(QStringLiteral("Sort: SNO ↓"), QStringLiteral("snodesc"));
     // "Latest" — bundles whose SNO first appeared in this game build. SnoIndex::isNew already backs
     // the same filter in Models and Bulk Extract; for a shop catalogue "what is new this patch" is
     // the single most natural question, and it was the one tab that could not answer it.
@@ -216,6 +268,72 @@ void CatalogueTab::buildUi()
         "Only bundles added in the current game update.\n"
         "Observational: it compares against the previous build this tool opened, so the first run "
         "on a new install establishes a baseline and marks nothing."));
+    // ── TACT-locked content ─────────────────────────────────────────────────────────────────────
+    // Same pair, same wording and same mutual exclusion as the Models tab, because it is the same
+    // question asked of a different list. Neither ticked = show both, which is the default: a
+    // locked bundle is real content the shop sold, and hiding it by default is what made the whole
+    // Diablo IV x DOOM collab look absent rather than locked.
+    // ── Loose products ──────────────────────────────────────────────────────────────────────────
+    // On by default. 337 products are neither a bundle nor inside one, so no amount of drilling
+    // reaches them and they were invisible in a tab that only ever listed bundles - which is the
+    // same silent-absence failure this tab keeps having. They announce what they are on their
+    // second line, and the coverage line underneath accounts for them, so showing them is honest
+    // rather than noisy.
+    m_showLoose = new QCheckBox(QStringLiteral("Show loose products"), left);
+    m_showLoose->setToolTip(QStringLiteral(
+        "Include products that are not a bundle and are in no bundle - single weapons, mounts\n"
+        "and trophies the shop sold on their own.\n\n"
+        "They are listed with what they are rather than an item count, and open showing\n"
+        "themselves as their own content."));
+    m_showLoose->setChecked(true);   // restoreFilterState may lower it, once, if Remember is on
+    // No private QSettings write here. This was the only filter in the tab that persisted itself
+    // from inside its own handler, which meant it kept its state across launches even with
+    // "Remember filters" switched OFF — a user who unticked it once lost 337 products permanently,
+    // with no chip, no funnel tint and nothing in "Clear all filters" to bring them back. It saves
+    // and restores through saveFilterState/restoreFilterState with the other eight now.
+    connect(m_showLoose, &QCheckBox::toggled, this, [this] { reloadBundleList(); });
+
+    // ── Locked drop ─────────────────────────────────────────────────────────────────────────────
+    // Answers "show me the DOOM collab" without anyone having to know what it is called. Blizzard
+    // encrypts a content drop under ONE TACT key, so the key is the game's own grouping of "these
+    // shipped together, embargoed" - and every locked product already carries its key name.
+    // Measured: the Diablo IV x DOOM content falls in exactly two cohorts, 50 products under
+    // f159f1f70eabaab1 and 21 under 0e5332fb2d834bbd, and no third key holds any of it.
+    m_dropFilter = new QComboBox(left);
+    m_dropFilter->addItem(QStringLiteral("Any locked drop"), QString());
+    m_dropFilter->setToolTip(QStringLiteral(
+        "Locked content, grouped the way the game groups it: one TACT key per drop.\n"
+        "Picking one shows just that drop's bundles - a whole collab in one click, without\n"
+        "having to know a single asset name."));
+    connect(m_dropFilter, &QComboBox::currentIndexChanged, this, [this] { reloadBundleList(); });
+
+    m_onlyDecrypted = new QCheckBox(QStringLiteral("Only decrypted"), left);
+    m_onlyDecrypted->setToolTip(QStringLiteral(
+        "Hide bundles whose record is encrypted with a TACT key you don't have.\n"
+        "Their contents cannot be listed or exported - only the shop art."));
+    m_onlyEncrypted = new QCheckBox(QStringLiteral("Only encrypted (TACT)"), left);
+    m_onlyEncrypted->setToolTip(QStringLiteral(
+        "Show only bundles whose record is TACT-encrypted - where new collab and seasonal\n"
+        "content lands before a key is published.\n\n"
+        "The name and the shop art still resolve, because both are derived from the SNO name.\n"
+        "The contents are genuinely unreadable, so they are shown as locked rather than empty."));
+    connect(m_onlyDecrypted, &QCheckBox::toggled, this, [this](bool on) {
+        if (on && m_onlyEncrypted && m_onlyEncrypted->isChecked()) m_onlyEncrypted->setChecked(false);
+        reloadBundleList();
+    });
+    connect(m_onlyEncrypted, &QCheckBox::toggled, this, [this](bool on) {
+        if (on && m_onlyDecrypted && m_onlyDecrypted->isChecked()) m_onlyDecrypted->setChecked(false);
+        reloadBundleList();
+    });
+    // Has icon - the thumbnails are derived from the product NAME, so "no art" is a checkable
+    // property of the data rather than a rendering accident.
+    m_hasIconChk = new QCheckBox(QStringLiteral("Has icon"), left);
+    m_hasIconChk->setToolTip(QStringLiteral(
+        "Only bundles that actually ship shop art.\n"
+        "The art is found by name (2DUI_Bundle_<name>_*), so this answers which bundles HAVE a\n"
+        "picture, not which ones happen to have decoded one yet."));
+    connect(m_hasIconChk, &QCheckBox::toggled, this, [this] { reloadBundleList(); });
+
     m_rememberChk = new QCheckBox(QStringLiteral("Remember filters"), left);
     m_rememberChk->setToolTip(QStringLiteral(
         "Restore the search text, filters and sort order on the next launch."));
@@ -261,6 +379,12 @@ void CatalogueTab::buildUi()
     fp->addWidget(m_branchFilter);
     fp->addWidget(m_seasonFilter);
     fp->addWidget(m_latestChk);
+    secHdr(QStringLiteral("Availability"));
+    fp->addWidget(m_showLoose);
+    fp->addWidget(m_dropFilter);
+    fp->addWidget(m_onlyDecrypted);
+    fp->addWidget(m_onlyEncrypted);
+    fp->addWidget(m_hasIconChk);
     secHdr(QStringLiteral("View"));
     fp->addWidget(m_sortCombo);
     {
@@ -280,6 +404,14 @@ void CatalogueTab::buildUi()
         { QSignalBlocker b(m_branchFilter); m_branchFilter->setCurrentIndex(0); }
         { QSignalBlocker b(m_seasonFilter); m_seasonFilter->setCurrentIndex(0); }
         { QSignalBlocker b(m_latestChk);    m_latestChk->setChecked(false); }
+        { QSignalBlocker b(m_dropFilter);    m_dropFilter->setCurrentIndex(0); }
+        { QSignalBlocker b(m_onlyDecrypted); m_onlyDecrypted->setChecked(false); }
+        { QSignalBlocker b(m_onlyEncrypted); m_onlyEncrypted->setChecked(false); }
+        { QSignalBlocker b(m_hasIconChk);    m_hasIconChk->setChecked(false); }
+        // Back to TRUE, not false: this one is a filter whose default is "show everything", so
+        // clearing it means ticking it. Leaving it out of this list is what let it hide 337
+        // products through a button whose whole promise is that nothing is being hidden.
+        { QSignalBlocker b(m_showLoose);     m_showLoose->setChecked(true); }
         { QSignalBlocker b(m_search);       m_search->clear(); }
         reloadBundleList();
     });
@@ -1011,7 +1143,7 @@ void CatalogueTab::showHoverPreview(int sno)
                                 cols << HoverInfo::Col::kMeta; }
     {
         QHash<int, int> perKind;
-        for (int cs : b->children)
+        for (int cs : contentSnos(*b))
             if (const auto* c = StoreProductIndex::instance().product(cs)) ++perKind[int(c->kind)];
         QStringList parts;
         for (auto i = perKind.constBegin(); i != perKind.constEnd(); ++i)
@@ -1127,6 +1259,17 @@ void CatalogueTab::reset()
         m_branchFilter->clear();
         m_branchFilter->addItem(QStringLiteral("Any patch"), QString());
     }
+    // Same reason, and worse if left out: the drop list is populated once and gated on
+    // `count() <= 1`, so after a switch that test is false forever and the combo keeps showing the
+    // PREVIOUS build's TACT keys and counts. With one selected, every row is then rejected against
+    // a key the new build has never heard of — a permanently empty list under a chip naming a drop
+    // that no longer exists.
+    if (m_dropFilter) {
+        const QSignalBlocker block(m_dropFilter);
+        m_dropFilter->clear();
+        m_dropFilter->addItem(QStringLiteral("Any locked drop"), QString());
+    }
+    m_dropLabel.clear();   // derived from the previous build's cohorts; a switch invalidates them
 }
 
 // Jump to one bundle, from a "Sold in" link in the Models tab.
@@ -1144,6 +1287,15 @@ void CatalogueTab::revealBundle(int storeProductSno)
     if (m_branchFilter) { QSignalBlocker b(m_branchFilter); m_branchFilter->setCurrentIndex(0); }
     if (m_seasonFilter) { QSignalBlocker b(m_seasonFilter); m_seasonFilter->setCurrentIndex(0); }
     if (m_latestChk)    { QSignalBlocker b(m_latestChk);    m_latestChk->setChecked(false); }
+    if (m_dropFilter)    { QSignalBlocker b(m_dropFilter);    m_dropFilter->setCurrentIndex(0); }
+    if (m_onlyDecrypted) { QSignalBlocker b(m_onlyDecrypted); m_onlyDecrypted->setChecked(false); }
+    if (m_onlyEncrypted) { QSignalBlocker b(m_onlyEncrypted); m_onlyEncrypted->setChecked(false); }
+    if (m_hasIconChk)    { QSignalBlocker b(m_hasIconChk);    m_hasIconChk->setChecked(false); }
+    // The one that mattered most and was missing. "Sold in" maps an asset to ANY product that
+    // reaches it, loose products included — so with this box unticked the jump landed on a list
+    // that did not contain its target and reported "it may be a single item rather than a bundle",
+    // a message that is true about the product and completely wrong about the cause.
+    if (m_showLoose)     { QSignalBlocker b(m_showLoose);     m_showLoose->setChecked(true); }
     reloadBundleList();
     if (!m_list) return;
     for (int i = 0; i < m_list->count(); ++i) {
@@ -1161,6 +1313,91 @@ void CatalogueTab::revealBundle(int storeProductSno)
                               .arg(storeProductSno));
 }
 
+// ── Naming a locked drop from its own contents ──────────────────────────────────────────────────
+// A TACT key groups a content drop, but the key itself ("f159f1f70eabaab1") tells a person nothing.
+// The cohort names itself, in priority order, from data that is already there:
+//
+//   1. A Catalog_* or AddOn_* name. These are the shop's OWN grouping records - the thing the
+//      store shows as a collection - so the name IS the drop's name. Catalog_S12_IP_Collab
+//      -> "S12 IP Collab"; AddOn_CollectionPack_Slayer -> "CollectionPack Slayer".
+//   2. Failing that, the stor### tokens the cohort's names share, most common first: a drop is
+//      usually one or two store sets.
+//   3. Failing that, a representative name. Never the bare key on its own - a label nobody can
+//      read is the same as no label.
+//
+// WHERE THE NAMES COME FROM, and a correction. This used to read only the cohort's StoreProduct
+// names, and a comment here claimed that reproduced every IP collab the game has shipped. It
+// cannot have: measured against CoreTOC, ALL 1,579 encrypted StoreProducts are "~unnamed_<sno>"
+// in the game's own table, so there was nothing for rule 1 or 2 to read and all 177 drops fell
+// through to a bare hex key. The claim was never true for the locked population it described.
+//
+// The drop's other assets are the fix. 142,586 of the 145,512 texture records carry a real name,
+// as do all but 441 of the 67,721 appearances, and they sit in the same TACT cohort. So the caller
+// hands in every name it can reach — products, appearances and shop art alike — and the three
+// rules run across all of them at once.
+//
+// Shop art is named after the thing it depicts, with a family prefix and a role suffix bolted on;
+// stripping both makes an art name contribute exactly what an appearance name does:
+//
+//   2DUI_Bundle_HArmor_bar_stor251_WebImage  ->  HArmor_bar_stor251
+//   barM_stor251_TRS                         ->  barM_stor251_TRS      (unchanged)
+//   2DInventory_Catalog_S12_IP_Collab        ->  Catalog_S12_IP_Collab
+//
+// That last one is the point: a drop's real NAME can be sitting inside one of its art names even
+// when no product in it is named at all.
+static QString bareAssetName(const QString& n)
+{
+    QString s = n;
+    for (const char* p : {"2DUI_Bundle_", "2DInventory_Bundle_", "2DUI_", "2DInventory_"}) {
+        const QLatin1String lp(p);
+        if (s.startsWith(lp, Qt::CaseInsensitive)) { s = s.mid(lp.size()); break; }
+    }
+    for (const char* x : {"_WebImage", "_background", "_details", "_icons"}) {
+        const QLatin1String ls(x);
+        if (s.endsWith(ls, Qt::CaseInsensitive)) { s.chop(ls.size()); break; }
+    }
+    return s;
+}
+
+// Candidates in, one label out. See the header above bareAssetName for where they come from and
+// why reading products alone did not work.
+static QString lockedDropLabel(const QStringList& candidateNames)
+{
+    static const QRegularExpression kGroupRx(
+        QStringLiteral("^(?:Catalog|AddOn)_(.+)$"), QRegularExpression::CaseInsensitiveOption);
+    QStringList names;
+    names.reserve(candidateNames.size());
+    for (const QString& n : candidateNames)
+        if (!n.isEmpty() && !n.startsWith(QLatin1String("~unnamed_"))) names << bareAssetName(n);
+    if (names.isEmpty()) return QString();
+    names.sort(Qt::CaseInsensitive);
+    for (const QString& n : names) {
+        const auto m = kGroupRx.match(n);
+        if (m.hasMatch()) return m.captured(1).replace(QLatin1Char('_'), QLatin1Char(' '));
+    }
+    static const QRegularExpression kStorRx(QStringLiteral("stor\\d+"),
+                                            QRegularExpression::CaseInsensitiveOption);
+    QHash<QString, int> toks;
+    for (const QString& n : names) {
+        auto it = kStorRx.globalMatch(n);
+        while (it.hasNext()) ++toks[it.next().captured(0).toLower()];
+    }
+    if (!toks.isEmpty()) {
+        QVector<QPair<int, QString>> byCount;
+        for (auto i = toks.constBegin(); i != toks.constEnd(); ++i) byCount << qMakePair(i.value(), i.key());
+        std::sort(byCount.begin(), byCount.end(),
+                  [](const QPair<int, QString>& a, const QPair<int, QString>& b) {
+                      return a.first != b.first ? a.first > b.first : a.second < b.second;
+                  });
+        QStringList top;
+        for (int i = 0; i < byCount.size() && i < 3; ++i) top << byCount[i].second;
+        return top.join(QStringLiteral(" / "));
+    }
+    // A representative name. Placeholders were already dropped on the way in, so anything reaching
+    // here is real; an empty return falls through to the bare key, which the caller handles.
+    return names.first();
+}
+
 void CatalogueTab::reloadBundleList()
 {
     if (!m_list) return;
@@ -1175,6 +1412,76 @@ void CatalogueTab::reloadBundleList()
         m_countLbl->setText(idx.building() ? QStringLiteral("Indexing the store catalogue…")
                                            : QStringLiteral("No d4data — set it in Settings."));
         return;
+    }
+
+    // Locked-drop dropdown, grouped by TACT key and labelled from each cohort's own contents.
+    if (m_dropFilter && m_dropFilter->count() <= 1 && !idx.locked().isEmpty()) {
+        QHash<QString, QVector<const StoreProductIndex::Product*>> byKey;
+        for (int sno : idx.locked())
+            if (const auto* p = idx.product(sno))
+                if (!p->tactKey.isEmpty()) byKey[p->tactKey].append(p);
+
+        // ── The cohort, inverted ONCE ───────────────────────────────────────────────────────────
+        // snosForTactKey is a linear pass over the 12,947-entry manifest, and calling it per key
+        // would be 177 of those. One inversion costs a single pass and answers every key.
+        QHash<QString, QVector<int>> cohortByKey;
+        if (m_reader && m_reader->isReady()) {
+            const QHash<int, QByteArray>& enc = m_reader->encryptedSnos();
+            for (auto i = enc.constBegin(); i != enc.constEnd(); ++i) {
+                const QString k = QString::fromLatin1(i.value().toHex());
+                if (byKey.contains(k)) cohortByKey[k].append(i.key());
+            }
+        }
+        QVector<QPair<int, QString>> order2;   // (product count, key)
+        for (auto i = byKey.constBegin(); i != byKey.constEnd(); ++i)
+            order2 << qMakePair(i.value().size(), i.key());
+        // Biggest drop first: a 50-product collab is what someone is looking for, not a stray
+        // one-product cohort.
+        std::sort(order2.begin(), order2.end(),
+                  [](const QPair<int, QString>& a, const QPair<int, QString>& b) {
+                      return a.first != b.first ? a.first > b.first : a.second < b.second;
+                  });
+        m_dropLabel.clear();
+        const QSignalBlocker block(m_dropFilter);
+        bool sepDone = false;
+        int named = 0;
+        for (const auto& kv : order2) {
+            QStringList cand;
+            for (const auto* p : byKey.value(kv.second)) cand << p->name;
+            // Appearance and texture names from the same TACT cohort. Capped: a label needs a
+            // representative sample, not the whole drop, and the cap keeps a 1,100-asset cohort
+            // from costing 2,200 index lookups for three tokens.
+            if (m_index) {
+                // constFind, not operator[] — the non-const one INSERTS a default for a missing
+                // key, which is this codebase's own documented scar and needless here besides.
+                const auto ci = cohortByKey.constFind(kv.second);
+                const QVector<int> co = ci == cohortByKey.constEnd() ? QVector<int>() : ci.value();
+                for (int i = 0; i < co.size() && i < 400; ++i) {
+                    const QString an = m_index->nameForSno(kAppearanceGroup(), co.at(i));
+                    if (!an.isEmpty()) { cand << an; continue; }
+                    const QString tn = m_index->nameForSno(kTextureGroup(), co.at(i));
+                    if (!tn.isEmpty()) cand << tn;
+                }
+            }
+            const QString lab = lockedDropLabel(cand);
+            if (!lab.isEmpty()) { m_dropLabel.insert(kv.second, lab); ++named; }
+            // The long tail is real — most of the 177 drops hold a single product — and hiding it
+            // would be filtering data out of a control whose whole job is to expose it. Separated
+            // instead, so the drops worth browsing are not buried under a hundred singletons.
+            // count() > 1 means at least one real drop is already above it. Without that guard a
+            // build whose drops are ALL singletons opens the list with a separator directly under
+            // "Any locked drop", separating nothing from everything.
+            if (!sepDone && kv.first < 2 && m_dropFilter->count() > 1) {
+                m_dropFilter->insertSeparator(m_dropFilter->count());
+                sepDone = true;
+            }
+            m_dropFilter->addItem(QStringLiteral("%1  (%2)")
+                                      .arg(lab.isEmpty() ? kv.second : lab).arg(kv.first),
+                                  kv.second);
+        }
+        qInfo("catalogue: %d locked product(s) across %d TACT-key drop(s); %d drop(s) named from "
+              "their cohort, %d left as a bare key",
+              int(idx.locked().size()), int(byKey.size()), named, int(byKey.size()) - named);
     }
 
     // Patch dropdown, populated once from the data rather than hard-coded.
@@ -1229,77 +1536,185 @@ void CatalogueTab::reloadBundleList()
     const QString wantBr = m_branchFilter->currentData().toString();
     const int wantSeason = m_seasonFilter ? m_seasonFilter->currentData().toInt() : 0;
     const bool wantLatest = m_latestChk && m_latestChk->isChecked();
+    const bool wantHasIcon = m_hasIconChk && m_hasIconChk->isChecked();
+    const QString wantDrop = m_dropFilter ? m_dropFilter->currentData().toString() : QString();
 
     // Sort BEFORE filtering, so the order is a property of the catalogue rather than of whatever
     // survived the filters. Season and patch fall back to the title, otherwise every bundle in one
     // season would come out in QHash order — different on every launch.
-    QVector<int> order = idx.bundles();
+    // ── What is even a candidate ────────────────────────────────────────────────────────────────
+    // bundles() is products with readable children; locked() is products whose record is
+    // TACT-encrypted, where "is it a bundle" is unreadable and therefore not claimed. Both by
+    // default: a locked bundle is real content, and omitting it is what made the DOOM collab look
+    // like it did not exist.
+    const bool onlyEnc = m_onlyEncrypted && m_onlyEncrypted->isChecked();
+    const bool onlyDec = m_onlyDecrypted && m_onlyDecrypted->isChecked();
+    QVector<int> order;
+    if (!onlyEnc) order = idx.bundles();
+    if (!onlyEnc && m_showLoose && m_showLoose->isChecked()) order += idx.loose();
+    if (!onlyDec) order += idx.locked();
     const QString sortBy = m_sortCombo ? m_sortCombo->currentData().toString()
                                        : QStringLiteral("name");
-    if (sortBy != QLatin1String("name")) {
-        const bool bySeason = (sortBy == QLatin1String("season"));
-        std::sort(order.begin(), order.end(), [&idx, bySeason](int a, int b) {
-            const auto* pa = idx.product(a);
-            const auto* pb = idx.product(b);
-            if (!pa || !pb) return pa != nullptr;
-            // Newest first: a shop history is read from the present backwards. Unset sorts last,
-            // not first — a bundle with no season is not "season zero".
-            const auto keyOf = [bySeason](const StoreProductIndex::Product* p) {
-                return bySeason ? p->season : 0;
-            };
-            if (bySeason) {
-                const int ka = keyOf(pa), kb = keyOf(pb);
-                if (ka != kb) return (ka == 0) ? false : (kb == 0) ? true : ka > kb;
-            } else {
-                if (pa->branch != pb->branch) {
-                    if (pa->branch.isEmpty()) return false;
-                    if (pb->branch.isEmpty()) return true;
-                    return pa->branch > pb->branch;
+    // ── Always sorted, "name" included ──────────────────────────────────────────────────────────
+    // `order` used to BE idx.bundles(), which the index hands back already sorted by name, so the
+    // default case could skip the sort and be right by accident. It is now three concatenated runs
+    // — bundles, then loose, then locked — and bundles are keyed on title-or-name while the other
+    // two are keyed on the SNO name. Skipping left a list sorted in three separate stretches and
+    // nowhere overall, which made the DEFAULT view the broken one.
+    //
+    // The SNO sorts are handled separately below because they need neither the index nor a
+    // tiebreak: `order` already holds the snos.
+    {
+        const bool bySeason  = (sortBy == QLatin1String("season"));
+        const bool byPatch   = (sortBy == QLatin1String("patch"));
+        const bool bySno     = (sortBy == QLatin1String("sno"));
+        const bool bySnoDesc = (sortBy == QLatin1String("snodesc"));
+        // `order` holds product SNOs, so a and b ARE the keys — no product lookup, and no
+        // tiebreak, because a sno is unique per record. Handled before the null check for
+        // the same reason: a sno orders fine whether or not the index can describe it, and
+        // sending the unreadable ones to one end would defeat the point of sorting by id.
+        if (bySno || bySnoDesc) {
+            std::sort(order.begin(), order.end(),
+                      [bySnoDesc](int a, int b) { return bySnoDesc ? a > b : a < b; });
+        } else {
+            std::sort(order.begin(), order.end(), [&idx, bySeason, byPatch](int a, int b) {
+                const auto* pa = idx.product(a);
+                const auto* pb = idx.product(b);
+                if (!pa || !pb) return pa != nullptr;
+                // Newest first: a shop history is read from the present backwards. Unset sorts last,
+                // not first — a bundle with no season is not "season zero".
+                if (bySeason) {
+                    const int ka = pa->season, kb = pb->season;
+                    if (ka != kb) return (ka == 0) ? false : (kb == 0) ? true : ka > kb;
+                } else if (byPatch) {
+                    if (pa->branch != pb->branch) {
+                        if (pa->branch.isEmpty()) return false;
+                        if (pb->branch.isEmpty()) return true;
+                        return pa->branch > pb->branch;
+                    }
                 }
-            }
-            const QString ta = pa->title.isEmpty() ? pa->name : pa->title;
-            const QString tb = pb->title.isEmpty() ? pb->name : pb->title;
-            const int c = ta.compare(tb, Qt::CaseInsensitive);
-            return c != 0 ? c < 0 : a < b;
-        });
+                // The tiebreak — and the whole ordering when sorting by name. Title-or-name is the
+                // string actually on screen, so this is an order a reader can verify by looking; the
+                // sno tiebreak keeps it a strict weak ordering when two products share a label.
+                const QString ta = pa->title.isEmpty() ? pa->name : pa->title;
+                const QString tb = pb->title.isEmpty() ? pb->name : pb->title;
+                const int c = ta.compare(tb, Qt::CaseInsensitive);
+                return c != 0 ? c < 0 : a < b;
+            });
+        }
     }
 
     m_list->clear();
     int shown = 0;
+    // Counted so the absence can be STATED. A TACT-locked record has no readable branch, no season
+    // and no readable contents, so `branch` is empty, `season` is 0 and contentSnos() is empty by
+    // construction — which means every one of the filters below excludes all 71 locked products
+    // whatever you set it to. That is correct: they genuinely do not match. It is also invisible,
+    // because the only symptom is a list that got shorter, and a list that quietly gets shorter is
+    // precisely the failure this whole change exists to end.
+    int lockedHidden = 0, looseHidden = 0;
     for (int sno : order) {
         const auto* b = idx.product(sno);
         if (!b) continue;
-        if (!wantBr.isEmpty() && b->branch != wantBr) continue;
-        if (wantSeason && b->season != wantSeason) continue;
-        // "Latest" is per-SNO and lives on the index, exactly as Models and Bulk Extract use it.
-        if (wantLatest && !(m_index && m_index->isNew(sno))) continue;
-        if (wantKind >= 0) {
-            bool has = false;
-            for (int cs : b->children)
-                if (const auto* c = idx.product(cs))
-                    if (int(c->kind) == wantKind) { has = true; break; }
-            if (!has) continue;
+        // A drop is a set of LOCKED products, so choosing one necessarily excludes readable
+        // bundles - they have no key. Said plainly rather than left to look like a bug.
+        if (!wantDrop.isEmpty() && b->tactKey != wantDrop) continue;
+        {
+            bool drop = false;
+            if (!wantBr.isEmpty() && b->branch != wantBr) drop = true;
+            else if (wantSeason && b->season != wantSeason) drop = true;
+            // "Latest" is per-SNO and lives on the index, as Models and Bulk Extract use it.
+            else if (wantLatest && !(m_index && m_index->isNew(sno))) drop = true;
+            else if (wantKind >= 0) {
+                bool has = false;
+                for (int cs : contentSnos(*b))
+                    if (const auto* c = idx.product(cs))
+                        if (int(c->kind) == wantKind) { has = true; break; }
+                if (!has) drop = true;
+            }
+            // Shop art is resolved from the NAME, so "has art" is answerable without decoding it.
+            if (!drop && wantHasIcon && shopTextures(b->name).isEmpty()) drop = true;
+            if (drop) {
+                if (b->encrypted) ++lockedHidden;
+                else if (b->children.isEmpty()) ++looseHidden;
+                continue;
+            }
         }
         if (!needle.isEmpty()) {
+            // Children and their resolved appearances included, so a model name finds the bundle
+            // that sold it - searching barM_stor251_HLM used to match nothing at all.
             QString hay = b->name + QLatin1Char(' ') + b->title + QLatin1Char(' ') + b->description;
+            for (int cs : contentSnos(*b))
+                if (const auto* c = idx.product(cs)) {
+                    hay += QLatin1Char(' ') + c->name + QLatin1Char(' ') + c->title;
+                    const QString pn = payloadNameOf(*c);
+                    if (!pn.isEmpty()) hay += QLatin1Char(' ') + pn;
+                }
             if (!hay.toLower().contains(needle)) continue;
         }
-        const QString label = b->title.isEmpty() ? b->name : b->title;
+        // A product whose NAME is a placeholder has nothing readable to show, and "~unnamed_2632490"
+        // reads as a bug rather than as what it is. Measured: all 1,579 encrypted products are
+        // ~unnamed_ in CoreTOC itself — the game withholds the name, so there is none to find.
+        // Saying "Locked product 2632490" states the same fact in words a person can act on.
+        const bool placeholder = b->name.startsWith(QLatin1String("~unnamed_"));
+        const QString label = !b->title.isEmpty() ? b->title
+                            : placeholder ? QStringLiteral("Locked product %1").arg(b->sno)
+                                          : b->name;
         // Two lines, as the shop's cards are: NAME above, then what it is. The shop's second line
         // is hBundleTypeLabel ("EQUIPMENT" / "MEGA BUNDLE"), which is a string-label hash we cannot
         // resolve yet — a summary of the actual contents is more informative anyway, and honest.
+        // A locked product says so instead of reporting "0 items", which reads as an empty bundle
+        // and is a different, wrong claim: the contents are unknown, not absent.
+        if (b->encrypted) {
+            // The drop's NAME where we have one. A hex key identifies the drop precisely and tells
+            // the reader nothing; "S12 IP Collab" is the same fact in the form they came for.
+            const QString drop = m_dropLabel.value(b->tactKey);
+            auto* lit = new QListWidgetItem(
+                label + QChar(QChar::LineSeparator)
+                      + (b->tactKey.isEmpty()
+                             ? QStringLiteral("locked - contents need a TACT key (unknown)")
+                         : drop.isEmpty()
+                             ? QStringLiteral("locked - contents need TACT key %1").arg(b->tactKey)
+                             : QStringLiteral("locked - %1").arg(drop)),
+                m_list);
+            lit->setData(Qt::UserRole, sno);
+            lit->setSizeHint(m_gridMode ? GridItemDelegate::tileFor(m_gridPx)
+                                        : QSize(0, thumbBox().height() + 4));
+            lit->setToolTip(QStringLiteral(
+                "%1\nSNO %2\n\nThis product's record is encrypted with a TACT key that has not "
+                "been published.\nIts name and shop art resolve; its contents cannot be read, so "
+                "they are\nnot listed rather than shown as empty.")
+                    .arg(b->name).arg(sno));
+            ++shown;
+            if (sno == keep) m_list->setCurrentItem(lit);
+            continue;
+        }
         QSet<int> kinds;
-        for (int cs : b->children)
+        for (int cs : contentSnos(*b))
             if (const auto* c = idx.product(cs)) kinds.insert(int(c->kind));
         QStringList kindNames;
         for (int k : kinds)
             if (k != StoreProductIndex::None)
                 kindNames << StoreProductIndex::kindLabel(StoreProductIndex::Kind(k)).toLower();
         std::sort(kindNames.begin(), kindNames.end());
-        const QString second = QStringLiteral("%1 item%2%3")
-            .arg(b->children.size()).arg(b->children.size() == 1 ? QString() : QStringLiteral("s"))
-            .arg(kindNames.isEmpty() ? QString()
-                                     : QStringLiteral("  ·  ") + kindNames.join(QStringLiteral(", ")));
+        // A standalone product reports WHAT IT IS. "1 item · weapon" reads like a bundle that
+        // happens to hold one thing, which is a different claim from "this is the thing".
+        const bool isLoose = b->children.isEmpty() && !b->encrypted;
+        QString second = isLoose
+            ? (kindNames.isEmpty() ? QStringLiteral("single product")
+                                   : kindNames.join(QStringLiteral(", ")))
+            : QStringLiteral("%1 item%2%3")
+                  .arg(contentSnos(*b).size())
+                  .arg(contentSnos(*b).size() == 1 ? QString() : QStringLiteral("s"))
+                  .arg(kindNames.isEmpty() ? QString()
+                                           : QStringLiteral("  ·  ") + kindNames.join(QStringLiteral(", ")));
+        // A product d4data never described has NO shop title, so the row above shows its SNO name
+        // where every neighbour shows a real one — Bundle_HArmor_bar_stor251 sitting beside "The
+        // Berserker Armor". That reads as a missing title rather than as a property of the source.
+        // Measured: 166 CASC-recovered products, 0 of them with a title, so this is the whole
+        // population and not an edge case. The detail pane has always said so; the list did not.
+        if (b->fromCasc && !b->encrypted && b->title.isEmpty())
+            second += QStringLiteral("  ·  no shop text in this snapshot");
         // QChar::LineSeparator, NOT '\n': QTextLayout breaks on U+2028, and QStyledItemDelegate
         // (unlike QItemDelegate) does not translate a raw newline into it.
         auto* it = new QListWidgetItem(
@@ -1319,7 +1734,83 @@ void CatalogueTab::reloadBundleList()
         ++shown;
         if (sno == keep) m_list->setCurrentItem(it);
     }
-    m_countLbl->setText(QStringLiteral("%1 of %2 bundles").arg(shown).arg(idx.bundles().size()));
+    // ── The coverage line ───────────────────────────────────────────────────────────────────────
+    // Not decoration. Every failure this tab has had was silent: the DOOM collab was absent for
+    // months and the only symptom was a list that looked complete. So the tab now states what
+    // happened to EVERY record in the group, and the parts are made to add up on screen -
+    // described + recovered + locked + unreadable == known. A future gap shows up as arithmetic
+    // that does not balance, which is a thing you can see, rather than as content that is simply
+    // not there, which is not.
+    const auto cov = idx.coverage();
+    QStringList parts;
+    // "listed", not "shown": the figures after it are the CATALOGUE's populations, not this
+    // listing's, and with loose and locked products both on by default the first number routinely
+    // exceeded the "bundles" count sitting right next to it. Two numbers that look like a subset
+    // relationship and are not is worse than no number.
+    parts << QStringLiteral("%1 listed").arg(shown);
+    parts << QStringLiteral("%1 bundles").arg(idx.bundles().size());
+    if (!idx.loose().isEmpty())  parts << QStringLiteral("%1 loose").arg(idx.loose().size());
+    if (!idx.locked().isEmpty()) parts << QStringLiteral("%1 locked").arg(idx.locked().size());
+    if (cov.unreadable > 0)      parts << QStringLiteral("%1 unreadable").arg(cov.unreadable);
+    if (cov.known > 0)           parts << QStringLiteral("of %1 products").arg(cov.known);
+    m_countLbl->setText(parts.join(QStringLiteral("  ·  ")));
+    m_countLbl->setToolTip(QStringLiteral(
+        "Every StoreProduct the game has, and what became of it.\n\n"
+        "  %1\tdescribed by d4data\n"
+        "  %2\trecovered from the game binary (no d4data entry)\n"
+        "  %3\tTACT-locked - name and shop art only\n"
+        "  %4\tunreadable for some other reason\n"
+        "  %5\ttotal known to the SNO index\n\n"
+        "The first three are every product that was actually built. The fourth is the residual:\n"
+        "records the index knew about that produced nothing at all. If that residual grows,\n"
+        "something is being dropped on the floor - which is exactly how the Diablo IV x DOOM\n"
+        "collab went missing.\n\n"
+        "\"loose\" are products that are neither a bundle nor inside one, so no amount of\n"
+        "drilling into bundles will reach them.")
+            .arg(cov.described).arg(cov.recovered).arg(cov.locked)
+            .arg(cov.unreadable).arg(cov.known));
+    // ── Why the list is short, or empty ─────────────────────────────────────────────────────────
+    // Stated, never implied. "0 listed" under eight filter chips is a puzzle; "0 listed - a locked
+    // drop holds only encrypted products, and Only decrypted hides every one of them" is an answer.
+    // Neither combination below is a bug to guard against: they are honest filters whose
+    // intersection is genuinely empty, which is a thing worth SAYING rather than preventing.
+    QStringList why;
+    if (onlyDec && !wantDrop.isEmpty())
+        why << QStringLiteral("a locked drop holds only encrypted products, and \"Only decrypted\" "
+                              "hides every one of them");
+    if (onlyEnc && (wantKind >= 0 || !wantBr.isEmpty() || wantSeason || wantLatest))
+        why << QStringLiteral("an encrypted record has no readable patch, season or contents, so "
+                              "those filters exclude all of them");
+    if (lockedHidden > 0)
+        why << QStringLiteral("%1 locked product(s) hidden — they carry no patch, season or "
+                              "readable contents to match on").arg(lockedHidden);
+    // Named by WHICH filters, not "the current filters": these two counters are incremented only
+    // in the patch/season/latest/kind/has-icon block, so a row lost to the drop combo or to the
+    // search box is deliberately not counted here and must not be implied.
+    if (looseHidden > 0)
+        why << QStringLiteral("%1 loose product(s) hidden by the patch, season, kind, Latest or "
+                              "Has icon filter").arg(looseHidden);
+    // !onlyEnc, because when "Only encrypted" is ticked the loose products were excluded by THAT,
+    // and blaming a checkbox that is not the cause sends the reader to the wrong control.
+    if (!onlyEnc && m_showLoose && !m_showLoose->isChecked() && !idx.loose().isEmpty())
+        why << QStringLiteral("%1 loose product(s) hidden by \"Show loose products\"")
+                   .arg(idx.loose().size());
+    // The commonest reason of all for an empty list, and the one this block was silent about.
+    if (shown == 0 && !needle.isEmpty())
+        why << QStringLiteral("nothing matched \"%1\" in any product name, title, description or "
+                              "content name").arg(m_search->text().trimmed());
+    if (m_status) {
+        static const QString kNotePfx = QStringLiteral("Note — ");
+        static const QString kNonePfx = QStringLiteral("Nothing matches — ");
+        if (!why.isEmpty())
+            m_status->setText((shown == 0 ? kNonePfx : kNotePfx)
+                              + why.join(QStringLiteral("  ·  ")));
+        // Taken down again, but ONLY if what is on screen is one of ours. An export summary or an
+        // error belongs to whoever wrote it; a note about a filter nobody has set any more does
+        // not, and leaving it up under a full list is its own small lie.
+        else if (m_status->text().startsWith(kNotePfx) || m_status->text().startsWith(kNonePfx))
+            m_status->clear();
+    }
     rebuildFilterChips();
     saveFilterState();   // one honest place to persist; no-ops unless "Remember" is on
     if (m_thumbTimer) m_thumbTimer->start();   // the visible rows changed — fill their icons
@@ -1363,6 +1854,20 @@ void CatalogueTab::rebuildFilterChips()
         addChip(m_seasonFilter->currentText(), [this] { m_seasonFilter->setCurrentIndex(0); });
     if (m_latestChk && m_latestChk->isChecked())
         addChip(QStringLiteral("Latest"), [this] { m_latestChk->setChecked(false); });
+    if (m_dropFilter && m_dropFilter->currentIndex() > 0)
+        addChip(m_dropFilter->currentText().section(QStringLiteral("  ("), 0, 0),
+                [this] { m_dropFilter->setCurrentIndex(0); });
+    if (m_onlyDecrypted && m_onlyDecrypted->isChecked())
+        addChip(QStringLiteral("Only decrypted"), [this] { m_onlyDecrypted->setChecked(false); });
+    if (m_onlyEncrypted && m_onlyEncrypted->isChecked())
+        addChip(QStringLiteral("Only encrypted"), [this] { m_onlyEncrypted->setChecked(false); });
+    if (m_hasIconChk && m_hasIconChk->isChecked())
+        addChip(QStringLiteral("Has icon"), [this] { m_hasIconChk->setChecked(false); });
+    // Inverted, because this filter's ACTIVE state is unticked. The chip says what the list is
+    // currently doing ("Bundles only"), and clicking it undoes that — the same contract as every
+    // other chip, just around the other way.
+    if (m_showLoose && !m_showLoose->isChecked())
+        addChip(QStringLiteral("Bundles only"), [this] { m_showLoose->setChecked(true); });
     m_chipRow->addStretch(1);
     updateFunnelTint();
 }
@@ -1377,7 +1882,12 @@ void CatalogueTab::updateFunnelTint()
     const bool active = (m_kindFilter   && m_kindFilter->currentIndex()   > 0)
                      || (m_branchFilter && m_branchFilter->currentIndex() > 0)
                      || (m_seasonFilter && m_seasonFilter->currentIndex() > 0)
-                     || (m_latestChk    && m_latestChk->isChecked());
+                     || (m_latestChk    && m_latestChk->isChecked())
+                     || (m_dropFilter    && m_dropFilter->currentIndex() > 0)
+                     || (m_onlyDecrypted && m_onlyDecrypted->isChecked())
+                     || (m_onlyEncrypted && m_onlyEncrypted->isChecked())
+                     || (m_hasIconChk    && m_hasIconChk->isChecked())
+                     || (m_showLoose     && !m_showLoose->isChecked());
     m_filtersToggle->setStyleSheet(active
         ? QStringLiteral("QToolButton{padding:1px;border:1px solid #a07a1a;border-radius:3px;"
                          "background:#3a2f12;} QToolButton:hover{border-color:#b0453c;}")
@@ -1401,6 +1911,13 @@ void CatalogueTab::saveFilterState()
     s.setValue(QStringLiteral("catalogue/lastSort"),
                m_sortCombo ? m_sortCombo->currentData().toString() : QString());
     s.setValue(QStringLiteral("catalogue/lastLatest"), m_latestChk && m_latestChk->isChecked());
+    s.setValue(QStringLiteral("catalogue/lastDrop"), m_dropFilter ? m_dropFilter->currentData() : QVariant());
+    s.setValue(QStringLiteral("catalogue/lastOnlyDec"), m_onlyDecrypted && m_onlyDecrypted->isChecked());
+    s.setValue(QStringLiteral("catalogue/lastOnlyEnc"), m_onlyEncrypted && m_onlyEncrypted->isChecked());
+    s.setValue(QStringLiteral("catalogue/lastHasIcon"), m_hasIconChk && m_hasIconChk->isChecked());
+    // Default TRUE on read-back, so a settings file written before this key existed restores the
+    // shipping default rather than an unticked box nobody chose.
+    s.setValue(QStringLiteral("catalogue/lastShowLoose"), !m_showLoose || m_showLoose->isChecked());
 }
 
 // Called ONCE, after the patch/season combos have been populated from the index — restoring
@@ -1421,6 +1938,36 @@ void CatalogueTab::restoreFilterState()
     if (m_latestChk) {
         QSignalBlocker b(m_latestChk);
         m_latestChk->setChecked(s.value(QStringLiteral("catalogue/lastLatest"), false).toBool());
+    }
+    // Restored blocked, like the rest: an unblocked setChecked here fires the mutual-exclusion
+    // lambda, which would clear the other box before it has been restored at all.
+    // The drop combo is filled from the index, which is still building on the first restore, so
+    // pick() finds nothing and leaves it at "Any" - correct, and the same shape as the patch combo.
+    pick(m_dropFilter, s.value(QStringLiteral("catalogue/lastDrop")));
+    if (m_onlyDecrypted) {
+        QSignalBlocker b(m_onlyDecrypted);
+        m_onlyDecrypted->setChecked(s.value(QStringLiteral("catalogue/lastOnlyDec"), false).toBool());
+    }
+    if (m_onlyEncrypted) {
+        QSignalBlocker b(m_onlyEncrypted);
+        m_onlyEncrypted->setChecked(s.value(QStringLiteral("catalogue/lastOnlyEnc"), false).toBool());
+    }
+    if (m_hasIconChk) {
+        QSignalBlocker b(m_hasIconChk);
+        m_hasIconChk->setChecked(s.value(QStringLiteral("catalogue/lastHasIcon"), false).toBool());
+    }
+    if (m_showLoose) {
+        QSignalBlocker b(m_showLoose);
+        m_showLoose->setChecked(
+            s.value(QStringLiteral("catalogue/lastShowLoose"), true).toBool());
+    }
+    // Both restored ticked is impossible through the UI but trivial to hand-edit into the ini,
+    // and it would show an empty list with two contradictory chips. Decrypted wins arbitrarily -
+    // what matters is that the state on screen is one the UI could have produced.
+    if (m_onlyDecrypted && m_onlyEncrypted
+        && m_onlyDecrypted->isChecked() && m_onlyEncrypted->isChecked()) {
+        QSignalBlocker b(m_onlyEncrypted);
+        m_onlyEncrypted->setChecked(false);
     }
     if (m_search) {
         QSignalBlocker b(m_search);
@@ -1475,9 +2022,25 @@ void CatalogueTab::showBundle(int sno)
     // season, no supported-classes line. Those live ONLY in the snapshot's JSON and string tables,
     // so their absence here is a property of the source, not a failure of the read — and a user
     // has no way to tell those apart without being told.
-    if (b->fromCasc) sub << QStringLiteral("read from game files — no shop text in this snapshot");
+    // !encrypted: a locked product is fromCasc too, and "read from game files" is a claim about a
+    // record that was, in fact, not readable.
+    if (b->fromCasc && !b->encrypted)
+        sub << QStringLiteral("read from game files — no shop text in this snapshot");
     m_subtitle->setText(sub.join(QStringLiteral("  ·  ")));
     if (!b->description.isEmpty()) m_lore->setPlainText(b->description);
+    // Before this branch existed, a locked product fell through to the fromCasc paragraph below —
+    // which ends "contents, artwork and models all export normally" and was being printed three
+    // lines above a header reading CONTENTS LOCKED. Two opposite claims on one screen.
+    else if (b->encrypted)
+        m_lore->setPlainText(QStringLiteral(
+            "This product's record is encrypted with a TACT key Blizzard has not published, so its "
+            "contents cannot be read — not by this tool and not by any other. What survives is what "
+            "the SNO name alone can give: the product itself, and the shop art named after it. Both "
+            "are shown above and both export.\n\n"
+            "Everything encrypted under the same key shipped as one content drop, which is the "
+            "game's own grouping rather than ours. Filters ▸ Availability ▸ the drop list shows the "
+            "rest of it; exporting writes that drop's models and textures once for the batch, with "
+            "the first product that carries the key."));
     else if (b->fromCasc)
         m_lore->setPlainText(QStringLiteral(
             "This bundle is not in the d4data snapshot, so its shop name, description, season and "
@@ -1560,16 +2123,47 @@ void CatalogueTab::showBundle(int sno)
     // ONE resolve for the whole pane. showBundle used to call appearancesFor per transmog child to
     // label the tree, and then resolveBundle called it again per child for the counts — double the
     // work for the same answer. resolveBundle now reports the per-child breakdown it already had.
-    const Resolved r = resolveBundle(*b);
+    // withDropCohort = FALSE. The cohort is an EXPORT concept. For a locked product it is 1,116
+    // assets under one key, 392 of them textures, and feeding those into r.textures made the
+    // "Bundle images" branch list an entire content drop underneath a header stating that the
+    // contents are locked — while costing a manifest scan and ~1,116 nameForSno lookups on every
+    // arrow-key press down a 50-row drop. The header below states the cohort's SIZE instead, which
+    // is the honest part of that and costs one linear pass.
+    const Resolved r = resolveBundle(*b, /*withDropCohort=*/false);
 
     // ── The contents strip: "INCLUDES 8 ITEMS:" ──────────────────────────────────────────────
     StoreProductIndex& idx = StoreProductIndex::instance();
     m_strip->clear();
     m_childApp = r.firstApp;       // remembered for the "open in Models" double-click
-    m_stripHdr->setText(QStringLiteral("INCLUDES %1 ITEM%2:")
-                            .arg(b->children.size())
-                            .arg(b->children.size() == 1 ? QString() : QStringLiteral("S")));
-    for (int cs : b->children) {
+    // "INCLUDES 0 ITEMS" for a locked bundle would be a claim about its contents, and the wrong
+    // one: they are unreadable, not absent. The shop art above is still real and still exportable.
+    QString lockedHdr;
+    if (b->encrypted) {
+        // The drop's derived name first, the key second. The key is the precise identifier and
+        // the label is the readable one; the pane owes the reader both, in that order of use.
+        const QString drop = m_dropLabel.value(b->tactKey);
+        lockedHdr = b->tactKey.isEmpty()
+            ? QStringLiteral("CONTENTS LOCKED - encrypted, key unknown")
+            : drop.isEmpty()
+                ? QStringLiteral("CONTENTS LOCKED - encrypted with TACT key %1").arg(b->tactKey)
+                : QStringLiteral("CONTENTS LOCKED - %1  (TACT key %2)").arg(drop, b->tactKey);
+        // The SIZE of the drop and nothing more: snosForTactKey is one linear pass over an
+        // already-parsed manifest. Resolving those snos to names to display them is what this pane
+        // used to do on every selection change, and is what it no longer does.
+        if (m_reader && !b->tactKey.isEmpty()) {
+            const int n =
+                m_reader->snosForTactKey(QByteArray::fromHex(b->tactKey.toLatin1())).size();
+            if (n > 0) lockedHdr += QStringLiteral("  ·  %1 asset(s) share this key").arg(n);
+        }
+    }
+    m_stripHdr->setText(b->encrypted
+        ? lockedHdr
+        : b->children.isEmpty()
+            ? QStringLiteral("THIS PRODUCT:")
+            : QStringLiteral("INCLUDES %1 ITEM%2:")
+                  .arg(contentSnos(*b).size())
+                  .arg(contentSnos(*b).size() == 1 ? QString() : QStringLiteral("S")));
+    for (int cs : contentSnos(*b)) {
         const auto* c = idx.product(cs);
         const QString label = c ? (c->title.isEmpty() ? c->name : c->title)
                                 : QStringLiteral("product %1").arg(cs);
@@ -1647,7 +2241,7 @@ void CatalogueTab::showBundle(int sno)
     }
     // Children grouped by kind — the whole reason to look at a bundle rather than its armour.
     QHash<int, QTreeWidgetItem*> groups;
-    for (int cs : b->children) {
+    for (int cs : contentSnos(*b)) {
         const auto* c = idx.product(cs);
         const QString cname = c ? (c->title.isEmpty() ? c->name : c->title)
                                 : QStringLiteral("product %1").arg(cs);
@@ -1714,16 +2308,13 @@ QVector<QPair<int, QString>> CatalogueTab::shopTextures(const QString& bundleNam
     QVector<QPair<int, QString>> out;
     if (!m_index) return out;
     ensureNameMaps();
-    QString bare = bundleName;
-    if (bare.startsWith(QLatin1String("Bundle_"), Qt::CaseInsensitive)) bare = bare.mid(7);
     // Order matters — the caller takes the first hit as the preview. The bare 2DUI_ tile is the
     // shop's own thumbnail and the smallest of the set, so it is both the right image and the
-    // cheapest to decode; _background and _WebImage are full-bleed art at up to 2048².
-    QStringList want;
-    for (const char* sfx : kUiSuffixes)
-        want << QStringLiteral("2DUI_Bundle_") + bare + QString::fromLatin1(sfx);
-    want << QStringLiteral("2DInventory_Bundle_") + bare;
-    for (const QString& w : want) {
+    // cheapest to decode; _background and _WebImage are full-bleed art at up to 2048². The list
+    // itself is uiArtCandidates(), so the detail pane, the thumbnails and the "Has icon" filter
+    // all answer from ONE definition of where art lives rather than three copies of two thirds
+    // of it.
+    for (const QString& w : uiArtCandidates(bundleName)) {
         const auto it = m_texByName.constFind(w.toLower());
         if (it != m_texByName.constEnd()) out.append(it.value());
     }
@@ -1758,9 +2349,15 @@ QImage CatalogueTab::heroImage(const QString& bundleName) const
     // at half scale. _details is the fallback banner.
     QString bare = bundleName;
     if (bare.startsWith(QLatin1String("Bundle_"), Qt::CaseInsensitive)) bare = bare.mid(7);
-    for (const char* sfx : {"_background", "_WebImage", "_details"}) {
-        const QString want = (QStringLiteral("2DUI_Bundle_") + bare + QString::fromLatin1(sfx)).toLower();
-        const auto it = m_texByName.constFind(want);
+    QStringList want;
+    for (const char* sfx : {"_background", "_WebImage", "_details"})
+        want << QStringLiteral("2DUI_Bundle_") + bare + QString::fromLatin1(sfx);
+    // The un-infixed form too, for the same reason shopTextures grew it: a loose or Catalog_*
+    // product is never named Bundle_*, so the 2DUI_Bundle_ shape can never match one.
+    for (const char* sfx : {"_background", "_WebImage", "_details"})
+        want << QStringLiteral("2DUI_") + bare + QString::fromLatin1(sfx);
+    for (const QString& w : want) {
+        const auto it = m_texByName.constFind(w.toLower());
         if (it == m_texByName.constEnd()) continue;
         const QImage img = decodeTexture(it.value().first, it.value().second);
         if (!img.isNull()) return img;
@@ -1778,9 +2375,17 @@ QImage CatalogueTab::cardImage(const QString& bundleName) const
         if (!img.isNull()) return img;
     }
     // No card sheet: the inventory sheet's biggest frame is a reasonable stand-in, and for a
-    // single-item product it IS the icon.
-    const auto inv = m_texByName.constFind((QStringLiteral("2DInventory_Bundle_") + bare).toLower());
-    if (inv != m_texByName.constEnd()) return largestFrame(inv.value().first, inv.value().second);
+    // single-item product it IS the icon. Both infix forms, because a loose or Catalog_* product
+    // is named without the Bundle_ that the first lookup assumes - 2DInventory_Catalog_S12_IP_Collab
+    // is the game's own name for the DOOM weapon icons and has no Bundle_ anywhere in it.
+    for (const QString& n : { QStringLiteral("2DInventory_Bundle_") + bare,
+                              QStringLiteral("2DInventory_") + bare,
+                              QStringLiteral("2DUI_") + bare }) {
+        const auto inv = m_texByName.constFind(n.toLower());
+        if (inv == m_texByName.constEnd()) continue;
+        const QImage img = largestFrame(inv.value().first, inv.value().second);
+        if (!img.isNull()) return img;
+    }
     return {};
 }
 
@@ -1859,7 +2464,13 @@ void CatalogueTab::renderVisibleThumbs()
                 pm = QPixmap::fromImage(img.scaled(m_list->iconSize(), Qt::KeepAspectRatio,
                                                    Qt::SmoothTransformation));
         }
-        m_thumbs.insert(sno, pm);   // null is cached too, so a bundle with no art is tried once
+        // Null is cached too, so a bundle with genuinely no art is tried once rather than once per
+        // scroll. Safe to cache unconditionally BECAUSE of the `m_texByName.isEmpty()` early return
+        // at the top of this function: nothing reaches here until the name maps hold something, so
+        // a null here means "this product has no art", never "the index has not loaded yet". That
+        // distinction is what ensureNameMaps now protects — it no longer latches on an empty
+        // index, so the early return above stops being permanent.
+        m_thumbs.insert(sno, pm);
         if (!pm.isNull()) it->setIcon(QIcon(pm));
     }
     if (more) m_thumbTimer->start();
@@ -1868,13 +2479,20 @@ void CatalogueTab::renderVisibleThumbs()
 void CatalogueTab::ensureNameMaps() const
 {
     if (m_nameMapsBuilt || !m_index) return;
-    m_nameMapsBuilt = true;
     const auto& apps = m_index->entries(kAppearanceGroup());
+    const auto& texs0 = m_index->entries(kTextureGroup());
+    // Latched on a build that PRODUCED something, not on entry. It used to set the flag first, so
+    // a call made while the SnoIndex was still loading - CatalogueTab::refresh() does not wait for
+    // it - left both maps permanently empty for the rest of the session. Every shop-art lookup
+    // then missed, "Has icon" hid the entire catalogue, and renderVisibleThumbs cached a null
+    // pixmap per row so the blanks survived even once the index had finished. An empty index is a
+    // "not yet", not an answer.
+    if (apps.isEmpty() && texs0.isEmpty()) return;
+    m_nameMapsBuilt = true;
     m_appByName.reserve(apps.size());
     for (const SnoEntry& e : apps) m_appByName.insert(e.name.toLower(), {e.snoId, e.name});
-    const auto& texs = m_index->entries(kTextureGroup());
-    m_texByName.reserve(texs.size());
-    for (const SnoEntry& e : texs) m_texByName.insert(e.name.toLower(), {e.snoId, e.name});
+    m_texByName.reserve(texs0.size());
+    for (const SnoEntry& e : texs0) m_texByName.insert(e.name.toLower(), {e.snoId, e.name});
 }
 
 QVector<QPair<int, QString>> CatalogueTab::appearancesFor(const QString& itemName) const
@@ -2092,7 +2710,8 @@ QString CatalogueTab::payloadNameOf(const StoreProductIndex::Product& p) const
     return m_index->nameForSno(p.payloadGroup, p.payloadSno);
 }
 
-CatalogueTab::Resolved CatalogueTab::resolveBundle(const StoreProductIndex::Product& b) const
+CatalogueTab::Resolved CatalogueTab::resolveBundle(const StoreProductIndex::Product& b,
+                                                   bool withDropCohort) const
 {
     Resolved r;
     StoreProductIndex& idx = StoreProductIndex::instance();
@@ -2109,8 +2728,52 @@ CatalogueTab::Resolved CatalogueTab::resolveBundle(const StoreProductIndex::Prod
     // The bundle's own shop art. Full textures rather than atlas frames, which is why they are
     // exported as textures and not as icons.
     r.textures = shopTextures(b.name);
+    // Seeded HERE, not after the cohort loop below. It used to be filled once the loop had already
+    // run, so the loop's own `!seenTex.contains(s)` test was asking an empty set: any texture that
+    // is both the bundle's shop art AND a member of its TACT cohort was appended twice. For a
+    // locked product that is the normal case, not the exotic one - the bundle's 2DUI_Bundle_* art
+    // is encrypted under the very key that defines the cohort.
     QSet<int> seenTex;
     for (const auto& t : r.textures) seenTex.insert(t.first);
+    // ── A locked product exports its whole DROP ─────────────────────────────────────────────────
+    // This is the answer to "how would I have gotten ALL of the collab's assets" - the question the
+    // Berserk set raised and the DOOM set repeated. A bundle's children are one slice of a release;
+    // the release itself is a TACT key, and that key reaches every group. Measured on the DOOM
+    // armour key: 1,116 assets, of which 50 are StoreProducts and 392 are textures, 72 appearances,
+    // 130 cloth, 109 materials, 157 anims.
+    //
+    // Only for a LOCKED product, and deliberately so: a readable bundle already resolves its own
+    // contents properly through the payload chain, and widening that to "everything encrypted
+    // alongside it" would be a different and much sloppier claim. A locked product has no readable
+    // contents at all, so its cohort is the only honest thing to offer - and it is the game's own
+    // grouping, not ours.
+    //
+    // Filled into the SAME r.models / r.textures the normal path uses, so the existing exporter
+    // writes them with no second pipeline and no new file layout.
+    if (withDropCohort && b.encrypted && m_reader && m_index && !b.tactKey.isEmpty()) {
+        const QVector<int> cohort =
+            m_reader->snosForTactKey(QByteArray::fromHex(b.tactKey.toLatin1()));
+        int nApp = 0, nTex = 0;
+        for (int s : cohort) {
+            // Group by asking the index, never by assuming: nameForSno returns empty for a group
+            // that does not hold this sno, and empty for an encrypted name in one that does.
+            const QString an = m_index->nameForSno(kAppearanceGroup(), s);
+            if (!an.isEmpty()) { r.models.append({s, an}); ++nApp; continue; }
+            const QString tn = m_index->nameForSno(kTextureGroup(), s);
+            if (!tn.isEmpty() && !seenTex.contains(s)) {
+                seenTex.insert(s);
+                r.textures.append({s, tn});
+                ++nTex;
+            }
+        }
+        // Stated, not silent. The cohort is mostly assets this tab has no exporter for (anims,
+        // cloth, materials), and a count that looked like "everything" when it was a third of it
+        // is exactly the kind of quiet half-answer that started this.
+        r.unresolved << QStringLiteral(
+            "locked drop %1: %2 asset(s) share this TACT key - %3 appearance(s) and %4 texture(s) "
+            "exportable here; the rest are anims, cloth and materials this tab has no path for")
+                            .arg(b.tactKey).arg(cohort.size()).arg(nApp).arg(nTex);
+    }
     auto addTex = [&](int sno, const QString& name) {
         if (sno > 0 && !name.isEmpty() && !seenTex.contains(sno)) {
             seenTex.insert(sno);
@@ -2119,7 +2782,7 @@ CatalogueTab::Resolved CatalogueTab::resolveBundle(const StoreProductIndex::Prod
     };
 
     QSet<int> seenModel;
-    for (int cs : b.children) {
+    for (int cs : contentSnos(b)) {
         const auto* c = idx.product(cs);
         if (!c) { r.unresolved << QStringLiteral("product %1 (not in index)").arg(cs); continue; }
         for (quint32 h : c->art) addArt(h);
@@ -2336,11 +2999,34 @@ void CatalogueTab::exportBundleList(QVector<int> bundles, bool promptDir)
     m_exportLog.clear();   // one batch, one log
     int nModels = 0, nTex = 0, nIcons = 0, nFrames = 0, done = 0, nSkipped = 0;
     QStringList unresolved;
+    // ── One drop, written once for the batch ────────────────────────────────────────────────────
+    // A locked product's export includes its whole TACT cohort, because that cohort is the only
+    // content it actually has. Right for one product; catastrophic for fifty. The cohort is a
+    // property of the KEY, so every product under f159f1f70eabaab1 resolves the SAME 72 appearances
+    // and 392 textures — "Export all matching" on that drop was writing 50 sibling folders each
+    // holding an identical copy: 3,600 GLB writes for 72 models, ~19,600 texture decodes for 392
+    // files, and a confirmation dialog that could not warn about any of it because the fan-out
+    // happens two levels below where it was counted.
+    QSet<QString> dropsWritten;
     for (int bs : bundles) {
         const auto* pb = StoreProductIndex::instance().product(bs);
         if (!pb) continue;   // re-checked: resolveBundle below spins the event loop
-        const Written w = writeBundle(*pb, dir, ++done, int(bundles.size()));
+        const bool keyed = pb->encrypted && !pb->tactKey.isEmpty();
+        const bool withCohort = !keyed || !dropsWritten.contains(pb->tactKey);
+        const Written w = writeBundle(*pb, dir, ++done, int(bundles.size()), withCohort);
+        // The key is claimed AFTER the write, never before it. writeBundle returns `skipped`
+        // without resolving anything when "only new" finds a covering manifest from an earlier run
+        // — so claiming the key up front meant the first product could skip, mark the drop as
+        // done, and leave every later product of that drop opting out of a cohort that no product
+        // in the batch ever wrote. The unresolved note asserting otherwise would have been false.
         if (w.skipped) { ++nSkipped; continue; }
+        if (keyed) {
+            if (withCohort) dropsWritten.insert(pb->tactKey);
+            // Said in the batch's own unresolved list, not left to be inferred from a thin folder.
+            else unresolved << QStringLiteral(
+                "locked drop %1: cohort written once for this batch, with the first product "
+                "carrying the key — not duplicated here").arg(pb->tactKey);
+        }
         nModels += w.models; nTex += w.textures; nIcons += w.icons; nFrames += w.frames;
         unresolved += w.unresolved;
     }
@@ -2404,7 +3090,8 @@ void CatalogueTab::exportBundleList(QVector<int> bundles, bool promptDir)
 // menu routes them to exportRows and relabels itself accordingly, so a partial export is something
 // you ask for by name rather than something a stale highlight causes.
 CatalogueTab::Written CatalogueTab::writeBundle(const StoreProductIndex::Product& b,
-                                                const QString& parentDir, int nth, int total)
+                                                const QString& parentDir, int nth, int total,
+                                                bool withDropCohort)
 {
     Written out;
     // COPIED, not referenced. product() hands back a pointer into the index's own QHash, and
@@ -2417,6 +3104,11 @@ CatalogueTab::Written CatalogueTab::writeBundle(const StoreProductIndex::Product
     // bundles into one folder is unusable, and the SNO name is not what anyone is looking for.
     QString stem = bc.title.isEmpty() ? bc.name : bc.title;
     stem.replace(QRegularExpression(QStringLiteral("[\\\\/:*?\"<>|]")), QStringLiteral("_"));
+    // An empty stem would make outDir == parentDir: manifest.json written into the folder the user
+    // picked, every such product colliding on it, and "only new" then reading a manifest belonging
+    // to something else entirely and skipping on the strength of it. A locked product has no title
+    // by definition, so its stem is the SNO name — which is one bad index entry away from blank.
+    if (stem.isEmpty()) stem = QStringLiteral("product_%1").arg(bc.sno);
     const QString outDir = QDir(parentDir).filePath(stem);
 
     // ── What this export is asked to write (Settings ▸ Export ▸ Catalogue export) ────────────────
@@ -2454,7 +3146,7 @@ CatalogueTab::Written CatalogueTab::writeBundle(const StoreProductIndex::Product
     }
     QDir().mkpath(outDir);
 
-    const Resolved r = resolveBundle(bc);
+    const Resolved r = resolveBundle(bc, withDropCohort);
 
     m_status->setText(total > 1
         ? QStringLiteral("Exporting %1 of %2 — %3…").arg(nth).arg(total).arg(stem)
@@ -2522,7 +3214,12 @@ CatalogueTab::Written CatalogueTab::writeBundle(const StoreProductIndex::Product
     }
     QJsonArray kids;
     StoreProductIndex& idx = StoreProductIndex::instance();
-    for (int cs : bc.children) {
+    // contentSnos, not bc.children — this was the one un-substituted site, and it is the one that
+    // writes a FILE. A loose product's children are empty by definition, so the manifest recorded
+    // "contents": [] beside a populated "modelsExported" and a models/ folder with the model in it:
+    // the exact self-contradiction the manifest exists to prevent. (A locked product's empty
+    // contents stay empty and are correct — contentSnos deliberately does not invent one.)
+    for (int cs : contentSnos(bc)) {
         const auto* c = idx.product(cs);
         QJsonObject o;
         o.insert(QStringLiteral("sno"), cs);
@@ -2637,7 +3334,9 @@ bool CatalogueTab::hasExportAllFiltered() const
 
 QString CatalogueTab::exportAllFilteredLabel() const
 {
-    return QStringLiteral("Export all %1 matching bundles").arg(filteredBundles().size());
+    // "products", not "bundles": the list now also holds loose products and locked ones, and a
+    // menu entry is a promise about what is about to be written.
+    return QStringLiteral("Export all %1 matching products").arg(filteredBundles().size());
 }
 
 void CatalogueTab::exportAllFiltered()       { exportAllFiltered(true); }

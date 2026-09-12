@@ -534,6 +534,286 @@ def check_truncation(path: Path, raw: str) -> list[str]:
     return []
 
 
+# ── Direct d4data JSON reads ────────────────────────────────────────────────────────────────────
+# A whole-tree check, not a per-file one, so it lives outside the per-file loop.
+#
+# WHY. Opening <d4>/json/base/meta/Material|Appearance/<name>.json directly is the single most
+# repeated defect shape in this project, and it always fails the same silent way: an ENCRYPTED
+# record ships no JSON, the read returns nothing, and the caller substitutes a default instead of
+# reporting a gap. Three separate user-visible bugs traced to exactly this in one session —
+# the DOOM StoreProducts discarded from the Catalogue, the Wardrobe weapon roster coming back
+# empty (white weapons), and the emissive colour defaulting to white (blown-out glows). Every one
+# was found by someone noticing something missing, never by the tool.
+#
+# MaterialDecode already states the rule in its own header: "THE ONLY correct way to read a
+# material's textures ... Use this, never QFile." texturesFor / appearanceRosterAny /
+# appearanceRosterFromMeta fall back to the CASC meta binary; a raw QFile cannot.
+#
+# WARN, DO NOT BLOCK. There are 39 of these outside the sanctioned readers today. Failing on all
+# of them would just teach everyone to pass --quiet. So the existing debt is recorded per file as
+# a baseline and only an INCREASE fails — new debt is caught the day it is written, old debt is
+# paid down deliberately.
+D4_JSON_RE = re.compile(r"json/base/meta/(Material|Appearance)/")
+
+# Files that read this JSON legitimately and must not be counted as debt:
+#   MaterialDecode.cpp — readMat() IS the sanctioned reader, and appearanceRoster() is the JSON
+#                        half of appearanceRosterAny()'s two routes.
+#   MatSnoSweep.cpp    — the audits and dumps read the JSON deliberately, as GROUND TRUTH to
+#                        score a binary derivation against. That is the opposite of the defect.
+D4_JSON_ALLOWED = {
+    "src/model/MaterialDecode.cpp",
+    "src/index/MatSnoSweep.cpp",
+}
+
+
+def _strip_exists_probes(body: str) -> str:
+    """Drop every QFile::exists(...) argument span.
+
+    The rule exists because a raw READ of a missing record returns nothing and the caller
+    substitutes a default, silently. A presence PROBE is the opposite: its only output is
+    "present" or "absent", which is the very fact the rule wants surfaced — the diagnostics use it
+    to report that an appearance ships no .app.json, or that a roster names a material with no
+    .mat.json on disk. Counting those as debt would push the dumps toward asserting presence
+    instead of measuring it.
+
+    Parenthesis-balanced rather than regex, because these paths are built with QStringLiteral(...)
+    .arg(...) chains that contain their own brackets and routinely wrap across three lines.
+
+    CAVEAT, and it is a real one: the exemption only fires when the path is built INLINE. Hoisting
+    it into a local — const QString p = QStringLiteral("…/Material/x.mat.json"); QFile::exists(p) —
+    re-arms the count, so this check quietly rewards the denser spelling. Anything wrapped in an
+    exists() call is also erased wholesale, so exists(helperThatAlsoReads(path)) would slip
+    through. Both are acceptable for a heuristic whose job is to catch NEW debt the day it lands;
+    neither should be mistaken for a guarantee.
+    """
+    out, i = [], 0
+    needle = "QFile::exists("
+    while True:
+        j = body.find(needle, i)
+        if j < 0:
+            out.append(body[i:])
+            return "".join(out)
+        out.append(body[i:j])
+        k = j + len(needle)
+        depth = 1
+        while k < len(body) and depth:
+            if body[k] == "(":
+                depth += 1
+            elif body[k] == ")":
+                depth -= 1
+            k += 1
+        if depth:
+            # Unbalanced. Reachable without any malformed C++: the caller strips comments with
+            # line.split("//")[0], so a "//" inside a string literal — QFile::exists(url) on an
+            # "http://…" path — truncates the line mid-literal and eats the closing paren. Skip
+            # only THIS occurrence rather than abandoning the rest of the file, so one odd literal
+            # cannot re-arm every later probe in it. Failing this way can only over-count (a
+            # spurious FAIL that names the file), never hide a read.
+            out.append(needle)
+            i = j + len(needle)
+            continue
+        i = k
+
+# Measured 2026-09-08. Lower a number when the site is converted; never raise one.
+D4_JSON_BASELINE = {
+    "src/tabs/ModelsTab.cpp":        14,
+    "src/tabs/WardrobeTab2.cpp":      9,   # 12 -> 9: fxScalar, emissiveColorOf, shaderMapOf
+    "src/tabs/StableTab2.cpp":        4,   # 7 -> 4: Appearance .app.json paths now via apprJsonPath()
+    "src/tabs/ModelsTab_Export.cpp":  5,
+    "src/model/ModelParser.cpp":      1,
+}
+
+
+def check_d4_json_reads(files: list) -> tuple:
+    """Returns (failures, warnings). A file over its baseline fails; the rest is reported."""
+    counts = {}
+    for f in files:
+        try:
+            raw = f.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        # Line comments dropped so a doc comment naming the path is not counted as a read.
+        body = "\n".join(l.split("//")[0] for l in raw.splitlines())
+        n = len(D4_JSON_RE.findall(_strip_exists_probes(body)))
+        if not n:
+            continue
+        rel = f.as_posix()
+        for root in ("src/",):
+            i = rel.find(root)
+            if i >= 0:
+                rel = rel[i:]
+                break
+        if rel in D4_JSON_ALLOWED:
+            continue
+        counts[rel] = n
+    fails, warns = [], []
+    for rel, n in sorted(counts.items()):
+        base = D4_JSON_BASELINE.get(rel, 0)
+        if n > base:
+            fails.append(f"{rel}: {n} direct d4data JSON read(s), baseline {base} — "
+                         f"route new ones through MaterialDecode (texturesFor / "
+                         f"appearanceRosterAny), which falls back to the CASC meta binary")
+        elif n < base:
+            warns.append(f"{rel}: {n} left (baseline {base}) — lower the baseline in verify-src.py")
+        else:
+            warns.append(f"{rel}: {n}")
+    return fails, warns
+
+
+# ── Settings-key hygiene ────────────────────────────────────────────────────────────────────────
+# Three checks over one idea: QSettings is this project's largest silent-failure surface. A key is
+# just a string, nothing validates it, and every way of getting it slightly wrong produces a control
+# that looks like it works. The three shapes below are the ones that have actually shipped here:
+#
+#   1. A key written and never read     — the control does nothing, forever. Four were found by hand
+#                                         in the Stable parity audit; two more are still open (R5).
+#   2. A combo persisted by currentText() — the DISPLAY string is not an identity. Relabel the item
+#                                         and every saved profile silently loses that selection.
+#   3. A character-vs-equipment test on a material NAME — "head" is a substring of wolfHead, "brow"
+#                                         of browplate, "lash" of backlash. The authored slot tag
+#                                         answers this; a substring cannot.
+#
+# All three are INVENTORY + BASELINE, like the d4data check above: existing entries are listed, and
+# only growth fails. None of them can prove a defect on its own — each says "a human should look at
+# this one", which is precisely what did not happen for any of the bugs above.
+
+
+def _settings_bodies(files: list) -> dict:
+    """path -> source with line comments stripped. Shared by the three checks below."""
+    out = {}
+    for f in files:
+        try:
+            raw = f.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        rel = f.as_posix()
+        i = rel.find("src/")
+        out[rel[i:] if i >= 0 else rel] = "\n".join(l.split("//")[0] for l in raw.splitlines())
+    return out
+
+
+# ── 1. Keys written and never read ─────────────────────────────────────────────────────────────
+# Accepted entries, with the reason each is not a defect. Empty is the goal; add to it only with a
+# reason a reader can check, never to silence the tool.
+SETTINGS_DEAD_ALLOWED = {
+    # (none)
+}
+
+_SET_LITERAL = re.compile(r'setValue\s*\(\s*QStringLiteral\(\s*"([A-Za-z0-9_]+/[^"%]*)"')
+_REMOVE_LITERAL = r'remove\s*\(\s*QStringLiteral\(\s*"%s"'
+_SETVALUE_LITERAL = r'setValue\s*\(\s*QStringLiteral\(\s*"%s"'
+# QStringLiteral("wardrobe2/viewport/") + key      → the whole family is reachable by a helper
+_CONCAT_PREFIX = re.compile(r'QStringLiteral\(\s*"([A-Za-z0-9_/]*/)"\s*\)\s*\+')
+# prefix + QStringLiteral("/_loading")             → the leaf is the literal, the group is computed
+_CONCAT_TAIL = re.compile(r'\+\s*QStringLiteral\(\s*"(/[A-Za-z0-9_/]+)"')
+
+
+def check_dead_settings_keys(files: list) -> tuple:
+    """A key written with a literal whose literal is read nowhere — directly or via a helper."""
+    bodies = _settings_bodies(files)
+    whole = "\n".join(bodies.values())
+    written = {}
+    for rel, body in bodies.items():
+        for k in _SET_LITERAL.findall(body):
+            written.setdefault(k, set()).add(rel)
+    # Concatenation is how most of this codebase reads grouped keys, and ignoring it made the first
+    # draft of this check report fifteen keys of which fourteen were fine. Both spellings count.
+    prefixes = set(_CONCAT_PREFIX.findall(whole))
+    tails = set(_CONCAT_TAIL.findall(whole))
+
+    def is_read(k: str) -> bool:
+        occurrences = whole.count('"%s"' % k)
+        occurrences -= len(re.findall(_SETVALUE_LITERAL % re.escape(k), whole))
+        occurrences -= len(re.findall(_REMOVE_LITERAL % re.escape(k), whole))
+        if occurrences > 0:
+            return True                       # named literally somewhere that is not a write
+        for p in prefixes:                    # value(QStringLiteral("group/") + leaf)
+            if k.startswith(p) and "/" not in k[len(p):]:
+                return True
+        for t in tails:                       # value(group + QStringLiteral("/leaf"))
+            if k.endswith(t):
+                return True
+        return False
+
+    fails, warns = [], []
+    for k in sorted(written):
+        if is_read(k) or k in SETTINGS_DEAD_ALLOWED:
+            continue
+        where = ", ".join(sorted(written[k]))
+        fails.append(f'"{k}" is written by {where} and read nowhere — either wire up the read, '
+                     f"delete the write, or record it in SETTINGS_DEAD_ALLOWED with a reason")
+    return fails, warns
+
+
+# ── 2. Combos persisted by their display text ──────────────────────────────────────────────────
+# Reviewed 2026-09-12. Every site below stores the LABEL on purpose, because the label is the
+# identity at that layer — the armour slots, the look presets and the theme resolver all speak
+# appearance NAMES end to end, and findText is how they are restored. skinTone/skinDetail were the
+# ones that did not fit that pattern (their items carry a colour and a style token their consumers
+# actually use) and have been converted to currentData(). A count ABOVE the baseline means a new
+# combo is being persisted by label — check whether its items carry userData first.
+SETTINGS_TEXT_BASELINE = {
+    "src/tabs/WardrobeTab2.cpp": 4,   # slot/%1 x2 (gender-swap + the handler), weaponType, weaponType2
+}
+_TEXT_PERSIST = re.compile(r'setValue\s*\([^;]{0,240}?currentText\s*\(\s*\)', re.S)
+
+
+def check_text_persisted_combos(files: list) -> tuple:
+    bodies = _settings_bodies(files)
+    fails, warns = [], []
+    for rel, body in sorted(bodies.items()):
+        n = len(_TEXT_PERSIST.findall(body))
+        if not n:
+            continue
+        base = SETTINGS_TEXT_BASELINE.get(rel, 0)
+        if n > base:
+            fails.append(f"{rel}: {n} combo(s) persisted by currentText(), baseline {base} — "
+                         f"store currentData() unless the LABEL really is the identity at that "
+                         f"layer, then raise the baseline with the reason")
+        elif n < base:
+            warns.append(f"{rel}: {n} left (baseline {base}) — lower the baseline in verify-src.py")
+        else:
+            warns.append(f"{rel}: {n}")
+    return fails, warns
+
+
+# ── 3. Character-vs-equipment decided by a material NAME ───────────────────────────────────────
+# Reviewed 2026-09-12, after palM_stor164_wolfHead — a PAULDRON ornament — matched contains("head")
+# and took the whole Paladin torso off screen with the HED toggle. The fix was not a better name
+# test; it was to gate on primSlot, which is authored data that answers the question directly.
+# These counts are the remaining name tests. They are not all wrong — some decide SHADING, where no
+# slot tag applies — but every one of them is a place where a material name is being asked a
+# question it cannot answer, so a NEW one has to be argued for.
+CHAR_NAME_TOKENS = ("head", "face", "body", "skin", "hair", "eyeball",
+                    "brow", "lash", "tooth", "teeth", "tongue", "mouth", "_hed", "_bod")
+CHAR_NAME_BASELINE = {
+    "src/tabs/ModelsTab.cpp":        2,   # hair, skin — shading only, no slot tag exists there
+    "src/tabs/ModelsTab_Export.cpp": 1,   # _HED, export scope
+    "src/tabs/StableTab2.cpp":       1,   # hair — mounts have no character/equipment split
+    "src/tabs/WardrobeTab2.cpp":    18,   # the classification loop; isHead/headCore/hed now slot-gated
+}
+_NAME_TEST = re.compile(r'contains\s*\(\s*QLatin1String\(\s*"([^"]+)"')
+
+
+def check_character_name_tests(files: list) -> tuple:
+    bodies = _settings_bodies(files)
+    fails, warns = [], []
+    for rel, body in sorted(bodies.items()):
+        n = sum(1 for t in _NAME_TEST.findall(body) if t.lower() in CHAR_NAME_TOKENS)
+        if not n:
+            continue
+        base = CHAR_NAME_BASELINE.get(rel, 0)
+        if n > base:
+            fails.append(f"{rel}: {n} character-token name test(s), baseline {base} — a material "
+                         f"NAME cannot tell the character from a worn item (wolfHead, browplate, "
+                         f"backlash). Gate on the slot tag, or raise the baseline with the reason")
+        elif n < base:
+            warns.append(f"{rel}: {n} left (baseline {base}) — lower the baseline in verify-src.py")
+        else:
+            warns.append(f"{rel}: {n}")
+    return fails, warns
+
+
 def main() -> int:
     args = [a for a in sys.argv[1:] if not a.startswith("--")]
     quiet = "--quiet" in sys.argv
@@ -578,11 +858,39 @@ def main() -> int:
             for p in problems:
                 print(f"       - {p}")
 
+    # Whole-tree, so it runs once after every file has been read.
+    d4fails, d4warns = check_d4_json_reads(files)
+    if d4fails:
+        total += len(d4fails)
+        print("\n[FAIL] direct d4data JSON reads above baseline")
+        for p in d4fails:
+            print(f"       - {p}")
+    if d4warns and not quiet:
+        print("\nverify-src: direct d4data JSON reads (existing debt, not a failure) —")
+        for p in d4warns:
+            print(f"       · {p}")
+
+    # Settings-key hygiene — three whole-tree checks, same inventory+baseline contract.
+    for title, (cfails, cwarns) in (
+            ("settings keys written but never read", check_dead_settings_keys(files)),
+            ("combos persisted by display text",     check_text_persisted_combos(files)),
+            ("character tokens tested by name",      check_character_name_tests(files))):
+        if cfails:
+            total += len(cfails)
+            print(f"\n[FAIL] {title}")
+            for p in cfails:
+                print(f"       - {p}")
+        if cwarns and not quiet:
+            print(f"\nverify-src: {title} (reviewed, not a failure) —")
+            for p in cwarns:
+                print(f"       · {p}")
+
     if total == 0:
         if not quiet:
             print(f"verify-src: OK — {len(files)} file(s) clean "
                   f"(non-empty, balance, header-only includes, format args, Qt macro names, "
-                  f"duplicate lambdas, duplicate map keys)")
+                  f"duplicate lambdas, duplicate map keys, d4data JSON baseline, "
+                  f"dead settings keys, combo text persistence, character name tests)")
         return 0
     print(f"\nverify-src: {total} problem(s) in {len(files)} file(s) — fix before building.")
     return 1

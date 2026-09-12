@@ -1,6 +1,7 @@
 #include "app/MainWindow.h"
 
 #include "app/Config.h"
+#include "util/TextReportDialog.h"   // Help ▸ Patch contents renders in the shared report dialog
 #include "app/Hotkeys.h"
 #include "app/LogConsole.h"
 #include "app/SettingsDialog.h"
@@ -71,7 +72,9 @@
 #include <QDirIterator>   // Health check counts the snapshot's files to report coverage
 #include <QFileInfo>
 #include <QDateTime>
+#include <algorithm>   // std::sort — used here since long before this line, transitively until now
 #include <QCheckBox>
+#include <QInputDialog>   // Help ▸ Find SNO
 #include <QMessageBox>
 #include <QProgressDialog>
 #include <QProcess>
@@ -137,9 +140,27 @@ MainWindow::MainWindow(QWidget* parent)
                  qPrintable(prefix), qPrintable(crumb));
         for (int i = 0; i < 5; ++i) s.remove(prefix + QStringLiteral("/slot/%1").arg(i));
         for (int i = 0; i < 9; ++i) s.remove(prefix + QStringLiteral("/creator/%1").arg(i));
-        for (const QString& k : {QStringLiteral("/weaponType"), QStringLiteral("/weapon"),
-                                 QStringLiteral("/weaponType2"), QStringLiteral("/weapon2"),
-                                 QStringLiteral("/trophy"), QStringLiteral("/anim")})
+        // The key names here must match what the tab actually WRITES, and one of them did not:
+        // "/trophy" was cleared while WardrobeTab2 persists the back cosmetic as "/backTrophy".
+        // A trophy that faulted during load therefore survived the recovery untouched and was
+        // restored again on the next launch — the exact crash-LOOP this block exists to break.
+        // "/trophy" is kept because the legacy "wardrobe" prefix is swept with the same list and
+        // removing an absent key is a no-op. The rest are added on the same test the weapon slots
+        // already pass: a selection the outfit REBUILD consumes, and so one that can re-trigger the
+        // fault on the next launch. "/skinTone" and "/skinDetail" qualify because they resolve
+        // BOD/HED texture SNOs and decode images during the rebuild — fault-prone work, and the
+        // tab's own resetDefaults() already treats them as outfit state.
+        //
+        // "/attachClip" is a PREFIX, not a leaf: the real keys are ".../attachClip/<appearance>"
+        // (with one legacy plain key beneath the same name). QSettings::remove deletes the named
+        // key and everything under it on every backend, which is what is wanted here — but it is
+        // therefore broader than its neighbours and drops every per-appearance clip choice.
+        for (const QString& k : {QStringLiteral("/weaponType"),   QStringLiteral("/weapon"),
+                                 QStringLiteral("/weaponType2"),  QStringLiteral("/weapon2"),
+                                 QStringLiteral("/weaponSheath"), QStringLiteral("/weaponSheath2"),
+                                 QStringLiteral("/trophy"),       QStringLiteral("/backTrophy"),
+                                 QStringLiteral("/skinTone"),     QStringLiteral("/skinDetail"),
+                                 QStringLiteral("/attachClip"),   QStringLiteral("/anim")})
             s.remove(prefix + k);
         s.remove(key);
     }
@@ -332,6 +353,27 @@ void MainWindow::buildMenu()
     // Post-patch triage: one screen that verifies storage, keys, d4data freshness, indexes and
     // live format probes — "what broke?" answered in seconds after a game update.
     help->addAction(QStringLiteral("&Health check…"), this, [this] { showHealthCheck(); });
+    // The other half of post-patch triage: Health check says what still works, this says what
+    // ARRIVED. Both read data the tool already has — the build ledger has been recorded since it
+    // existed and, until now, could only be read one tab at a time through the "Latest" filter.
+    help->addAction(QStringLiteral("&Patch contents…"), this, [this] { showPatchContents(); });
+    // "What is sno 2462986" — the question every investigation in this project opens with, and
+    // which until now meant grepping a 43 MB CoreTOC dump outside a tool that holds the same table
+    // in memory. Ctrl+F is taken by the per-tab filters, so this stays menu-only.
+    help->addAction(QStringLiteral("&Find SNO…"), this, [this] { showFindSno(); });
+    // Populated when it opens, not when it is built — probe files appear and change while the app
+    // is running, which is exactly when someone reaches for this.
+    {
+        // "Dia&gnostic", not "&Diagnostic": Alt+D already belongs to "Open &data folder" further
+        // down this menu, and a duplicated mnemonic cycles instead of activating.
+        QMenu* diag = help->addMenu(QStringLiteral("Dia&gnostic output"));
+        // On the MENU ACTION, not on the popup — the popup is not the thing being hovered — and
+        // per-action tooltips need the owning menu opted in, exactly as the index menu does.
+        diag->menuAction()->setToolTip(
+            QStringLiteral("The .txt / .csv files the D4_* probes write beside the exe"));
+        help->setToolTipsVisible(true);
+        connect(diag, &QMenu::aboutToShow, this, [this, diag] { fillDiagnosticMenu(diag); });
+    }
     // Coverage of the BUILT-IN Bulk Extract presets. They are 27 hard-coded queries against a
     // dataset that changes every patch: a family the game renames turns its preset into a silent
     // zero, and nothing in the UI distinguishes that from a preset nobody happened to click.
@@ -564,6 +606,11 @@ void MainWindow::buildTabs()
     // A "Sold in" link in the INFO panel → that bundle in the Catalogue, with nav history so
     // Alt+Left returns to the model you came from. group 110 = StoreProduct.
     connect(models, &ModelsTab::revealBundleRequested, this,
+            [this](int sno) { jumpTo(110, sno); });
+    // The same jump from shop art in the Textures tab. Until now the link ran one way only: you
+    // could get from a model to the bundle that sold it, but standing on the bundle's own artwork
+    // there was nothing to click.
+    connect(textures, &TexturesTab::revealBundleRequested, this,
             [this](int sno) { jumpTo(110, sno); });
     add(new LazyTab([](QWidget* p) { return new WardrobeTab2(p); }), QStringLiteral("Wardrobe"));
     add(new LazyTab([](QWidget* p) { return new StableTab2(p); }), QStringLiteral("Stable"));
@@ -1096,8 +1143,13 @@ void MainWindow::reload()
             // loop still takes both groups deliberately: 37 is not empty, and nothing has
             // established that no material of interest lives there.
             auto map = std::make_shared<QHash<QString, qint64>>();
-            for (const int g : {SnoIndex::groupIdByName(QStringLiteral("Material"), 37),
-                                SnoIndex::groupIdByName(QStringLiteral("Material (2)"), 57)})
+            // Group 57 alone. The second entry here was group 37, included defensively because
+            // nothing had established that no material of interest lived there. Something has
+            // now: 37 is the SHADER MAP group (hero_hair, hero_opaque_skin, Hero_Eye and the 377
+            // vfx* shaders are all in it; zero of its 3,633 records end in "_mat"), so including
+            // it only mixed 3,631 shader names into a material-name table — inert until a name
+            // collides, and then wrong. Measured against CoreTOC; see wiki/Asset-formats.md.
+            for (const int g : {SnoIndex::groupIdByName(QStringLiteral("Material"), 57)})
                 for (const SnoEntry& e : index->entries(g))
                     if (!e.name.isEmpty()) map->insert(e.name.toLower(), e.snoId);
             r.nMatNames = map->size();
@@ -1865,6 +1917,405 @@ void MainWindow::indexAll()
     qInfo("Index all: kicked every shared index; %d tab(s) built on demand", built);
     refreshIndexMenu();
     refreshIndexIndicator();
+}
+
+// ── Help ▸ Patch contents ───────────────────────────────────────────────────────────────────────
+// SnoIndex has recorded, per game build it was opened on, exactly which SNOs appeared in it — that
+// is what drives the "Latest" filter in the Catalogue, Models and Bulk Extract. Until now the only
+// way to see it was to tick Latest in one tab and read what survived the filter, which answers
+// "what is new in THIS tab" and never "what did the patch contain".
+//
+// This is the whole ledger, newest build first, with each build's additions grouped by SNO type and
+// named. It is the question anyone extracting assets asks first after a patch, and the data has
+// been sitting there the entire time.
+//
+// Reads only — buildHistory() is deliberately const and there is no setter. The limits are the
+// ledger's own and are printed rather than hidden: a build this tool was never opened on cannot be
+// reconstructed (nothing in CoreTOC stamps an asset with the build that introduced it), and when
+// two observed builds are not consecutive the record covers the gap, which is why each entry says
+// what it was diffed against.
+void MainWindow::showPatchContents()
+{
+    // A reload worker calls clear() on m_index from its own thread, and the walk below holds
+    // references into it for the length of ~820k entries. isLoaded() alone only proves the index
+    // was loaded when the menu item was clicked.
+    if (m_reloading) {
+        QMessageBox::information(this, QStringLiteral("Patch contents"),
+            QStringLiteral("The index is reloading — try again once it finishes."));
+        return;
+    }
+    const QVector<SnoIndex::BuildRecord> hist = m_index.buildHistory();
+    QString out = QStringLiteral("PATCH CONTENTS\n==============\n\n");
+    if (!m_index.isLoaded()) {
+        out += QStringLiteral("The SNO index is not loaded — open a game install first.\n");
+        TextReport::show(this, QStringLiteral("Patch contents"), out);
+        return;
+    }
+    if (hist.isEmpty()) {
+        out += QStringLiteral(
+            "No builds recorded yet.\n\n"
+            "A build's additions can only be captured the first time this tool is opened on it,\n"
+            "so the ledger starts from the first run and fills in as patches land.\n");
+        TextReport::show(this, QStringLiteral("Patch contents"), out);
+        return;
+    }
+
+    // sno -> group, for the additions only. SnoIndex indexes BY group and has no reverse lookup —
+    // and building one for all ~820k entries to answer a question about a few thousand would be a
+    // waste. One pass over every group, keeping only the ids the ledger actually mentions.
+    // The NAME is captured in the same pass, not looked up later. nameForSno builds a full
+    // reverse map for the whole group on first touch and keeps it for the index's lifetime — tens
+    // of megabytes across Texture + Material + Appearance, to print at most 25 names per group.
+    // This loop is already standing on every SnoEntry, so the name costs one hash insert.
+    QSet<int> wanted;
+    for (const SnoIndex::BuildRecord& b : hist) wanted += b.added;
+    QHash<int, int> groupOf;
+    QHash<int, QString> nameOf;
+    groupOf.reserve(wanted.size());
+    nameOf.reserve(wanted.size());
+    for (int g : m_index.groups())
+        for (const SnoEntry& e : m_index.entries(g))
+            if (wanted.contains(e.snoId)) {
+                groupOf.insert(e.snoId, g);
+                nameOf.insert(e.snoId, e.name);   // implicitly shared — no second copy of the name
+            }
+
+    out += QStringLiteral("%1 build(s) observed, newest first.\n\n").arg(hist.size());
+    // Whole-report cap. The per-group cap below bounds one group, not the report: 130-odd groups
+    // times a long ledger reaches multiple MB, and the cost lands in QPlainTextEdit's document
+    // parser as a multi-second freeze on a menu click. Newest builds are the ones anyone opens this
+    // for, and the ledger is newest-first, so truncating the tail keeps what matters.
+    const int kMaxBuilds = 12;
+    int shown = 0;
+    // Newest first is what buildHistory() documents, so it is not re-sorted here — re-sorting a
+    // list whose order is part of its contract is how the two quietly diverge.
+    for (const SnoIndex::BuildRecord& b : hist) {
+        if (shown++ >= kMaxBuilds) {
+            out += QStringLiteral("──────────────────────────────────────────────────────────────\n"
+                                  "… and %1 older build(s), not listed.\n")
+                       .arg(hist.size() - kMaxBuilds);
+            break;
+        }
+        out += QStringLiteral("──────────────────────────────────────────────────────────────\n");
+        out += QStringLiteral("%1%2\n")
+                   .arg(b.gameVersion.isEmpty() ? QStringLiteral("(version unknown)") : b.gameVersion)
+                   .arg(b.product.isEmpty() ? QString() : QStringLiteral("   [%1]").arg(b.product));
+        out += QStringLiteral("  build      %1\n")
+                   .arg(b.buildId.isEmpty() ? QStringLiteral("(unknown)") : b.buildId);
+        if (b.firstSeen > 0)
+            out += QStringLiteral("  first seen %1\n")
+                       .arg(QDateTime::fromSecsSinceEpoch(b.firstSeen).toString(Qt::ISODate));
+        if (b.isBaseline()) {
+            out += QStringLiteral("  baseline — the first build seen for this product, so nothing "
+                                  "is counted as added.\n\n");
+            continue;
+        }
+        if (b.prevUnknown())
+            out += QStringLiteral("  diffed against  (previous build unknown — additions predate "
+                                  "the ledger)\n");
+        else
+            out += QStringLiteral("  diffed against  %1\n")
+                       .arg(b.prevGameVersion.isEmpty() ? b.prevBuildId : b.prevGameVersion);
+        out += QStringLiteral("  added %1 SNO(s)\n\n").arg(b.added.size());
+
+        // Group the additions by SNO type. A patch's shape is far more legible as "412 Appearance,
+        // 1,940 Texture, 30 StoreProduct" than as four thousand ids.
+        QHash<int, QVector<int>> byGroup;
+        // -1 for an sno the index no longer holds: a later patch can REMOVE an asset, and the
+        // ledger keeps the addition either way. Counted under "(no longer present)" rather than
+        // dropped, because silently shrinking the total would make the report disagree with the
+        // "added N SNO(s)" line directly above it.
+        for (int sno : b.added) byGroup[groupOf.value(sno, -1)].append(sno);
+        QVector<int> gs = byGroup.keys();
+        std::sort(gs.begin(), gs.end(), [&byGroup](int a, int c) {
+            const int na = byGroup[a].size(), nc = byGroup[c].size();
+            return na != nc ? na > nc : a < c;     // biggest first, then by id so ties are stable
+        });
+        for (int g : gs) {
+            QVector<int>& v = byGroup[g];
+            std::sort(v.begin(), v.end());
+            out += QStringLiteral("    %1  %2\n")
+                       .arg(g < 0 ? QStringLiteral("(no longer present)") : SnoIndex::groupName(g),
+                            -20)
+                       .arg(v.size());
+            // Capped per group: a texture-heavy patch runs to five figures, and a dialog that
+            // scrolls for ten minutes has hidden the summary this report exists to give.
+            const int kMax = 25;
+            for (int i = 0; i < v.size() && i < kMax; ++i) {
+                // The label is chosen by WHY the name is missing, not by the fact that it is.
+                // Everything in the g < 0 bucket has no name here because the index does not hold
+                // the sno at all; calling that "encrypted" asserts a fact about an asset this
+                // build cannot see, and contradicts the group header two lines up.
+                const QString nm = nameOf.value(v[i]);
+                out += QStringLiteral("        %1  %2\n")
+                           .arg(v[i], 9)
+                           .arg(g < 0 ? QStringLiteral("(not in this index)")
+                                      : nm.isEmpty() ? QStringLiteral("(unnamed — encrypted)") : nm);
+            }
+            if (v.size() > kMax)
+                out += QStringLiteral("        … and %1 more\n").arg(v.size() - kMax);
+        }
+        out += QLatin1Char('\n');
+    }
+    TextReport::show(this, QStringLiteral("Patch contents"), out);
+}
+
+// ── Help ▸ Find SNO ─────────────────────────────────────────────────────────────────────────────
+// Nearly every investigation in this project starts with an id nobody recognises — "what is sno
+// 2462986" — and answering it meant grepping a 43 MB CoreTOC dump outside the tool, which holds the
+// same table in memory the whole time. One box: an id, or part of a name.
+//
+// Deliberately a LOOKUP, not a navigator. Jumping to the owning tab needs a reveal hook on
+// BrowserTab implemented across five tabs with five different selection models; this is the part
+// that needs none of that, and it is the part the question actually asks for. If the reveal is
+// built later this is where it hangs off.
+//
+// Everything printed is a fact one of the loaded indexes already holds — no probing, no decode, no
+// file reads. Where an index is not ready that is said, rather than printing a blank that reads as
+// "nothing found".
+void MainWindow::showFindSno()
+{
+    if (!m_index.isLoaded()) {
+        QMessageBox::information(this, QStringLiteral("Find SNO"),
+            QStringLiteral("The SNO index is not loaded — open a game install first."));
+        return;
+    }
+    // Same guard as Patch contents: a reload worker calls clear() on m_index from its own thread,
+    // and the search below holds references into it.
+    if (m_reloading) {
+        QMessageBox::information(this, QStringLiteral("Find SNO"),
+            QStringLiteral("The index is reloading — try again once it finishes."));
+        return;
+    }
+    bool ok = false;
+    const QString q = QInputDialog::getText(this, QStringLiteral("Find SNO"),
+                          QStringLiteral("SNO id, or part of a name:"),
+                          QLineEdit::Normal, QString(), &ok).trimmed();
+    if (!ok || q.isEmpty()) return;
+    // RE-CHECKED after the dialog, and this is the whole reason the guard above is not enough:
+    // getText runs a nested event loop, so anything queued to the GUI thread executes while it is
+    // open — including the icon audit's completion handler, which calls reload(). A reload deferred
+    // as m_reloadPending (so m_reloading was still false on the way in) can therefore start its
+    // worker, and that worker's first act is clear() on m_index, while the loops below are about to
+    // hold const references straight into it.
+    if (m_reloading || !m_index.isLoaded()) {
+        QMessageBox::information(this, QStringLiteral("Find SNO"),
+            QStringLiteral("The index started reloading — try again once it finishes."));
+        return;
+    }
+
+    // Extra facts, printed per hit. Each is gated on its own index being ready, because an empty
+    // collection and an unbuilt AppearanceMeta are different answers.
+    const AppearanceMeta& meta = AppearanceMeta::instance();
+    const AssetLinks&     links = AssetLinks::instance();
+    auto detailFor = [&](int group, int sno) -> QString {
+        QString extra;
+        if (m_index.isNew(sno)) extra += QStringLiteral("   [new this build]");
+        if (group == 9 && meta.ready()) {
+            const QString coll = meta.collectionFor(sno);
+            if (!coll.isEmpty()) extra += QStringLiteral("   collection: %1").arg(coll);
+        }
+        // Material is group 57 and ONLY 57. Group 37 was long treated here as a possible second
+        // material group on the grounds that it is not empty and nothing had established what it
+        // holds; it is now measured, and it is the SHADER MAP group — every shader this project
+        // classifies submeshes by (hero_hair, hero_opaque_skin, Hero_Eye, hair_pbr_igc,
+        // hero_opaque_hollow) is in 37 and in none of them is in 57, and not one of its 3,633
+        // records ends in "_mat". See wiki/Asset-formats.md.
+        static const int kMaterial = SnoIndex::groupIdByName(QStringLiteral("Material"), 57);
+        if (group == kMaterial && links.ready()) {
+            const int n = links.appsForMaterial(sno).size();
+            extra += QStringLiteral("   used by %1 appearance(s)").arg(n);
+        }
+        return extra;
+    };
+
+    QString out = QStringLiteral("FIND SNO\n========\n\nquery: %1\n\n").arg(q);
+    bool numeric = false;
+    const int wantSno = q.toInt(&numeric);
+
+    // An all-digits query that does not survive toInt (0, negative, past INT_MAX) would otherwise
+    // fall through to a SUBSTRING search and come back "no name contains that" — an answer to a
+    // question nobody asked. Said plainly instead.
+    {
+        bool allDigits = !q.isEmpty();
+        for (const QChar& c : q)
+            if (!c.isDigit()) { allDigits = false; break; }
+        if (allDigits && !(numeric && wantSno > 0)) {
+            out += QStringLiteral("  \"%1\" is not a usable SNO id — ids are positive and fit in a "
+                                  "32-bit int.\n").arg(q);
+            TextReport::show(this, QStringLiteral("Find SNO"), out);
+            return;
+        }
+    }
+
+    if (numeric && wantSno > 0) {
+        // One pass over every group. entries() is sorted by NAME, so there is no binary search on
+        // sno to take advantage of, and the linear scan over ~820k entries is milliseconds.
+        bool found = false;
+        for (int g : m_index.groups()) {
+            for (const SnoEntry& e : m_index.entries(g)) {
+                if (e.snoId != wantSno) continue;
+                found = true;
+                out += QStringLiteral("  group   %1 (%2)\n").arg(SnoIndex::groupName(g)).arg(g);
+                out += QStringLiteral("  name    %1\n")
+                           .arg(e.name.isEmpty() ? QStringLiteral("(unnamed — encrypted)") : e.name);
+                out += QStringLiteral("  sno     %1%2\n").arg(e.snoId).arg(detailFor(g, e.snoId));
+                break;
+            }
+            if (found) break;
+        }
+        if (!found)
+            out += QStringLiteral("  Not in the loaded index.\n\n"
+                                  "  An sno can be absent because it belongs to an EXCLUDED group,\n"
+                                  "  because this install predates it, or because the index was\n"
+                                  "  built from d4data rather than the game and the two differ.\n");
+    } else {
+        // Substring, case-insensitive, across every group. Capped because a two-letter query
+        // matches five figures of rows and a report nobody can read is not an answer.
+        const int kMax = 80;
+        int hits = 0, shown = 0;
+        QString body;
+        // Wait cursor, as runIconAudit does for the same reason: `hits` has to keep counting past
+        // the print cap, so a one- or two-character query case-folds every one of ~820k names on
+        // the GUI thread. That is the comment two paragraphs up being true only of the NUMERIC
+        // branch — an int compare — and not of this one.
+        QApplication::setOverrideCursor(Qt::WaitCursor);
+        for (int g : m_index.groups()) {
+            for (const SnoEntry& e : m_index.entries(g)) {
+                if (!e.name.contains(q, Qt::CaseInsensitive)) continue;
+                ++hits;
+                if (shown >= kMax) continue;   // keep counting, stop printing
+                ++shown;
+                body += QStringLiteral("  %1  %2  %3%4\n")
+                            .arg(SnoIndex::groupName(g), -16)
+                            .arg(e.snoId, 9)
+                            .arg(e.name)
+                            .arg(detailFor(g, e.snoId));
+            }
+        }
+        QApplication::restoreOverrideCursor();
+        out += hits == 0
+                   ? QStringLiteral("  No name contains that.\n\n"
+                                    "  Encrypted assets reach the index as \"~unnamed_<sno>\" unless a\n"
+                                    "  TACT key recovered the real name, so a piece that exists in the\n"
+                                    "  game can still be unfindable by name here.\n")
+                   : QStringLiteral("  %1 match(es)%2\n\n")
+                         .arg(hits)
+                         .arg(hits > kMax ? QStringLiteral(", first %1 shown").arg(kMax) : QString())
+                     + body;
+    }
+
+    if (!meta.ready())
+        out += QStringLiteral("\n(Collection names are unavailable — the appearance metadata index "
+                              "has not finished building.)\n");
+    if (!links.ready())
+        out += QStringLiteral("(Material usage counts are unavailable — the asset-link index has "
+                              "not finished building.)\n");
+    TextReport::show(this, QStringLiteral("Find SNO"), out);
+}
+
+// ── Help ▸ Diagnostic output ────────────────────────────────────────────────────────────────────
+// There are 30-odd D4_* probes and a "Dump - *.bat" per investigation, and every one of them ends
+// the same way: a differently-named .txt or .csv appears beside the exe and you go hunting for
+// which file just changed. The tool wrote them; it can list them.
+//
+// Derived from the filesystem at popup time, never from a hard-coded table of probe names. A table
+// would be wrong the first time a probe is added or renamed, and wrong silently — which is the
+// failure mode this whole family of tooling exists to avoid. The rule is stated in the menu: .txt
+// and .csv beside the exe, newest first.
+//
+// This is the discoverable-and-readable half of the problem. The other half — running a probe from
+// inside the app instead of setting an environment variable and relaunching — needs each probe to
+// be callable independently of startup, which most are not today.
+void MainWindow::fillDiagnosticMenu(QMenu* m)
+{
+    m->clear();
+    const QDir dir(QCoreApplication::applicationDirPath());
+    QFileInfoList files = dir.entryInfoList({QStringLiteral("*.txt"), QStringLiteral("*.csv")},
+                                            QDir::Files, QDir::Time);   // QDir::Time is newest-first
+    // The TACT key list is a plain .txt users commonly drop beside the exe, and it is the one file
+    // here that is neither written by this tool nor anyone's idea of diagnostic output. Compared by
+    // canonical path rather than by name, because its location is free-form.
+    {
+        const QString keys = QFileInfo(Config::tactKeysPath()).canonicalFilePath();
+        if (!keys.isEmpty())
+            for (int i = files.size() - 1; i >= 0; --i)
+                if (files[i].canonicalFilePath() == keys) files.removeAt(i);
+    }
+    // (The app log is NOT filtered here: it lives in the data folder, not beside the exe, so it
+    // cannot appear in this listing at all. Help ▸ Open log folder remains the way to it.)
+    if (files.isEmpty()) {
+        QAction* a = m->addAction(QStringLiteral("(no .txt or .csv beside the exe yet)"));
+        a->setEnabled(false);
+        return;
+    }
+    const QDateTime now = QDateTime::currentDateTime();
+    // Capped. A debugging session leaves dozens of these, and past ~40 items the popup is taller
+    // than the screen and turns into a scroll-arrow menu — worse to read than the folder itself,
+    // which is one item below.
+    const int kMaxItems = 30;
+    int listed = 0;
+    for (const QFileInfo& fi : files) {
+        if (listed++ >= kMaxItems) {
+            QAction* more = m->addAction(
+                QStringLiteral("… and %1 older file(s)").arg(files.size() - kMaxItems));
+            more->setEnabled(false);
+            break;
+        }
+        // Size and age on the label, because "which one did the run I just did write" is the actual
+        // question, and a name alone cannot answer it.
+        const qint64 kb = (fi.size() + 1023) / 1024;
+        const qint64 mins = fi.lastModified().secsTo(now) / 60;
+        const QString age = mins < 1    ? QStringLiteral("just now")
+                          : mins < 60   ? QStringLiteral("%1 min ago").arg(mins)
+                          : mins < 2880 ? QStringLiteral("%1 h ago").arg(mins / 60)
+                                        : fi.lastModified().toString(QStringLiteral("yyyy-MM-dd"));
+        const QString path = fi.absoluteFilePath();
+        // The file name is CONCATENATED, never passed through arg(): a name containing "%2" would
+        // consume the next placeholder, and one containing "&" would silently become a mnemonic.
+        // Doubling the ampersand is what keeps it visible as itself.
+        QString label = fi.fileName();
+        label.replace(QLatin1Char('&'), QLatin1String("&&"));
+        label += QStringLiteral("   (%1 KB, %2)").arg(kb).arg(age);
+        m->addAction(label, this, [this, path] { showDiagnosticFile(path); });
+    }
+    m->addSeparator();
+    m->addAction(QStringLiteral("Open the folder"), [dir] {
+        QDesktopServices::openUrl(QUrl::fromLocalFile(dir.absolutePath()));
+    });
+}
+
+void MainWindow::showDiagnosticFile(const QString& path)
+{
+    QFile f(path);
+    // NOT QIODevice::Text. In text mode Windows collapses CRLF on the way in, so read(kCap)
+    // consumes more than kCap raw bytes and the "N of M KB" line below would quietly drift on every
+    // CRLF file — which is all of them here. Raw bytes in, newlines normalised afterwards.
+    if (!f.open(QIODevice::ReadOnly)) {
+        QMessageBox::warning(this, QStringLiteral("Diagnostic output"),
+            QStringLiteral("Could not open %1.").arg(QDir::toNativeSeparators(path)));
+        return;
+    }
+    // Capped: the cloth and material sweeps run to several MB, and QPlainTextEdit parses whatever
+    // it is handed on the GUI thread. The head is the part with the verdict in it; the tail of a
+    // per-row CSV is not what anyone opens this for.
+    const qint64 kCap = 2 * 1024 * 1024;
+    const qint64 total = f.size();
+    QByteArray head = f.read(kCap);
+    f.close();
+    // Cutting at exactly 2 MiB can land inside a multi-byte UTF-8 sequence and produce a replacement
+    // character at the seam. Trimming back to the last newline costs at most one line and makes the
+    // truncation land somewhere a reader expects it to.
+    if (total > kCap) {
+        const int nl = head.lastIndexOf('\n');
+        if (nl > 0) head.truncate(nl + 1);
+    }
+    QString text = QString::fromUtf8(head);
+    text.replace(QLatin1String("\r\n"), QLatin1String("\n"));
+    if (total > kCap)
+        text += QStringLiteral("\n\n… truncated — %1 of %2 KB shown. Open the file directly for the "
+                               "rest.\n").arg(kCap / 1024).arg((total + 1023) / 1024);
+    TextReport::show(this, QFileInfo(path).fileName(), text);
 }
 
 void MainWindow::runIconAudit()

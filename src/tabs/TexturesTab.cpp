@@ -725,6 +725,51 @@ QWidget* TexturesTab::buildLeft()
     m_view->hideColumn(4);   // COLLECTION
     m_view->setColumnWidth(0, 70);   // SNO
     m_view->horizontalHeader()->setStretchLastSection(true);
+    // Restore the saved column layout — widths, order, visibility, sort. The header context menu
+    // below has been SAVING this state since it was added, and nothing has ever read it back, so
+    // un-hiding NAME or COLLECTION lasted exactly as long as the session. The Models tab has both
+    // halves (ModelsTab.cpp, models/listHeader); this is the missing one.
+    //
+    // After the defaults above, so a fresh profile still opens with SNO | FILENAME and the three
+    // extra columns hidden, and a saved layout then overrides them.
+    {
+        QHeaderView* hh = m_view->horizontalHeader();
+        const QByteArray saved = QSettings().value(QStringLiteral("tex/listHeader")).toByteArray();
+        if (!saved.isEmpty()) {
+            hh->restoreState(saved);
+            // A state with every column hidden leaves a blank table whose only recovery is a
+            // right-click on a header that is now zero columns wide. Cheap insurance: treat it as
+            // corrupt and fall back to the defaults rather than shipping an unrecoverable view.
+            bool anyShown = false;
+            for (int c = 0; c < 5 && !anyShown; ++c) anyShown = !m_view->isColumnHidden(c);
+            if (!anyShown) {
+                for (int c = 0; c < 5; ++c) m_view->setColumnHidden(c, c == 1 || c == 3 || c == 4);
+                m_view->setColumnWidth(0, 70);
+            }
+        }
+        hh->setStretchLastSection(true);   // policy, not state — re-asserted so restore can't drop it
+        // Save on every change, not only when the column menu closes. A width drag or a column
+        // move was lost the moment the menu was not involved, which reads as "it remembers
+        // sometimes". Same three signals the Models tab uses.
+        auto saveHdr = [hh] {
+            QSettings().setValue(QStringLiteral("tex/listHeader"), hh->saveState());
+        };
+        // sectionResized is DEBOUNCED and the other two are not, because they are different kinds
+        // of event. stretchLastSection recomputes the last column on every viewport resize, so a
+        // window drag fires sectionResized continuously — and each save is a temporary QSettings
+        // whose destructor syncs, i.e. a registry write per mouse-move. A column MOVE or a sort
+        // click is one deliberate act, so it is written immediately and cannot be lost to a quit
+        // inside the debounce window.
+        auto* resizeSave = new QTimer(this);
+        resizeSave->setSingleShot(true);
+        resizeSave->setInterval(250);
+        connect(resizeSave, &QTimer::timeout, this, [saveHdr] { saveHdr(); });
+        connect(hh, &QHeaderView::sectionResized, this,
+                [resizeSave](int, int, int) { resizeSave->start(); });
+        connect(hh, &QHeaderView::sectionMoved,   this, [saveHdr](int, int, int) { saveHdr(); });
+        connect(hh, &QHeaderView::sortIndicatorChanged, this,
+                [saveHdr](int, Qt::SortOrder) { saveHdr(); });
+    }
     // Three columns start hidden and there was no way to get them back — the Models tab's browser
     // has exactly this menu on its header (ModelsTab::showColumnMenu).
     m_view->horizontalHeader()->setContextMenuPolicy(Qt::CustomContextMenu);
@@ -1407,6 +1452,38 @@ void TexturesTab::onGridThumbReady(int sno, const QImage& img)
 }
 
 // Shared right-click menu for both the table and the grid (they share one selection model).
+// ── Shop art, back to the product that sells it ─────────────────────────────────────────────────
+// The Catalogue builds an art name FROM a product name — "Bundle_HArmor_pal_stor171" becomes
+// "2DUI_Bundle_HArmor_pal_stor171", "Catalog_S12_IP_Collab" becomes
+// "2DInventory_Catalog_S12_IP_Collab". This runs that derivation backwards: strip the family
+// prefix and the role suffix, then ask the index whether what is left names a StoreProduct.
+//
+// Measured over the whole corpus: of 6,031 art-named textures, 3,661 (60.7%) resolve to a real
+// product. The rest are generic inventory sheets — 2DInventory_Axes, 2DInventory_Amulets — which
+// are not product art at all, so not resolving them is the right answer rather than a miss.
+// Returns 0 when there is no product, and the caller then offers nothing.
+static int productSnoForArtName(const SnoIndex* idx, const QString& texName)
+{
+    if (!idx || texName.isEmpty()) return 0;
+    QString s = texName;
+    bool hadPrefix = false;
+    for (const char* p : {"2DUI_Bundle_", "2DInventory_Bundle_", "2DUI_", "2DInventory_"}) {
+        const QLatin1String lp(p);
+        if (s.startsWith(lp, Qt::CaseInsensitive)) { s = s.mid(lp.size()); hadPrefix = true; break; }
+    }
+    // No art prefix means this is not shop art, and guessing past that point would start matching
+    // ordinary material textures against products they have nothing to do with.
+    if (!hadPrefix || s.isEmpty()) return 0;
+    for (const char* x : {"_WebImage", "_background", "_details", "_icons"}) {
+        const QLatin1String ls(x);
+        if (s.endsWith(ls, Qt::CaseInsensitive)) { s.chop(ls.size()); break; }
+    }
+    if (s.isEmpty()) return 0;
+    // Both shapes, because the prefix strip may or may not have eaten the product's own "Bundle_".
+    if (const int a = idx->snoForName(110, s)) return a;
+    return idx->snoForName(110, QStringLiteral("Bundle_") + s);
+}
+
 void TexturesTab::showBrowserMenu(QAbstractItemView* view, const QPoint& viewportPos)
 {
     if (!view || !m_model) return;
@@ -1481,6 +1558,20 @@ void TexturesTab::showBrowserMenu(QAbstractItemView* view, const QPoint& viewpor
     } else {
         menu.addAction(QStringLiteral("%1  —  %2 rows").arg(MenuText::kCopySno).arg(n), this, [snoStrs, copy] { copy(snoStrs); });
         menu.addAction(QStringLiteral("%1  —  %2 rows").arg(MenuText::kCopyFileName).arg(n), this, [names, copy] { copy(names); });
+    }
+    // Navigation last, after the copy block — the standardized order the other tabs use, where
+    // "Variants" and "Show dependencies…" sit in the same place.
+    //
+    // Single selection only: "which product sells these four textures" has no one answer, and an
+    // entry that quietly acted on one of a multi-selection is the ambiguity the clicked-row rule
+    // at the top of this function exists to remove.
+    if (n == 1) {
+        const int ps = productSnoForArtName(m_index, names.first());
+        if (ps > 0) {
+            menu.addSeparator();
+            menu.addAction(QStringLiteral("Show in Catalogue"), this,
+                           [this, ps] { emit revealBundleRequested(ps); });
+        }
     }
     menu.exec(view->viewport()->mapToGlobal(viewportPos));
 }

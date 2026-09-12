@@ -137,6 +137,80 @@ void StoreProductIndex::install(QHash<int, Product> byId, QVector<int> bundles,
     m_byId = std::move(byId);
     m_bundles = std::move(bundles);
     m_soldIn = std::move(soldIn);
+    // Derived here rather than passed in, so every existing caller of install() is untouched -
+    // and so the cache-hit path reports exactly the same figures as a fresh build, which is the
+    // only way the line under the list can be trusted.
+    m_locked.clear();
+    m_loose.clear();
+    QSet<int> soldAsChild;
+    for (auto it = m_byId.constBegin(); it != m_byId.constEnd(); ++it)
+        for (int c : it.value().children) soldAsChild.insert(c);
+    Coverage cov;
+    cov.known = m_coverage.known;
+    for (auto it = m_byId.constBegin(); it != m_byId.constEnd(); ++it) {
+        const Product& p = it.value();
+        if (p.encrypted)     { ++cov.locked;    m_locked.append(it.key()); }
+        else if (p.fromCasc) ++cov.recovered;
+        else                 ++cov.described;
+        if (!p.encrypted && p.children.isEmpty() && !soldAsChild.contains(it.key()))
+            m_loose.append(it.key());
+    }
+    // The residual, not a count of its own: anything the index knew about that produced no
+    // product. Clamped at zero because `known` is captured before the build and a patch landing
+    // mid-build could legitimately leave m_byId larger.
+    // int(), not the bare size(): qMax(int, qsizetype) has no common deduced type and does not
+    // compile. QHash::size() is qsizetype on Qt 6.
+    cov.unreadable = qMax(0, cov.known - int(m_byId.size()));
+    m_coverage = cov;
+    // ── A check that can actually fail ──────────────────────────────────────────────
+    // The one this replaces could not. It tested described + recovered + locked + unreadable ==
+    // known — but `unreadable` IS known - m_byId.size(), and the first three ARE m_byId.size(), so
+    // the identity held for every possible input. It printed a clean balance through the exact
+    // failure it was written to catch: a build that recovered nothing at all.
+    //
+    // The obvious replacement, `described + recovered + locked == m_byId.size()`, is the SAME
+    // tautology wearing different arithmetic — those three counters are incremented by an
+    // exhaustive if/else over m_byId a dozen lines above. install() holds no independent
+    // measurement of its own categories, and saying so is better than dressing one up. What is
+    // genuinely independent, and can therefore be false:
+    //
+    //   · `known` comes from the SNO index, before the build. A build producing MORE products than
+    //     the index has records is a category error, not a rounding difference.
+    //   · records went missing (`unreadable`) while NOT ONE was classified as TACT-locked. That is
+    //     the exact signature of the failure that hid the DOOM collab: the encrypted manifest was
+    //     unavailable, so every locked record fell through to "unreadable for another reason".
+    const int  categorised = cov.described + cov.recovered + cov.locked;
+    const bool overrun  = cov.known > 0 && cov.known < int(m_byId.size());
+    const bool blindGap = cov.known > 0 && cov.unreadable > 0 && cov.locked == 0;
+    qInfo("StoreProductIndex: coverage — %d described + %d recovered + %d locked = %d product(s); "
+          "%d of %d known unreadable%s | %d bundles, %d loose",
+          cov.described, cov.recovered, cov.locked, categorised,
+          cov.unreadable, cov.known,
+          overrun  ? "  <-- MORE PRODUCTS THAN THE INDEX HAS RECORDS"
+        : blindGap ? "  <-- RECORDS LOST AND NONE CLASSIFIED AS TACT-LOCKED"
+                   : "",
+          int(m_bundles.size()), int(m_loose.size()));
+    // known == 0 means ensureBuilt was handed a null SnoIndex, which the header documents as
+    // supported. That is a measurement that was never taken, not one that failed, so it is stated
+    // rather than logged as a fault - and the tab must not print "of 0 products" as if it were one.
+    if (cov.known == 0)
+        qInfo("StoreProductIndex: coverage — the total product count is unknown (no SnoIndex at "
+              "build time), so the unreadable residual is not meaningful and is not shown");
+    // constFind, NOT m_byId[a]: QHash's non-const operator[] INSERTS a default-constructed value
+    // for a missing key, so a comparator written that way can grow - and rehash - the very
+    // container it is reading, mid-sort. The keys all exist here; the point is that the code
+    // should not stop being correct if one day they do not.
+    const auto nameOf = [this](int sno) -> const QString& {
+        static const QString kEmpty;
+        const auto it = m_byId.constFind(sno);
+        return it == m_byId.constEnd() ? kEmpty : it.value().name;
+    };
+    const auto byName = [&nameOf](int a, int b) {
+        const int c = nameOf(a).compare(nameOf(b), Qt::CaseInsensitive);
+        return c != 0 ? c < 0 : a < b;   // total order: equal names must not compare both ways
+    };
+    std::sort(m_loose.begin(),  m_loose.end(),  byName);
+    std::sort(m_locked.begin(), m_locked.end(), byName);
     m_byName.clear();
     m_byName.reserve(m_byId.size());
     for (auto it = m_byId.constBegin(); it != m_byId.constEnd(); ++it)
@@ -162,6 +236,9 @@ void StoreProductIndex::reset()
     m_byId.clear();
     m_byName.clear();
     m_bundles.clear();
+    m_locked.clear();
+    m_loose.clear();
+    m_coverage = Coverage{};
     m_soldIn.clear();
     QFile::remove(AppPaths::dataDir()
                   + QStringLiteral("/store_products_v%1.json").arg(kCacheVersion));
@@ -207,8 +284,26 @@ void StoreProductIndex::ensureBuilt(const QString& d4dataDir, const SnoIndex* in
     if (index)
         for (const SnoEntry& e : index->entries(110))   // 110 StoreProduct
             prdEntries.insert(e.snoId, e.name);
+    // The encrypted manifest, snapshotted here for the same reason as prdEntries above:
+    // CascReader::encryptedSnos() lazily parses base/EncryptedSNOs.dat on first call and caches it,
+    // so letting the worker be the first caller would race the GUI thread doing the same.
+    // sno -> TACT key name; 12,947 entries in the live build.
+    QHash<int, QByteArray> encSnos;
+    // ONE readiness decision, taken HERE and carried into the worker. The worker used to re-test
+    // reader->isReady() for itself, three separate times, which opens a window: the reader becoming
+    // ready between this line and the worker's own test gives a build that runs the CASC fallback
+    // with an EMPTY encrypted manifest. Every TACT-locked product then falls into "unreadable for
+    // another reason" and the DOOM collab silently vanishes again - and because the signature below
+    // recorded haveCasc=1, that inert build was byte-indistinguishable from a good one and loaded
+    // clean on every subsequent launch. Snapshot the decision, not just the data it implies.
+    const bool cascReady = reader && reader->isReady();
+    if (cascReady) encSnos = reader->encryptedSnos();
+    // Recorded here, on the calling thread, because this IS the population every other coverage
+    // figure is measured against - and it is the one number the worker cannot recompute later.
+    m_coverage.known = prdEntries.size();
     const int gen = m_generation;
-    std::thread([this, prdDir, strDir, cache, d4data, gearNames, prdEntries, reader, gen]() {
+    std::thread([this, prdDir, strDir, cache, d4data, gearNames, prdEntries, encSnos, reader,
+                 cascReady, gen]() {
         int sig = 0;
         {
             QDirIterator c(prdDir, QStringList{QStringLiteral("*.prd.json")}, QDir::Files);
@@ -233,9 +328,17 @@ void StoreProductIndex::ensureBuilt(const QString& d4dataDir, const SnoIndex* in
         const bool haveGraph = QFile::exists(d4data
                                    + QStringLiteral("/json/outgoingSnoReferences.json"));
         const bool haveGear  = !gearNames.isEmpty();
-        const bool haveCasc  = reader && reader->isReady();
-        const QString inputs = QStringLiteral("%1|%2|%3|%4").arg(int(haveGraph)).arg(int(haveGear))
-                                   .arg(int(haveCasc)).arg(prdEntries.size());
+        // The SNAPSHOT's decision, never a fresh isReady() - see the comment at the capture site.
+        const bool haveCasc  = cascReady;
+        //   · the encrypted manifest's SIZE. This is the input that decides whether locked products
+        //     can be recovered at all, and without it in the signature a build that ran with an
+        //     empty manifest caches "1,628 bundles, 0 locked" under exactly the string a complete
+        //     build writes. No later launch can tell the two apart. Same lesson as the AppearanceMeta
+        //     signature learning to count NAMES: a signature that cannot see the thing it depends on
+        //     is not a signature.
+        const QString inputs = QStringLiteral("%1|%2|%3|%4|%5")
+                                   .arg(int(haveGraph)).arg(int(haveGear))
+                                   .arg(int(haveCasc)).arg(prdEntries.size()).arg(encSnos.size());
 
         // ── Cache hit ────────────────────────────────────────────────────────────────────────
         if (QFile::exists(cache)) {
@@ -271,6 +374,8 @@ void StoreProductIndex::ensureBuilt(const QString& d4dataDir, const SnoIndex* in
                         p.slot        = o.value(QStringLiteral("slot")).toString();
                         p.payloadGroup = o.value(QStringLiteral("pgrp")).toInt();
                         p.fromCasc     = o.value(QStringLiteral("casc")).toBool();
+                        p.encrypted    = o.value(QStringLiteral("enc")).toBool();
+                        p.tactKey      = o.value(QStringLiteral("key")).toString();
                         {
                             auto getIds = [&o](const char* k, QVector<int>& v) {
                                 for (const QJsonValue& x : o.value(QLatin1String(k)).toArray())
@@ -429,7 +534,7 @@ void StoreProductIndex::ensureBuilt(const QString& d4dataDir, const SnoIndex* in
         // EVERY field is validated. A record that fails any check is skipped entirely rather than
         // contributing a half-built product — a bundle listing children that resolve to nothing
         // looks broken, which is worse than the honest absence we have today.
-        if (reader && reader->isReady() && !prdEntries.isEmpty()) {
+        if (cascReady && !prdEntries.isEmpty()) {
             constexpr int  kRecBase   = 0x10;    // the record proper, after the file header
             constexpr int  kChildDesc = 0x28;    // {relOffset, byteSize}
             constexpr int  kPayload0  = 0x74;    // first of thirteen u32 slots, 4-byte stride
@@ -438,11 +543,37 @@ void StoreProductIndex::ensureBuilt(const QString& d4dataDir, const SnoIndex* in
                 return quint32(uchar(b[off])) | quint32(uchar(b[off + 1])) << 8
                      | quint32(uchar(b[off + 2])) << 16 | quint32(uchar(b[off + 3])) << 24;
             };
-            int recovered = 0, rejected = 0, childless = 0;
+            int recovered = 0, rejected = 0, childless = 0, locked = 0;
             for (auto pe = prdEntries.constBegin(); pe != prdEntries.constEnd(); ++pe) {
                 if (byId.contains(pe.key())) continue;        // json already described this one
                 const QByteArray m = reader->readMetaBySno(quint64(pe.key()));
-                if (m.size() < kPayload0 + 13 * 4) { ++rejected; continue; }
+                if (m.size() < kPayload0 + 13 * 4) {
+                    // ── Unreadable. Is it LOCKED, or just missing? ──────────────────────────────
+                    // These are not the same thing and used to share one fate: `continue`. A
+                    // TACT-encrypted product decrypts to nothing, failed this size test, and was
+                    // discarded — which is why the entire Diablo IV x DOOM collab was absent from
+                    // the Catalogue. Measured: Bundle_HArmor_bar_stor251 (2333972),
+                    // Bundle_HArmor_dru_stor235, Bundle_HArmor_pal_stor171, Catalog_S12_IP_Collab
+                    // and AddOn_CollectionPack_Slayer are all listed in base/EncryptedSNOs.dat,
+                    // while their readable sibling Bundle_HArmor_rog_stor251 is not — and only the
+                    // sibling reached the tab.
+                    //
+                    // The manifest answers it definitively, per sno, and names the key. So a locked
+                    // product is now carried with what IS knowable — its name, and therefore its
+                    // shop art, which the Catalogue derives from the name by suffix convention.
+                    // Children and payload stay empty because they are genuinely unreadable.
+                    const auto ek = encSnos.constFind(pe.key());
+                    if (ek == encSnos.constEnd()) { ++rejected; continue; }
+                    Product lp;
+                    lp.sno       = pe.key();
+                    lp.name      = pe.value();
+                    lp.fromCasc  = true;
+                    lp.encrypted = true;
+                    lp.tactKey   = QString::fromLatin1(ek.value().toHex());
+                    byId.insert(lp.sno, lp);
+                    ++locked;
+                    continue;
+                }
 
                 Product p;
                 p.sno  = pe.key();
@@ -505,16 +636,25 @@ void StoreProductIndex::ensureBuilt(const QString& d4dataDir, const SnoIndex* in
                 byId.insert(p.sno, p);
                 ++recovered;
             }
-            qInfo("StoreProductIndex: CASC fallback — %d product(s) recovered that d4data does not "
-                  "describe, %d unreadable, %d with no children and no payload",
-                  recovered, rejected, childless);
+            qInfo("StoreProductIndex: CASC fallback — %d recovered that d4data does not describe, "
+                  "%d TACT-locked (listed, contents unreadable), %d unreadable for another reason, "
+                  "%d with no children and no payload",
+                  recovered, locked, rejected, childless);
+            // The one condition under which this build is KNOWN to be wrong, said out loud. A ready
+            // reader with an empty encrypted manifest is never correct for this game - D4 ships
+            // 12,947 encrypted SNOs - so this cannot false-positive, and it is exactly the state
+            // that made every locked product fall into `rejected` and disappear.
+            if (encSnos.isEmpty())
+                qWarning("StoreProductIndex: CASC is ready but the encrypted manifest is EMPTY — "
+                         "no TACT-locked product can be recovered in this build. "
+                         "base/EncryptedSNOs.dat did not parse.");
         } else {
             // NOT `index` here: it is deliberately uncaptured, because touching a live SnoIndex
             // from this worker is the race the gearNames/prdEntries snapshots exist to avoid.
             // prdEntries IS the captured evidence of whether the index had anything to give.
             qInfo("StoreProductIndex: CASC fallback skipped (reader %s, %d product sno(s) known) — "
                   "products absent from d4data will not appear",
-                  (reader && reader->isReady()) ? "ready" : "not ready", int(prdEntries.size()));
+                  cascReady ? "ready" : "not ready", int(prdEntries.size()));
         }
 
         // ── SNO reference graph: real slots, and where each asset was sold ──────────────────────
@@ -612,6 +752,8 @@ void StoreProductIndex::ensureBuilt(const QString& d4dataDir, const SnoIndex* in
             if (!p.slot.isEmpty()) o.insert(QStringLiteral("slot"), p.slot);
             if (p.payloadGroup) o.insert(QStringLiteral("pgrp"), p.payloadGroup);
             if (p.fromCasc)     o.insert(QStringLiteral("casc"), true);
+            if (p.encrypted)    o.insert(QStringLiteral("enc"), true);
+            if (!p.tactKey.isEmpty()) o.insert(QStringLiteral("key"), p.tactKey);
             {
                 auto putIds = [&o](const char* k, const QVector<int>& v) {
                     if (v.isEmpty()) return;

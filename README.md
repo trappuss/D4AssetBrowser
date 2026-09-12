@@ -5,8 +5,7 @@ directly (CASC), decodes textures, and previews or exports appearances, armour s
 weapons, mounts and pets as animated `.glb` — with cloth physics, dyes, markings,
 hair, makeup and animations.
 
-**A full C++17 / Qt6 / OpenGL rewrite** of
-[trappuss/Diablo4AssetBrowser](https://github.com/trappuss/Diablo4AssetBrowser)
+**A full C++17 / Qt6 / OpenGL rewrite** of the original `Diablo4AssetBrowser`
 (Python / PySide6). Single native executable — no Python, no external extractor.
 
 > Not affiliated with or endorsed by Blizzard. For personal use with a copy of Diablo IV
@@ -389,9 +388,11 @@ python verify-src.py --quiet    :: only print problems
 ### Continuous integration
 
 `.github/workflows/release.yml` builds the portable Windows folder on GitHub's runners. Push a
-tag matching `v*` and it compiles, runs `windeployqt`, zips the result and publishes it as a
-GitHub Release; run it by hand from **Actions ▸ Release ▸ Run workflow** to get the same zip as
-a plain artifact without cutting a release.
+version tag — `2.3.0` or `v2.3.0`, both fire — and it compiles, runs `windeployqt`, zips the
+result and publishes it as a GitHub Release, using the matching section of `CHANGELOG.md` as the
+release body rather than a list of commit subjects. Run it by hand from
+**Actions ▸ Release ▸ Run workflow** to get the same zip as a plain artifact without cutting a
+release.
 
 The CI build installs a **prebuilt Qt 6.7.3** rather than letting vcpkg compile Qt, and uses
 vcpkg only for the four small dependencies. That is the single reason a cold CI build takes
@@ -498,6 +499,24 @@ a whole category its icons shows up as a number rather than as a bug report mont
 has versus how many the metadata snapshot describes. That gap is the honest answer to "why is this
 bundle missing", and it is the first thing to read after a patch.
 
+Three more sit beside it, each answering a question that used to mean leaving the tool:
+
+- **Help → Find SNO** — paste an id or part of a name. Reports the asset group, the name, the
+  collection it belongs to, how many appearances use a material, and whether it arrived in this
+  game build. `2462986` is a wolf-head ornament material; you no longer have to grep a 43 MB
+  metadata dump to learn that.
+- **Help → Patch contents** — what each game build *added*, newest first, grouped by asset type and
+  named. The tool has recorded this since it was first opened on a build; this is the first time it
+  can be read as a whole rather than one tab's filter at a time. It cannot reconstruct a build the
+  tool was never opened on, and it says so.
+- **Help → Diagnostic output** — the reports the `Dump - *.bat` probes write beside the exe, listed
+  newest first with size and age, and readable in place. The list is the folder, not a hard-coded
+  table, so a new probe appears without anything being updated.
+
+**Right-click a part → Explain this material** now ends with every appearance that uses it. That is
+how you tell a piece's own material from one shared across a set — or across both genders, which is
+how several Paladin and store sets are authored.
+
 `Dump StoreProduct Layout.bat` and `Dump Marking Model.bat` each build, run, write a report and
 exit on their own — one double-click, no babysitting.
 
@@ -576,7 +595,8 @@ changed — attach that output to an issue and it saves a lot of back-and-forth.
 
 ## Credits
 
-Original tool and design: **[trappuss](https://github.com/trappuss/Diablo4AssetBrowser)**.
+Original tool and design: **[trappuss](https://github.com/trappuss)** — the Python
+`Diablo4AssetBrowser` this one is a rewrite of.
 Community tooling: **d4data** (DiabloTools) · **d4extract** (narascode, no longer
 required) · **[rustydemon](https://github.com/HoldMyBeer-gg/rustydemon)** (TACT keys) ·
 **d4analyzer** (reference extractions used to verify binary format derivations).

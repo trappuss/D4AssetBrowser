@@ -10,7 +10,8 @@ against real data; the numbers are measurements, not estimates.
 | [`ASSETBROWSER_TEMPLATE.md`](ASSETBROWSER_TEMPLATE.md) | The family design system for every `(Game\|Engine)AssetBrowser` tool — product identity, architecture skeleton, tab templates, viewport, panel system, exporting and the GIF budget ladder, settings, hotkeys, porting guide. Read this before starting a new browser rather than re-deriving D4's UX. |
 | [`CONTEXT_MENUS.md`](CONTEXT_MENUS.md) | The complete context-menu specification — label grammar, the selection rule, row/viewport/per-tab menus, the File · Export · Help menu bar, and when to omit versus disable. |
 | [`MODEL_EXPORT.md`](MODEL_EXPORT.md) | What every export option actually does: scopes, detail-map baking, unit scale, rig retargeting, and the normal-map green-channel convention with the measurement behind it. |
-| [`PUBLISHING.md`](PUBLISHING.md) | Cutting a release — version bump, packaging, smoke test, GitHub. |
+| [`PUBLISHING.md`](PUBLISHING.md) | Cutting a release — the order the steps must happen in, the five places the version lives, and the two standing rules for git in this folder. |
+| [`HYGIENE_TOOLING.md`](HYGIENE_TOOLING.md) | What `verify-src.py` checks and why each check exists, the one inventory of the three tabs' render settings, and the reports built over data the tool already had. |
 
 ## Investigations
 
@@ -18,6 +19,9 @@ against real data; the numbers are measurements, not estimates.
 |---|---|
 | [`RENDER_CRASH_INVESTIGATION.md`](RENDER_CRASH_INVESTIGATION.md) | The GPU-fault triage and what the SEH guards are protecting. |
 | [`DD2_ADDON_CONTEXT.md`](DD2_ADDON_CONTEXT.md) | Context for the Blender add-on that consumes these exports. |
+| [`PALADIN_MATERIAL_SHARING.md`](PALADIN_MATERIAL_SHARING.md) | Head-named ornaments and cross-gender material sharing — measured from CoreTOC, with the SNOs. |
+| [`PET_CLIP_NAMING.md`](PET_CLIP_NAMING.md) | The two ways the game names pet animation clips, measured across all 48 companions. |
+| [`STABLE_PARITY_AUDIT.md`](STABLE_PARITY_AUDIT.md) | Stable against Wardrobe across four dimensions: what was fixed, what is open, and nine bugs the reverse pass found in Wardrobe. |
 | [`NEXT_SESSION_BUILD_VERIFY.md`](NEXT_SESSION_BUILD_VERIFY.md) · [`NEXT_SESSION_DETAIL_BAKE.md`](NEXT_SESSION_DETAIL_BAKE.md) | Handoff notes with the verification each change still needs. |
 
 ## `notes\`

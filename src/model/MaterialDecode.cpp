@@ -10,7 +10,9 @@
 #include "tex/TexMeta.h"
 
 #include <QByteArray>
+#include <QColor>
 #include <QFile>
+#include <QReadWriteLock>
 #include <QMutex>
 #include <QSet>
 #include <QStringList>
@@ -755,13 +757,137 @@ void MaterialDecode::bakeDetailForMaterial(CascReader* reader, const QString& d4
                qBound(0.0f, sN, 4.0f), qBound(0.0f, sR, 4.0f), sO);
 }
 
+QJsonObject MaterialDecode::uberMaterial(const QString& d4, const QString& matName)
+{
+    if (d4.isEmpty() || matName.isEmpty()) return {};
+    // Keyed on d4 AND the name, so switching d4data folders cannot serve the old snapshot's
+    // values. A read-write lock rather than a plain mutex because the Wardrobe's decode pass runs
+    // on a worker thread while the GUI thread reads the same materials for its panels: the hit
+    // path is read-only and must not serialise.
+    static QReadWriteLock lock;
+    static QHash<QString, QJsonObject> cache;
+    const QString key = d4 + QLatin1Char('|') + matName;
+    {
+        QReadLocker r(&lock);
+        const auto it = cache.constFind(key);
+        if (it != cache.constEnd()) return it.value();
+    }
+    const QByteArray j = readMat(d4, matName);
+    const QJsonObject um = j.isEmpty()
+        ? QJsonObject()
+        : QJsonDocument::fromJson(j).object().value(QStringLiteral("tUberMaterial")).toObject();
+    QWriteLocker w(&lock);
+    // An ABSENT material caches its empty object too. Encrypted materials have no .mat.json and
+    // are asked for just as often as any other, so not caching the miss would leave exactly the
+    // population this session has been chasing paying a failed file open on every single lookup.
+    if (cache.size() > 4096) cache.clear();   // bounded; a full corpus sweep must not grow forever
+    cache.insert(key, um);
+    return um;
+}
+
+QString MaterialDecode::shaderMap(const QString& d4, const QString& matName)
+{
+    return uberMaterial(d4, matName)
+               .value(QStringLiteral("snoShaderMap")).toObject()
+               .value(QStringLiteral("name")).toString();
+}
+
+float MaterialDecode::materialScalar(const QString& d4, const QString& matName,
+                                     const char* want, float fallback)
+{
+    const QJsonObject um = uberMaterial(d4, matName);
+    if (um.isEmpty()) return fallback;
+    const QString w = QString::fromLatin1(want);
+    for (const QJsonValue& rv : um.value(QStringLiteral("ptRunTimeMaterialValues")).toArray())
+        for (const QJsonValue& sv : rv.toObject()
+                                      .value(QStringLiteral("arMaterialScalarValues")).toArray()) {
+            const QJsonObject tv = sv.toObject().value(QStringLiteral("tValue")).toObject();
+            if (tv.value(QStringLiteral("snoMaterialValue")).toObject()
+                  .value(QStringLiteral("name")).toString().startsWith(w, Qt::CaseInsensitive))
+                return float(tv.value(QStringLiteral("value")).toDouble());
+        }
+    return fallback;
+}
+
+QColor MaterialDecode::materialColor(const QString& d4, const QString& matName, const char* want)
+{
+    const QJsonObject um = uberMaterial(d4, matName);
+    if (um.isEmpty()) return QColor();   // INVALID, not white — the caller must be able to tell
+    const QString w = QString::fromLatin1(want);
+    for (const QJsonValue& rv : um.value(QStringLiteral("ptRunTimeMaterialValues")).toArray())
+        for (const QJsonValue& sv : rv.toObject()
+                                      .value(QStringLiteral("arMaterialVectorValues")).toArray()) {
+            const QJsonObject tv = sv.toObject().value(QStringLiteral("tValue")).toObject();
+            if (tv.value(QStringLiteral("snoMaterialValue")).toObject()
+                  .value(QStringLiteral("name")).toString().startsWith(w, Qt::CaseInsensitive)) {
+                const QJsonObject c = tv.value(QStringLiteral("value")).toObject();
+                return QColor::fromRgbF(qBound(0.0, c.value(QStringLiteral("x")).toDouble(), 1.0),
+                                        qBound(0.0, c.value(QStringLiteral("y")).toDouble(), 1.0),
+                                        qBound(0.0, c.value(QStringLiteral("z")).toDouble(), 1.0));
+            }
+        }
+    return QColor();
+}
+
+QColor MaterialDecode::emissiveTint(const QString& d4, const QString& matName,
+                                    const QImage& emissive, const QImage& baseColor)
+{
+    static const QColor kWhite(255, 255, 255);
+    const QColor authored = materialColor(d4, matName, "emissive color");
+    if (authored.isValid()) return authored;
+    if (emissive.isNull()) return kWhite;
+    // Is the map a MASK? Measured, never assumed: a mask is monochrome, so the largest channel
+    // spread across its LIT texels answers it. Sampled on a grid — a 2048² map does not need every
+    // pixel to settle a yes/no question about its own chromaticity.
+    const QImage e = emissive.convertToFormat(QImage::Format_RGBA8888);
+    if (e.isNull() || e.width() < 1 || e.height() < 1) return kWhite;
+    const int stepX = qMax(1, e.width() / 64), stepY = qMax(1, e.height() / 64);
+    int spread = 0, lit = 0;
+    for (int y = 0; y < e.height(); y += stepY)
+        for (int x = 0; x < e.width(); x += stepX) {
+            const QRgb p = e.pixel(x, y);
+            const int r = qRed(p), g = qGreen(p), b = qBlue(p);
+            if (r + g + b < 24) continue;   // unlit background: carries no colour either way
+            ++lit;
+            spread = qMax(spread, qMax(qMax(r, g), b) - qMin(qMin(r, g), b));
+        }
+    if (lit == 0)     return kWhite;   // nothing glows, so the tint is moot
+    if (spread > 12)  return kWhite;   // a COLOURED map states its own colour; do not tint it
+    if (baseColor.isNull()) return kWhite;
+    const QImage bc = baseColor.convertToFormat(QImage::Format_RGBA8888);
+    if (bc.isNull() || bc.width() < 1 || bc.height() < 1) return kWhite;
+    double sr = 0, sg = 0, sb = 0, sw = 0;
+    for (int y = 0; y < e.height(); y += stepY)
+        for (int x = 0; x < e.width(); x += stepX) {
+            const QRgb ep = e.pixel(x, y);
+            const double w = (qRed(ep) + qGreen(ep) + qBlue(ep)) / 765.0;
+            if (w <= 0.05) continue;
+            // Same UVs, different resolutions: sample the base map proportionally rather than
+            // assuming the two maps are the same size (they routinely are not).
+            const int bx = qBound(0, int(double(x) / e.width()  * bc.width()),  bc.width()  - 1);
+            const int by = qBound(0, int(double(y) / e.height() * bc.height()), bc.height() - 1);
+            const QRgb bp = bc.pixel(bx, by);
+            sr += qRed(bp) * w; sg += qGreen(bp) * w; sb += qBlue(bp) * w; sw += w;
+        }
+    if (sw <= 0.0) return kWhite;
+    // Normalised to the brightest channel, because this is a HUE and not a brightness. Brightness
+    // is the authored multiplier times the slider; folding a dark albedo in here would leave the
+    // slider fighting a number nobody can see.
+    double r = sr / sw, g = sg / sw, b = sb / sw;
+    const double mx = qMax(qMax(r, g), b);
+    if (mx < 1.0) return kWhite;
+    return QColor(int(r / mx * 255.0 + 0.5), int(g / mx * 255.0 + 0.5), int(b / mx * 255.0 + 0.5));
+}
+
 void MaterialDecode::factors(CascReader*, const QString& d4, const QString& matName,
-                             float& metal, float& rough)
+                             float& metal, float& rough, bool* authored)
 {
     metal = 0.0f; rough = 0.6f;
+    if (authored) *authored = false;
     const QByteArray j = readMat(d4, matName);
     if (j.isEmpty()) return;
     const MaterialValues v = parseMaterialValues(j);
+    if (authored) *authored = v.hasMetal || v.hasRough;
     if (v.hasMetal) metal = float(v.metal);
     if (v.hasRough) rough = float(v.rough);
 }
@@ -804,6 +930,30 @@ QStringList MaterialDecode::appearanceRosterFromMeta(const QByteArray& meta, con
         // nameless-but-known material actually takes it.
         out << (nm.isEmpty() ? QStringLiteral("~unnamed_%1").arg(s) : nm);
     }
+    return out;
+}
+
+QStringList MaterialDecode::appearanceRosterAny(CascReader* reader, const QString& d4,
+                                                const QString& appName, const QByteArray& meta,
+                                                int sno, const SnoIndex* idx,
+                                                QVector<bool>* clothOut)
+{
+    QStringList out = appearanceRoster(d4, appName, clothOut);
+    if (!out.isEmpty()) return out;
+    // No .app.json. For encrypted content that is the NORMAL case rather than an edge one, so the
+    // fallback is the rule here and not an exception bolted on by whoever happened to hit it.
+    QByteArray m = meta;
+    if (m.isEmpty() && reader && reader->isReady() && sno > 0)
+        m = reader->readMetaBySno(quint64(sno));
+    if (m.isEmpty()) return out;
+    // Both callees clear clothOut on entry, so the flags can never be a mix of the two routes.
+    out = appearanceRosterFromMeta(m, idx, nullptr, clothOut);
+    // Logged HERE rather than at each call site, so every route through this function says which
+    // source answered. One site used to log it and the others did not, which meant the log could
+    // not be used to tell "took the fallback" apart from "never had a fallback to take".
+    if (!out.isEmpty())
+        qInfo("appearance %s: material roster read from the meta binary — %d entry(ies) "
+              "(no .app.json in this d4data snapshot)", qPrintable(appName), int(out.size()));
     return out;
 }
 

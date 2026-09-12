@@ -200,9 +200,19 @@ private:
     void exportItemModel(int sno, const QString& name, bool toLast = false);  // one item's model → .glb
     void onSettingsChanged() override;   // re-apply nude/sidebar settings live
     void onSettingsLiveChanged(bool rebuild) override;   // per-toggle live apply
+    void linkColliderToggles();    // mirror the Overlays + Physics "collision model" boxes
     void rebuildPartList();  // (re)build the per-part visibility tree (grouped by piece)
+    // D4_DUMP_PIECEROSTER=1 -> piece_roster.txt beside the exe: per equipped piece, the material
+    // roster BOTH routes resolve plus every primitive's material, flags and visibility. See the
+    // definition for why it is kept on the rebuild path.
+    void dumpPieceRoster();
     void recomputePartVisibility();        // tree checks ∧ FX/SIM toggles → visibility
     QList<int> primitivesOf(QTreeWidgetItem* it) const;
+    QTreeWidgetItem* itemForPart(int part) const;   // parts-tree row for a merged primitive index
+    // Everything that follows the parts-tree selection: the viewport outline and the materials
+    // panel. A named slot rather than a lambda because the viewport's click handler edits the tree
+    // with signals blocked (one sync instead of two) and then has to run this itself.
+    void syncPartSelection();
     QList<int> selectedParts() const;
     qint64 texSnoFor(const QString& texName);   // resolve a texture name → SNO (lazy index)
 
@@ -226,6 +236,20 @@ private:
 
     QComboBox* m_class  = nullptr;
     QComboBox* m_gender = nullptr;
+    // ── Dressing from a content drop, without knowing a single piece name ────────────────────────
+    // Blizzard encrypts one content drop under ONE TACT key, so the key IS the game's own grouping
+    // of "these shipped together". The Catalogue already uses that to show a whole collab as one
+    // row; the Wardrobe could not, so finding the DOOM set meant already knowing that
+    // barM_stor251_TRS was the piece you wanted. Measured on this build: 126 appearances resolve
+    // their material roster only from the CASC binary and every one of them is encrypted — that
+    // population IS the collab and seasonal wardrobe, and it is what this selects.
+    QComboBox* m_dropFilter = nullptr;
+    // The selected drop's appearance SNOs. EMPTY MEANS NO FILTER, never "nothing matches" — the
+    // two populate paths below both test it and an empty-set-means-hide-everything reading would
+    // silently blank the entire wardrobe.
+    QSet<int>  m_dropSnos;
+    void rebuildDropFilter();                  // fill the combo from the encrypted manifest
+    bool dropAllows(int appearanceSno) const;  // the one predicate both populate paths ask
     QWidget*     m_ensemblePanel = nullptr;   // "Ensembles" panel (saved full-character looks)
     QListWidget* m_ensembleList  = nullptr;   // tile grid of saved ensembles
     QString      m_activeLook;                // name of the currently-loaded ensemble (highlighted)
@@ -550,6 +574,12 @@ private:
     QCheckBox* m_physChkBones = nullptr;
     QCheckBox* m_physChkAxis  = nullptr;
     QCheckBox* m_rigChkSkel = nullptr; QCheckBox* m_rigChkPhys = nullptr; QCheckBox* m_rigChkAxis = nullptr;
+    // "Collision model" exists twice — Overlays panel and Physics panel — over ONE setting key, so
+    // toggling either left the other visibly stale. Mirrored rather than de-duplicated because both
+    // placements earn their spot: it is a guide and it is a cloth-debug control.
+    QCheckBox* m_ovlChkColliders  = nullptr;   // Overlays panel "Collision model"
+    QCheckBox* m_physChkColliders = nullptr;   // Physics panel "Show collision models"
+    bool       m_colliderTogglesLinked = false;
     QCheckBox* m_rigChkNames = nullptr; QCheckBox* m_rigChkTrans = nullptr;   // Rig-panel checkboxes
     QCheckBox* m_rigChkHideUnk = nullptr;   // Rig-panel "Hide unnamed bones"
     // Live cloth-physics tuning popup (debug).
@@ -571,6 +601,10 @@ private:
     // viewport AND parts panel. `groupPart` is any part belonging to the group whose HEADER was
     // right-clicked: part stays -1 (no single part was picked) but the model-level actions still
     // scope to that group's source item instead of falling back to the whole assembly.
+    // "Explain this material…" — see src/model/MaterialReport.h. The Wardrobe needs this more than
+    // any other tab: its model is a MERGE of many pieces, so "which of these is why that looks
+    // wrong" cannot be answered by looking at one appearance.
+    void showMaterialReport(const QString& materialName, const QString& apprName, int apprSno);
     void showPartContextMenu(int part, const QPoint& globalPos, int groupPart = -1);
     QVector<int> visibleParts() const;                          // parts drawn right now
     QVector<int> partsOfSource(int part) const;                 // parts sharing one source item

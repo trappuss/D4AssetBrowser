@@ -133,6 +133,14 @@ public:
     // the order used by the EncryptedNameDict-0x<id>.dat filenames, which are byte-reversed.
     const QHash<int, QByteArray>& encryptedSnos();
 
+    // Every sno locked under one key, i.e. one embargoed content DROP. Blizzard encrypts a release
+    // under a single key, so this is the game's own grouping of "these shipped together" - and it
+    // reaches far past the shop: the Diablo IV x DOOM armour key covers 1,116 assets, of which only
+    // 50 are StoreProducts and the rest are 392 textures, 157 anims, 130 cloth, 109 materials and
+    // 72 appearances. Exporting "the bundle" was therefore never exporting the collab.
+    // Built from the same manifest, on first use.
+    QVector<int> snosForTactKey(const QByteArray& keyName);
+
     // ── Shared payloads: assets that deliberately have no payload of their own ───────────────────
     // source sno -> the sno whose payload it actually uses. From base/CoreTOCSharedPayloadsMapping.dat
     // (layout from d4data parse.js:140-147: u32 unread, u32 count, count x { u32 source, u32 dest }).

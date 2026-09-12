@@ -224,6 +224,99 @@ QString runMatSnoSweep(const QString& d4, SnoIndex* idx, CascReader* rd, QWidget
         qInfo("metadump: wrote %d blob(s) to %s", wrote, qPrintable(dumpDir));
     }
 
+    // ── D4_MATVALUE_DUMP=<count> — PAIRED material blobs, for deriving the VALUE table ────────
+    // The last gap in the binary material chain. matTexFromMeta() already reads a material's
+    // TEXTURE list out of the meta blob (+0x38 descriptor, 48-byte records, verified against
+    // armor_skin_mat). Its VALUES — ptRunTimeMaterialValues, the authored scalars and vectors —
+    // are still read only from .mat.json, and MaterialDecode::readMat() is the only route to them.
+    // So for every encrypted material the tool silently substitutes defaults:
+    //
+    //     metal 0.0 · rough 0.6 · "emissive multiplier" 1.0 · "emissive color" absent
+    //
+    // That is why the DOOM set renders on stand-in PBR, and why its glows had to fall back to a
+    // tint derived from the base map instead of the authored colour.
+    //
+    // Deriving the layout needs GROUND TRUTH, and the only ground truth is a material that has
+    // BOTH a blob and a .mat.json. This writes those pairs, side by side, so the layout can be
+    // solved offline in one sitting rather than one hypothesis per rebuild — the same reason
+    // D4_METADUMP_NAMES exists below.
+    //
+    // SELF-SELECTING: it walks the material groups and takes the first <count> entries that have a
+    // .mat.json on disk. No name list to maintain, and no sample biased toward whatever anyone
+    // happened to think of — which is exactly how a hand-picked set once made a broken stride test
+    // look like a "12 of 25" result.
+    //
+    // Writes matvalue/<sno>_<name>.meta.bin next to matvalue/<sno>_<name>.mat.json.
+    if (!qEnvironmentVariable("D4_MATVALUE_DUMP").isEmpty()) {
+        const int want = qMax(1, qEnvironmentVariable("D4_MATVALUE_DUMP").toInt());
+        const QString dumpDir = QCoreApplication::applicationDirPath() + QStringLiteral("/matvalue");
+        QDir().mkpath(dumpDir);
+        int pairs = 0, noJson = 0, noMeta = 0;
+        // 57 "Material (2)" then 37 "Material" — the same pair appearanceRosterFromMeta resolves
+        // names over, so a material this dump can reach is one the reader will have to handle.
+        for (int group : {57, 37}) {
+            for (const SnoEntry& e : idx->entries(group)) {
+                if (pairs >= want) break;
+                if (e.name.isEmpty() || e.name.startsWith(QLatin1String("~unnamed_"))) continue;
+                QFile jf(QStringLiteral("%1/json/base/meta/Material/%2.mat.json").arg(d4, e.name));
+                if (!jf.open(QIODevice::ReadOnly)) { ++noJson; continue; }
+                const QByteArray json = jf.readAll();
+                const QByteArray meta = rd->readMetaBySno(quint64(e.snoId));
+                if (meta.isEmpty()) { ++noMeta; continue; }
+                const QString stem =
+                    QStringLiteral("%1/%2_%3").arg(dumpDir).arg(e.snoId).arg(e.name);
+                QFile bf(stem + QStringLiteral(".meta.bin"));
+                if (bf.open(QIODevice::WriteOnly)) bf.write(meta);
+                QFile of(stem + QStringLiteral(".mat.json"));
+                if (of.open(QIODevice::WriteOnly)) of.write(json);
+                ++pairs;
+            }
+            if (pairs >= want) break;
+        }
+        // The two counters are not noise: "0 pairs, 4000 had no .mat.json" means the d4data folder
+        // is stale or unset, and "0 pairs, 4000 no meta blob" means CASC is not the problem the
+        // derivation is about. Told apart here rather than guessed at from an empty folder.
+        qInfo("matvalue: wrote %d pair(s) to %s  (%d had no .mat.json, %d no meta blob)",
+              pairs, qPrintable(dumpDir), noJson, noMeta);
+    }
+
+    // ── D4_CLOTHVALUE_DUMP=<count> — the same pairs, for CLOTH tuning ─────────────────────────
+    // The cloth audit measured the other half of the same gap: 55 named cloth pieces across 39
+    // appearances run UNTUNED defaults, and every one of them is in an encrypted set (stor171,
+    // 190, 235, 245, 251, 266 plus the trophies). resolveClothTuning reads the appearance's
+    // .app.json for snoCloth and then Cloth/<name>.clt.json for the parameters — both d4data JSON,
+    // neither of which an encrypted record ships. So a DOOM cape simulates on fallback physics,
+    // always, and the only symptom is that it moves slightly wrong.
+    //
+    // Same method as D4_MATVALUE_DUMP above, same reason: the layout can only be DERIVED against
+    // ground truth, and the only ground truth is a Cloth record that has both a blob and a JSON.
+    // Dumped in the same run so one sitting covers both derivations.
+    //
+    // Writes to clothvalue/<sno>_<name>.meta.bin + <sno>_<name>.clt.json.
+    if (!qEnvironmentVariable("D4_CLOTHVALUE_DUMP").isEmpty()) {
+        const int want = qMax(1, qEnvironmentVariable("D4_CLOTHVALUE_DUMP").toInt());
+        const QString dumpDir = QCoreApplication::applicationDirPath() + QStringLiteral("/clothvalue");
+        QDir().mkpath(dumpDir);
+        int pairs = 0, noJson = 0, noMeta = 0;
+        for (const SnoEntry& e : idx->entries(11)) {   // 11 Cloth
+            if (pairs >= want) break;
+            if (e.name.isEmpty() || e.name.startsWith(QLatin1String("~unnamed_"))) continue;
+            QFile jf(QStringLiteral("%1/json/base/meta/Cloth/%2.clt.json").arg(d4, e.name));
+            if (!jf.open(QIODevice::ReadOnly)) { ++noJson; continue; }
+            const QByteArray json = jf.readAll();
+            const QByteArray meta = rd->readMetaBySno(quint64(e.snoId));
+            if (meta.isEmpty()) { ++noMeta; continue; }
+            const QString stem = QStringLiteral("%1/%2_%3").arg(dumpDir).arg(e.snoId).arg(e.name);
+            QFile bf(stem + QStringLiteral(".meta.bin"));
+            if (bf.open(QIODevice::WriteOnly)) bf.write(meta);
+            QFile of(stem + QStringLiteral(".clt.json"));
+            if (of.open(QIODevice::WriteOnly)) of.write(json);
+            ++pairs;
+        }
+        qInfo("clothvalue: wrote %d pair(s) to %s  (%d had no .clt.json, %d no meta blob)",
+              pairs, qPrintable(dumpDir), noJson, noMeta);
+    }
+
     // D4_METADUMP_SNOS=<sno,sno,...> — dump by raw sno, any group. Needed for Material and Texture
     // blobs, which have no appearance name to look up: an encrypted material resolves to
     // "~unnamed_<sno>", so the sno IS the handle. Writes meta and, for textures, the payload too,
@@ -679,7 +772,7 @@ QString runHealthAudit(const QString& d4, SnoIndex* idx, CascReader* rd, QWidget
         return QStringLiteral("health: cannot write asset_health.csv");
     QTextStream cs(&csv);
     cs << "name,sno,status,encrypted,keyHeld,metaBytes,payloadBytes,prims,materials,"
-          "texturesResolved,droppedSubObjects,iconHandle\n";
+          "texturesResolved,droppedSubObjects,iconHandle,rosterSource,matValuesDefaulted\n";
 
     // ── Icon coverage ───────────────────────────────────────────────────────────────────────────
     // Rendering health is not the only way an asset can be unusable. An appearance with no icon is
@@ -712,6 +805,9 @@ QString runHealthAudit(const QString& d4, SnoIndex* idx, CascReader* rd, QWidget
     QMap<Health, QStringList> examples;
     QHash<QString, QString> current;   // name -> status, for the diff against last run
     int scanned = 0;
+    // Corpus totals for the two CSV columns added below. These are the numbers that turn "the DOOM
+    // weapons are white" into something visible before anyone has to report it.
+    int rosterFromJson = 0, rosterFromMeta = 0, matsDefaulted = 0, appsWithDefaultedMats = 0;
 
     for (const SnoEntry& e : apps) {
         if ((++scanned % 128) == 0) {
@@ -726,7 +822,8 @@ QString runHealthAudit(const QString& d4, SnoIndex* idx, CascReader* rd, QWidget
         const bool held = enc ? rd->haveTactKey(kn) : true;
 
         Health h = Health::Ok;
-        int prims = 0, mats = 0, texOk = 0, geoDropped = 0;
+        int prims = 0, mats = 0, texOk = 0, geoDropped = 0, valDefaulted = 0;
+        const char* rosterSrc = "-";
 
         if (meta.isEmpty() || pay.isEmpty()) {
             // Distinguish "gated behind a key we lack" from "genuinely absent". Only the second is
@@ -739,10 +836,35 @@ QString runHealthAudit(const QString& d4, SnoIndex* idx, CascReader* rd, QWidget
             if (!geo.valid || prims == 0) {
                 h = Health::NoGeometry;
             } else {
+                // ── Two columns that would have caught this year's silent failures ──────────
+                // rosterSource: which of the two routes answered. An appearance that can only be
+                // read from the binary is one that any JSON-only call site loses entirely — which
+                // is precisely how the Wardrobe's weapon path rendered the DOOM collab white while
+                // the Models tab rendered it correctly. A corpus-wide count of "meta" rows is the
+                // number that makes that class of bug visible before a user reports it.
                 QStringList roster = MaterialDecode::appearanceRoster(d4, e.name);
-                if (roster.isEmpty()) roster = MaterialDecode::appearanceRosterFromMeta(meta, idx);
+                if (!roster.isEmpty()) {
+                    rosterSrc = "json";
+                    ++rosterFromJson;
+                } else {
+                    roster = MaterialDecode::appearanceRosterFromMeta(meta, idx);
+                    rosterSrc = roster.isEmpty() ? "none" : "meta";
+                    if (!roster.isEmpty()) ++rosterFromMeta;
+                }
                 mats = 0;
                 for (const QString& m : roster) if (!m.isEmpty()) ++mats;
+                // matValuesDefaulted: how many of this appearance's materials have NO .mat.json,
+                // and therefore no authored metal, roughness, emissive multiplier or emissive
+                // colour — the tool substitutes 0.0 / 0.6 / 1.0 / absent and says nothing. There is
+                // no binary route for material VALUES yet (see D4_MATVALUE_DUMP), so this column is
+                // the honest size of that gap, per asset, until there is.
+                for (const QString& m : roster) {
+                    if (m.isEmpty()) continue;
+                    QFile mvf(QStringLiteral("%1/json/base/meta/Material/%2.mat.json").arg(d4, m));
+                    if (!mvf.exists()) ++valDefaulted;
+                }
+                matsDefaulted += valDefaulted;
+                if (valDefaulted > 0) ++appsWithDefaultedMats;
                 if (mats == 0) {
                     h = Health::NoMaterials;
                 } else {
@@ -793,7 +915,8 @@ QString runHealthAudit(const QString& d4, SnoIndex* idx, CascReader* rd, QWidget
 
         cs << e.name << ',' << e.snoId << ',' << healthName(h) << ',' << (enc ? "yes" : "no") << ','
            << (held ? "yes" : "no") << ',' << meta.size() << ',' << pay.size() << ',' << prims
-           << ',' << mats << ',' << texOk << ',' << geoDropped << ',' << icon << '\n';
+           << ',' << mats << ',' << texOk << ',' << geoDropped << ',' << icon
+           << ',' << rosterSrc << ',' << valDefaulted << '\n';
     }
     prog.setValue(int(apps.size()));
     csv.close();
@@ -840,6 +963,24 @@ QString runHealthAudit(const QString& d4, SnoIndex* idx, CascReader* rd, QWidget
                          Health::NoGeometry, Health::Locked, Health::NoData})
             ts << QStringLiteral("  %1 %2\n").arg(QLatin1String(healthName(h)), -18)
                       .arg(tally.value(h), 8);
+        // ── The two gaps that are not "health" but decide whether an asset LOOKS right ────────
+        ts << QStringLiteral(
+                  "\nWHERE THE MATERIAL ROSTER CAME FROM\n"
+                  "  %1 from .app.json\n"
+                  "  %2 from the CASC meta binary only\n\n"
+                  "  The second number is the population that ANY json-only call site loses in\n"
+                  "  silence — no error, just an empty roster, empty material names and an\n"
+                  "  untextured mesh. That is exactly how the Wardrobe rendered the DOOM collab\n"
+                  "  weapons white while the Models tab rendered them correctly. While it is\n"
+                  "  non-zero, every roster read in the tool has to go through appearanceRosterAny.\n"
+                  "\nMATERIALS RUNNING ON DEFAULT VALUES\n"
+                  "  %3 material slot(s) across %4 appearance(s) have no .mat.json\n\n"
+                  "  Those render and export with metal 0.0, roughness 0.6, emissive multiplier 1.0\n"
+                  "  and no emissive colour, because there is a binary route for a material's\n"
+                  "  TEXTURES and none yet for its VALUES. Not a bug report — the measured size of\n"
+                  "  a known gap. See D4_MATVALUE_DUMP.\n")
+                  .arg(rosterFromJson).arg(rosterFromMeta)
+                  .arg(matsDefaulted).arg(appsWithDefaultedMats);
         ts << "\nLOCKED is not a defect — those need a TACT key we do not hold. Everything else\n"
               "above OK is something the tool should be able to show and cannot.\n";
         ts << QStringLiteral(

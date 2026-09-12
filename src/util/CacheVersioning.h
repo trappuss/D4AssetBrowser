@@ -40,6 +40,22 @@
 //                                               build stamp; the Appearance count is there because
 //                                               the route-3 test reads that folder.
 //   wardrobe_anims_v<N>.json    WardrobeTab2    currently 1 — the ui_wardrobe clip-name index
+//   stable_anims_v<N>.json      StableTab2      currently 2 — mount/pet clips bucketed by the
+//                                               appearance that OWNS each one. Signature is the
+//                                               build stamp + the Anim directory's mtime + the
+//                                               build stamp's own mtime, NOT a file count:
+//                                               counting that folder is the expensive operation
+//                                               the cache exists to avoid.
+//                                               v2 is a HOUSEKEEPING bump, not a correctness one,
+//                                               and it is worth being honest about which: v2
+//                                               changed the PET token from the appearance's first
+//                                               two segments to its species, so a v1 file's pet
+//                                               keys are ones v2 never asks for. It cannot give a
+//                                               WRONG answer — it simply misses and re-walks — so
+//                                               it fails this file's own test for a bump. The
+//                                               bump is here to stop the dead keys accumulating
+//                                               forever, and it costs one re-walk of the mount
+//                                               tokens, which did not change.
 //   latest_v<N>.bin             SnoIndex        currently 2 — per-build "what is new" baseline
 //   build_history_v<N>.bin      SnoIndex        currently 1 — which build each asset first appeared in
 //   back_trophy_v<N>.json       BackTrophyIndex kCacheVersion, currently 4

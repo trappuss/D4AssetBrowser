@@ -11,8 +11,8 @@ IDI_ICON1 ICON "app.ico"
 // binary fields, dotted for the string) — do not edit one by hand and expect the others to follow.
 // Two spellings of one version. The numeric form is comma-separated because that is what the
 // VERSIONINFO fields require; the trailing 0 is the build field, unused here.
-#define VER_NUM 2,2,9,0
-#define VER_STR "2.2.9"
+#define VER_NUM 2,3,0,0
+#define VER_STR "2.3.0"
 
 // Literal 1, not VS_VERSION_INFO. That constant lives in winver.h and this file includes no
 // headers — rc.exe does not error on an unknown identifier in the ID position, it silently makes a

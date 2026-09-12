@@ -1,6 +1,8 @@
 #pragma once
 #include <QByteArray>
+#include <QColor>     // materialColor / emissiveTint return one; QImage does not pull it in
 #include <QImage>
+#include <QJsonObject>   // uberMaterial() returns one by value
 #include <QString>
 #include <QStringList>
 #include <QVector>
@@ -176,8 +178,47 @@ void bakeDetailForMaterial(CascReader* reader, const QString& d4, const QString&
 QImage baseColor(CascReader* reader, const QString& d4, const QString& matName);   // BASE_COLOR
 QImage normalMap(CascReader* reader, const QString& d4, const QString& matName);   // NORMAL (raw RG)
 QImage orm(CascReader* reader, const QString& d4, const QString& matName);         // AO(R)/rough(G)/metal(B)
+// `reader` is accepted and NOT yet used: there is a binary route for a material's textures and
+// none for its VALUES, so an encrypted material silently receives metal 0.0 / rough 0.6 here. That
+// silence is the defect — the parameter reads as a promise the function does not keep. Until the
+// binary route exists (see D4_MATVALUE_DUMP), `authored` is how a caller finds out: false means
+// these are stand-ins, not measurements. The part inspector reports it; the renderers ignore it.
 void   factors(CascReader* reader, const QString& d4, const QString& matName,
-               float& metal, float& rough);
+               float& metal, float& rough, bool* authored = nullptr);
+
+// ── Authored MaterialValues, by name prefix ──────────────────────────────────────────────────
+// e.g. "emissive multiplier" (scalar), "emissive color" (vector). These live only in the .mat.json
+// today — there is no binary route for material VALUES yet, unlike texturesFor() — so an encrypted
+// material returns the fallback / an invalid colour. That is precisely why emissiveTint() below
+// does not simply default to white.
+// The material's parsed tUberMaterial, cached per (d4, material). THE reason this exists: the
+// authored values are read one at a time by name, and filling a single material's detail-cache
+// entry asks for twelve of them — so the JSON-only readers opened and fully re-parsed the same
+// multi-KB document twelve times to extract twelve numbers, per material, per rebuild. matScalar()
+// already takes a pre-parsed object for exactly this reason and its own comment says so; this puts
+// the parse behind one call so every reader gets it instead of only the one that was rewritten.
+// Returns an empty object when there is no .mat.json (every encrypted material). Thread-safe.
+QJsonObject uberMaterial(const QString& d4, const QString& matName);
+
+// The material's shader map name (tUberMaterial.snoShaderMap). The Wardrobe routes three of its
+// rendering decisions through this — facial hair on hero_opaque_hollow, eyes on Hero_Eye, hair on
+// hero_hair — so it decides how a part is SHADED, not merely what it is called. Served from the
+// cached parse above rather than its own file read.
+QString shaderMap(const QString& d4, const QString& matName);
+
+float  materialScalar(const QString& d4, const QString& matName, const char* want, float fallback);
+QColor materialColor (const QString& d4, const QString& matName, const char* want);
+
+// The colour a glow should be, decided from data in this order:
+//   1. the authored "emissive color", when the material has one;
+//   2. else, if the EMISSIVE map is MONOCHROME — a mask, which is what D4 mostly ships — the mean
+//      of the base map UNDER that mask, normalised to a hue. A mask carries no colour of its own,
+//      and white is the one answer that is certainly wrong: it is what made every such glow read
+//      as blown-out paper regardless of what was glowing;
+//   3. else white — a COLOURED emissive map already states its own colour and must not be tinted.
+// Pure: it decodes nothing, and takes the two images the caller already holds.
+QColor emissiveTint(const QString& d4, const QString& matName,
+                    const QImage& emissive, const QImage& baseColor);
 
 // ── Cloth flags, positionally aligned with the roster ────────────────────────────────────────
 // Both roster functions collapse snoOverrideMaterial > snoMaterial > snoCloth >
@@ -201,6 +242,25 @@ QStringList appearanceRoster(const QString& d4, const QString& appName,
 // it returns empty. See AppearanceMatBin::read.
 QStringList appearanceRosterFromMeta(const QByteArray& meta, const SnoIndex* idx,
                                      QString* why = nullptr, QVector<bool>* clothOut = nullptr);
+
+// The roster via whichever route works — .app.json when d4data has one, the meta binary when it
+// does not. THE ONLY correct way to read an appearance's material roster, for exactly the reason
+// texturesFor() states one line below for a material's textures.
+//
+// The two-call version of this ("try JSON, and if it comes back empty try the meta") was written
+// out by hand at some call sites and simply forgotten at others, and the failure is silent: an
+// encrypted appearance ships no .app.json, so the JSON roster is empty, every primitive gets an
+// empty material name, and the render path — which keys on that name — draws it untextured. The
+// same asset then textures in one tab and not in another, which is how the Diablo IV x DOOM
+// weapons (mace_stor067, twoHandSorcStaff_stor060, twoHandCrossbow_stor063) came out right in
+// Models and white in the Wardrobe. Encryption is not the only cause: a d4data snapshot older
+// than the game produces the identical symptom for anything newer than it.
+//
+//   `meta` — the appearance's CASC meta blob if the caller already holds it; may be empty.
+//   `sno`  — used to read the blob through `reader` when the caller does not hold it; may be 0.
+QStringList appearanceRosterAny(CascReader* reader, const QString& d4, const QString& appName,
+                                const QByteArray& meta, int sno, const SnoIndex* idx,
+                                QVector<bool>* clothOut = nullptr);
 
 // The texture SNOs a material references, via whichever route works — .mat.json when it exists,
 // the meta binary when it does not. Used by the health audit to check a material can resolve its

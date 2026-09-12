@@ -8,7 +8,7 @@ name: Release
 # source via vcpkg. vcpkg is used only for the four small deps (zlib, lz4, fastgltf, tinygltf).
 on:
   push:
-    tags: ['v*']
+    tags: ['v*', '[0-9]*']
   workflow_dispatch:
 
 permissions:
@@ -73,9 +73,61 @@ jobs:
           name: D4AssetBrowser-portable
           path: dist/D4AssetBrowser.zip
 
-      - name: Publish GitHub Release (on tag)
+      # The release body is the matching section of CHANGELOG.md, so the notes
+      # that ship are the ones actually written for this version rather than a
+      # list of commit subjects. Keyed on the tag: v2.2.9 takes "## 2.2.9" up to
+      # the next "## " heading. A missing section is a warning, not a failure -
+      # generate_release_notes below still fills the body in that case.
+      - name: Release notes from CHANGELOG.md (on tag)
         if: startsWith(github.ref, 'refs/tags/')
+        shell: pwsh
+        run: |
+          $ver = "${{ github.ref_name }}" -replace '^v', ''
+          if (-not (Test-Path CHANGELOG.md)) {
+            Write-Warning "No CHANGELOG.md - falling back to generated notes."
+            exit 0
+          }
+          $md = Get-Content CHANGELOG.md -Raw
+          # SINGLE-quoted, deliberately: in a double-quoted PowerShell string the
+          # regex group "$(.*?)" is read as a subexpression and evaluated.
+          # CHANGELOG.md is CRLF, so the heading's end-anchor allows the \r.
+          $rx = '(?ms)^##[ \t]+v?' + [regex]::Escape($ver) + '[ \t]*\r?$(.*?)(?=^##[ \t]|\z)'
+          $m  = [regex]::Match($md, $rx)
+          if (-not $m.Success) {
+            Write-Warning "CHANGELOG.md has no section for $ver - falling back to generated notes."
+            exit 0
+          }
+          $body = $m.Groups[1].Value.Trim()
+          if ($body.Length -lt 40) {
+            Write-Warning "Section for $ver is essentially empty - falling back to generated notes."
+            exit 0
+          }
+          Set-Content -Path RELEASE_BODY.md -Value $body -Encoding utf8
+          Write-Host ("Release body: {0} chars from CHANGELOG.md" -f $body.Length)
+
+      # github.bat option 2 builds the zip on the maintainer's machine and
+      # publishes the release itself, which is the normal path. This job still
+      # runs on the tag as a clean-machine cross-check that the tagged source
+      # compiles from nothing - but it must NOT then publish a second, differently
+      # named zip over that release, so it stands down when one already exists.
+      - name: Has a release already been published for this tag?
+        id: rel
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "${{ github.ref_name }}" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "A release for ${{ github.ref_name }} already exists - this job will not publish."
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Publish GitHub Release (on tag, only if none exists)
+        if: startsWith(github.ref, 'refs/tags/') && steps.rel.outputs.exists != 'true'
         uses: softprops/action-gh-release@v2
         with:
           files: dist/D4AssetBrowser.zip
+          body_path: RELEASE_BODY.md
           generate_release_notes: true

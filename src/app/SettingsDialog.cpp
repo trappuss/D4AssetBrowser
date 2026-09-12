@@ -4,6 +4,7 @@
 #include "app/AppPaths.h"
 
 #include "app/Config.h"
+#include "app/ViewportSettings.h"   // one inventory of the three tabs' render settings
 #include "util/AnimExportScope.h"   // the five animation sources + pre-2.2.8 migration
 #include "app/Hotkeys.h"
 #include "deps/D4DataDownloader.h"
@@ -2188,6 +2189,32 @@ the internal <code>barF_stor150_HLM</code>.</li>
     auto* cWard2 = new QPushButton(QStringLiteral("Clear Wardrobe memory"), cache);
     QObject::connect(cWard2, &QPushButton::clicked, this, [clearWardrobeMem] { clearWardrobeMem(QStringLiteral("wardrobe2"), QStringLiteral("Wardrobe")); });
     cl->addWidget(cWard2);
+    // The same escape hatch for the Stable tab, which had none — the dialog did not mention that
+    // tab anywhere, so a mount that failed to load on restore could only be escaped by editing the
+    // registry. Its remembered selection is the whole stable2/cur/ subtree (mount, barding, trophy
+    // snos plus the display/description strings the cards restore from), so it is cleared as a
+    // subtree rather than by naming keys — the Wardrobe version above names eleven and has already
+    // been caught missing one.
+    auto* cStable = new QPushButton(QStringLiteral("Clear Stable memory"), cache);
+    cStable->setToolTip(QStringLiteral(
+        "Forget the remembered mount, barding and trophy. The remember feature stays on; saved "
+        "camera, lighting and cloth presets are untouched."));
+    QObject::connect(cStable, &QPushButton::clicked, this, [this] {
+        QSettings s;
+        s.beginGroup(QStringLiteral("stable2"));
+        const QStringList all = s.allKeys();
+        int n = 0;
+        for (const QString& k : all)
+            if (k.startsWith(QStringLiteral("cur/"))) { s.remove(k); ++n; }
+        s.endGroup();
+        s.sync();
+        emit settingsChanged();
+        QMessageBox::information(this, QStringLiteral("Clear Stable memory"),
+            n ? QStringLiteral("Cleared the remembered mount (%1 setting(s)). Reopen the tab (or "
+                               "restart) to start fresh.").arg(n)
+              : QStringLiteral("The Stable tab has nothing remembered."));
+    });
+    cl->addWidget(cStable);
     // Total cache footprint + one-click purge — the TVFS/idx/CoreTOC/index caches quietly add
     // up to ~100+ MB, and users deserve to see and control that. d4data and the ensembles
     // (user content) are excluded from both the number and the purge.
@@ -2319,8 +2346,11 @@ the internal <code>barF_stor150_HLM</code>.</li>
         [this, pfCoalesce, pfAsync, pfTex, pfVram] {
             if (QMessageBox::question(this, QStringLiteral("Restore Defaults"),
                     QStringLiteral("Reset the View, Models, Wardrobe-panel, Performance, Export and "
-                                   "preview-feature options to their defaults?\n\nYour folder paths, "
-                                   "CASC product and preview camera/lighting are left unchanged.")) != QMessageBox::Yes)
+                                   "viewport options to their defaults?\n\nThe lighting, shading, "
+                                   "overlay and cloth settings of the Models, Wardrobe and Stable "
+                                   "viewports are all reset.\n\nYour folder paths, CASC product, "
+                                   "saved light/camera/cloth presets and remembered selections are "
+                                   "left unchanged.")) != QMessageBox::Yes)
                 return;
             // Non-live (persisted on OK).
             m_rememberTab->setChecked(false);
@@ -2340,23 +2370,27 @@ the internal <code>barF_stor150_HLM</code>.</li>
             pfVram->setChecked(false);
             // Export tab (each action sets its widget to default → live-writes the key).
             for (const auto& r : m_exportResetActions) r();
-            // Preview Settings popup feature toggles (rendering features, not camera/lighting/bg).
-            // These are re-applied from settings on the next wardrobe rebuild, which we trigger below.
-            {
-                QSettings s;
-                s.setValue(QStringLiteral("wardrobe2/viewport/detail"),     true);
-                s.setValue(QStringLiteral("wardrobe2/viewport/specaa"),     true);
-                s.setValue(QStringLiteral("wardrobe2/viewport/shadow"),     true);
-                s.setValue(QStringLiteral("wardrobe2/viewport/ssao"),       true);
-                s.setValue(QStringLiteral("wardrobe2/viewport/subsurface"), true);
-                s.setValue(QStringLiteral("wardrobe2/viewport/hair"),       true);
-                s.setValue(QStringLiteral("wardrobe2/viewport/ibl"),        true);
-                s.setValue(QStringLiteral("wardrobe2/viewport/mask"),       false);
-                s.setValue(QStringLiteral("wardrobe2/viewport/tonemap"),    true);
-                s.setValue(QStringLiteral("wardrobe2/viewport/fur"),        true);
-            }
+            // Viewport/render state for ALL THREE 3D tabs, via ViewportSettings.
+            //
+            // This used to be ten wardrobe2/viewport keys written out by name, which meant two
+            // things: the Models and Stable viewports were never reset at all (the dialog has no
+            // Stable section either — same root cause), and the ten values were a second copy of
+            // the readers' own defaults, free to drift from them exactly the way the Subsurface
+            // slider did. Removal has neither problem: each reader falls back to the default it
+            // already carries, so there is nothing to keep in sync and a newly added setting is
+            // covered the day it lands. Saved light/camera/cloth PRESETS are skipped — see the
+            // header. Verified equivalent for the ten keys this replaced: every value written here
+            // matched its read site (detail/specaa/shadow/ssao/subsurface/hair/ibl/tonemap/fur
+            // true, mask false).
+            const int nReset = ViewportSettings::resetAll();
+            QSettings().sync();
             emit settingsChanged();
             emit wardrobeLiveChanged(true);   // re-apply viewport features + refresh the preview
+            QMessageBox::information(this, QStringLiteral("Restore Defaults"),
+                nReset ? QStringLiteral("Reset the options, and cleared %1 viewport setting(s) "
+                                        "across the Models, Wardrobe and Stable tabs.").arg(nReset)
+                       : QStringLiteral("Reset the options. The three viewports were already at "
+                                        "their defaults."));
         });
     connect(bb, &QDialogButtonBox::accepted, this, &SettingsDialog::accept);
     connect(bb, &QDialogButtonBox::rejected, this, &SettingsDialog::reject);

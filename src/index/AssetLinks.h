@@ -32,6 +32,17 @@ public:
     // appearances that use it.
     QVector<MatLink> linksForTexture(int texSno) const;
 
+    // Every appearance that references this material. matToApps has been built and cached since
+    // this index existed, but the only way in was through a TEXTURE — so "which appearances use
+    // this material" could not be asked at all, even though the answer was already in memory.
+    //
+    // It is the question every material bug starts from. The Paladin HED bug (a pauldron ornament
+    // material named palM_stor164_wolfHead, matched by a contains("head") test, which took the
+    // whole torso off screen) was found by sweeping CoreTOC by hand; this answers it directly.
+    // Empty when the index is not ready() yet — callers must check, because empty otherwise reads
+    // as "nothing uses it", which is a different and alarming answer.
+    QVector<int> appsForMaterial(int matSno) const { return m_matToApps.value(matSno); }
+
     static QString slotRole(int slot);
 
 signals:
