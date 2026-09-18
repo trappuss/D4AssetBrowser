@@ -783,46 +783,20 @@ def check_text_persisted_combos(files: list) -> tuple:
     return fails, warns
 
 
-# ── 4. Line endings, per file ──────────────────────────────────────────────────────────────────
-# This repo has 163 commits of committed line endings and deliberately NO .gitattributes, so a
-# file that flips wholesale is a diff of every line in it — and it happens silently: reading a
-# CRLF file in Python text mode and writing it back converts the whole file to LF without
-# touching a single character of content. That is exactly how CatalogueTab.cpp flipped, and the
-# only reason it was caught is that the byte size moved in the wrong direction.
+# ── 4. Line endings ────────────────────────────────────────────────────────────────────────────
+# MIXED ONLY, and deliberately so. The first version of this check carried a per-file CRLF/LF
+# baseline and it was wrong: git here runs with core.autocrlf, which normalises to LF in the index
+# on commit and writes CRLF back into the working tree — so the eleven files written through a
+# bridge and then committed all "flipped" to CRLF at once, and the check blocked a release on a
+# state git itself had just produced. A baseline of the working tree cannot distinguish that from
+# a real accident, so it does not get to fail the build. (This is also the actual mechanism behind
+# the "endings here are mixed and already committed that way" note in docs/PUBLISHING.md, and the
+# reason a .gitattributes would renormalise the whole history in one commit.)
 #
-# Two rules, both cheap:
-#   · no file may be MIXED — half-converted is a botched edit, whichever direction it went;
-#   · a file listed below is CRLF and must stay CRLF; every other file is LF and must stay LF.
-# Adding a file? Give it LF unless it sits beside CRLF siblings, and add it here if it is CRLF.
-CRLF_FILES = {
-    "src/app/ExportNotifier.h",
-    "src/app/MainWindow.cpp",
-    "src/app/MainWindow.h",
-    "src/app/SettingsDialog.cpp",
-    "src/deps/D4DataDownloader.cpp",
-    "src/deps/DependencyDialog.h",
-    "src/index/IconIndex.cpp",
-    "src/index/SnoIndex.cpp",
-    "src/index/SnoListModel.cpp",
-    "src/index/SnoListModel.h",
-    "src/main.cpp",
-    "src/model/MaterialDecode.cpp",
-    "src/model/ModelExporter.cpp",
-    "src/model/ModelExporter.h",
-    "src/tabs/CatalogueTab.cpp",
-    "src/tabs/CatalogueTab.h",
-    "src/tabs/MarkingCompose.cpp",
-    "src/tabs/MarkingCompose.h",
-    "src/tabs/ModelsTab.cpp",
-    "src/tabs/TexturesTab.cpp",
-    "src/tabs/TexturesTab.h",
-    "src/tabs/WardrobeTab2.cpp",
-    "src/tabs/WardrobeTab2.h",
-    "src/tex/BcDecode.cpp",
-    "src/tex/BcDecode.h",
-}
-
-
+# What survives is the half that is always a defect whichever direction it went: a file that is
+# half CRLF is a botched edit, not a policy. Reading a CRLF file in Python text mode and writing
+# it back converts the whole file silently — that is how CatalogueTab.cpp flipped — but the damage
+# that matters and that nothing else catches is the half-converted file.
 def check_line_endings(files: list) -> tuple:
     fails, warns = [], []
     crlf_seen = 0
@@ -831,22 +805,15 @@ def check_line_endings(files: list) -> tuple:
             raw = path.read_bytes()
         except OSError:
             continue
-        rel = path.relative_to(ROOT).as_posix()
         n, c = raw.count(b"\n"), raw.count(b"\r\n")
         if c and n != c:
+            rel = path.relative_to(ROOT).as_posix()
             fails.append(f"{rel}: MIXED line endings ({c} CRLF of {n} lines) — a half-converted "
                          f"edit; rewrite the whole file in one ending")
-            continue
-        want_crlf = rel in CRLF_FILES
-        if c and not want_crlf:
-            fails.append(f"{rel}: became CRLF and is not in CRLF_FILES — either it flipped by "
-                         f"accident (every line shows as changed) or the table needs the row")
-        elif n and not c and want_crlf:
-            fails.append(f"{rel}: flipped to LF but CRLF_FILES says CRLF — usually a Python text-"
-                         f"mode round trip; restore CRLF rather than committing a whole-file diff")
-        if c:
+        elif c:
             crlf_seen += 1
-    warns.append(f"{crlf_seen} CRLF file(s), {len(files) - crlf_seen} LF")
+    warns.append(f"{crlf_seen} CRLF file(s), {len(files) - crlf_seen} LF "
+                 f"(informational — git's autocrlf decides this, not the repo)")
     return fails, warns
 
 

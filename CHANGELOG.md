@@ -50,7 +50,7 @@ this file is the same content in one place.
 
 - `Probe - Catalogue Icons.bat` — reports Catalogue icon coverage from the app's own index files, with no rebuild and without launching the app.
 - `Test - Icon Audit Compare.bat` — runs the icon audit twice, once with the diablo4.dad copy forced and once without, and prints the two summaries side by side. It is what settled whether that step is carrying the icons or hiding a broken route: without it, 311 appearances resolve no icon at all and 30 wear another class's.
-- `verify-src.py` checks line endings. This repository has 163 commits of committed endings and deliberately no `.gitattributes`, so a file that flips wholesale is a diff of every line in it — and reading a CRLF file in Python text mode and writing it back does exactly that, silently.
+- `verify-src.py` rejects a file with MIXED line endings — always a half-finished edit, whichever direction it went, and the one ending fault nothing else catches. Whole-file CRLF/LF is deliberately *not* policed: git normalises that on commit, so a baseline of the working tree would fail the build on a state git itself produced.
 
 ## 2.3.0
 
