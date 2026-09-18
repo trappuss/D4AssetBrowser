@@ -473,11 +473,13 @@ void MainWindow::showShortcutSheet()
         "<tr><td class='k'>F1 &nbsp;/&nbsp; ?</td><td>This sheet</td></tr>"
         "<tr><td class='s' colspan='2'>Export/capture hotkeys are rebindable in Settings ▸ Hotkeys.</td></tr>"
         "<tr><td colspan='2'>&nbsp;</td></tr>"
-        "<tr><td class='h' colspan='2'>3D viewport (Models · Wardrobe)</td></tr>"
+        "<tr><td class='h' colspan='2'>3D viewport (Models · Wardrobe · Stable)</td></tr>"
         "<tr><td class='k'>Drag / right-drag / wheel</td><td>Orbit · pan · zoom</td></tr>"
         "<tr><td class='k'>Middle-click</td><td>Re-frame the model</td></tr>"
-        "<tr><td class='k'>Double-click</td><td>Select part (same part / empty space deselects; "
-        "camera snap is a Camera-panel option)</td></tr>"
+        "<tr><td class='k'>Click</td><td>Select the part under the cursor; empty space clears</td></tr>"
+        "<tr><td class='k'>Ctrl+click · Shift+click</td><td>Add to the selection, or take one back out</td></tr>"
+        "<tr><td class='k'>Double-click</td><td>Frame the part (camera snap is a Camera-panel option)</td></tr>"
+        "<tr><td class='k'>Right-click</td><td>Part menu — acts on the whole selection if the part is in it</td></tr>"
         "<tr><td class='k'>Esc</td><td>Deselect part · exit fullscreen</td></tr>"
         "<tr><td class='k'>F</td><td>Fullscreen (maximize in place)</td></tr>"
         "<tr><td class='k'>H · Shift+H · Alt+H</td><td>Hide selected · solo selected · show all</td></tr>"
@@ -1027,15 +1029,20 @@ static bool refreshDadDb()
 // reset() is posted back to the GUI thread: these singletons are reset from MainWindow::reload on
 // the GUI thread too, and resetting from a worker while a build is in flight is the race their
 // generation counters exist to survive, not one to add deliberately.
-static void startDadRefresh()
+// `onChanged` runs on the GUI thread and only when the fetch brought back NEW bytes. It is a
+// callback rather than the resets themselves because those two resets are NOT unconditionally safe:
+// the icon-audit worker reads AppearanceMeta and IconIndex for several seconds after startup, and
+// this fetch is a network call that lands whenever it lands. Resetting underneath it is the race
+// reload() already defers for — and this path used to walk straight into it, because a free
+// function has no way to ask whether the audit is running.
+static void startDadRefresh(std::function<void()> onChanged)
 {
-    std::thread([] {
+    std::thread([onChanged = std::move(onChanged)] {
         if (!refreshDadDb()) return;                      // 304 / offline / no curl → nothing to do
         if (!QCoreApplication::instance()) return;   // app already torn down (fast quit)
-        QMetaObject::invokeMethod(qApp, [] {
+        QMetaObject::invokeMethod(qApp, [onChanged] {
             qInfo("d4dad: DB changed — re-deriving appearance icons against it");
-            AppearanceMeta::instance().reset();            // the delta phase reads the DB
-            IconIndex::instance().reset();
+            if (onChanged) onChanged();
         }, Qt::QueuedConnection);
     }).detach();
 }
@@ -1176,6 +1183,11 @@ void MainWindow::reload()
 
 void MainWindow::finishReload(const ReloadResult& r)
 {
+    // QPointer, not a bare `this`: the fetch is a detached network call that can land after the
+    // window is gone, and the callback runs on the GUI thread where a dangling `this` would be a
+    // use-after-free rather than a race. Shared by both startDadRefresh call sites below.
+    const QPointer<MainWindow> self(this);
+    const std::function<void()> dadReset = [self] { if (self) self->applyDadReset(); };
     QElapsedTimer tailT; tailT.start();
     const bool cascOk = r.cascOk, idx = r.idx;
     if (r.nKeys > 0) qInfo("CASC: %d TACT keys registered before open()", r.nKeys);
@@ -1513,7 +1525,7 @@ void MainWindow::finishReload(const ReloadResult& r)
             // resets below run NOW against whatever copy exists, and the fetch re-triggers the two
             // indexes that actually read the DB — but only if the bytes really changed. In the
             // common case (HTTP 304, or no network) that costs nothing at all.
-            startDadRefresh();
+            startDadRefresh(dadReset);
             IconIndex::instance().reset();
             AppearanceMeta::instance().reset();
             AssetLinks::instance().reset();
@@ -1548,7 +1560,7 @@ void MainWindow::finishReload(const ReloadResult& r)
             QPixmapCache::clear();   // in-memory thumbnails (grid views) — stale art after a patch
             s.setValue(QStringLiteral("index/fingerprint"), fp);
         } else if (!QFileInfo::exists(DadOverride::defaultPath())) {
-            startDadRefresh();   // first-run bootstrap of the diablo4.dad DB, also off-thread
+            startDadRefresh(dadReset);   // first-run bootstrap of the diablo4.dad DB, also off-thread
         }
     }
 
@@ -2360,10 +2372,28 @@ void MainWindow::runIconAudit()
 // worker. reload() therefore defers while m_iconAuditRunning, and the completion handler below
 // honours any reload that was deferred. Deferring rather than blocking keeps the GUI responsive,
 // which is the entire point of the change.
+// Deferred exactly like reload(): the audit worker is READING both of these, and resetting an
+// index out from under a reader is what the generation counters exist to survive rather than
+// something to do on purpose. The audit is bounded and one-shot, so this delays the re-derive by
+// seconds at most and cannot drop it.
+void MainWindow::applyDadReset()
+{
+    if (m_iconAuditRunning) { m_dadResetPending = true; return; }
+    AppearanceMeta::instance().reset();   // the delta phase reads the DB
+    IconIndex::instance().reset();
+}
+
 void MainWindow::autoIconAudit()
 {
     if (m_iconAuditRan) return;
-    if (!AppearanceMeta::instance().ready() || !IconIndex::instance().ready()) return;
+    // StoreProductIndex too. The audit's two Catalogue sections need it, and without this the
+    // automatic run fired the moment the appearance and icon indexes landed - several seconds
+    // before the product index does - so it wrote "CATALOGUE ICON COVERAGE - skipped: the
+    // store-product index was not ready" and the report was a third of its real size. An audit
+    // that silently omits half of what it measures is worse than a slower one.
+    if (!AppearanceMeta::instance().ready() || !IconIndex::instance().ready()
+        || !StoreProductIndex::instance().ready())
+        return;
     if (m_reloading) return;   // index is mid-rebuild; readyChanged fires again when it settles
     m_iconAuditRan = true;
     m_iconAuditRunning = true;
@@ -2385,6 +2415,10 @@ void MainWindow::autoIconAudit()
             qInfo("icon audit: %lld ms (background thread — GUI stayed responsive)", ms);
             setStatus(summary);
             qInfo().noquote() << summary;
+            if (m_dadResetPending) {   // the d4dad DB changed while the audit held the indexes
+                m_dadResetPending = false;
+                applyDadReset();
+            }
             if (m_reloadPending) {   // a reload arrived while the audit held the index
                 m_reloadPending = false;
                 reload();
@@ -3616,6 +3650,10 @@ void MainWindow::buildIndexIndicator()
     // Auto-regenerate icon_audit.txt once indexing completes (whichever of the two finishes last).
     connect(&AppearanceMeta::instance(), &AppearanceMeta::readyChanged, this, &MainWindow::autoIconAudit);
     connect(&IconIndex::instance(), &IconIndex::readyChanged, this, &MainWindow::autoIconAudit);
+    // The product index is usually the LAST of the three to land, so without this the audit would
+    // wait for a signal that had already fired and never run at all.
+    connect(&StoreProductIndex::instance(), &StoreProductIndex::readyChanged,
+            this, &MainWindow::autoIconAudit);
     refreshIndexIndicator();
 }
 

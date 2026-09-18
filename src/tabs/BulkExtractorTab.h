@@ -43,10 +43,38 @@ protected:
     // pre-click snapshot is needed) without disturbing the rest of the Ctrl/Shift selection.
     bool eventFilter(QObject* obj, QEvent* ev) override;
 
+public:
+    // ── One matched / queued item ───────────────────────────────────────────────────────────────
+    //
+    // The GROUP is part of the identity, not decoration. A SNO is unique only WITHIN its group, so
+    // appearance 12345 and texture 12345 are different assets that share a number. Everything here
+    // used to be a QPair<sno, name> keyed on the sno alone, which was correct while a run was
+    // either all models or all textures and became a collision the moment Both mode could put both
+    // in one list: queueing the appearance would have marked the texture queued, and removing one
+    // would have removed the other.
+    struct Item {
+        int     group = 0;      // SNO group — kModelGroup (Appearance) or kTextureGroup
+        int     sno   = 0;
+        QString name;
+    };
+
 private:
-    bool textureMode() const;   // true = extract textures (group 44), false = models (.glb, group 9)
+    // ── The three modes ─────────────────────────────────────────────────────────────────────────
+    // Stored as the combo's index in bulk/mode, so the two existing values keep their meaning and
+    // an old profile opens on the mode it was left in.
+    enum Mode { kModeModels = 0, kModeTextures = 1, kModeBoth = 2 };
+    int  modeIndex() const;
+    bool textureMode()   const;   // TEXTURES ONLY — the old meaning, kept for the paths that mean it
+    bool wantsModels()   const;   // Models or Both
+    bool wantsTextures() const;   // Textures or Both
+    // Membership key for the queue: "<group>:<sno>". See Item.
+    static QString itemKey(int group, int sno);
+    // Only the entries of one group, as the (sno, name) pairs the export pipelines take.
+    static QVector<QPair<int, QString>> pairsOfGroup(const QVector<Item>& items, int group);
+
     // Non-const: delegates to ModelsTab::queryEntries, which lazily builds indexes + caches.
-    QVector<QPair<int, QString>> computeMatches();
+    // In Both mode this is the model matches followed by the texture matches, each tagged.
+    QVector<Item> computeMatches();
     void updateCount();
     void buildTagPanel();       // the Blender-style filter funnel popup (parity with Models)
     void refillTagPanel();      // (re)populate its tag-group checkboxes from the Models tab
@@ -56,8 +84,8 @@ private:
     void restoreFilterState();  // re-apply it at construction
     // promptDir = ask for the destination folder (else reuse the last one). The work set is the
     // queued rows in manual mode, otherwise every match — unless explicitItems is given (context menu).
-    void doExtract(bool promptDir, const QVector<QPair<int, QString>>& explicitItems = {});
-    QVector<QPair<int, QString>> workSet();          // queued rows (manual) else all matches
+    void doExtract(bool promptDir, const QVector<Item>& explicitItems = {});
+    QVector<Item> workSet();                         // queued rows (manual) else all matches
     void syncExtractButtons();                      // label + enablement from the current work set
     void syncQueue();                               // reconcile the visible selection into the queue
     void queueAllMatches();                         // queue EVERY match, including rows past the list cap
@@ -68,7 +96,7 @@ private:
     // ItemDef's hero-class table at runtime, so a new class extends them with no edit here.
     struct FactoryPreset {
         QString name;      // combo label
-        int     mode;      // 0 = models, 1 = textures
+        int     mode;      // 0 = models, 1 = textures, 2 = both (no built-in uses 2 today)
         QString query;     // NAME-box text (may use the '|' OR syntax)
         QStringList tags;  // funnel tag selection (ANDed unless tagOr)
         bool    tagOr = false;
@@ -96,7 +124,7 @@ public:
 
 private:
     void loadQueueForMode(int mode);                // load a mode's persisted queue into m_queued
-    void writeRunReport(const QString& dir, const QVector<QPair<int, QString>>& items) const;
+    void writeRunReport(const QString& dir, const QVector<Item>& items) const;
     void showListMenu(const QPoint& pos);           // right-click menu on the matches list
     void loadFolderManifest();               // <outDir>/_bulk_manifest.json → m_folderDone (delta)
     void refreshPresets();                   // rebuild the preset combo from settings
@@ -148,8 +176,8 @@ private:
     bool         m_syncingQueue = false;   // guards the list↔queue mirror against re-entry
     // The queue is a PERSISTENT store (per mode), not just a mirror of the transient selection — so it
     // survives filter tweaks, mode switches and reopening the tool.
-    QVector<QPair<int, QString>> m_queued;   // ordered (sno, name)
-    QSet<int>    m_queuedSnos;                // membership index for m_queued
+    QVector<Item> m_queued;                  // ordered, group-tagged
+    QSet<QString> m_queuedKeys;               // membership index for m_queued — "<group>:<sno>"
     int          m_prevMode = 0;             // to persist the outgoing mode's queue on a mode switch
     QPushButton* m_openBtn = nullptr;        // "Open folder" (last output dir)
     QLabel*      m_count = nullptr;
@@ -159,8 +187,9 @@ private:
     QPushButton* m_copyBtn = nullptr;
     QSet<int>     m_folderDone;          // snos already in the current output folder's ledger
     QSet<QString> m_folderStems;         // base names of files already in the folder (any extension)
+    QSet<QString> m_folderTexStems;      // …the same, for files under a "textures" subfolder
     bool         m_loadingPreset = false;
-    QSet<int>    m_preClickSel;          // selection snapshot captured at the start of a click sequence
+    QSet<QString> m_preClickSel;         // selection snapshot at the start of a click sequence — itemKey()s
     qint64       m_lastPressMs = 0;      // to tell a fresh press from the 2nd press of a double-click
     // ── Live run console (real-time progress + reasoned failures + working Cancel) ──
     void logLine(const QString& s);      // timestamped append + auto-scroll

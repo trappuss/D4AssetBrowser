@@ -2494,6 +2494,14 @@ static QStringList liveSettingKeys()
         QStringLiteral("wardrobe2/dbg/log"), QStringLiteral("wardrobe2/viewport/ensembles"),
         QStringLiteral("wardrobe2/perf/coalesce"), QStringLiteral("wardrobe2/perf/asyncLoad"),
         QStringLiteral("wardrobe2/perf/texCache"), QStringLiteral("wardrobe2/perf/vramPool"),
+        // The six weapon-seating checkboxes. All are registered with live(..., rebuild=true), so
+        // they write the moment they are ticked and reseat the weapons immediately - and none was
+        // listed here, so Cancel could not put any of them back. wardrobe2/ is deliberately NOT a
+        // derived prefix (the tabs write panel geometry under it), which is exactly why a key added
+        // to this page has to be added here by hand.
+        QStringLiteral("wardrobe2/weap/classRestrict"), QStringLiteral("wardrobe2/weap/autoUpright"),
+        QStringLiteral("wardrobe2/weap/flipMain"),      QStringLiteral("wardrobe2/weap/flipOff"),
+        QStringLiteral("wardrobe2/weap/invMain"),       QStringLiteral("wardrobe2/weap/invOff"),
         QStringLiteral("tex/format"), QStringLiteral("tex/trim"), QStringLiteral("tex/lastDir"),
         QStringLiteral("tex/reconstructNormalZ"),
         QStringLiteral("export/gifFps"), QStringLiteral("export/gifTurntableFrames"),

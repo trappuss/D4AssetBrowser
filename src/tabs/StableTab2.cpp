@@ -1198,6 +1198,13 @@ void StableTab2::reset()
     m_exportMats.clear();
     m_undo.clear();
 
+    // The cards themselves belong to the old build: m_gridEntries above is already empty, so every
+    // remaining card indexes into nothing. Take them down here rather than waiting for the next
+    // fillGrid(), and say why the picker is empty — refresh() repopulates it.
+    clearGrid();
+    if (m_gridLayout)
+        m_gridLayout->addWidget(new QLabel(QStringLiteral("  (reloading…)")), 0, 0);
+
     m_loaded = false;
 }
 
@@ -1715,12 +1722,25 @@ void StableTab2::rebuildCollections()
     m_collFilter->setVisible(!colls.isEmpty());
 }
 
+// Drop every card in the picker grid. fillGrid() calls this before repopulating; reset() calls it
+// because the cards OUTLIVE the data they index into. Between reset() and the next refresh() the
+// previous game build's cards were still on screen and still clickable: a click pushed an undo
+// snapshot, ran the category/compatibility pruning, and scheduled a full rebuild for a selection
+// that no longer resolves. Bounds-checked, so never a crash — just a dirtied undo stack and a
+// pipeline run for nothing, on a grid that is about to be thrown away regardless.
+void StableTab2::clearGrid()
+{
+    if (!m_gridLayout) return;
+    while (QLayoutItem* it = m_gridLayout->takeAt(0)) { if (it->widget()) it->widget()->deleteLater(); delete it; }
+    delete m_gridGroup;
+    m_gridGroup = nullptr;
+    m_gridCols = 0;   // force a reflow on the next fill, whatever width it lands at
+}
+
 void StableTab2::fillGrid()
 {
     if (!m_gridLayout) return;
-    // Clear the previous cards + button group.
-    while (QLayoutItem* it = m_gridLayout->takeAt(0)) { if (it->widget()) it->widget()->deleteLater(); delete it; }
-    delete m_gridGroup;
+    clearGrid();
     m_gridGroup = new QButtonGroup(this);
     m_gridGroup->setExclusive(true);
 
@@ -1961,6 +1981,73 @@ void StableTab2::fillGrid()
                                   sno, name, sno == m_slotSel[m_activeSlot]);
         b->setProperty("appName", name);   // raw appearance name — never the tooltip (title breaks roster)
         m_gridGroup->addButton(b, sno);
+
+        // Right-click, on the PRE-SCAN grid too. Until the roster scan lands this is the only grid
+        // there is, and it answered a right-click with nothing — so every card action was simply
+        // unavailable for however long ensurePetIndex() takes on a cold cache. The theme actions
+        // are absent by construction, not by choice: they need a resolved StableEntry (item id,
+        // type, look), which is exactly what this path does not have yet. Everything a bare
+        // appearance SNO + name can answer is here, worded identically to the item grid.
+        const int slot = m_activeSlot;
+        const bool isPet = petSnos.contains(sno);
+        b->setContextMenuPolicy(Qt::CustomContextMenu);
+        connect(b, &QWidget::customContextMenuRequested, this,
+                [this, b, name, sno, slot, isPet](const QPoint& p) {
+                    QMenu menu;
+                    if (sno <= 0) {   // the "(none)" card
+                        QAction* a = menu.addAction(QStringLiteral("Clear"), this, [this, slot] {
+                            equipFallbackPick(slot, 0, QString());
+                            if (m_gridGroup) if (auto* n = m_gridGroup->button(0)) n->setChecked(true);
+                        });
+                        a->setEnabled(m_slotSel[slot] > 0);
+                        menu.exec(b->mapToGlobal(p));
+                        return;
+                    }
+                    menu.addAction(QStringLiteral("Equip"), this, [this, slot, sno, name] {
+                        // Same route the click takes, then check the card by hand: the grid is NOT
+                        // rebuilt here, so the button this menu belongs to stays alive under it.
+                        equipFallbackPick(slot, sno, name);
+                        if (m_gridGroup) if (auto* c = m_gridGroup->button(sno)) c->setChecked(true);
+                    });
+                    menu.addSeparator();
+                    {
+                        const QString exDir = ViewportPartMenu::condensePath(
+                            QSettings().value(QStringLiteral("stable2/exportDir")).toString());
+                        QStringList ex = exportMenuSuffix(name, isPet).split(QStringLiteral(" + "), Qt::SkipEmptyParts);
+                        for (int i = ex.size() - 1; i >= 0; --i)
+                            if (ex[i].trimmed() == QLatin1String("1 model")) ex.removeAt(i);
+                        const QString extra = ex.isEmpty()
+                            ? QString() : QStringLiteral("  —  %1").arg(ex.join(QStringLiteral(" + ")));
+                        if (!exDir.isEmpty())
+                            menu.addAction(ViewportPartMenu::withValue(MenuText::kExportModelLast, exDir) + extra,
+                                           this, [this, sno, name] { exportAppearanceModel(sno, name, true); });
+                        menu.addAction(ViewportPartMenu::prompts(MenuText::kExportModel + extra), this,
+                                       [this, sno, name] { exportAppearanceModel(sno, name, false); });
+                    }
+                    LookIcon::addActions(menu, this, slotIcon(sno), name);
+                    menu.addSeparator();
+                    // Named apart from the item grid's identical pair: they sit in two separate
+                    // lambda scopes and are legal C++, but verify-src's duplicate-lambda check is
+                    // per function body and cannot see that — and the check is worth more than the
+                    // shorter name.
+                    auto toClip = [](const QString& s) { QGuiApplication::clipboard()->setText(s); };
+                    auto elide  = [](const QString& s) { return s.size() > 30 ? s.left(29) + QChar(0x2026) : s; };
+                    const QString disp = AppearanceMeta::instance().titleFor(sno);
+                    const QString coll = AppearanceMeta::instance().collectionFor(sno);
+                    menu.addAction(QStringLiteral("%1  (%2)").arg(MenuText::kCopySno).arg(sno), this,
+                                   [sno, toClip] { toClip(QString::number(sno)); });
+                    menu.addAction(QStringLiteral("%1  (%2)").arg(MenuText::kCopyFileName).arg(elide(name)), this,
+                                   [name, toClip] { toClip(name); });
+                    QAction* aName = menu.addAction(
+                        QStringLiteral("%1  (%2)").arg(MenuText::kCopyName).arg(elide(disp.isEmpty() ? QStringLiteral("—") : disp)),
+                        this, [disp, toClip] { toClip(disp); });
+                    aName->setEnabled(!disp.isEmpty());
+                    QAction* aColl = menu.addAction(
+                        QStringLiteral("%1  (%2)").arg(MenuText::kCopyCollection).arg(elide(coll.isEmpty() ? QStringLiteral("—") : coll)),
+                        this, [coll, toClip] { toClip(coll); });
+                    aColl->setEnabled(!coll.isEmpty());
+                    menu.exec(b->mapToGlobal(p));
+                });
     };
 
     if (optional) addCard(QStringLiteral("(none)"), 0);
@@ -1982,29 +2069,44 @@ void StableTab2::fillGrid()
     }
 
     connect(m_gridGroup, &QButtonGroup::idClicked, this, [this](int sno) {
-        pushUndo();   // snapshot before the change (Ctrl+Z)
-        const int slot = m_activeSlot;
-        m_slotSel[slot] = sno;
-        if (auto* b = qobject_cast<QToolButton*>(m_gridGroup->checkedButton()))
-            m_slotName[slot] = (sno > 0) ? b->property("appName").toString() : QString();
-        m_slotDisp[slot].clear(); m_slotDesc[slot].clear(); m_slotLook[slot] = 0;
-        if (slot == SlotMount) {
-            m_mountType = -1;
-            // Picking a mount can change the category: pets have no barding/trophy, and a
-            // barding from another species no longer applies — drop what no longer fits.
-            const bool pet = petMode();
-            m_slotCell[SlotBarding]->setEnabled(!pet);
-            m_slotCell[SlotTrophy]->setEnabled(!pet);
-            const QString cat = mountCategory();
-            if (pet || m_slotName[SlotBarding].isEmpty()
-                || !m_slotName[SlotBarding].toLower().contains(QLatin1String("_") + cat)) {
-                m_slotSel[SlotBarding] = 0; m_slotName[SlotBarding].clear();
-            }
-            if (pet) { m_slotSel[SlotTrophy] = 0; m_slotName[SlotTrophy].clear(); }
-        }
-        refreshSlotCells();
-        scheduleRebuild();
+        QString appName;
+        if (sno > 0)
+            if (auto* b = qobject_cast<QToolButton*>(m_gridGroup->checkedButton()))
+                appName = b->property("appName").toString();
+        equipFallbackPick(m_activeSlot, sno, appName);
     });
+}
+
+// Apply a pick from the PRE-SCAN fallback grid, where the only identity a card carries is its
+// appearance SNO and raw name. Factored out of the grid's click handler so the card's right-click
+// "Equip" takes the identical route — the item-driven grid has equipEntry() for exactly that
+// reason, and this path had no equivalent, which is why its menu could not be written before.
+// Deliberately NOT equipEntry(): there is no StableEntry here, the display name/description/look
+// are unknown (cleared, as the click always did), and the category prune falls back to the name
+// token rather than the authored type.
+void StableTab2::equipFallbackPick(int slot, int sno, const QString& appName)
+{
+    if (slot < 0 || slot >= SlotCount) return;
+    pushUndo();   // snapshot before the change (Ctrl+Z)
+    m_slotSel[slot] = sno;
+    m_slotName[slot] = (sno > 0) ? appName : QString();
+    m_slotDisp[slot].clear(); m_slotDesc[slot].clear(); m_slotLook[slot] = 0;
+    if (slot == SlotMount) {
+        m_mountType = -1;
+        // Picking a mount can change the category: pets have no barding/trophy, and a
+        // barding from another species no longer applies — drop what no longer fits.
+        const bool pet = petMode();
+        if (m_slotCell[SlotBarding]) m_slotCell[SlotBarding]->setEnabled(!pet);
+        if (m_slotCell[SlotTrophy])  m_slotCell[SlotTrophy]->setEnabled(!pet);
+        const QString cat = mountCategory();
+        if (pet || m_slotName[SlotBarding].isEmpty()
+            || !m_slotName[SlotBarding].toLower().contains(QLatin1String("_") + cat)) {
+            m_slotSel[SlotBarding] = 0; m_slotName[SlotBarding].clear();
+        }
+        if (pet) { m_slotSel[SlotTrophy] = 0; m_slotName[SlotTrophy].clear(); }
+    }
+    refreshSlotCells();
+    scheduleRebuild();
 }
 
 // Seat the trophy rigidly on the mount at the hardpoint the TROPHY authoritatively names

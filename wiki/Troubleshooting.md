@@ -1,5 +1,20 @@
 # Troubleshooting
 
+**Start here.** Most faults fall into one of five shapes, and the shape tells you which tool
+answers it.
+
+| Symptom | Most likely cause | Go to |
+|---|---|---|
+| Nothing loads at all | A folder is not set, or a download did not finish | [below](#nothing-loads-at-all) · **Help ▸ Health check** |
+| One piece is white or flat | Encrypted material, or newer than the snapshot | [below](#a-piece-renders-white-or-with-no-roughness-or-metal) · **Explain this material** |
+| A piece is missing geometry | A known parser limit, or a category toggle | [below](#a-model-is-missing-parts) |
+| Something is in the game but not in a list | Encrypted, un-described, or unnamed | [below](#an-asset-appears-in-the-game-but-not-in-a-list) |
+| An export looks wrong in Blender | Normal-map convention, or detail maps off | [Exporting](Exporting#the-normal-map-convention) · [Settings](Settings#the-options-that-change-results) |
+
+Two reports answer most of the rest: **Help ▸ Health check** for "is my setup right", and
+right-click a part ▸ **Explain this material** for "why does this one thing look like that".
+Both are covered on [Diagnostics](Diagnostics).
+
 ## Nothing loads at all
 
 Check the game folder in **File ▸ Settings** points at the installation itself, and that both
@@ -47,6 +62,38 @@ The Wardrobe leaves a breadcrumb while it loads an outfit. If it crashes mid-loa
 launch detects the breadcrumb, clears that remembered selection and opens on a safe tab. If it
 is still looping, **Settings ▸ Clear Wardrobe memory** or **Clear Stable memory** forgets the
 outfit or mount entirely without turning the remember feature off.
+
+## The viewport is black, or the app will not start at all
+
+The viewport needs **OpenGL 4.5**. On a laptop with switchable graphics, Windows may be
+handing the app the integrated GPU — set D4AssetBrowser.exe to *High performance* in
+**Windows Settings ▸ Display ▸ Graphics**. A remote-desktop or virtual-machine session
+often cannot offer 4.5 at all.
+
+If the window never appears, `data\D4AssetBrowser.log` is written before the viewport is
+created, so it will usually name what failed.
+
+## An export finished but the folder is empty, or a file is missing
+
+An export writes **exactly what is visible**. A part hidden by a checkbox, or by the FX, SIM,
+FORM or HED category buttons, is not in the file. If you meant to export a subset, select the
+parts first and use the part menu — it names the count it is about to write.
+
+Batch runs never fail silently: failures land in `_bulk_failed.txt` with a reason each, and
+**Only new** skips anything already recorded in `_bulk_manifest.json`. An "empty" run is
+usually *Only new* correctly doing nothing. → [Bulk Extract](Tabs#bulk-extract)
+
+## Exported textures look wrong in another application
+
+Three separate causes, and they are worth telling apart:
+
+- **Lighting is inverted everywhere** → the normal-map convention. Diablo IV authors DirectX;
+  glTF and Blender are OpenGL. → [Exporting](Exporting#the-normal-map-convention)
+- **Relief is flat or the normal map has an empty blue channel** → BC5 stores two channels and
+  the third is rebuilt at render time. Enable the blue-channel rebuild in
+  **Settings ▸ Export ▸ Texture export**.
+- **Surfaces look plainer than the viewport** → detail maps are not being baked.
+  → [Settings](Settings#bake-detail-maps--export--model-export)
 
 ## A setting does not seem to stick
 

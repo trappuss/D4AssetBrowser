@@ -7,12 +7,11 @@
 //
 // This is the boundary between the two halves of model export:
 //
-//   D4 model payload  ──[ModelParser, TODO]──►  ModelGeometry  ──[ModelExporter,
-//                                                                  fastgltf]──► .glb
+//   D4 model payload  ──[ModelParser]──►  ModelGeometry  ──[ModelExporter]──► .glb
 //
-// The parser (not yet implemented — needs the D4 binary model format; see
-// docs/MODEL_EXPORT.md) fills a ModelGeometry from base/payload/<sno>. The exporter
-// serializes it with fastgltf. Material textures + MaterialValues are supplied
+// The parser (model/ModelParser.cpp; format in docs/MODEL_EXPORT.md) fills a ModelGeometry
+// from base/payload/<sno>. The exporter serializes it with its own hand-written glTF 2.0
+// writer (no glTF library). Material textures + MaterialValues are supplied
 // separately by the existing d4data parsers (model/Material.h) and applied during
 // export, reusing the same accuracy rules already implemented for textures.
 //

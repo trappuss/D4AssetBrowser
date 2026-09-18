@@ -96,8 +96,16 @@ private:
     // way the app's menus did before MenuText. `bundleSno` is always set; `appSno`/`texSno` are the
     // row-specific subjects and each action is omitted when its subject is absent — the rule
     // ViewportPartMenu already follows.
+    // `rowProductSno` is the STORE PRODUCT the clicked row stands for, where the row is one — a
+    // contents row or a strip tile. It is what "Also sold in" needs and what the appearance sno
+    // cannot answer: two bundles selling the same helmet resolve the same appearance, and the
+    // question is which PRODUCTS carry it.
     void showRowMenu(QWidget* from, const QPoint& globalPos, int bundleSno, int appSno, int texSno,
-                     const QString& subjectName);
+                     const QString& subjectName, int rowProductSno = 0);
+    // Every OTHER product that sells the same payload asset, nearest-first and without the row's
+    // own product or the bundle being viewed. Answered from StoreProductIndex::soldIn, the
+    // reference-graph reverse map the index already builds and only ModelsTab ever asked.
+    QVector<int> alsoSoldIn(int productSno) const;
     void reloadBundleList();          // (re)apply search + filters to the index
     void rebuildFilterChips();        // one removable pill per active filter
     void updateFunnelTint();          // gold border on the funnel while any filter is set
@@ -159,11 +167,37 @@ private:
     // So the first version was showing an entire 808x2888 sprite sheet squeezed into 260px, which
     // is why the preview looked like two stamps. Single-frame art is used whole; multi-frame sheets
     // are cropped to a frame.
+    // Restore the bundle's own art to the pane after one of its images was previewed there.
+    void showHeroArt();
     QImage heroImage(const QString& bundleName) const;   // the big single-frame banner
-    QImage cardImage(const QString& bundleName) const;   // the portrait card, cropped out of the sheet
+    // The portrait card, cropped out of the sheet. `arbitraryFrame`, when given, is set true when
+    // the image came from a many-frame INVENTORY sheet - i.e. it is one of the product's CONTENTS
+    // picked by area, not a picture of the product itself. A caller with a better option should
+    // take it; a caller that just wants the biggest available image can ignore it.
+    QImage cardImage(const QString& bundleName, bool* arbitraryFrame = nullptr) const;
+    // The product's own authored art handle, or 0 when it has none that is demonstrably its own.
+    // The second route to a row thumbnail, used only when the name-derived art above finds
+    // nothing. Deliberately returns 0 rather than a shared banner - see the definition.
+    quint32 ownArtHandle(const StoreProductIndex::Product& b) const;
+    // The third and last thumbnail route: the icon of the first thing the product CONTAINS.
+    // Memoised per product because the "Has icon" filter asks it for every row on every keystroke.
+    quint32 contentIconHandle(const StoreProductIndex::Product& b) const;
+    // The first appearance the product resolves through its contents, or 0. What
+    // contentIconHandle walks to find an icon, exposed so the bundle row's menu can open the
+    // thing itself in Models rather than only its picture.
+    int firstContentAppearance(const StoreProductIndex::Product& b) const;
+    // The LAST thumbnail route: the payload actor's own portrait. Memoised per product because
+    // resolving one opens a d4data actor file, and the "Has icon" filter asks per keystroke.
+    quint32 portraitIconHandle(const StoreProductIndex::Product& b) const;
+    mutable QHash<int, quint32> m_portraitIcon;
+    // One sentence saying why this row has no thumbnail, or empty when it has one or the answer
+    // is not yet knowable. Appended to the row tooltip as it is decided, never guessed up front.
+    QString noArtReason(const StoreProductIndex::Product& b) const;
     // Crop `name`'s largest ptFrame. Returns the whole image when it has none (or when the frame
     // rectangles are unavailable, which is the case for encrypted atlases).
-    QImage largestFrame(int sno, const QString& name) const;
+    // `frameCount`, when given, receives how many frames the sheet has - 1 means the image IS the
+    // picture rather than a crop chosen out of several.
+    QImage largestFrame(int sno, const QString& name, int* frameCount = nullptr) const;
     // Row thumbnails, decoded a few per tick for VISIBLE rows only. 1,628 bundles × one BC-encoded
     // shop tile each is far too much to decode while building the list.
     void renderVisibleThumbs();
@@ -221,6 +255,40 @@ private:
     mutable QHash<QString, QPair<int, QString>> m_texByName;
     mutable bool m_nameMapsBuilt = false;
 
+    // ── Which art handle is a product's OWN, rather than a banner it shares ──────────────────────
+    // How many PRODUCTS carry each art handle, counted across the whole catalogue - children
+    // included, since a banner is shared with them too. This is the only thing that separates a
+    // product's own card from the class or promo art sitting in front of it in Product::art; see
+    // ownArtHandle for why the authored field name cannot answer it.
+    // ── Shop art the template list cannot know about ────────────────────────────────────────────
+    // One pass over the Texture group that finds, for every product, the UI atlases whose NAME
+    // contains that product's name as a whole token span preceded by a prefix. Derived entirely
+    // from the data: no prefix list, no suffix list.
+    //
+    // It exists because the template list is a guess about filenames and the game keeps inventing
+    // new prefixes - 2DUI_S12_, 2DUI_BP_S13_, 2DUI_RL_S08_ and 2DInventory_Catalog_ are all real
+    // and none were in it, so those products went blank until someone shipped a tool update. A new
+    // season's prefix is found here the day it appears.
+    void ensureDerivedArt() const;
+    mutable QHash<QString, QVector<QPair<int, QString>>> m_artByProduct;  // lower product stem
+    mutable bool m_derivedArtBuilt = false;
+    // The derived candidates for one product, best first, or empty.
+    QVector<QPair<int, QString>> derivedArt(const QString& productName) const;
+
+    void ensureArtOwnership() const;
+    mutable QHash<quint32, int> m_artUses;        // handle -> products carrying it
+    mutable bool m_artUsesBuilt = false;
+    // product sno -> content icon handle (0 = resolved to nothing). Resolving one walks
+    // contentSnos -> payloadNameOf -> appearancesFor -> AppearanceMeta, which is far too much to
+    // repeat per keystroke; 0 is cached as a real answer so a product with none is tried once.
+    mutable QHash<int, quint32> m_contentIcon;
+    // product sno -> its LEAF contents, memoised. leafContentSnos is a recursive descent that
+    // allocates a vector and a visited set per call, and the filter chain now asks it for every
+    // row on every keystroke (kind, class, slot and the search haystack all walk it). Cleared
+    // wherever the other product-keyed caches are.
+    const QVector<int>& leafSnosOf(const StoreProductIndex::Product& b) const;
+    mutable QHash<int, QVector<int>> m_leafSnos;
+
     ModelsTab*    m_models   = nullptr;
     TexturesTab*  m_textures = nullptr;
     class QTimer* m_searchDebounce = nullptr;
@@ -260,6 +328,13 @@ private:
     class QFrame*      m_filterPanel   = nullptr;
     QCheckBox*    m_multiSelect = nullptr;    // several bundles at once → several bundle exports
     QComboBox*    m_kindFilter = nullptr;
+    // Class and slot: both authored, both already SHOWN in the detail pane (classSummary, the SLOT
+    // column) and neither filterable until now. Both are rolled up through the row's LEAVES — see
+    // leafSnosOf. Reading Product::slot off the row itself is the eight-helmets trap: on a
+    // container that field is the first GearItem the reference graph reaches.
+    QComboBox*    m_classFilter = nullptr;    // fPreviewOnClasses bit -> classLabel
+    QComboBox*    m_slotFilter  = nullptr;    // authored slot string, values taken from the data
+    QCheckBox*    m_rewardChk   = nullptr;    // arRequiresOwning set: a reward, not a shop purchase
     QComboBox*    m_branchFilter = nullptr;
     QComboBox*    m_seasonFilter = nullptr;   // snoAssociatedSeason, by display name
     QComboBox*    m_sortCombo   = nullptr;    // name / season / patch / sno asc / sno desc
@@ -284,7 +359,13 @@ private:
 
     QLabel*       m_title    = nullptr;
     QLabel*       m_subtitle = nullptr;
-    QLabel*       m_art      = nullptr;   // wide hero banner (_background / _WebImage)
+    // The art pane. An ImageView (file-local, see CatalogueTab.cpp) rather than a QLabel: any of
+    // the bundle's images can be shown here, zoomed and panned, with the row menu on right-click.
+    class CatalogueArtView* m_art = nullptr;
+    // Which image the pane is showing, so the menu can act on it and "show the hero art again"
+    // knows it has somewhere to go back to. 0 = the bundle's own hero, picked automatically.
+    int           m_artTex   = 0;
+    QString       m_artName;
     QLabel*       m_card     = nullptr;   // portrait card, cropped from the 2DUI sheet
     QTextBrowser* m_lore     = nullptr;
     // "INCLUDES 8 ITEMS:" — the shop's horizontal contents strip. Scanning eight items across a

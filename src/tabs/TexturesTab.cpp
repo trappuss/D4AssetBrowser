@@ -1,4 +1,5 @@
 #include "tabs/TexturesTab.h"
+#include "util/QueryTerm.h"
 
 #include <QElapsedTimer>
 #include <memory>
@@ -2024,15 +2025,19 @@ void TexturesTab::applyNameFilter()
             if (blob.isEmpty()) blob = e.name.toLower() + QLatin1Char(' ') + texBlob(e.snoId);
             return blob;
         };
+        // Through the ONE matcher (util/QueryTerm.h), like the Models list, Bulk and the entity
+        // query. This predicate was the fourth parser and the one that kept a bare contains(), so
+        // "a|b" (OR within a term) silently matched nothing here while it worked everywhere else —
+        // exactly the drift QueryTerm was written to end.
         if (!terms.isEmpty() || !excl.isEmpty()) {
             const QString& b = haveBlob();
-            for (const QString& t : terms) if (!b.contains(t)) return false;
-            for (const QString& x : excl)  if (b.contains(x))  return false;
+            for (const QString& t : terms) if (!QueryTerm::matches(b, t)) return false;
+            for (const QString& x : excl)  if (QueryTerm::matches(b, x))  return false;
         }
         if (!tagTerms.isEmpty() || !tagExcl.isEmpty()) {   // '#' terms: metadata only, never the name
             const QString meta = texBlob(e.snoId);
-            for (const QString& t : tagTerms) if (!meta.contains(t)) return false;
-            for (const QString& x : tagExcl)  if (meta.contains(x))  return false;
+            for (const QString& t : tagTerms) if (!QueryTerm::matches(meta, t)) return false;
+            for (const QString& x : tagExcl)  if (QueryTerm::matches(meta, x))  return false;
         }
         if (!tagSel.isEmpty()) {
             const QString& b = haveBlob();

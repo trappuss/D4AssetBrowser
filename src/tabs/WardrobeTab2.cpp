@@ -1210,16 +1210,6 @@ Mat4 quatPosMat(const std::array<float,4>& q, const std::array<float,3>& p)
 const Mat4 kSwapZtoY{{1,0,0,0, 0,0,-1,0, 0,1,0,0, 0,0,0,1}};
 const Mat4 kSwapYtoZ{{1,0,0,0, 0,0,1,0, 0,-1,0,0, 0,0,0,1}};
 
-QIcon pigmentIcon(const QColor c[4])
-{
-    QPixmap pm(16, 16); pm.fill(Qt::transparent);
-    QPainter p(&pm);
-    p.fillRect(0, 0, 8, 8, c[0]); p.fillRect(8, 0, 8, 8, c[1]);
-    p.fillRect(0, 8, 8, 8, c[2]); p.fillRect(8, 8, 8, 8, c[3]);
-    p.end();
-    return QIcon(pm);
-}
-
 // Size of a pigment swatch card in the library grid (small, dense, palette-style).
 constexpr int kPigSwatch = 46;
 
@@ -2770,20 +2760,17 @@ WardrobeTab2::WardrobeTab2(QWidget* parent) : BrowserTab(parent)
             QSettings().setValue(QStringLiteral("wardrobe2/slot/%1").arg(i), m_slot[i]->currentText());
             scheduleRebuild();
         });
-    connect(m_weaponType, &QComboBox::currentIndexChanged, this, [this](int) {
-        if (m_restoring) return;
-        QSettings().setValue(QStringLiteral("wardrobe2/weaponType"), m_weaponType->currentText());
-        populateWeapons();
-    });
+    // m_weaponType / m_weaponType2 are RETIRED backing widgets: populateWeapons() clears them
+    // under a QSignalBlocker and never refills them, so currentIndexChanged can no longer fire.
+    // Their handlers wrote "wardrobe2/weaponType[2]" — keys nothing has read since the icon
+    // browser replaced the type dropdowns, and whose value was the visible display text anyway.
+    // The handlers are gone; the keys stay in the migration sweeps (refresh(), resetDefaults(),
+    // MainWindow's crash sweep, Settings' "Clear Wardrobe memory") so an existing profile's
+    // stale value is still cleaned up. Weapons are identified by appearance key alone.
     connect(m_weapon, &QComboBox::currentIndexChanged, this, [this](int) {
         if (m_restoring) return;
         QSettings().setValue(QStringLiteral("wardrobe2/weapon"), weaponKeyOf(m_weapon));
         scheduleRebuild();
-    });
-    connect(m_weaponType2, &QComboBox::currentIndexChanged, this, [this](int) {
-        if (m_restoring) return;
-        QSettings().setValue(QStringLiteral("wardrobe2/weaponType2"), m_weaponType2->currentText());
-        populateWeapons();
     });
     connect(m_weapon2, &QComboBox::currentIndexChanged, this, [this](int) {
         if (m_restoring) return;
@@ -2944,7 +2931,6 @@ void WardrobeTab2::refresh()
     });
     // Icon-index progress is shown by the global status-bar indicator now; nothing per-tab.
     restoreSelection();        // class/gender (combos), env
-    rebuildDyeCombo();         // restores saved dye via wardrobe/dyeSel
     restoreSlotDyes();         // restores each slot's per-slot pigment
     ensureWeaponIndex();       // restores saved weapon type/model when ready
     populateCreator();         // restores saved creator picks
@@ -4447,6 +4433,28 @@ void WardrobeTab2::exportItemModel(int sno, const QString& name, bool toLast)
     const bool wantTex = QSettings().value(QStringLiteral("export/includeTex"), true).toBool();
     const QStringList palette = appearancePalette(d4, name, m_reader, m_index, sno);
     QVector<ModelExporter::ExportMaterial> mats = buildExportMats(palette, geo, name, d4, m_reader, wantTex);
+    // ── export/bakeDetail ────────────────────────────────────────────────────────────────────────
+    // Bake the tiled detail grain into the exported normal + ORM, so a piece exports with its
+    // leather/metal surface instead of a smooth base normal. This path ignored the setting: the
+    // same option changed Stable's and the Models tab's output and silently did nothing here, which
+    // is the worst kind of shared option - one that works everywhere the user did not test.
+    //
+    // Read at EXPORT time rather than at load, so toggling it applies to the next export instead of
+    // the next outfit rebuild. Cached by material NAME: every ExportMaterial with a given name took
+    // its normal/ORM from the same per-material cache, so this is one bake per distinct material
+    // rather than one per primitive. Skipped entirely when textures are off - there would be
+    // nothing to bake into.
+    if (wantTex && QSettings().value(QStringLiteral("export/bakeDetail"), false).toBool()) {
+        QHash<QString, QImage> bakedN, bakedO;   // two hashes, not QPair: <QPair> is not included here
+        for (ModelExporter::ExportMaterial& em : mats) {
+            if (em.normal.isNull() || em.name.isEmpty()) continue;
+            auto it = bakedN.constFind(em.name);
+            if (it != bakedN.constEnd()) { em.normal = it.value(); em.orm = bakedO.value(em.name); continue; }
+            MaterialDecode::bakeDetailForMaterial(m_reader, d4, em.name, em.normal, em.orm);
+            bakedN.insert(em.name, em.normal);
+            bakedO.insert(em.name, em.orm);
+        }
+    }
     ModelExporter::Options opt = ModelExporter::optionsFromSettings();
     if (QSettings().value(QStringLiteral("export/hardpointEmpties"), false).toBool())
         Hardpoints::readInto(geo, QStringLiteral("%1/json/base/meta/Appearance/%2.app.json").arg(d4, name));
@@ -4458,9 +4466,54 @@ void WardrobeTab2::exportItemModel(int sno, const QString& name, bool toLast)
     const bool ok = ModelExporter::exportGlb(geo, path, mats, {}, {}, opt);
     const QString folder = QFileInfo(path).absolutePath();
     QSettings().setValue(QStringLiteral("wardrobe2/exportDir"), folder);
+
+    // ── export/withDeps ──────────────────────────────────────────────────────────────────────────
+    // The raw .app and its distinct .tex sources, into a "deps" folder beside the .glb.
+    //
+    // exportMenuSuffix has always COUNTED these - the menu reads "1 model + 37 raw files" - and
+    // this function never wrote one of them. A label that promises work the code does not do is
+    // worse than no label: nothing fails, nothing warns, and the folder is simply short. Same
+    // folder name and the same rule as Stable and the Models/Bulk paths, because export/withDeps
+    // is ONE setting and had grown two layouts.
+    int nRaw = 0;
+    if (ok && QSettings().value(QStringLiteral("export/withDeps"), false).toBool()) {
+        const QString depDir = QFileInfo(path).dir().filePath(QStringLiteral("deps"));
+        QDir().mkpath(depDir);
+        const QString base = QFileInfo(path).completeBaseName();
+        QFile af(depDir + QLatin1Char('/') + base + QStringLiteral(".app"));
+        if (af.open(QIODevice::WriteOnly)) { af.write(payload); af.close(); ++nRaw; }
+        QSet<qint64> doneTex;
+        for (const QString& mn : MaterialDecode::appearanceRoster(d4, name)) {
+            // An empty roster slot is not a failure: the roster is padded so its indices line up
+            // with materialIndex, and a slot with no ptSOAs legitimately has no material.
+            if (mn.isEmpty()) continue;
+            // texturesFor, not a direct .mat.json read: it falls back to the CASC meta binary, so
+            // an ENCRYPTED material - "~unnamed_<sno>", of which d4data ships ~1,079 - contributes
+            // its textures here instead of being skipped for having no JSON. Stable's copy of this
+            // block predates the helper and still misses them.
+            for (const MatTexture& mt : MaterialDecode::texturesFor(m_reader, d4, mn)) {
+                if (mt.texSno == 0 || doneTex.contains(mt.texSno)) continue;
+                doneTex.insert(mt.texSno);
+                const QByteArray tb = m_reader->readPayloadBySno(quint64(mt.texSno));
+                if (tb.isEmpty()) continue;
+                const QString tn = mt.texName.isEmpty() ? QStringLiteral("tex_%1").arg(mt.texSno)
+                                                        : mt.texName;
+                QFile tf(depDir + QLatin1Char('/') + tn + QStringLiteral(".tex"));
+                if (tf.open(QIODevice::WriteOnly)) { tf.write(tb); tf.close(); ++nRaw; }
+            }
+        }
+    }
+
     if (ok) ExportNotifier::instance().notify(
-                QStringLiteral("Exported %1%2").arg(QFileInfo(path).fileName(),
-                                                    ExportNotifier::glbOptionsLine(opt)), folder);
+                QStringLiteral("Exported %1%2%3").arg(
+                    QFileInfo(path).fileName(),
+                    ExportNotifier::glbOptionsLine(opt),
+                    // Reported, so a short deps folder is visible rather than something to discover
+                    // later by counting files.
+                    nRaw ? QStringLiteral("  + %1 raw source file%2")
+                               .arg(nRaw).arg(nRaw == 1 ? QString() : QStringLiteral("s"))
+                         : QString()),
+                folder);
     else    QMessageBox::warning(this, QStringLiteral("Export model"), QStringLiteral("Export failed."));
 }
 
@@ -4638,8 +4691,7 @@ void WardrobeTab2::populateWeapons()
     //   UserRole+1      = full appearance name
     //   UserRole+2      = weapon-type label (for dividers + hardpoint seating)
     auto fillHand = [&](QComboBox* typeCb, QComboBox* modelCb, bool offHand,
-                        const QString& typeKey, const QString& modelKey) {
-        Q_UNUSED(typeKey);
+                        const QString& modelKey) {
         if (!modelCb) return;
         const QString savedModel = QSettings().value(modelKey).toString();
         if (typeCb) { QSignalBlocker bt(typeCb); typeCb->clear(); }   // type combo retired (hidden)
@@ -4685,16 +4737,12 @@ void WardrobeTab2::populateWeapons()
         }
     };
 
-    fillHand(m_weaponType, m_weapon, /*offHand=*/false,
-             QStringLiteral("wardrobe2/weaponType"), QStringLiteral("wardrobe2/weapon"));
-    fillHand(m_weaponType2, m_weapon2, /*offHand=*/true,
-             QStringLiteral("wardrobe2/weaponType2"), QStringLiteral("wardrobe2/weapon2"));
+    fillHand(m_weaponType,  m_weapon,  /*offHand=*/false, QStringLiteral("wardrobe2/weapon"));
+    fillHand(m_weaponType2, m_weapon2, /*offHand=*/true,  QStringLiteral("wardrobe2/weapon2"));
     // Sheathed slots draw from the same class-usable weapon pool as the held hands
     // (main-hand eligibility for the sheathed main, off-hand for the sheathed off).
-    fillHand(nullptr, m_weapon3, /*offHand=*/false,
-             QString(), QStringLiteral("wardrobe2/weaponSheath"));
-    fillHand(nullptr, m_weapon4, /*offHand=*/true,
-             QString(), QStringLiteral("wardrobe2/weaponSheath2"));
+    fillHand(nullptr, m_weapon3, /*offHand=*/false, QStringLiteral("wardrobe2/weaponSheath"));
+    fillHand(nullptr, m_weapon4, /*offHand=*/true,  QStringLiteral("wardrobe2/weaponSheath2"));
     updateWeaponSlotAvailability();
     if (!m_restoring) rebuildOutfit();
     if (m_lookLayout) { fillLookGrid(); refreshSlotCells(); }   // refresh the weapon slot cell + grid
@@ -4726,45 +4774,25 @@ void WardrobeTab2::updateWeaponSlotAvailability()
     gate(7, m_weapon3, why);   // Sheath (main)
 }
 
-void WardrobeTab2::rebuildDyeCombo()
-{
-    if (!m_dyeCombo) return;
-    QSignalBlocker block(m_dyeCombo);
-    const QString cur = QSettings().value(QStringLiteral("wardrobe2/dyeSel"),
-                                          QStringLiteral("None")).toString();
-    m_dyeCombo->clear();
-    m_dyeCombo->addItem(QStringLiteral("None (undyed)"));
-    for (const DyeDef& dd : loadPlayerDyes(Config::d4dataDir())) {
-        QStringList hex; for (int k = 0; k < 4; ++k) hex << dd.colors[k].name();
-        m_dyeCombo->addItem(pigmentIcon(dd.colors), dd.name, hex);
-    }
-    const int idx = m_dyeCombo->findText(cur);
-    m_dyeCombo->setCurrentIndex(idx > 0 ? idx : 0);
-}
-
-// The bottom dye combo changed — recompute pigments. (Kept as the slot for the existing
-// signal connection; the real work is per-slot in applyAllDyes.)
+// A dye selection changed — recompute pigments. Dye is per-slot (Set Pigment); this is the
+// one entry point the pigment picker and the outfit rebuild both call.
 void WardrobeTab2::applyDye() { applyAllDyes(); }
 
 // Compute the effective pigment for every drawn primitive and push it to the view. Each slot
-// can carry its own pigment (Set Pigment); slots without one fall back to the global dye combo.
+// carries its own pigment (Set Pigment); a slot without one is left undyed.
+//
+// There is no global dye fallback any more. The old bottom-of-panel dye combo (m_dyeCombo,
+// "wardrobe2/dyeSel") was retired when Set Pigment went per-slot: the widget was never
+// constructed, so its restore path was unreachable and the key was read but never written.
+// Removed rather than left as a null-guarded no-op that reads like a live feature.
 // No geometry rebuild — this only updates the per-part dye uniforms.
 void WardrobeTab2::applyAllDyes()
 {
     if (!m_view) return;
-    QStringList globalHex;
-    if (m_dyeCombo && m_dyeCombo->currentIndex() > 0)
-        globalHex = m_dyeCombo->currentData().toStringList();
-
     const int n = m_partSlot.size();
     if (n == 0) {
-        // No slot map yet (e.g. before the first rebuild) — fall back to the simple global path.
-        if (globalHex.size() == 4) {
-            for (int k = 0; k < 4; ++k) m_view->setDyeColor(k, QColor(globalHex[k]));
-            m_view->setFeatureDye(true);
-        } else {
-            m_view->setFeatureDye(false);
-        }
+        // No slot map yet (e.g. before the first rebuild) — nothing to dye.
+        m_view->setFeatureDye(false);
         m_view->setPartDye({}, {});
         m_view->update();
         return;
@@ -4773,9 +4801,8 @@ void WardrobeTab2::applyAllDyes()
     QVector<float> col(n * 12, 1.0f);
     for (int i = 0; i < n; ++i) {
         const int slot = m_partSlot[i];
-        if (slot >= 5) continue;   // weapons (Main/Off) can't be dyed
-        const QStringList hex = (slot >= 0 && slot < kSlotCount && m_slotDye[slot].hex.size() == 4)
-                                    ? m_slotDye[slot].hex : globalHex;
+        if (slot < 0 || slot >= 5) continue;   // weapons (Main/Off) can't be dyed
+        const QStringList hex = m_slotDye[slot].hex;
         if (hex.size() != 4) continue;
         on[i] = 1;
         for (int k = 0; k < 4; ++k) {
@@ -5701,8 +5728,11 @@ static QStringList wardrobeLookKeys()
 {
     QStringList k = { QStringLiteral("class"), QStringLiteral("gender"),
                       QStringLiteral("skinTone"), QStringLiteral("skinDetail"),
-                      QStringLiteral("weaponType"), QStringLiteral("weapon"),
-                      QStringLiteral("weaponType2"), QStringLiteral("weapon2"),
+                      // "weaponType"/"weaponType2" deliberately absent — retired write-only keys
+                      // (see the weapon connects in buildUi). A saved Look carried them and
+                      // restored nothing; deleteEnsemble/renameEnsemble work on the whole group,
+                      // so an older Look's orphaned copy is still removed with it.
+                      QStringLiteral("weapon"), QStringLiteral("weapon2"),
                       QStringLiteral("weaponSheath"), QStringLiteral("weaponSheath2"),
                       QStringLiteral("backTrophy"), QStringLiteral("anim") };
     // NB: free function — can't see WardrobeTab2::kSlotCount (private). Keep this literal in
@@ -7310,6 +7340,9 @@ void WardrobeTab2::resetDefaults()
     // Barbarian Female every time, which meant re-picking the character before you could carry on
     // — and "reset" reads as "clear what I put on this model", not "give me a different model".
     QSettings s;
+    // "weaponType"/"weaponType2"/"dyeSel" are LEGACY entries: nothing writes them any more (the
+    // type dropdowns and the global dye combo are both retired). They stay in this sweep so a
+    // profile carrying an old value still gets it cleared.
     for (const QString& k : {QStringLiteral("wardrobe2/weaponType"), QStringLiteral("wardrobe2/weapon"),
                              QStringLiteral("wardrobe2/weaponType2"), QStringLiteral("wardrobe2/weapon2"),
                              QStringLiteral("wardrobe2/weaponSheath"), QStringLiteral("wardrobe2/weaponSheath2"),
@@ -7335,7 +7368,6 @@ void WardrobeTab2::resetDefaults()
     if (m_weapon3 && m_weapon3->count() > 0) m_weapon3->setCurrentIndex(0);
     if (m_weapon4 && m_weapon4->count() > 0) m_weapon4->setCurrentIndex(0);
     if (m_backTrophy && m_backTrophy->count() > 0) m_backTrophy->setCurrentIndex(0);
-    if (m_dyeCombo && m_dyeCombo->count() > 0) m_dyeCombo->setCurrentIndex(0);
     if (m_skinTone && m_skinTone->count() > 0) m_skinTone->setCurrentIndex(0);       // "(default)"
     if (m_skinDetail && m_skinDetail->count() > 0) m_skinDetail->setCurrentIndex(0); // "(none)"
     if (m_env) m_env->setCurrentIndex(1);
@@ -8273,7 +8305,6 @@ void WardrobeTab2::rebuildOutfitImpl(bool async)
         QStringList e;
         e << (skinCol.isValid() ? skinCol.name() : QStringLiteral("-"));
         for (int c = 0; c < 9; ++c) e << (m_creator[c] ? m_creator[c]->currentText() : QString());
-        e << (m_dyeCombo ? m_dyeCombo->currentText() : QString());
         colorEpoch = e.join(QLatin1Char('\x1f'));
     }
     // Decode the makeup/marking overlay + mask textures once (resolve name → SNO).
@@ -9591,7 +9622,6 @@ bool WardrobeTab2::exportOutfitGlb(const QString& path, const QVector<int>& keep
                     const int slot = m_partSlot[si];
                     QStringList hex;
                     if (slot >= 0 && slot < kSlotCount && m_slotDye[slot].hex.size() == 4) hex = m_slotDye[slot].hex;
-                    else if (m_dyeCombo && m_dyeCombo->currentIndex() > 0) hex = m_dyeCombo->currentData().toStringList();
                     if (slot < 5 && hex.size() == 4) {
                         float cols[12];
                         for (int k = 0; k < 4; ++k) { const QColor c(hex[k]);

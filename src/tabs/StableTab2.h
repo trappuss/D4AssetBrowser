@@ -97,7 +97,11 @@ private:
     // ── Slot cells + card grid ───────────────────────────────────────────────
     void selectSlot(int slot);                      // make a slot active → refill the grid
     void refreshSlotCells();                        // redraw the 3 slot-cell buttons
+    void clearGrid();                               // take down every card (fillGrid + reset)
     void fillGrid();                                // (re)build the browser cards for the active slot
+    // Apply a pick from the pre-scan fallback grid (SNO + raw appearance name only) — shared by
+    // the card click and the card's right-click "Equip". The item-driven grid uses equipEntry().
+    void equipFallbackPick(int slot, int sno, const QString& appName);
     void rebuildCollections();                      // repopulate the collection filter
 
     // ── Assemble + texture ───────────────────────────────────────────────────

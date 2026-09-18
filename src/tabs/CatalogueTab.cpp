@@ -5,6 +5,9 @@
 #include "casc/CascReader.h"
 #include "index/AppearanceMeta.h"
 #include "index/IconIndex.h"
+// contentSnos / leafContentSnos / isContainer — shared with IconAudit so the audit measures the
+// SAME descent the tab draws. Comment on its own line (verify-src matches the directive to EOL).
+#include "index/ProductContents.h"
 #include "model/MaterialDecode.h"
 #include "tex/FrameTable.h"     // CASC-side atlas frames — the only frame source for shop art that
                                 // d4data has no .tex.json for, which is most of it
@@ -38,6 +41,7 @@
 #include <QPolygonF>    // the funnel glyph is drawn, not shipped as an asset
 #include <QIcon>
 #include <QJsonArray>
+#include <QShortcut>    // Ctrl+F focuses the search, as ModelsTab does
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QLabel>
@@ -54,6 +58,8 @@
 #include <QTextBrowser>
 #include <QTimer>
 #include <QCursor>
+#include <QContextMenuEvent>
+#include <QKeyEvent>     // Esc in the search box (eventFilter)
 #include <QMouseEvent>
 #include <QPainter>
 #include <QScreen>
@@ -119,25 +125,11 @@ inline QStringList uiArtCandidates(const QString& productName)
     return out;
 }
 
-// ── What a product's contents ARE ───────────────────────────────────────────────────────────────
-// A product with no children is not an empty bundle. It is a single item, and the shop sells 337
-// of them that way - Scythe_stor007, mnt_amor103_horse_stor - none of which any amount of drilling
-// into bundles will ever reach. Answering "its contents are itself" in ONE place makes the strip,
-// the contents tree, the hover card and the exporter all handle it unchanged, instead of each
-// growing its own leaf special case.
-//
-// Locked products are deliberately excluded: their children are unreadable, and saying the product
-// is its own content would be inventing one rather than reporting one.
-inline QVector<int> contentSnos(const StoreProductIndex::Product& b)
-{
-    if (!b.children.isEmpty() || b.encrypted) return b.children;
-    return QVector<int>{ b.sno };
-}
-
 QString settingsLastDir()
 {
     return QSettings().value(QStringLiteral("catalogue/lastDir")).toString();
 }
+
 
 // Grid-view cell painter — a copy of the Models tab's, which lives in ITS anonymous namespace with
 // no header (TexturesTab already carries a second copy for the same reason). Aspect-preserved
@@ -174,6 +166,17 @@ public:
         }
         // TWO lines, elided independently. Eliding the joined string instead removed the middle —
         // which is exactly where the separator sits — and collapsed the caption to one mangled row.
+        //
+        // ── Elide the END of the first line, not the middle ──────────────────────────────────────
+        // Shop names share their tails, not their heads: "Ancient's Collection Pack", "Sands of
+        // Kehjan Collection Pack", "Warcraft Collection Pack". ElideMiddle keeps the shared tail
+        // and throws away the half that identifies the row, so a screen of packs all read
+        // "...tion Pack" and the grid became unusable for the thing it is for. ElideRight keeps the
+        // distinguishing start: "Ancient's Colle...".
+        //
+        // The SECOND line keeps ElideMiddle: it is a summary ("8 items  ·  armour, weapon", or
+        // "locked - contents need TACT key ..."), where the head is a count and the tail is the
+        // part that differs, so losing the middle costs least there.
         const QString name = idx.data(Qt::DisplayRole).toString();
         const QStringList rows = name.split(QChar::LineSeparator);
         const QRect tr(r.left() + 2, r.top() + 4 + imgH + 2, r.width() - 4, r.height() - imgH - 8);
@@ -184,7 +187,8 @@ public:
             if (li == 1) p->setPen(QColor(0x9a, 0x9a, 0x9a));
             p->drawText(QRect(tr.left(), ty, tr.width(), opt.fontMetrics.height()),
                         Qt::AlignHCenter | Qt::AlignTop,
-                        opt.fontMetrics.elidedText(rows[li], Qt::ElideMiddle, tr.width()));
+                        opt.fontMetrics.elidedText(
+                            rows[li], li == 0 ? Qt::ElideRight : Qt::ElideMiddle, tr.width()));
             ty += opt.fontMetrics.height();
         }
         p->restore();
@@ -194,6 +198,191 @@ private:
 };
 
 }  // namespace
+
+// FILE SCOPE, not the anonymous namespace above, and a distinctive name: CatalogueTab.h has to
+// forward-declare this to hold a pointer to it, and a forward declaration names the GLOBAL type.
+// A class of the same name inside an anonymous namespace would be a DIFFERENT type, and the
+// member assignment would not compile. GridItemDelegate can stay anonymous because nothing
+// outside this file ever names it.
+// ── The art pane, as a viewer rather than a label ────────────────────────────────────────────────
+//
+// It was a QLabel holding one pre-scaled pixmap: whatever the bundle's hero art happened to be,
+// fitted once and then unreadable. A shop hero is 5120x2160 and a card sheet is 832x2624, so
+// "fitted to a 400px pane" throws away most of the picture, and there was no way to look at any of
+// the OTHER images a bundle ships - the background, the WebImage, the details banner, the per-item
+// inventory sheet - even though the contents tree lists them by name.
+//
+// So: any image the bundle owns can be shown here, zoomed and panned.
+//
+//   wheel               zoom about the cursor, so the thing under the pointer stays under it
+//   left-drag           pan
+//   double-click        back to fit
+//   right-click         the same row menu the lists use, acting on THIS image
+//
+// No Q_OBJECT: moc would need this declared in a header, and it is not worth one. The context
+// menu is therefore a std::function the tab installs, not a signal.
+class CatalogueArtView : public QWidget {
+public:
+    explicit CatalogueArtView(QWidget* parent = nullptr) : QWidget(parent)
+    {
+        setMinimumHeight(220);
+        setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
+        setCursor(Qt::ArrowCursor);
+        setFocusPolicy(Qt::StrongFocus);
+        setContextMenuPolicy(Qt::DefaultContextMenu);
+    }
+
+    // `label` is shown in the corner so it is always clear WHICH of a bundle's images is on screen -
+    // "the art" was ambiguous the moment more than one could be displayed.
+    void setImage(const QImage& img, const QString& label)
+    {
+        m_img = img;
+        m_label = label;
+        resetView();
+    }
+    void clear() { setImage(QImage(), QString()); m_placeholder.clear(); update(); }
+    void setPlaceholder(const QString& t) { m_placeholder = t; update(); }
+    bool hasImage() const { return !m_img.isNull(); }
+    QString label() const { return m_label; }
+    void onContextMenu(std::function<void(const QPoint&)> cb) { m_menu = std::move(cb); }
+
+    void resetView()
+    {
+        m_fit = true;
+        m_zoom = 1.0;
+        m_pan = QPointF();
+        update();
+    }
+
+protected:
+    void paintEvent(QPaintEvent*) override
+    {
+        QPainter p(this);
+        p.fillRect(rect(), QColor(0x1b, 0x1b, 0x1b));
+        p.setPen(QColor(0x3a, 0x3a, 0x3a));
+        p.drawRect(rect().adjusted(0, 0, -1, -1));
+        if (m_img.isNull()) {
+            if (!m_placeholder.isEmpty()) {
+                p.setPen(QColor(0x9a, 0x9a, 0x9a));
+                p.drawText(rect(), Qt::AlignCenter, m_placeholder);
+            }
+            return;
+        }
+        const QRectF dst = target();
+        p.setRenderHint(QPainter::SmoothPixmapTransform, true);
+        p.drawImage(dst, m_img);
+
+        // Name and zoom, bottom-left, over a strip dark enough to stay readable on bright art.
+        const QString txt = m_label.isEmpty()
+            ? QStringLiteral("%1 x %2  -  %3%")
+                  .arg(m_img.width()).arg(m_img.height()).arg(qRound(scale() * 100))
+            : QStringLiteral("%1   %2 x %3  -  %4%")
+                  .arg(m_label).arg(m_img.width()).arg(m_img.height()).arg(qRound(scale() * 100));
+        const QFontMetrics fm(font());
+        const QRect box(0, height() - fm.height() - 6, width(), fm.height() + 6);
+        p.fillRect(box, QColor(0, 0, 0, 150));
+        p.setPen(QColor(0xdd, 0xdd, 0xdd));
+        p.drawText(box.adjusted(6, 0, -6, 0), Qt::AlignVCenter | Qt::AlignLeft,
+                   fm.elidedText(txt, Qt::ElideMiddle, box.width() - 12));
+    }
+
+    void wheelEvent(QWheelEvent* e) override
+    {
+        if (m_img.isNull()) { QWidget::wheelEvent(e); return; }
+        const int dy = e->angleDelta().y();
+        // A tilt wheel and some touchpads report y() == 0; treating that as "down" would zoom out
+        // on a horizontal scroll, which is the same trap the list's wheel handler documents.
+        if (dy == 0) { QWidget::wheelEvent(e); return; }
+        const QPointF cursor = e->position();
+        // The image point under the cursor BEFORE the zoom, so it can be put back afterwards -
+        // otherwise the picture slides away from whatever you were trying to look at.
+        const QPointF before = widgetToImage(cursor);
+        const double step = dy > 0 ? 1.15 : 1.0 / 1.15;
+        const double base = m_fit ? fitScale() : m_zoom;
+        m_zoom = qBound(0.05, base * step, 40.0);
+        m_fit = false;
+        const QPointF after = widgetToImage(cursor);
+        m_pan += (after - before) * m_zoom;
+        update();
+        e->accept();
+    }
+
+    void mousePressEvent(QMouseEvent* e) override
+    {
+        if (e->button() == Qt::LeftButton && !m_img.isNull()) {
+            m_dragging = true;
+            m_dragFrom = e->pos();
+            setCursor(Qt::ClosedHandCursor);
+        }
+        QWidget::mousePressEvent(e);
+    }
+    void mouseMoveEvent(QMouseEvent* e) override
+    {
+        if (m_dragging) {
+            // Panning implies a zoom level: dragging while still in fit mode would have nothing to
+            // move, so the first drag pins the current fit scale and leaves fit mode.
+            if (m_fit) { m_zoom = fitScale(); m_fit = false; }
+            m_pan += QPointF(e->pos() - m_dragFrom);
+            m_dragFrom = e->pos();
+            update();
+        }
+        QWidget::mouseMoveEvent(e);
+    }
+    void mouseReleaseEvent(QMouseEvent* e) override
+    {
+        if (m_dragging && e->button() == Qt::LeftButton) {
+            m_dragging = false;
+            setCursor(Qt::ArrowCursor);
+        }
+        QWidget::mouseReleaseEvent(e);
+    }
+    void mouseDoubleClickEvent(QMouseEvent* e) override
+    {
+        resetView();
+        QWidget::mouseDoubleClickEvent(e);
+    }
+    void contextMenuEvent(QContextMenuEvent* e) override
+    {
+        if (m_menu) { m_menu(e->globalPos()); e->accept(); return; }
+        QWidget::contextMenuEvent(e);
+    }
+    void resizeEvent(QResizeEvent* e) override { update(); QWidget::resizeEvent(e); }
+
+private:
+    double fitScale() const
+    {
+        if (m_img.isNull() || m_img.width() <= 0 || m_img.height() <= 0) return 1.0;
+        // qMax(1, ...) because this pane sits in a splitter and a splitter can collapse it to zero
+        // width. The divisor was already safe; the DIVIDEND was not, and a negative scale builds a
+        // QRectF with negative extents that drawImage renders mirrored.
+        return qMax(0.01, qMin(double(qMax(1, width() - 8)) / m_img.width(),
+                               double(qMax(1, height() - 8)) / m_img.height()));
+    }
+    double scale() const { return m_fit ? fitScale() : m_zoom; }
+    QRectF target() const
+    {
+        const double s = scale();
+        const QSizeF sz(m_img.width() * s, m_img.height() * s);
+        QPointF tl((width() - sz.width()) / 2.0, (height() - sz.height()) / 2.0);
+        if (!m_fit) tl += m_pan;
+        return QRectF(tl, sz);
+    }
+    QPointF widgetToImage(const QPointF& w) const
+    {
+        const QRectF t = target();
+        const double s = scale();
+        if (s <= 0.0) return QPointF();
+        return QPointF((w.x() - t.left()) / s, (w.y() - t.top()) / s);
+    }
+
+    QImage  m_img;
+    QString m_label, m_placeholder;
+    double  m_zoom = 1.0;
+    bool    m_fit = true, m_dragging = false;
+    QPointF m_pan;
+    QPoint  m_dragFrom;
+    std::function<void(const QPoint&)> m_menu;
+};
 
 CatalogueTab::CatalogueTab(ModelsTab* models, TexturesTab* textures, QWidget* parent)
     : BrowserTab(parent), m_models(models), m_textures(textures)
@@ -238,6 +427,36 @@ void CatalogueTab::buildUi()
     m_kindFilter->addItem(QStringLiteral("Any contents"), -1);
     for (int k = StoreProductIndex::Transmog; k <= StoreProductIndex::DyeArmor; ++k)
         m_kindFilter->addItem(StoreProductIndex::kindLabel(StoreProductIndex::Kind(k)), k);
+    // ── Class ───────────────────────────────────────────────────────────────────────────────────
+    // fPreviewOnClasses, already displayed by classSummary in the detail pane and never filterable.
+    // Measured over the 9,385 products: 6,343 are all-class, 1,787 carry no mask at all, and 1,255
+    // are class-specific — which is the population this answers for. The entries are built from the
+    // bits the DATA uses, never a hardcoded class list, so a class added in a future patch appears
+    // by itself.
+    m_classFilter = new QComboBox(left);
+    m_classFilter->setFixedHeight(kBarH);
+    m_classFilter->addItem(QStringLiteral("Any class"), -1);
+    m_classFilter->setToolTip(QStringLiteral(
+        "Only products a given class can wear, taken from the game's own fPreviewOnClasses.\n\n"
+        "Asked of what a bundle CONTAINS, so a pack matches when any piece inside it does.\n"
+        "Products authored for every class are not class-specific and do not match a single class."));
+    connect(m_classFilter, &QComboBox::currentIndexChanged, this, [this] { reloadBundleList(); });
+
+    // ── Slot ────────────────────────────────────────────────────────────────────────────────────
+    // 6,335 products carry an authored slot across ~20 values (Helm 1,206, Boots 699, Legs 654,
+    // Gloves 654, Chest 630, Trophy 319, MountItem 213, CosmeticBack 209, HorseArmor 172, then the
+    // weapon types). Values come from the data for the same reason the patch and season combos do.
+    m_slotFilter = new QComboBox(left);
+    m_slotFilter->setFixedHeight(kBarH);
+    m_slotFilter->addItem(QStringLiteral("Any slot"), QString());
+    m_slotFilter->setToolTip(QStringLiteral(
+        "Only products that fill a given slot - helm, boots, back trophy, mount armour and the\n"
+        "weapon types.\n\n"
+        "Read off the PIECES, never off the bundle: a container's own slot field is whichever\n"
+        "gear item the reference graph reaches first, which is what once made a pack of eight\n"
+        "armour sets read as eight helmets."));
+    connect(m_slotFilter, &QComboBox::currentIndexChanged, this, [this] { reloadBundleList(); });
+
     m_branchFilter = new QComboBox(left);
     m_branchFilter->setFixedHeight(kBarH);
     m_branchFilter->addItem(QStringLiteral("Any patch"), QString());
@@ -334,6 +553,18 @@ void CatalogueTab::buildUi()
         "picture, not which ones happen to have decoded one yet."));
     connect(m_hasIconChk, &QCheckBox::toggled, this, [this] { reloadBundleList(); });
 
+    // ── Reward, not a purchase ──────────────────────────────────────────────────────────────────
+    // arRequiresOwning is already printed in the detail pane ("Requires: Battlepass_Season3_
+    // Premium") and has never been askable. It is the only field that separates what the shop SOLD
+    // from what a season or battlepass GAVE, and that distinction exists nowhere else in the tool.
+    m_rewardChk = new QCheckBox(QStringLiteral("Reward only (not sold)"), left);
+    m_rewardChk->setToolTip(QStringLiteral(
+        "Only products that require owning something else - a battlepass tier or a season pass.\n"
+        "These were never sold on their own, which is why hunting for them in the shop's own\n"
+        "listing never finds them.\n\n"
+        "Matches the product itself or anything it contains."));
+    connect(m_rewardChk, &QCheckBox::toggled, this, [this] { reloadBundleList(); });
+
     m_rememberChk = new QCheckBox(QStringLiteral("Remember filters"), left);
     m_rememberChk->setToolTip(QStringLiteral(
         "Restore the search text, filters and sort order on the next launch."));
@@ -375,6 +606,8 @@ void CatalogueTab::buildUi()
     // arrived, HOW the list is shown.
     secHdr(QStringLiteral("Contents"));
     fp->addWidget(m_kindFilter);
+    fp->addWidget(m_classFilter);
+    fp->addWidget(m_slotFilter);
     secHdr(QStringLiteral("Released"));
     fp->addWidget(m_branchFilter);
     fp->addWidget(m_seasonFilter);
@@ -385,6 +618,7 @@ void CatalogueTab::buildUi()
     fp->addWidget(m_onlyDecrypted);
     fp->addWidget(m_onlyEncrypted);
     fp->addWidget(m_hasIconChk);
+    fp->addWidget(m_rewardChk);
     secHdr(QStringLiteral("View"));
     fp->addWidget(m_sortCombo);
     {
@@ -408,6 +642,9 @@ void CatalogueTab::buildUi()
         { QSignalBlocker b(m_onlyDecrypted); m_onlyDecrypted->setChecked(false); }
         { QSignalBlocker b(m_onlyEncrypted); m_onlyEncrypted->setChecked(false); }
         { QSignalBlocker b(m_hasIconChk);    m_hasIconChk->setChecked(false); }
+        { QSignalBlocker b(m_classFilter);   m_classFilter->setCurrentIndex(0); }
+        { QSignalBlocker b(m_slotFilter);    m_slotFilter->setCurrentIndex(0); }
+        { QSignalBlocker b(m_rewardChk);     m_rewardChk->setChecked(false); }
         // Back to TRUE, not false: this one is a filter whose default is "show everything", so
         // clearing it means ticking it. Leaving it out of this list is what let it hide 337
         // products through a button whose whole promise is that nothing is being hidden.
@@ -443,8 +680,21 @@ void CatalogueTab::buildUi()
     filterRow->setSpacing(6);
     filterRow->addWidget(m_filtersToggle);
     m_search = new QLineEdit(left);
-    m_search->setPlaceholderText(QStringLiteral("Search bundles…"));
+    m_search->setPlaceholderText(QStringLiteral("Search bundles…  (Ctrl+F)"));
     m_search->setClearButtonEnabled(true);
+    // Ctrl+F focuses the search from anywhere in this tab; Esc inside it clears. Ported verbatim
+    // from ModelsTab, which is the only tab that had it - the same key must not mean two things,
+    // or nothing, depending on which tab is open. WidgetWithChildrenShortcut, so it does not
+    // steal Ctrl+F from whatever tab is actually in front.
+    {
+        auto* findSc = new QShortcut(QKeySequence::Find, this);
+        findSc->setContext(Qt::WidgetWithChildrenShortcut);
+        connect(findSc, &QShortcut::activated, this, [this] {
+            m_search->setFocus(Qt::ShortcutFocusReason);
+            m_search->selectAll();
+        });
+        m_search->installEventFilter(this);   // Esc → clear (handled in eventFilter)
+    }
     m_search->setFixedHeight(kBarH);
     filterRow->addWidget(m_search, 1);
     m_gridBtn = new QToolButton(left);
@@ -503,11 +753,24 @@ void CatalogueTab::buildUi()
     // this is the thing the tab exists to show — the first version capped it at 260px tall.
     auto* artRow = new QHBoxLayout;
     artRow->setSpacing(6);
-    m_art = new QLabel(right);
-    m_art->setAlignment(Qt::AlignCenter);
-    m_art->setMinimumHeight(220);
-    m_art->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
-    m_art->setStyleSheet(QStringLiteral("QLabel{background:#1b1b1b;border:1px solid #3a3a3a;}"));
+    m_art = new CatalogueArtView(right);
+    m_art->setToolTip(QStringLiteral(
+        "Scroll to zoom, drag to pan, double-click to fit.\n"
+        "Right-click for export and copy actions.\n"
+        "Pick any row under \"Bundle images\" below to show it here."));
+    m_art->onContextMenu([this](const QPoint& g) {
+        if (m_curBundle <= 0) return;
+        // The SUBJECT is whatever is on screen: a chosen bundle image acts as that texture, the
+        // automatic hero art acts as the bundle's own first shop texture, so "export this" always
+        // means the thing being looked at.
+        int tex = m_artTex;
+        if (tex <= 0)
+            if (const auto* b = StoreProductIndex::instance().product(m_curBundle)) {
+                const auto ts = shopTextures(b->name);
+                if (!ts.isEmpty()) tex = ts.first().first;
+            }
+        showRowMenu(m_art, g, m_curBundle, 0, tex, m_artName);
+    });
     artRow->addWidget(m_art, 3);
     m_card = new QLabel(right);
     m_card->setAlignment(Qt::AlignCenter);
@@ -570,6 +833,30 @@ void CatalogueTab::buildUi()
     // The other half of the mirror. Kept symmetric on purpose: the pane you clicked in is the
     // authority, whichever one that is.
     connect(m_contents, &QTreeWidget::itemSelectionChanged, this, [this] { syncSelection(false); });
+    // ── Picking an image row shows it in the art pane ────────────────────────────────────────────
+    // The tree has always LISTED the bundle's images by name; there was no way to look at one
+    // short of sending it to the Textures tab, which loses the bundle you were reading. Selecting
+    // one now loads it into the pane above at full resolution, where it can be zoomed and panned.
+    // Double-click still opens it in Textures - this adds a step rather than replacing one.
+    connect(m_contents, &QTreeWidget::currentItemChanged, this,
+            [this](QTreeWidgetItem* cur, QTreeWidgetItem*) {
+                if (!cur || !m_art) return;
+                const int ts = cur->data(0, Qt::UserRole + 2).toInt();
+                if (ts <= 0) return;             // a product row: leave the hero art alone
+                if (ts == m_artTex) return;      // already showing it
+                const QString nm = cur->text(0);
+                const QImage img = decodeTexture(ts, nm);
+                if (img.isNull()) {
+                    // Said rather than left blank: an image that will not decode is a fact about
+                    // the asset, and a pane that silently keeps the previous picture is a lie.
+                    m_art->clear();
+                    m_art->setPlaceholder(QStringLiteral("%1 — does not decode").arg(nm));
+                } else {
+                    m_art->setImage(img, nm);
+                }
+                m_artTex  = ts;
+                m_artName = nm;
+            });
     // Sortable, like the Models tab's views. Group rows are top-level so children sort within
     // their kind, which is what you want — sorting by SLOT across the whole tree would interleave
     // armour with mounts. showBundle turns this OFF while populating and back on afterwards.
@@ -631,6 +918,10 @@ void CatalogueTab::buildUi()
             const auto ts = shopTextures(pb->name);
             if (!ts.isEmpty()) tex = ts.first().first;
         }
+        // appSno stays 0 DELIBERATELY: a list row's subject is the bundle, and passing an
+        // appearance here would add "export model <sno>" beside "export bundle" and make the
+        // single-row export act on one child. showRowMenu resolves an appearance of its own, for
+        // the View action only - see viewApp there.
         showRowMenu(m_list, m_list->viewport()->mapToGlobal(p), bs, 0, tex, QString());
     });
     m_strip->setContextMenuPolicy(Qt::CustomContextMenu);
@@ -645,7 +936,8 @@ void CatalogueTab::buildUi()
         // where it is the actual subject.
         showRowMenu(m_strip, m_strip->viewport()->mapToGlobal(p), m_curBundle,
                     it->data(Qt::UserRole + 1).toInt(), 0,
-                    it->text().split(QChar::LineSeparator).first());
+                    it->text().split(QChar::LineSeparator).first(),
+                    it->data(Qt::UserRole).toInt());   // the strip tile's own product
     });
     m_contents->setContextMenuPolicy(Qt::CustomContextMenu);
     // ORDER MATTERS, and it is the trap ModelsTab documents twice: CsvCopy::install skips its own
@@ -671,8 +963,10 @@ void CatalogueTab::buildUi()
         // Bundle-image rows carry their texture sno in UserRole+2 and no product sno, so passing 0
         // here left them without "View in Textures" — the one action they actually have.
         const int ts = it->data(0, Qt::UserRole + 2).toInt();
+        // cs is 0 on a bundle-image row, which is right: an image is not a product and has
+        // nowhere else to have been sold.
         showRowMenu(m_contents, m_contents->viewport()->mapToGlobal(p), m_curBundle,
-                    m_childApp.value(cs, 0), ts, it->text(0));
+                    m_childApp.value(cs, 0), ts, it->text(0), cs);
     });
 
     connect(m_contents, &QTreeWidget::itemDoubleClicked, this,
@@ -776,6 +1070,23 @@ void CatalogueTab::buildUi()
     // before the icons land shows "(no shop art resolved)" and never repaints — the same
     // connection ModelsTab, StableTab2 and WardrobeTab2 all make.
     connect(&IconIndex::instance(), &IconIndex::readyChanged, this, [this] {
+        // Repainting the detail pane is not enough. Every cache below can be holding a NEGATIVE
+        // that was only true while the icons were missing - a null thumbnail, a 0 content icon,
+        // and a "Has icon" filter that culled rows on the strength of them. Drop them and ask
+        // again, rather than leaving the tab permanently wrong about a build that has since
+        // finished.
+        m_thumbs.clear();
+        m_contentIcon.clear();
+        m_portraitIcon.clear();
+        reloadBundleList();
+        if (m_curBundle > 0) showBundle(m_curBundle);
+    });
+    // AppearanceMeta lands independently and route 3 depends on it, so the same argument applies.
+    // The thumbnail pass self-heals through its own deferred re-arm; the FILTER does not, because
+    // nothing re-runs it.
+    connect(&AppearanceMeta::instance(), &AppearanceMeta::readyChanged, this, [this] {
+        m_contentIcon.clear();
+        reloadBundleList();
         if (m_curBundle > 0) showBundle(m_curBundle);
     });
 }
@@ -978,7 +1289,8 @@ void CatalogueTab::exportRows(const QVector<int>& appSnos, const QVector<int>& t
 }
 
 void CatalogueTab::showRowMenu(QWidget* from, const QPoint& globalPos, int bundleSno,
-                               int appSno, int texSno, const QString& subjectName)
+                               int appSno, int texSno, const QString& subjectName,
+                               int rowProductSno)
 {
     const auto* b = StoreProductIndex::instance().product(bundleSno);
     if (!b) return;
@@ -1043,11 +1355,62 @@ void CatalogueTab::showRowMenu(QWidget* from, const QPoint& globalPos, int bundl
         menu.addAction(MenuText::exportSetPrompt(oneWhat), this,
                        [this, selApps, selTexs] { exportRows(selApps, selTexs, true); });
     }
-    if (appSno > 0 || texSno > 0) {
+    // ── Opening the thing, as opposed to exporting it ───────────────────────────────────────────
+    // The bundle-list pane passes appSno = 0, because a list row's subject is the bundle and the
+    // export actions above must act on the bundle. That left the list with no "View in Models" at
+    // all: finding a cosmetic in the catalogue and then looking at it meant opening the bundle and
+    // right-clicking its strip, which is the one step the whole tab exists to remove.
+    //
+    // So the View action resolves its own appearance when it was given none. Used HERE only -
+    // appSno is untouched, so nothing above changes what it exports.
+    // Only when the pane is showing something else - an action that cannot change anything is
+    // noise, and this menu is shared by four views.
+    if (from == m_art && m_artTex > 0)
+        menu.addAction(QStringLiteral("Show the bundle's own art"), this, [this] { showHeroArt(); });
+    // ── Where else did this ship? ───────────────────────────────────────────────────────────────
+    // StoreProductIndex builds a reverse map of the SNO reference graph (soldIn) and until now only
+    // ModelsTab ever asked it - so the Catalogue, the one tab about what shipped with what, could
+    // not answer "this helm is also in four other bundles". The entries jump: the row is selected
+    // when the current filters still show it, and the detail pane opens either way, with the status
+    // line saying so when the list cannot follow.
+    if (rowProductSno > 0) {
+        const QVector<int> also = alsoSoldIn(rowProductSno);
+        if (!also.isEmpty()) {
+            menu.addSeparator();
+            QMenu* sub = menu.addMenu(QStringLiteral("Also sold in  (%1)").arg(also.size()));
+            const auto& sidx = StoreProductIndex::instance();
+            for (int ps : also) {
+                const auto* p = sidx.product(ps);
+                if (!p) continue;
+                QString lab = p->title.isEmpty() ? p->name : p->title;
+                if (!p->seasonName.isEmpty()) lab += QStringLiteral("   %1").arg(p->seasonName);
+                sub->addAction(lab, this, [this, ps] {
+                    for (int i = 0; i < m_list->count(); ++i) {
+                        QListWidgetItem* it = m_list->item(i);
+                        if (it->data(Qt::UserRole).toInt() != ps) continue;
+                        m_list->setCurrentItem(it);       // fires showBundle through the list
+                        m_list->scrollToItem(it, QAbstractItemView::PositionAtCenter);
+                        return;
+                    }
+                    // Filtered out of the list. Showing it anyway is the useful answer - the
+                    // alternative is a menu entry that appears to do nothing - and the status
+                    // line says why the selection did not move.
+                    showBundle(ps);
+                    if (m_status)
+                        m_status->setText(QStringLiteral(
+                            "Showing a product the current filters hide - clear them to select it "
+                            "in the list."));
+                });
+            }
+        }
+    }
+
+    const int viewApp = appSno > 0 ? appSno : firstContentAppearance(*b);
+    if (viewApp > 0 || texSno > 0) {
         menu.addSeparator();
-        if (appSno > 0)
+        if (viewApp > 0)
             menu.addAction(QStringLiteral("View in Models"), this,
-                           [this, appSno] { emit revealModelRequested(appSno); });
+                           [this, viewApp] { emit revealModelRequested(viewApp); });
         if (texSno > 0)
             menu.addAction(QStringLiteral("View in Textures"), this,
                            [this, texSno] { emit revealTextureRequested(texSno); });
@@ -1143,7 +1506,7 @@ void CatalogueTab::showHoverPreview(int sno)
                                 cols << HoverInfo::Col::kMeta; }
     {
         QHash<int, int> perKind;
-        for (int cs : contentSnos(*b))
+        for (int cs : ProductContents::contentSnos(*b))
             if (const auto* c = StoreProductIndex::instance().product(cs)) ++perKind[int(c->kind)];
         QStringList parts;
         for (auto i = perKind.constBegin(); i != perKind.constEnd(); ++i)
@@ -1178,6 +1541,14 @@ void CatalogueTab::showHoverPreview(int sno)
 
 bool CatalogueTab::eventFilter(QObject* obj, QEvent* ev)
 {
+    // Esc in the search box clears it, rather than falling through to whatever Esc means to the
+    // window. Consumed only when there IS text: an empty box must not swallow the key.
+    if (m_search && obj == m_search && ev->type() == QEvent::KeyPress) {
+        if (static_cast<QKeyEvent*>(ev)->key() == Qt::Key_Escape && !m_search->text().isEmpty()) {
+            m_search->clear();
+            return true;
+        }
+    }
     if (m_list && obj == m_list->viewport()) {
         const QEvent::Type t = ev->type();
         if (t == QEvent::MouseMove) {
@@ -1250,6 +1621,13 @@ void CatalogueTab::reset()
     m_nameMapsBuilt = false;
     m_appByName.clear();
     m_texByName.clear();
+    m_artUsesBuilt = false;
+    m_artUses.clear();   // a new snapshot can re-author which handle a product shares
+    m_contentIcon.clear();
+    m_leafSnos.clear();   // a patch re-authors what a pack contains, and how deeply
+    m_derivedArtBuilt = false;
+    m_artByProduct.clear();   // a patch can add both products and the art naming them
+    m_portraitIcon.clear();
     m_portrait.clear();   // keyed by NAME, and a d4data switch can re-author the actor behind it
     m_actorApp.clear();   // same: a new snapshot can re-point Item.snoActor / Actor.snoAppearance
     m_thumbs.clear();   // a new build/snapshot can re-author the same bundle's art
@@ -1523,6 +1901,59 @@ void CatalogueTab::reloadBundleList()
                                         .arg(perSeason.value(pr.second)), pr.second);
     }
 
+    // Class and slot, built from the data like the patch and season combos above, and counted the
+    // same way they are: over ROWS, not products. A label reading "Helm  (612)" promises 612 rows
+    // and must deliver them, so the count comes from the same leaf descent the filter uses and a
+    // row is counted once however many helms it holds. One pass fills both combos.
+    if ((m_classFilter && m_classFilter->count() <= 1)
+        || (m_slotFilter && m_slotFilter->count() <= 1)) {
+        QHash<int, int> perBit;
+        QHash<QString, int> perSlot;
+        QVector<int> pop = idx.bundles();
+        pop += idx.loose();
+        pop += idx.locked();   // no readable contents, so it contributes nothing - counted anyway
+        for (int sno : pop) {
+            const auto* p = idx.product(sno);
+            if (!p) continue;
+            QSet<int> bits;
+            QSet<QString> slotSet;   // NOT `slots`: Qt macro, expands to nothing
+            for (int cs : leafSnosOf(*p)) {
+                const auto* c = idx.product(cs);
+                if (!c) continue;
+                const quint32 m = c->classMask;
+                // Unset, or every class: not class-SPECIFIC, so it belongs to no single entry.
+                if (m && m != 0xFFu)
+                    for (int i = 0; i < 32; ++i) if (m >> i & 1u) bits.insert(i);
+                if (!c->slot.isEmpty()) slotSet.insert(c->slot);
+            }
+            for (int b : bits) ++perBit[b];
+            for (const QString& s : slotSet) ++perSlot[s];
+        }
+        if (m_classFilter && m_classFilter->count() <= 1) {
+            // One entry per BIT the data uses, named by StoreProductIndex::classLabel. A bit it
+            // cannot name is skipped rather than shown as "class 6": an unnamed entry in a filter
+            // is worse than an absent one, and a class added in a later patch arrives named or
+            // not at all. Sorted by bit so the order is the game's, not a hash's.
+            QVector<int> bits;
+            for (auto i = perBit.constBegin(); i != perBit.constEnd(); ++i) bits << i.key();
+            std::sort(bits.begin(), bits.end());
+            const QSignalBlocker block(m_classFilter);
+            for (int b : bits) {
+                const QString lab = StoreProductIndex::classLabel(b);
+                if (lab.isEmpty()) continue;
+                m_classFilter->addItem(QStringLiteral("%1  (%2)").arg(lab).arg(perBit.value(b)), b);
+            }
+        }
+        if (m_slotFilter && m_slotFilter->count() <= 1) {
+            QStringList slotNames;
+            for (auto i = perSlot.constBegin(); i != perSlot.constEnd(); ++i) slotNames << i.key();
+            slotNames.sort(Qt::CaseInsensitive);
+            const QSignalBlocker block(m_slotFilter);
+            for (const QString& s : slotNames)
+                m_slotFilter->addItem(QStringLiteral("%1  (%2)").arg(s).arg(perSlot.value(s)), s);
+        }
+    }
+
     // Restore ONCE, and only now: the patch and season combos were empty until the two blocks
     // above filled them from the index, so an earlier findData() would have matched nothing and
     // silently discarded the saved filters.
@@ -1538,6 +1969,9 @@ void CatalogueTab::reloadBundleList()
     const bool wantLatest = m_latestChk && m_latestChk->isChecked();
     const bool wantHasIcon = m_hasIconChk && m_hasIconChk->isChecked();
     const QString wantDrop = m_dropFilter ? m_dropFilter->currentData().toString() : QString();
+    const int wantClassBit = m_classFilter ? m_classFilter->currentData().toInt() : -1;
+    const QString wantSlot = m_slotFilter ? m_slotFilter->currentData().toString() : QString();
+    const bool wantReward  = m_rewardChk && m_rewardChk->isChecked();
 
     // Sort BEFORE filtering, so the order is a property of the catalogue rather than of whatever
     // survived the filters. Season and patch fall back to the title, otherwise every bundle in one
@@ -1626,14 +2060,58 @@ void CatalogueTab::reloadBundleList()
             // "Latest" is per-SNO and lives on the index, as Models and Bulk Extract use it.
             else if (wantLatest && !(m_index && m_index->isNew(sno))) drop = true;
             else if (wantKind >= 0) {
+                // LEAVES, not contentSnos. A collection pack's direct children are per-class
+                // BUNDLES, which carry no kind at all - so "Any contents: Transmog" dropped the
+                // 311 nested packs even though every piece inside them is a transmog. Same descent
+                // the strip, the tree, the export and the manifest were already moved onto.
                 bool has = false;
-                for (int cs : contentSnos(*b))
+                for (int cs : leafSnosOf(*b))
                     if (const auto* c = idx.product(cs))
                         if (int(c->kind) == wantKind) { has = true; break; }
                 if (!has) drop = true;
             }
+            // A row matches a CLASS when any piece inside it does. A product authored for every
+            // class (mask 0xFF) is deliberately not a match for one class: "Necromancer" should
+            // mean the Necromancer's own cosmetics, not the 6,343 products everyone can wear.
+            if (!drop && wantClassBit >= 0) {
+                bool has = false;
+                for (int cs : leafSnosOf(*b))
+                    if (const auto* c = idx.product(cs)) {
+                        const quint32 m = c->classMask;
+                        if (m && m != 0xFFu && (m >> wantClassBit & 1u)) { has = true; break; }
+                    }
+                if (!has) drop = true;
+            }
+            if (!drop && !wantSlot.isEmpty()) {
+                bool has = false;
+                for (int cs : leafSnosOf(*b))
+                    if (const auto* c = idx.product(cs))
+                        if (c->slot.compare(wantSlot, Qt::CaseInsensitive) == 0) { has = true; break; }
+                if (!has) drop = true;
+            }
+            // The row itself first: a bundle that requires a battlepass IS the reward, and its
+            // pieces need carry nothing. Then its contents, for a reward sold loose.
+            if (!drop && wantReward) {
+                bool has = !b->requires_.isEmpty();
+                if (!has)
+                    for (int cs : leafSnosOf(*b))
+                        if (const auto* c = idx.product(cs))
+                            if (!c->requires_.isEmpty()) { has = true; break; }
+                if (!has) drop = true;
+            }
             // Shop art is resolved from the NAME, so "has art" is answerable without decoding it.
-            if (!drop && wantHasIcon && shopTextures(b->name).isEmpty()) drop = true;
+            // BOTH routes, because the thumbnail now has two: a product with no art named after it
+            // but a unique authored handle does get a picture, and hiding it here would mean the
+            // filter and the grid disagreed about what "has icon" means - the row would be culled
+            // while its neighbour with the identical situation stayed. ownArtHandle is a hash
+            // lookup plus a frame-table probe, so this stays cheap enough for a per-keystroke path.
+            // All FOUR routes, or the filter and the grid disagree about what "has icon" means.
+            // Only a row that has already failed the first three reaches the portrait probe, and
+            // a locked product short-circuits before it (no payload, so no actor file is opened) -
+            // so the disk cost is bounded to a few hundred small reads, once, then memoised.
+            if (!drop && wantHasIcon && shopTextures(b->name).isEmpty()
+                && !ownArtHandle(*b) && !contentIconHandle(*b) && !portraitIconHandle(*b))
+                drop = true;
             if (drop) {
                 if (b->encrypted) ++lockedHidden;
                 else if (b->children.isEmpty()) ++looseHidden;
@@ -1643,8 +2121,11 @@ void CatalogueTab::reloadBundleList()
         if (!needle.isEmpty()) {
             // Children and their resolved appearances included, so a model name finds the bundle
             // that sold it - searching barM_stor251_HLM used to match nothing at all.
+            // Leaves, so searching a piece finds the nested pack that sold it. Before this, the
+            // 45 pieces inside a collection pack were unreachable by search: the haystack held the
+            // eight per-class BUNDLES between them and their names.
             QString hay = b->name + QLatin1Char(' ') + b->title + QLatin1Char(' ') + b->description;
-            for (int cs : contentSnos(*b))
+            for (int cs : leafSnosOf(*b))
                 if (const auto* c = idx.product(cs)) {
                     hay += QLatin1Char(' ') + c->name + QLatin1Char(' ') + c->title;
                     const QString pn = payloadNameOf(*c);
@@ -1689,8 +2170,12 @@ void CatalogueTab::reloadBundleList()
             if (sno == keep) m_list->setCurrentItem(lit);
             continue;
         }
+        // LEAVES here too, so the row agrees with the pane it opens. A collection pack's row read
+        // "8 items" above a strip of 50 and a contents tree of 50, because the strip, the tree,
+        // the export and the manifest were moved onto the leaf descent and the ROW was not.
+        const QVector<int>& leaves = leafSnosOf(*b);
         QSet<int> kinds;
-        for (int cs : contentSnos(*b))
+        for (int cs : leaves)
             if (const auto* c = idx.product(cs)) kinds.insert(int(c->kind));
         QStringList kindNames;
         for (int k : kinds)
@@ -1704,8 +2189,8 @@ void CatalogueTab::reloadBundleList()
             ? (kindNames.isEmpty() ? QStringLiteral("single product")
                                    : kindNames.join(QStringLiteral(", ")))
             : QStringLiteral("%1 item%2%3")
-                  .arg(contentSnos(*b).size())
-                  .arg(contentSnos(*b).size() == 1 ? QString() : QStringLiteral("s"))
+                  .arg(leaves.size())
+                  .arg(leaves.size() == 1 ? QString() : QStringLiteral("s"))
                   .arg(kindNames.isEmpty() ? QString()
                                            : QStringLiteral("  ·  ") + kindNames.join(QStringLiteral(", ")));
         // A product d4data never described has NO shop title, so the row above shows its SNO name
@@ -1863,6 +2348,16 @@ void CatalogueTab::rebuildFilterChips()
         addChip(QStringLiteral("Only encrypted"), [this] { m_onlyEncrypted->setChecked(false); });
     if (m_hasIconChk && m_hasIconChk->isChecked())
         addChip(QStringLiteral("Has icon"), [this] { m_hasIconChk->setChecked(false); });
+    // Counts stripped from the chip: "Necromancer  (289)" is right in the dropdown, where the
+    // number helps you choose, and noise on a pill whose job is to say what is currently on.
+    if (m_classFilter && m_classFilter->currentIndex() > 0)
+        addChip(m_classFilter->currentText().section(QStringLiteral("  ("), 0, 0),
+                [this] { m_classFilter->setCurrentIndex(0); });
+    if (m_slotFilter && m_slotFilter->currentIndex() > 0)
+        addChip(m_slotFilter->currentText().section(QStringLiteral("  ("), 0, 0),
+                [this] { m_slotFilter->setCurrentIndex(0); });
+    if (m_rewardChk && m_rewardChk->isChecked())
+        addChip(QStringLiteral("Reward only"), [this] { m_rewardChk->setChecked(false); });
     // Inverted, because this filter's ACTIVE state is unticked. The chip says what the list is
     // currently doing ("Bundles only"), and clicking it undoes that — the same contract as every
     // other chip, just around the other way.
@@ -1887,6 +2382,9 @@ void CatalogueTab::updateFunnelTint()
                      || (m_onlyDecrypted && m_onlyDecrypted->isChecked())
                      || (m_onlyEncrypted && m_onlyEncrypted->isChecked())
                      || (m_hasIconChk    && m_hasIconChk->isChecked())
+                     || (m_classFilter   && m_classFilter->currentIndex() > 0)
+                     || (m_slotFilter    && m_slotFilter->currentIndex()  > 0)
+                     || (m_rewardChk     && m_rewardChk->isChecked())
                      || (m_showLoose     && !m_showLoose->isChecked());
     m_filtersToggle->setStyleSheet(active
         ? QStringLiteral("QToolButton{padding:1px;border:1px solid #a07a1a;border-radius:3px;"
@@ -1915,6 +2413,11 @@ void CatalogueTab::saveFilterState()
     s.setValue(QStringLiteral("catalogue/lastOnlyDec"), m_onlyDecrypted && m_onlyDecrypted->isChecked());
     s.setValue(QStringLiteral("catalogue/lastOnlyEnc"), m_onlyEncrypted && m_onlyEncrypted->isChecked());
     s.setValue(QStringLiteral("catalogue/lastHasIcon"), m_hasIconChk && m_hasIconChk->isChecked());
+    s.setValue(QStringLiteral("catalogue/lastClass"),
+               m_classFilter ? m_classFilter->currentData().toInt() : -1);
+    s.setValue(QStringLiteral("catalogue/lastSlot"),
+               m_slotFilter ? m_slotFilter->currentData().toString() : QString());
+    s.setValue(QStringLiteral("catalogue/lastReward"), m_rewardChk && m_rewardChk->isChecked());
     // Default TRUE on read-back, so a settings file written before this key existed restores the
     // shipping default rather than an unticked box nobody chose.
     s.setValue(QStringLiteral("catalogue/lastShowLoose"), !m_showLoose || m_showLoose->isChecked());
@@ -1961,6 +2464,15 @@ void CatalogueTab::restoreFilterState()
         m_showLoose->setChecked(
             s.value(QStringLiteral("catalogue/lastShowLoose"), true).toBool());
     }
+    // Both of these are filled from the DATA in reloadBundleList, above this call, so findData
+    // has something to match by the time it runs - the same ordering the patch and season combos
+    // depend on, and the reason restoreFilterState is called from there and not from the ctor.
+    pick(m_classFilter, s.value(QStringLiteral("catalogue/lastClass"), -1));
+    pick(m_slotFilter,  s.value(QStringLiteral("catalogue/lastSlot")));
+    if (m_rewardChk) {
+        QSignalBlocker b(m_rewardChk);
+        m_rewardChk->setChecked(s.value(QStringLiteral("catalogue/lastReward"), false).toBool());
+    }
     // Both restored ticked is impossible through the UI but trivial to hand-edit into the ini,
     // and it would show an empty list with two contradictory chips. Decrypted wins arbitrarily -
     // what matters is that the state on screen is one the UI could have produced.
@@ -1993,8 +2505,9 @@ void CatalogueTab::showBundle(int sno)
     if (m_stripHdr) m_stripHdr->clear();
     m_childApp.clear();
     m_card->clear();   // else filtering to zero results leaves the PREVIOUS bundle's card up
-    m_art->setPixmap(QPixmap());
-    m_art->setText(QString());
+    m_art->clear();
+    m_artTex = 0;
+    m_artName.clear();
     m_lore->clear();
     m_status->clear();
 
@@ -2104,14 +2617,18 @@ void CatalogueTab::showBundle(int sno)
         for (quint32 h : b->art)   // last resort: a UI handle, usually a category icon
             if (!(hero = IconIndex::instance().iconImage(h, m_reader)).isNull()) break;
     if (hero.isNull()) {
-        m_art->setText(QStringLiteral("(no shop art resolved)"));
+        m_art->setPlaceholder(QStringLiteral("(no shop art resolved)"));
     } else {
         // Title ENGRAVED over the art, the way the shop lays the panel out, rather than only as a
         // separate line above it. Drawn with a dark outline so it stays readable over bright art.
         // The shop engraves the title over the art because the art IS its header — there is no
         // separate title line. Here m_title already shows the same string directly above, so
         // painting it on again was the same words twice, forty pixels apart. Art only.
-        m_art->setPixmap(fit(hero, heroBox));
+        // Full resolution into the view, NOT pre-scaled: the view does its own fitting, and
+        // handing it a 400px copy of a 5120x2160 hero would make zooming pointless.
+        m_artTex  = 0;
+        m_artName = heroIsCard ? QStringLiteral("card art") : QStringLiteral("hero art");
+        m_art->setImage(hero, m_artName);
     }
 
     if (!card.isNull() && !heroIsCard)
@@ -2133,6 +2650,10 @@ void CatalogueTab::showBundle(int sno)
 
     // ── The contents strip: "INCLUDES 8 ITEMS:" ──────────────────────────────────────────────
     StoreProductIndex& idx = StoreProductIndex::instance();
+    // Resolved ONCE: leafContentSnos is a recursive descent, and the header, its count and the loop
+    // below all need the same answer. They must also BE the same answer - a header disagreeing with
+    // the rows under it is how "INCLUDES 8 ITEMS" came to sit above a 45-row contents tree.
+    const QVector<int> stripSnos = ProductContents::leafContentSnos(idx, *b);
     m_strip->clear();
     m_childApp = r.firstApp;       // remembered for the "open in Models" double-click
     // "INCLUDES 0 ITEMS" for a locked bundle would be a claim about its contents, and the wrong
@@ -2161,9 +2682,14 @@ void CatalogueTab::showBundle(int sno)
         : b->children.isEmpty()
             ? QStringLiteral("THIS PRODUCT:")
             : QStringLiteral("INCLUDES %1 ITEM%2:")
-                  .arg(contentSnos(*b).size())
-                  .arg(contentSnos(*b).size() == 1 ? QString() : QStringLiteral("S")));
-    for (int cs : contentSnos(*b)) {
+                  .arg(stripSnos.size())
+                  .arg(stripSnos.size() == 1 ? QString() : QStringLiteral("S")));
+    // leafContentSnos, matching resolveBundle. r.firstApp / r.appsOf / r.appsPerChild are keyed by
+    // LEAF product, so walking the direct children of a nested pack looked every one of them up
+    // and missed: the eight per-class bundles fell back to their own card art (so the strip looked
+    // plausible) while carrying no appearance at all, which left double-click opening nothing and
+    // the per-gender split silent. The header counts the same population it is about to list.
+    for (int cs : stripSnos) {
         const auto* c = idx.product(cs);
         const QString label = c ? (c->title.isEmpty() ? c->name : c->title)
                                 : QStringLiteral("product %1").arg(cs);
@@ -2175,11 +2701,17 @@ void CatalogueTab::showBundle(int sno)
         // Per APPEARANCE, not per product: armour resolves to a female and a male appearance with
         // different icons, and one icon reused across both rows would be wrong for one of them.
         // Falls back to the product art only when the appearance has no icon.
+        // Via ownArtHandle, NOT the first non-zero entry of c->art. The comment above records the
+        // symptom this used to produce - a row of identical class symbols - and the cause is now
+        // measured: taking the first handle scores 0.47 distinct handles per row across the
+        // catalogue, with 123 products landing on one image. ownArtHandle accepts a handle only
+        // when no other product carries it, so a shared banner is declined and the row falls
+        // through to the product art below rather than showing another product's picture.
         QIcon fallbackIcon;
         if (c)
-            for (quint32 h : c->art) {
+            if (const quint32 h = ownArtHandle(*c)) {
                 const QImage ic = IconIndex::instance().iconImage(h, m_reader);
-                if (!ic.isNull()) { fallbackIcon = QIcon(QPixmap::fromImage(ic)); break; }
+                if (!ic.isNull()) fallbackIcon = QIcon(QPixmap::fromImage(ic));
             }
         // Last resort: the payload actor's own portrait. This is what headstones have INSTEAD of
         // the two routes above, and without it they were the one kind that reached the strip
@@ -2240,24 +2772,21 @@ void CatalogueTab::showBundle(int sno)
         si->setToolTip(tip.join(QLatin1Char('\n')));
     }
     // Children grouped by kind — the whole reason to look at a bundle rather than its armour.
+    //
+    // A nested pack groups by SET instead. Its direct children are per-class bundles, which have
+    // no kind and no payload, so grouping them by kind filed all eight under "Other" and printed
+    // the first GearItem's slot ("Helm") beside each. The set is the meaningful grouping, and its
+    // own pieces are what the columns are about.
     QHash<int, QTreeWidgetItem*> groups;
-    for (int cs : contentSnos(*b)) {
+    auto addLeafRow = [&](QTreeWidgetItem* parent, int cs) {
         const auto* c = idx.product(cs);
         const QString cname = c ? (c->title.isEmpty() ? c->name : c->title)
                                 : QStringLiteral("product %1").arg(cs);
-        const int kind = c ? int(c->kind) : int(StoreProductIndex::None);
-        QTreeWidgetItem*& g = groups[kind];
-        if (!g) {
-            g = new QTreeWidgetItem(m_contents,
-                    QStringList{StoreProductIndex::kindLabel(StoreProductIndex::Kind(kind))});
-            g->setFirstColumnSpanned(true);
-            g->setExpanded(true);
-        }
         // payloadNameOf, not payloadName: a CASC-recovered product carries only a sno, and the
         // RESOLVES TO column was computed through the resolver — so showing the raw field here
         // produced rows reading "  →  2 appearances" with nothing in front of the arrow.
         const QString pname = c ? payloadNameOf(*c) : QString();
-        auto* row = new QTreeWidgetItem(g, QStringList{
+        auto* row = new QTreeWidgetItem(parent, QStringList{
             cname, c ? c->slot : QString(), QString::number(cs), pname});
         row->setData(0, Qt::UserRole, cs);
         // No icon here on purpose: the strip above already shows every item's art, and repeating
@@ -2270,6 +2799,34 @@ void CatalogueTab::showBundle(int sno)
                                       .arg(pname).arg(n)
                                       .arg(n == 1 ? QString() : QStringLiteral("s")));
         }
+    };
+    for (int cs : ProductContents::contentSnos(*b)) {
+        const auto* c = idx.product(cs);
+        if (c && ProductContents::isContainer(*c)) {
+            // A set, not an item. Its own name heads the group; SLOT stays blank because a set of
+            // five pieces does not have one, and claiming "Helm" was the whole complaint.
+            const QString setName = c->title.isEmpty() ? c->name : c->title;
+            QVector<int> leaves;
+            QSet<int> seen;
+            ProductContents::collectLeafContents(idx, cs, leaves, seen, 0);
+            auto* g = new QTreeWidgetItem(m_contents, QStringList{
+                setName, QString(), QString::number(cs),
+                QStringLiteral("%1 piece%2").arg(leaves.size())
+                                            .arg(leaves.size() == 1 ? QString() : QStringLiteral("s"))});
+            g->setData(0, Qt::UserRole, cs);   // still a product row: the menu can act on the set
+            g->setExpanded(true);
+            for (int ls : leaves) addLeafRow(g, ls);
+            continue;
+        }
+        const int kind = c ? int(c->kind) : int(StoreProductIndex::None);
+        QTreeWidgetItem*& g = groups[kind];
+        if (!g) {
+            g = new QTreeWidgetItem(m_contents,
+                    QStringList{StoreProductIndex::kindLabel(StoreProductIndex::Kind(kind))});
+            g->setFirstColumnSpanned(true);
+            g->setExpanded(true);
+        }
+        addLeafRow(g, cs);
     }
     // ── Bundle images, as their own branch ──────────────────────────────────────────────────────
     // The shop art was counted in the status line and written by the exporter, but never listed —
@@ -2318,14 +2875,22 @@ QVector<QPair<int, QString>> CatalogueTab::shopTextures(const QString& bundleNam
         const auto it = m_texByName.constFind(w.toLower());
         if (it != m_texByName.constEnd()) out.append(it.value());
     }
+    // Then whatever the templates could not have known to ask for. Appended, never inserted, so
+    // the order above stays the contract and a product that resolved before resolves identically;
+    // this only adds art that was previously invisible - a new season's prefix, most of all.
+    QSet<int> seen;
+    for (const auto& t : out) seen.insert(t.first);
+    for (const auto& t : derivedArt(bundleName))
+        if (!seen.contains(t.first)) { seen.insert(t.first); out.append(t); }
     return out;
 }
 
-QImage CatalogueTab::largestFrame(int sno, const QString& name) const
+QImage CatalogueTab::largestFrame(int sno, const QString& name, int* frameCount) const
 {
     const QImage full = decodeTexture(sno, name);
     if (full.isNull()) return full;
     const TexMeta meta = TexturesTab::texMetaFor(m_reader, Config::d4dataDir(), name, sno);
+    if (frameCount) *frameCount = int(meta.frames.size());
     if (meta.frames.size() < 2) return full;   // single-frame art is the picture
     // Biggest frame by area. On the card sheet that is one of the two full portrait cards rather
     // than a badge; picking frame 0 blindly would sometimes land on a 200px sticker.
@@ -2341,6 +2906,98 @@ QImage CatalogueTab::largestFrame(int sno, const QString& name) const
                   qRound((best->v1 - best->v0) * full.height()));
     const QRect clipped = r.intersected(full.rect());
     return clipped.isEmpty() ? full : full.copy(clipped);
+}
+
+// ── Finding shop art without knowing what it will be called ─────────────────────────────────────
+//
+// uiArtCandidates spells out the filenames shop art is expected to have. That list is a guess, and
+// the measurements say the game has already outgrown it: across the catalogue the prefixes in use
+// include 2DUI_Bundle_, 2DInventory_Bundle_, 2DUI_, 2DInventory_, 2DUI_Bundle_AddOn_,
+// 2DInventory_Catalog_, 2DUI_RL_S08_, 2DUI_S12_, 2DUI_BP_S13_ and even a misspelled 2DUIBundle_.
+// Four of those are in the list. A season that invents 2DUI_S17_ blanks its own products until
+// somebody ships a new build - which is exactly the dependency this is meant to remove.
+//
+// So the art is found STRUCTURALLY instead:
+//
+//   * the product's name must appear in the texture's name as a whole TOKEN SPAN - "stor001" never
+//     matches "stor0010", because tokens are compared, not characters;
+//   * that span must be PRECEDED by at least one token. Shop art is <prefix>_<product>; a material
+//     map is <product>_color / <product>_ao / <product>_BDY_normal, product first. That one rule
+//     removes every material map without naming a single channel;
+//   * and the texture must be one IconIndex treats as an ATLAS - something the UI draws sprites
+//     out of. That removes the VFX colour gradients and portal core maps that survive the first
+//     two rules, again without naming any of them.
+//
+// Measured against the template list: same 948 rows, plus 9 the templates cannot reach, and no row
+// lost. The 9 are the seasonal prefixes above - the shape of every future miss.
+//
+// This EXTENDS the template list rather than replacing it. The templates encode a useful ordering
+// (the plain tile before _background before _WebImage) and resolve 3 rows whose art is not an
+// atlas, so they stay the first answer and this is the fallback.
+void CatalogueTab::ensureDerivedArt() const
+{
+    if (m_derivedArtBuilt || !m_index) return;
+    const auto& idx = StoreProductIndex::instance();
+    const IconIndex& ii = IconIndex::instance();
+    // Both must be up: without products there is nothing to key on, and without the icon index
+    // every candidate would fail the atlas test and the empty result would latch.
+    if (!idx.ready() || !ii.ready()) return;
+    const QVector<SnoEntry>& texs = m_index->entries(kTextureGroup());
+    if (texs.isEmpty()) return;
+
+    // Product stems to look for. Every product, not just the rows on screen: a child's art is
+    // reachable from the contents pane and the exporter.
+    QSet<QString> stems;
+    auto addStem = [&](int sno) {
+        if (const auto* p = idx.product(sno)) {
+            QString bare = p->name;
+            if (bare.startsWith(QLatin1String("Bundle_"), Qt::CaseInsensitive)) bare = bare.mid(7);
+            // A one-token stem would match far too much ("stor" appears in thousands of names).
+            if (bare.count(QLatin1Char('_')) >= 1) stems.insert(bare.toLower());
+        }
+    };
+    for (int s : idx.bundles()) {
+        addStem(s);
+        if (const auto* p = idx.product(s)) for (int k : p->children) addStem(k);
+    }
+    for (int s : idx.loose())  addStem(s);
+    for (int s : idx.locked()) addStem(s);
+    if (stems.isEmpty()) return;
+
+    m_derivedArtBuilt = true;
+    for (const SnoEntry& e : texs) {
+        if (!ii.isAtlas(e.snoId)) continue;          // not UI art: a material map or a VFX gradient
+        const QString low = e.name.toLower();
+        const QStringList tk = low.split(QLatin1Char('_'), Qt::SkipEmptyParts);
+        // From 1, never 0 - the product name must be PRECEDED by a prefix. This is the whole
+        // material-map filter, and it costs nothing.
+        for (int i = 1; i < tk.size(); ++i) {
+            QString span = tk.at(i);
+            for (int j = i + 1; j <= tk.size(); ++j) {
+                if (stems.contains(span)) m_artByProduct[span].append({ e.snoId, e.name });
+                if (j == tk.size()) break;
+                span += QLatin1Char('_') + tk.at(j);
+            }
+        }
+    }
+    // Shortest name first: the plain tile before _background and _WebImage, which is the same
+    // preference the template order encodes. Name as the tiebreak so the choice is stable between
+    // runs rather than depending on the order the SNO group happened to be read in.
+    for (auto it = m_artByProduct.begin(); it != m_artByProduct.end(); ++it)
+        std::sort(it.value().begin(), it.value().end(),
+                  [](const QPair<int, QString>& a, const QPair<int, QString>& b) {
+                      if (a.second.size() != b.second.size()) return a.second.size() < b.second.size();
+                      return a.second.compare(b.second, Qt::CaseInsensitive) < 0;
+                  });
+}
+
+QVector<QPair<int, QString>> CatalogueTab::derivedArt(const QString& productName) const
+{
+    ensureDerivedArt();
+    if (!m_derivedArtBuilt) return {};
+    QString bare = productName;
+    if (bare.startsWith(QLatin1String("Bundle_"), Qt::CaseInsensitive)) bare = bare.mid(7);
+    return m_artByProduct.value(bare.toLower());
 }
 
 QImage CatalogueTab::heroImage(const QString& bundleName) const
@@ -2365,10 +3022,14 @@ QImage CatalogueTab::heroImage(const QString& bundleName) const
     return {};
 }
 
-QImage CatalogueTab::cardImage(const QString& bundleName) const
+QImage CatalogueTab::cardImage(const QString& bundleName, bool* arbitraryFrame) const
 {
+    if (arbitraryFrame) *arbitraryFrame = false;
     QString bare = bundleName;
     if (bare.startsWith(QLatin1String("Bundle_"), Qt::CaseInsensitive)) bare = bare.mid(7);
+    // 2DUI_Bundle_<name> is the product's OWN card sheet - named for it, and holding its card and
+    // that card's hover variant. Whatever largestFrame returns from it is a picture OF the product,
+    // so this branch is never arbitrary.
     const auto it = m_texByName.constFind((QStringLiteral("2DUI_Bundle_") + bare).toLower());
     if (it != m_texByName.constEnd()) {
         const QImage img = largestFrame(it.value().first, it.value().second);
@@ -2378,15 +3039,340 @@ QImage CatalogueTab::cardImage(const QString& bundleName) const
     // single-item product it IS the icon. Both infix forms, because a loose or Catalog_* product
     // is named without the Bundle_ that the first lookup assumes - 2DInventory_Catalog_S12_IP_Collab
     // is the game's own name for the DOOM weapon icons and has no Bundle_ anywhere in it.
+    // _icons LAST, and present at all because uiArtCandidates() - which backs the detail pane and
+    // the "Has icon" filter - has always known these two templates while this function did not.
+    // A product whose only art is 2DUI_Bundle_<name>_icons therefore passed the filter, took a row
+    // in the list, and drew blank. Exactly one product is in that position today
+    // (Bundle_TPortals_stor001), which is why it went unnoticed; the defect is that two functions
+    // disagreed about where shop art lives, not the size of today's symptom. Appended rather than
+    // inserted, so nothing that resolved before resolves differently now.
     for (const QString& n : { QStringLiteral("2DInventory_Bundle_") + bare,
                               QStringLiteral("2DInventory_") + bare,
-                              QStringLiteral("2DUI_") + bare }) {
+                              QStringLiteral("2DUI_") + bare,
+                              QStringLiteral("2DUI_Bundle_") + bare + QStringLiteral("_icons"),
+                              QStringLiteral("2DUI_") + bare + QStringLiteral("_icons") }) {
         const auto inv = m_texByName.constFind(n.toLower());
         if (inv == m_texByName.constEnd()) continue;
-        const QImage img = largestFrame(inv.value().first, inv.value().second);
-        if (!img.isNull()) return img;
+        int nFrames = 0;
+        const QImage img = largestFrame(inv.value().first, inv.value().second, &nFrames);
+        if (img.isNull()) continue;
+        // ── When "the biggest frame" stops being an answer ──────────────────────────────────────
+        // A 2DInventory_ sheet is the per-ITEM icon sheet: for a single-item product it genuinely
+        // IS the icon, which is why this fallback exists. For a pack it is a sheet of the pack's
+        // CONTENTS, and picking the largest frame picks one piece by area - an accident of the
+        // sheet's layout, not a decision the game made.
+        //
+        // Measured: Catalog_BattlePass_015_armor has no 2DUI_ art at all, so it lands here on a
+        // 121-frame sheet covering the whole battle pass, where one frame is 150x225 among a sea
+        // of 120x180 - so the row shows that one piece and nothing else. 70 rows are in this
+        // position, and 55 of them have their own authored art going unused.
+        //
+        // Reported rather than suppressed: for the single-item products this fallback was built
+        // for, the frame IS the answer, and the caller is the one that knows whether it has a
+        // better option.
+        if (arbitraryFrame && nFrames > 2) *arbitraryFrame = true;
+        return img;
+    }
+    // Nothing the templates name exists. Anything the data itself associates with this product is
+    // still better than a blank tile - and for a product whose prefix postdates the template list,
+    // this is the ONLY route that can find its art.
+    for (const auto& t : derivedArt(bundleName)) {
+        int nFrames = 0;
+        const QImage img = largestFrame(t.first, t.second, &nFrames);
+        if (img.isNull()) continue;
+        if (arbitraryFrame && nFrames > 2) *arbitraryFrame = true;
+        return img;
     }
     return {};
+}
+
+// ── Which art handle is this product's OWN? ─────────────────────────────────────────────────────
+//
+// Product::art is twelve authored fields flattened in a fixed order with zeros skipped, and the
+// index does not record which field each surviving handle came from - so the first entry is
+// whichever of hSplashImage / hConfirmImage / hCategoryIcon happened to be non-zero, and those are
+// art a whole class or promo family shares by design.
+//
+// MEASURED, not assumed. Taking the first renderable handle scores 0.47 distinct handles per row
+// across the catalogue, with 123 rows landing on one image and five more on 82-85 each. A grid of
+// 31 identical Barbarian banners is WORSE than 31 blanks: a blank reads as missing data, a wrong
+// picture reads as correct data. That is why the strip's own comment records the same failure -
+// "a row of identical class symbols instead of the actual pieces".
+//
+// The field identity is unavailable, but it turns out not to be needed: a shared banner is
+// identifiable by BEING shared. Counting how many products carry each handle separates the two
+// without knowing which field either came from, and it keeps working when a patch introduces a
+// banner nobody anticipated - which a hardcoded field preference would not.
+// Bundle_HArmor_bar_stor276 carries 3712417547 (on 204 products) and 3461930798 (on exactly one);
+// the second is the bundle's own card.
+//
+// ONLY A UNIQUE HANDLE IS ACCEPTED. "Least-shared" was measured too and is not good enough - 0.64
+// distinct per row, still 71 rows on one image. Unique-only is 1.00 by construction: 1,157 rows,
+// 1,157 different pictures, and it fills 323 rows that are blank today. The rows it declines stay
+// blank, which is the honest outcome for a product whose only art is its family's.
+//
+// Order is cardArt first, then art: arCardArtVariants is the shop's own card image, which is what
+// a grid tile is. Both are then filtered by uniqueness, so the order decides only WHICH of a
+// product's own images is used, never whether a shared one slips through.
+void CatalogueTab::ensureArtOwnership() const
+{
+    if (m_artUsesBuilt) return;
+    const auto& idx = StoreProductIndex::instance();
+    // An empty index is a "not yet", not an answer - the same trap ensureNameMaps fell into, where
+    // latching on entry left every lookup permanently wrong for the rest of the session.
+    if (!idx.ready()) return;
+
+    // EVERY product, children included. A banner shared between a bundle and its children must
+    // count as shared; counting only the rows on screen would let a two-product banner look unique.
+    QSet<int> all;
+    for (int s : idx.bundles()) {
+        all.insert(s);
+        if (const auto* p = idx.product(s))
+            for (int k : p->children) all.insert(k);
+    }
+    for (int s : idx.loose())  all.insert(s);
+    for (int s : idx.locked()) all.insert(s);
+    if (all.isEmpty()) return;   // still building; try again next tick rather than latching
+
+    for (int s : all) {
+        const auto* p = idx.product(s);
+        if (!p) continue;
+        for (quint32 h : p->cardArt) if (h) ++m_artUses[h];
+        for (quint32 h : p->art)     if (h) ++m_artUses[h];
+    }
+    m_artUsesBuilt = true;
+}
+
+quint32 CatalogueTab::ownArtHandle(const StoreProductIndex::Product& b) const
+{
+    ensureArtOwnership();
+    if (!m_artUsesBuilt) return 0;
+    const IconIndex& ii = IconIndex::instance();
+    for (const QVector<quint32>* list : { &b.cardArt, &b.art })
+        for (quint32 h : *list) {
+            if (!h || m_artUses.value(h) != 1) continue;   // shared: a banner, not this product's
+            // has() is a pure lookup into the immutable frame table - no decode, no atlas cache -
+            // so a product with no frame for its handle costs nothing and falls through to 0.
+            if (ii.has(h)) return h;
+        }
+    return 0;
+}
+
+// ── Route 3: the icon of what the product CONTAINS ──────────────────────────────────────────────
+//
+// A shop bundle's own record often carries nothing but its class banner - Bundle_HArmor_bar_stor277
+// has exactly one art handle and 203 other products share it. Measured across the catalogue, 810
+// rows are in that position: real products, with art, none of it their own. ownArtHandle correctly
+// declines all of them, which leaves them blank.
+//
+// But a bundle is not only its own record. Its CHILDREN are transmog items, and those have genuine
+// per-piece icons - 11,516 appearances resolving to 10,168 distinct handles. Showing the chest
+// piece on the row that sells the chest piece is both the obvious thing and what the item strip
+// beside it has always done. Measured gain: 475 more rows, 393 distinct images, and Season 15 goes
+// from 44 blank rows to 4.
+//
+// Route order is deliberate and is the order of decreasing specificity: art named after this exact
+// product, then art authored on this exact product, then the icon of its first content. Nothing
+// here overrides a more specific answer that already succeeded.
+//
+// contentSnos() is what makes a loose product work unchanged: it answers "its contents are itself",
+// so a single mount or weapon resolves its own appearance rather than being skipped for having no
+// children.
+quint32 CatalogueTab::contentIconHandle(const StoreProductIndex::Product& b) const
+{
+    const auto cached = m_contentIcon.constFind(b.sno);
+    if (cached != m_contentIcon.constEnd()) return cached.value();
+    // NOT cached when the indexes are not ready: a 0 written now would be a "not yet" frozen into
+    // a permanent "no". Same trap ensureNameMaps documents.
+    const AppearanceMeta& am = AppearanceMeta::instance();
+    // IconIndex too, and it is the one that matters: the decision below is `ii.has(h)`, so with the
+    // icons still building EVERY handle fails, `found` stays 0, and that 0 is memoised for the
+    // session. The filter calls this per keystroke, so typing before the icons land would poison
+    // the cache for every product typed past. portraitIconHandle already guards on both; these two
+    // siblings must not disagree about what "ready" means.
+    if (!am.ready() || !IconIndex::instance().ready() || !m_index) return 0;
+
+    const auto& idx = StoreProductIndex::instance();
+    const IconIndex& ii = IconIndex::instance();
+    quint32 found = 0;
+    for (int cs : ProductContents::contentSnos(b)) {
+        const auto* c = idx.product(cs);
+        if (!c) continue;
+        const QString pn = payloadNameOf(*c);
+        if (pn.isEmpty()) continue;
+        // appearancesForProduct, not appearancesFor. appearancesFor is rule 1 ALONE — the armour
+        // convention, which matches helm|chest|gloves|pants|boots and nothing else — so every
+        // weapon, mount, trophy and companion fell straight through this route and the grid drew
+        // them blank, while the STRIP beside it resolved them fine because it had already been
+        // moved onto the shared resolver. The same divergence, in the same tab, one function apart.
+        for (const auto& a : appearancesForProduct(pn)) {
+            const quint32 h = am.iconFor(a.first);
+            // has() only - a pure frame-table lookup. Decoding here would put an atlas read on the
+            // "Has icon" filter's per-keystroke path.
+            if (h && ii.has(h)) { found = h; break; }
+        }
+        if (found) break;
+    }
+    m_contentIcon.insert(b.sno, found);
+    return found;
+}
+
+int CatalogueTab::firstContentAppearance(const StoreProductIndex::Product& b) const
+{
+    if (!AppearanceMeta::instance().ready() || !m_index) return 0;
+    const auto& idx = StoreProductIndex::instance();
+    for (int cs : ProductContents::contentSnos(b)) {
+        const auto* c = idx.product(cs);
+        if (!c) continue;
+        const QString pn = payloadNameOf(*c);
+        if (pn.isEmpty()) continue;
+        const auto apps = appearancesForProduct(pn);   // same rule as the icon above
+        if (!apps.isEmpty()) return apps.first().first;
+    }
+    return 0;
+}
+
+// ── Why is this row blank? ──────────────────────────────────────────────────────────────────────
+// Every failure this tab has had was silent, and a blank tile is the most silent of all: "no art
+// exists", "the record is encrypted" and "the tool cannot find it" look identical on screen, and
+// only the last is a bug. Measured over the catalogue, the blanks are 1,433 encrypted records,
+// 341 products that author no art of their own, and 317 with no art handles at all - three
+// different facts wearing one face.
+//
+// Encrypted rows are skipped here because their second line already says so; repeating it would
+// just make the tooltip longer than the answer.
+QString CatalogueTab::noArtReason(const StoreProductIndex::Product& b) const
+{
+    if (b.encrypted) return {};
+    const bool anyHandle = std::any_of(b.art.cbegin(), b.art.cend(), [](quint32 h) { return h != 0; })
+                        || std::any_of(b.cardArt.cbegin(), b.cardArt.cend(), [](quint32 h) { return h != 0; });
+    if (!anyHandle)
+        return QStringLiteral("No shop art is authored for this product, none is named after it, "
+                              "and its payload actor carries no portrait either.");
+    // It has art, but ownArtHandle declined all of it - every handle is carried by other products
+    // too. Naming the sharing count is what separates "the tool lost it" from "there is nothing
+    // here that belongs to this row".
+    ensureArtOwnership();
+    int worst = 0;
+    for (const QVector<quint32>* list : { &b.cardArt, &b.art })
+        for (quint32 h : *list)
+            if (h) worst = qMax(worst, m_artUses.value(h));
+    if (worst > 1)
+        return QStringLiteral("This product authors no art of its own - its only images are shared "
+                              "with %1 other products, so showing one here would show another "
+                              "product's picture.").arg(worst - 1);
+    return QStringLiteral("Its art handles resolve to no icon frame in this build.");
+}
+
+// ── The last thumbnail route: the payload actor's portrait ──────────────────────────────────────
+//
+// Measured, 317 rows reach the end of the other three routes with no art handles at all: loose
+// companions and mount trophies - cmp_base000_bearLarge, mnt_uniq48_trophy - whose product record
+// authors no imagery of any kind. They are not empty, though. They have a payload, that payload is
+// an actor, and an actor carries hPortraitImage. The item strip has resolved headstones that way
+// since it was written; the grid simply never asked.
+//
+// Last on purpose. A portrait is a picture OF the thing rather than the shop's picture of the
+// product, so it loses to anything more specific - and it is the only route that touches the disk,
+// one actor file per product, which is why it runs only where the other three have already failed.
+//
+// Memoised per product, 0 included: a product with no portrait must not re-open the file on every
+// scroll tick. Not cached before the indexes are up, for the same reason contentIconHandle is not -
+// a 0 written too early would freeze as a permanent "no".
+// The row's leaf contents, memoised. ProductContents::leafContentSnos is a recursive descent that
+// allocates a vector and a visited set per call; the filter chain asks it per row per keystroke
+// across four filters and the search haystack, which is 3,837 descents five times over for one
+// typed character. Keyed on the product sno and dropped with the rest in reset().
+//
+// Returns a reference into the cache: the callers all just iterate it, and copying a 50-entry
+// vector per row per filter is the cost this exists to avoid.
+const QVector<int>& CatalogueTab::leafSnosOf(const StoreProductIndex::Product& b) const
+{
+    const auto it = m_leafSnos.constFind(b.sno);
+    if (it != m_leafSnos.constEnd()) return it.value();
+    return *m_leafSnos.insert(b.sno,
+                              ProductContents::leafContentSnos(StoreProductIndex::instance(), b));
+}
+
+// Every OTHER product that reaches this one's payload asset. soldIn is keyed on the ASSET - the
+// Item or Actor sno a product points at - so two bundles selling the same helmet both appear
+// against that helmet's item, which is exactly the question. The row's own product and the bundle
+// being viewed are dropped: naming them would be answering "where else" with "here".
+QVector<int> CatalogueTab::alsoSoldIn(int productSno) const
+{
+    const auto& idx = StoreProductIndex::instance();
+    const auto* c = idx.product(productSno);
+    if (!c || c->payloadSno <= 0) return {};
+    QVector<int> out;
+    QSet<int> seen{ productSno, m_curBundle };
+    for (int ps : idx.soldIn(c->payloadSno)) {
+        if (seen.contains(ps)) continue;
+        seen.insert(ps);
+        out.append(ps);
+    }
+    // Sorted by title, so a long list reads as a list rather than as whatever order the graph was
+    // inverted in - QHash order, which Qt6 randomises per process.
+    std::sort(out.begin(), out.end(), [&idx](int a, int b) {
+        const auto* pa = idx.product(a);
+        const auto* pb = idx.product(b);
+        if (!pa || !pb) return pa != nullptr;
+        const QString ta = pa->title.isEmpty() ? pa->name : pa->title;
+        const QString tb = pb->title.isEmpty() ? pb->name : pb->title;
+        const int k = ta.compare(tb, Qt::CaseInsensitive);
+        return k != 0 ? k < 0 : a < b;
+    });
+    return out;
+}
+
+quint32 CatalogueTab::portraitIconHandle(const StoreProductIndex::Product& b) const
+{
+    const auto cached = m_portraitIcon.constFind(b.sno);
+    if (cached != m_portraitIcon.constEnd()) return cached.value();
+    if (!StoreProductIndex::instance().ready() || !IconIndex::instance().ready()) return 0;
+
+    const auto& idx = StoreProductIndex::instance();
+    const IconIndex& ii = IconIndex::instance();
+    quint32 found = 0;
+    // contentSnos, so a loose product asks about ITSELF - which is the whole population this route
+    // exists for - while a bundle asks about what it contains.
+    for (int cs : ProductContents::contentSnos(b)) {
+        const auto* c = idx.product(cs);
+        if (!c) continue;
+        const quint32 h = portraitFor(payloadNameOf(*c));
+        if (h && ii.has(h)) { found = h; break; }
+    }
+    m_portraitIcon.insert(b.sno, found);
+    return found;
+}
+
+// Put the bundle's own hero art back after a bundle image has been previewed. Called from the row
+// menu; cheap, because showBundle's work is already done and only the pane needs rewriting.
+void CatalogueTab::showHeroArt()
+{
+    if (!m_art || m_curBundle <= 0) return;
+    const auto* b = StoreProductIndex::instance().product(m_curBundle);
+    if (!b) return;
+    QImage hero = heroImage(b->name);
+    bool isCard = false;
+    if (hero.isNull()) { hero = cardImage(b->name); isCard = !hero.isNull(); }
+    if (hero.isNull())
+        for (quint32 h : b->cardArt)
+            if (!(hero = IconIndex::instance().iconImage(h, m_reader)).isNull()) break;
+    if (hero.isNull())
+        if (const quint32 h = ownArtHandle(*b))
+            hero = IconIndex::instance().iconImage(h, m_reader);
+    m_artTex  = 0;
+    m_artName = isCard ? QStringLiteral("card art") : QStringLiteral("hero art");
+    // The pane is driven by currentItemChanged, so leaving the image row current would make
+    // clicking it again emit nothing and the picture unrecoverable. Clearing it means the next
+    // click on that row is a real change.
+    if (m_contents) m_contents->setCurrentItem(nullptr);
+    if (hero.isNull()) {
+        m_art->clear();
+        m_art->setPlaceholder(QStringLiteral("(no shop art resolved)"));
+    } else {
+        m_art->setImage(hero, m_artName);
+    }
 }
 
 QImage CatalogueTab::decodeTexture(int sno, const QString& name) const
@@ -2411,7 +3397,12 @@ void CatalogueTab::renderVisibleThumbs()
     // Do NOT run before the SNO index has entries. shopTextures would return empty for every
     // bundle, each would be cached as a null "tried and failed", and nothing short of reset()
     // would ever retry — the whole catalogue permanently art-less because of one early tick.
-    if (m_texByName.isEmpty()) return;
+    // RE-ARMED, not abandoned. This used to be a bare return, so a tick that landed before the SNO
+    // index had entries ended the thumbnail pass for good: nothing re-arms the timer except a
+    // scroll or a list rebuild, which is exactly why "the icons only appear after I toggle grid
+    // view" - toggling calls setThumbPx, which starts the timer again. The guard was right; ending
+    // the pass was not.
+    if (m_texByName.isEmpty()) { m_thumbTimer->start(400); return; }
     // The first call into MaterialDecode with no .tex.json builds TextureDefTable: a 34 MB read
     // and a 141k-record parse, HELD UNDER ITS MUTEX. On the GUI thread that is a multi-second
     // freeze on the first scroll. refresh() warms it on a worker; until then, wait rather than
@@ -2430,20 +3421,56 @@ void CatalogueTab::renderVisibleThumbs()
     }
 
     const QRect vp = m_list->viewport()->rect();
-    if (vp.isEmpty()) return;   // tab not shown yet — nothing is visible to fill
-    // Visibility is tested per item rather than by probing for a first/last row. IconMode lays out
-    // from (spacing, spacing) with the same gutter between rows, so a probe at y=2 lands in that
-    // gutter whenever a gap sits at the top of the viewport; the probe then failed, `first` fell
-    // back to 0, and the whole decode budget went on rows ABOVE the viewport — re-armed forever,
-    // and restarted from scratch by every Ctrl+wheel because the zoom clears the cache.
+    // Re-armed for the same reason as the guard above: a tick that arrives before the tab has been
+    // shown has nothing to fill, but it must not be the LAST tick.
+    if (vp.isEmpty()) { m_thumbTimer->start(400); return; }
+    const int count = m_list->count();
+    if (count <= 0) return;
+
+    // ── Finding the first visible row ───────────────────────────────────────────────────────────
+    // BINARY SEARCH, not a linear scan and not a hit test.
+    //
+    // The hit test came first and was wrong: IconMode lays out from (spacing, spacing) with the
+    // same gutter between rows, so a probe at y=2 lands in that gutter whenever a gap sits at the
+    // top of the viewport. indexAt then returned an invalid index, `first` fell back to 0, and the
+    // entire decode budget went on rows ABOVE the viewport, re-armed forever.
+    //
+    // The scan that replaced it was correct but O(n): it asked visualItemRect for EVERY item above
+    // the viewport before reaching a visible one. Scrolled to the end of a 3,837-row grid that is
+    // ~3,800 rect queries per tick, the timer re-arms while work remains, and every scroll stop
+    // pays it several times over. That is the "scrolling is extremely slow in grid view".
+    //
+    // Binary search is exact where the hit test was not, because it never asks what lies at a
+    // point - a gutter cannot make "is this item's bottom at or past the viewport top" ambiguous.
+    // It is valid because that predicate is monotonic in the item index: both ListMode and
+    // IconMode flow top-to-bottom, so bottom() is non-decreasing as the index grows (items sharing
+    // a grid row share a bottom, which keeps it non-decreasing rather than strictly increasing).
+    int first = count;
+    for (int lo = 0, hi = count - 1; lo <= hi; ) {
+        const int mid = lo + (hi - lo) / 2;
+        const QListWidgetItem* mi = m_list->item(mid);
+        if (mi && m_list->visualItemRect(mi).bottom() >= vp.top()) { first = mid; hi = mid - 1; }
+        else                                                        lo = mid + 1;
+    }
+
+    // Routes 2 and 3 read indexes that finish LATER than the texture names do. Until both are up,
+    // a row that resolves nothing has not been fully tried, and caching that as "no art" would
+    // latch it blank for the rest of the session - the same trap the guard above documents, one
+    // level further down. Such a row is left uncached and retried instead.
+    // IconIndex included: all three fallback routes end in ii.has(), and the render itself is
+    // iconImage(). Without it a tick that lands while the icons are still building writes a null
+    // into m_thumbs and freezes the tile - the precise thing the comment below says it prevents.
+    const bool routesReady = StoreProductIndex::instance().ready()
+                          && AppearanceMeta::instance().ready()
+                          && IconIndex::instance().ready();
+
     int budget = 8;   // per tick; the timer re-arms while work remains so the UI never stalls
-    bool more = false;
-    for (int i = 0; i < m_list->count(); ++i) {
+    bool more = false, deferred = false;
+    for (int i = first; i < count; ++i) {
         QListWidgetItem* it = m_list->item(i);
         if (!it) continue;
         const QRect ir = m_list->visualItemRect(it);
-        if (ir.bottom() < vp.top())    continue;   // above the viewport — spend nothing on it
-        if (ir.top()    > vp.bottom()) break;      // below it — everything after is too
+        if (ir.top() > vp.bottom()) break;   // below the viewport — everything after is too
         const int sno = it->data(Qt::UserRole).toInt();
         const auto cached = m_thumbs.constFind(sno);
         if (cached != m_thumbs.constEnd()) {
@@ -2458,22 +3485,71 @@ void CatalogueTab::renderVisibleThumbs()
             // The CARD, cropped out of the sheet — not the sheet. Showing the whole 808x2888
             // atlas scaled to 64px produced a sliver with two thumbnail-sized cards in it, which
             // is what "previews are way too small" was.
-            QImage img = cardImage(b->name);
-            if (img.isNull()) { --budget; img = heroImage(b->name); }
+            bool arbitrary = false;
+            QImage img = cardImage(b->name, &arbitrary);
+            if (img.isNull()) { --budget; img = heroImage(b->name); arbitrary = false; }
+            // ── An arbitrary crop loses to the product's own art ─────────────────────────────────
+            // cardImage reports when all it could find was one frame out of a many-frame inventory
+            // sheet. That frame is a piece of what the product CONTAINS, chosen by area - which is
+            // why a pack of eight class sets showed a single helm. The product's own authored
+            // handle, when it has one no other product shares, is a picture of the product, so it
+            // wins. Routes are ordered by CONFIDENCE here, not by source.
+            //
+            // Only the inventory-sheet fallback is treated this way. 2DUI_Bundle_<name> is the
+            // product's own card sheet, so its crop is a picture of the product and keeps priority.
+            if (arbitrary)
+                if (const quint32 own = ownArtHandle(*b)) {
+                    --budget;
+                    const QImage ic = IconIndex::instance().iconImage(own, m_reader);
+                    if (!ic.isNull()) img = ic;
+                }
             if (!img.isNull())
                 pm = QPixmap::fromImage(img.scaled(m_list->iconSize(), Qt::KeepAspectRatio,
                                                    Qt::SmoothTransformation));
+            // ── Routes 2 and 3, tried only when the name lookup above found nothing ─────────────
+            // Shop art is named after the product, so route 1 can only find art for a product the
+            // game named to match - the classic Bundle_* bundles. Everything else, which is most
+            // of every recent season, drew blank: 948 of 3,837 rows rendered, so three in four
+            // were empty. Those products do have art; the grid simply never asked for it.
+            //
+            // iconImage() is GUI-thread-only (it fills IconIndex's atlas cache) and this is a
+            // timer slot on the widget, so the call is legal here - unlike in IconAudit, which
+            // runs on a worker and is restricted to has()/atlasFor().
+            if (pm.isNull()) {
+                quint32 h = ownArtHandle(*b);           // its own authored art
+                if (!h) h = contentIconHandle(*b);      // else the icon of what it contains
+                if (!h) h = portraitIconHandle(*b);     // else its payload actor's own portrait
+                if (h) {
+                    --budget;   // an atlas decode, the same cost class as a texture above
+                    const QImage ic = IconIndex::instance().iconImage(h, m_reader);
+                    if (!ic.isNull())
+                        pm = QPixmap::fromImage(ic.scaled(m_list->iconSize(), Qt::KeepAspectRatio,
+                                                          Qt::SmoothTransformation));
+                }
+            }
         }
-        // Null is cached too, so a bundle with genuinely no art is tried once rather than once per
-        // scroll. Safe to cache unconditionally BECAUSE of the `m_texByName.isEmpty()` early return
-        // at the top of this function: nothing reaches here until the name maps hold something, so
-        // a null here means "this product has no art", never "the index has not loaded yet". That
-        // distinction is what ensureNameMaps now protects — it no longer latches on an empty
-        // index, so the early return above stops being permanent.
-        m_thumbs.insert(sno, pm);
+        // Null is cached too, so a product with genuinely no art is tried once rather than once
+        // per scroll — but ONLY once every route could actually be tried. The `m_texByName` guard
+        // at the top of this function used to make that unconditional, and it was sufficient while
+        // the name lookup was the only route. It no longer is: ownArtHandle needs
+        // StoreProductIndex and contentIconHandle needs AppearanceMeta, both of which finish after
+        // the SNO names do. Caching a null while either was still building would freeze a blank
+        // tile for the rest of the session, and the row would come back only on a reset() — the
+        // precise failure the comment above was written about, reintroduced one level down.
+        if (!pm.isNull() || routesReady) m_thumbs.insert(sno, pm);
+        else                             deferred = true;
         if (!pm.isNull()) it->setIcon(QIcon(pm));
+        // State the reason the moment it is decided, not before. Reached once per row, because
+        // this branch runs only on a cache miss.
+        else if (b && routesReady) {
+            const QString why = noArtReason(*b);
+            if (!why.isEmpty()) it->setToolTip(it->toolTip() + QStringLiteral("\n\n") + why);
+        }
     }
-    if (more) m_thumbTimer->start();
+    // Work remaining: come straight back. Nothing to do but a route still building: back off, so
+    // waiting for an index costs one tick every 400 ms rather than a spin at 16 Hz.
+    if (more)          m_thumbTimer->start();
+    else if (deferred) m_thumbTimer->start(400);
 }
 
 void CatalogueTab::ensureNameMaps() const
@@ -2782,7 +3858,10 @@ CatalogueTab::Resolved CatalogueTab::resolveBundle(const StoreProductIndex::Prod
     };
 
     QSet<int> seenModel;
-    for (int cs : contentSnos(b)) {
+    // leafContentSnos, not contentSnos: a collection pack's direct children are per-class bundles
+    // with no payload of their own, and stopping there resolved nothing at all. See the note on
+    // collectLeafContents.
+    for (int cs : ProductContents::leafContentSnos(idx, b)) {
         const auto* c = idx.product(cs);
         if (!c) { r.unresolved << QStringLiteral("product %1 (not in index)").arg(cs); continue; }
         for (quint32 h : c->art) addArt(h);
@@ -3219,7 +4298,10 @@ CatalogueTab::Written CatalogueTab::writeBundle(const StoreProductIndex::Product
     // "contents": [] beside a populated "modelsExported" and a models/ folder with the model in it:
     // the exact self-contradiction the manifest exists to prevent. (A locked product's empty
     // contents stay empty and are correct — contentSnos deliberately does not invent one.)
-    for (int cs : contentSnos(bc)) {
+    // leafContentSnos: "modelsExported" comes from `r`, which resolveBundle built from the leaves.
+    // Listing the containers here instead produced a manifest claiming 45 models and 8 contents,
+    // each with an empty payload - the same self-contradiction one nesting level up.
+    for (int cs : ProductContents::leafContentSnos(idx, bc)) {
         const auto* c = idx.product(cs);
         QJsonObject o;
         o.insert(QStringLiteral("sno"), cs);

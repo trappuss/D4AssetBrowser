@@ -577,15 +577,22 @@ if errorlevel 1 (
 )
 
 set "TAG="
-set /p "TAG=  Tag [blank = v!APPVER!]: "
-if not defined TAG set "TAG=v!APPVER!"
+set /p "TAG=  Tag [blank = !APPVER!]: "
+if not defined TAG set "TAG=!APPVER!"
 
-echo !TAG! | findstr /r "^v[0-9]" >nul || (
+:: Every published tag on this repo is a BARE number -- 2.2.9, 2.2.8, 2.2.7 -- so that is
+:: what blank gives you. A leading v is still accepted, because the one v-tag that exists
+:: has to stay re-publishable, but it is never the default. The release workflow matches
+:: both spellings ('v*' and '[0-9]*'), so neither one silently fails to build.
+echo !TAG! | findstr /r "^v*[0-9]" >nul || (
     echo.
-    echo   [X] "!TAG!" does not start with v + a digit. Use v!APPVER!.
+    echo   [X] "!TAG!" does not start with a digit ^(or v + a digit^). Use !APPVER!.
     exit /b 1
 )
-if /i not "!TAG!"=="v!APPVER!" (
+:: Compare without a leading v, so "2.3.0" and "v2.3.0" both count as matching the exe.
+set "TAGNUM=!TAG!"
+if /i "!TAGNUM:~0,1!"=="v" set "TAGNUM=!TAGNUM:~1!"
+if /i not "!TAGNUM!"=="!APPVER!" (
     echo.
     echo   [note] !TAG! does not match the version in the exe ^(!APPVER!^).
     echo       Set the version first with "Release - Set Version.bat".
@@ -713,10 +720,23 @@ REM Branch on the two questions separately rather than building an argument
 REM string: "set VAR=--notes-file "path"" nests quotes inside a quoted SET on a
 REM line that also has to close a block, and cmd does not read that the way it
 REM looks.
-if not exist "!NOTES!" echo   [note] No changelog section for !APPVER! - using generated notes.
+REM EXISTS is not the test. The extractor above has written a ONE-BYTE file at
+REM least once, and "if exist" waved it through - the release went out with an
+REM empty body and the failure was only visible on the website. Anything under
+REM 32 bytes is not a changelog section, so it is discarded and we fall back to
+REM generated notes, which are at least honest about being generated.
+set "NOTESOK="
+if exist "!NOTES!" for %%S in ("!NOTES!") do if %%~zS GTR 32 set "NOTESOK=1"
+if not defined NOTESOK (
+    if exist "!NOTES!" del /q "!NOTES!"
+    echo   [note] No usable changelog section for !APPVER! - using generated notes.
+    echo       If CHANGELOG.md DOES have a "## !APPVER!" section, the extractor
+    echo       failed rather than the file. Write the body by hand and run:
+    echo           gh release edit !TAG! --notes-file "path\to\notes.md"
+)
 gh release view "!TAG!" >nul 2>&1
 if errorlevel 1 (
-    if exist "!NOTES!" (
+    if defined NOTESOK (
         gh release create "!TAG!" "!ZIP!" --title "!TAG!" --notes-file "!NOTES!"
     ) else (
         gh release create "!TAG!" "!ZIP!" --title "!TAG!" --generate-notes
@@ -725,6 +745,12 @@ if errorlevel 1 (
     REM --clobber: re-running after a failed publish must REPLACE the asset, not
     REM error out on a name that is already there.
     gh release upload "!TAG!" "!ZIP!" --clobber
+    REM The release workflow publishes its own release the instant the tag lands,
+    REM so by the time a hand-run gets here the release usually ALREADY EXISTS,
+    REM carrying the workflow's generated notes. Uploading the zip and stopping
+    REM left the changelog off every release that raced this way - 2.3.0 among
+    REM them. Set the body too.
+    if defined NOTESOK gh release edit "!TAG!" --notes-file "!NOTES!"
 )
 if errorlevel 1 (
     echo.

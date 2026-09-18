@@ -1,5 +1,6 @@
 #pragma once
 #include <QHash>
+#include <QSet>
 #include <QImage>
 #include <QObject>
 #include <QString>
@@ -21,6 +22,24 @@ public:
     bool ready() const { return m_ready; }
     bool building() const { return m_building; }
     bool has(quint32 handle) const { return m_frames.contains(handle); }
+    // The atlas texture sno a handle's frame sits on, or 0 when the handle is not indexed.
+    //
+    // Same immutable table has() reads, so it is safe from ANY thread once ready() — unlike
+    // iconImage(), which touches m_atlasCache and is GUI-thread-only. That distinction is why the
+    // icon audit, which runs on a worker, may call this and must never call iconImage().
+    //
+    // It exists so a diagnostic can say WHICH atlas a blank icon belongs to: one dead atlas takes
+    // out every icon on it at once, and a report that groups failures by atlas turns hundreds of
+    // blank rows into one line naming the cause.
+    int  atlasFor(quint32 handle) const;
+    // Is this group-44 texture one the icon index treats as an ATLAS - i.e. something the UI
+    // draws sprites out of, rather than a material map or a VFX gradient? A pure lookup into an
+    // immutable set, so it is safe from any thread once ready(), like has() and atlasFor().
+    //
+    // Exists because it is the only NAME-FREE way to ask "is this texture UI art". The Catalogue
+    // used to answer that with a hardcoded list of filename prefixes, which the game outgrows
+    // every season (2DUI_S12_, 2DUI_BP_S13_, 2DUI_RL_S08_ are all real and none were in it).
+    bool isAtlas(int sno) const;
 
     // Build (or load from cache) on a background thread. No-op if ready/in-progress.
     //
@@ -54,6 +73,8 @@ private:
     void install(QHash<quint32, Frame> frames);
 
     QHash<quint32, Frame> m_frames;
+    // Every distinct atlasSno in m_frames. Derived in install(), never stored - see isAtlas().
+    QSet<int> m_atlasSnos;
     // Decoded-atlas cache so many icons sharing one atlas decode it once. Used only
     // from the GUI thread (icon painting), so no locking. Capped to a few atlases.
     mutable QHash<int, QImage> m_atlasCache;

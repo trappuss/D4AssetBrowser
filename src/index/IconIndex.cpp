@@ -38,9 +38,22 @@ IconIndex& IconIndex::instance()
 void IconIndex::install(QHash<quint32, Frame> frames)
 {
     m_frames = std::move(frames);
+    // Derived here, once, so isAtlas() is a lookup rather than a scan of the frame table - it is
+    // asked per candidate texture while the Catalogue builds its name index, which is tens of
+    // thousands of calls. Built alongside m_frames and cleared with it, so the two can never
+    // disagree about what this build contains.
+    m_atlasSnos.clear();
+    m_atlasSnos.reserve(m_frames.size());
+    for (auto it = m_frames.constBegin(); it != m_frames.constEnd(); ++it)
+        if (it.value().atlasSno) m_atlasSnos.insert(it.value().atlasSno);
     m_building = false;
     m_ready = true;
     emit readyChanged();
+}
+
+bool IconIndex::isAtlas(int sno) const
+{
+    return sno > 0 && m_atlasSnos.contains(sno);
 }
 
 void IconIndex::reset()
@@ -48,6 +61,7 @@ void IconIndex::reset()
     m_ready = false;
     m_building = false;   // clear any in-flight build flag, else ensureBuilt() never rebuilds
     m_frames.clear();
+    m_atlasSnos.clear();
     m_atlasCache.clear();
     const QString cachePath = AppPaths::dataDir()
                               + QStringLiteral("/icon_index_v%1.json").arg(kCacheVersion);
@@ -235,6 +249,12 @@ void IconIndex::ensureBuilt(const QString& d4dataDir, CascReader* reader)
             install(frames);
         }, Qt::QueuedConnection);
     }).detach();
+}
+
+int IconIndex::atlasFor(quint32 handle) const
+{
+    const auto it = m_frames.constFind(handle);
+    return it == m_frames.constEnd() ? 0 : it.value().atlasSno;
 }
 
 QImage IconIndex::iconImage(quint32 handle, CascReader* reader) const

@@ -823,7 +823,26 @@ BuildResult crawl(const QString& d4, const SnoIndex* index, CascReader* reader,
     // d4dad is the reference the audit checks against and is refreshed promptly after patches, so
     // this makes the tool match it. Runs LAST + unconditionally (overrides StoreProduct etc.);
     // never blanks an icon (0 handles are skipped).
-    {
+    // ── D4_NO_DAD_FORCE=1 skips this pass ────────────────────────────────────────────────────
+    // The Icon audit compares the tool's handles against diablo4.dad and reports 0 diffs. It
+    // cannot report anything else while this pass runs, because this pass COPIES d4dad's handles
+    // over the tool's own - so the audit is grading a copy of its own reference rather than the
+    // tool's independent derivation. That is a real blind spot: if the binary route silently broke
+    // after a patch, the audit would still read 0.
+    //
+    // Set D4_NO_DAD_FORCE=1 and re-run File > Icon audit and the DIFF count becomes the honest
+    // answer: how many appearances the tool's OWN derivation resolves differently, and the sample
+    // names them. That number is what decides whether the preference should be inverted - the
+    // question cannot be settled by reading the code, because both sides are plausible.
+    //
+    // Default is unchanged. This is an instrument, not a behaviour change: nothing about a normal
+    // run differs, and the cache signature is untouched because the env var is a diagnostic the
+    // user sets deliberately for one run.
+    const bool skipDadForce = qEnvironmentVariableIsSet("D4_NO_DAD_FORCE");
+    if (skipDadForce)
+        qInfo("AppearanceMeta: D4_NO_DAD_FORCE set - diablo4.dad handles are NOT forced; the icon "
+              "audit's DIFF count now measures the tool's own derivation against d4dad");
+    if (!skipDadForce) {
         // The sprite index is kicked off alongside this crawl (the tab calls both ensureBuilt).
         // It's fast, but may still be finishing — wait briefly (bounded) so the sprite preference
         // below is meaningful. Runs on the crawl's background thread, so it never blocks the UI.
@@ -942,9 +961,15 @@ void AppearanceMeta::ensureBuilt(const QString& d4dataDir, const SnoIndex* index
     // The diablo4.dad DB feeds the delta phase, so a refreshed d4dad.json must
     // invalidate this cache even when the game/d4data fingerprint didn't change.
     const QFileInfo dadFi(DadOverride::defaultPath());
-    const QString dadSig = dadFi.exists()
+    QString dadSig = dadFi.exists()
         ? QStringLiteral("%1:%2").arg(dadFi.size()).arg(dadFi.lastModified().toSecsSinceEpoch())
         : QStringLiteral("none");
+    // D4_NO_DAD_FORCE produces DIFFERENT metadata, so it must not share a cache with a normal run.
+    // Folded into the signature rather than guarded at the write: that way the diagnostic run
+    // neither reads nor writes the normal cache, and clearing the variable invalidates itself
+    // automatically. The cost is one rebuild each way, which is the honest price of the answer.
+    if (qEnvironmentVariableIsSet("D4_NO_DAD_FORCE"))
+        dadSig += QStringLiteral("+nodadforce");
     // The game build, because part of this crawl comes from CASC and not from d4data: encrypted
     // appearance names recovered from cloth payloads, and icon handles resolved through the live
     // reader. appCount alone was the only game-side guard, and it is a COUNT — two builds with the

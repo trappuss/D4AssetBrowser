@@ -37,3 +37,27 @@ Attaching that diff to an issue saves a great deal of back-and-forth.
   definitions, so much of this resolves anyway — but names may not.
 - **No name at all.** Encrypted pieces reach the index without one. Cloth-bearing pieces can
   have their name recovered from their cloth data; plain helms, gloves and boots cannot.
+
+**"Unnamed" and "missing" are different**, and the tool labels them differently on purpose.
+Unnamed means the record is there and its name is encrypted — it will usually still render and
+export. Missing means the record is not present at all.
+→ [Glossary](Glossary#words-this-project-uses-in-a-specific-way)
+
+## Why the snapshot always lags, and why that is survivable
+
+The community snapshot is a decoded dump of the game's meta records. It is produced after a
+build ships, so there is always a window where the game has content it does not describe —
+and that window is exactly where new seasonal and collaboration content lives.
+
+The tool's answer is to **fail closed rather than substitute**: where the snapshot has nothing,
+it reads the game's own binary tables for appearances, materials, texture definitions and body
+markings, and where even that cannot answer, it says so rather than showing a plausible
+stand-in. That is why a Catalogue bundle can appear with its assets intact but its shop text
+replaced by *"read from game files — no shop text in this snapshot"* — the models are real, the
+marketing copy simply is not in the game files.
+
+Re-downloading d4data once it catches up fills the names and text back in. Nothing needs
+re-exporting.
+
+→ [Asset formats §3](Asset-formats#3-directories-and-file-types) for the measured size of the
+gap, and [Diagnostics](Diagnostics) for the reports named above.

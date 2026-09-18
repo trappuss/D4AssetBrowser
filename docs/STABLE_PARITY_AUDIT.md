@@ -50,9 +50,14 @@ trophies own clips at all — see §5.
 
 | # | Bug | Where | Effect |
 |---|---|---|---|
-| B4 | No card context menu on the pre-scan fallback grid | `StableTab2.cpp` ~1690 | Right-click does nothing until `ensurePetIndex` lands |
-| B5 | `stable2/showFx` defaults **on**; `wardrobe2/showFx` defaults **off** | — | Wardrobe's reasoning ("made an ordinary outfit look wrong before the user touched anything") applies to mounts. Changing it needs a versioned migration |
-| B6 | Between `reset()` and the next `refresh()`, old cards stay clickable | `StableTab2.cpp` ~1654 | Not a crash (bounds-checked) but dirties the undo stack and re-runs the pipeline for nothing |
+| B5 | `stable2/showFx` defaults **on**; `wardrobe2/showFx` defaults **off** | — | Wardrobe's reasoning ("made an ordinary outfit look wrong before the user touched anything") applies to mounts. **Left open on purpose:** flipping a shipped default silently changes what existing users see, so it needs a versioned migration (write the new default once, under a flag, and leave a value the user has actually set alone) — a decision about their installs, not a code gap |
+
+### Fixed
+
+| # | Was | Now |
+|---|---|---|
+| B4 | No card context menu on the pre-scan fallback grid — right-click did nothing until `ensurePetIndex` landed, which on a cold cache is the whole first minute of the tab | The fallback cards carry the same menu, minus the theme actions, which need a resolved `StableEntry` (item id, type, look) that this path does not have. The click handler's body became `equipFallbackPick()` so the menu's **Equip** takes the identical route — the reason the menu could not be written before |
+| B6 | Between `reset()` and the next `refresh()`, the previous build's cards stayed on screen and clickable: a click pushed an undo snapshot, ran the compatibility prune and scheduled a rebuild for a selection that no longer resolved. Bounds-checked, so never a crash | `clearGrid()`, factored out of `fillGrid()` and called from `reset()`, which now also says `(reloading…)` instead of leaving a stale-looking grid |
 
 ---
 
@@ -87,20 +92,21 @@ trophies own clips at all — see §5.
 
 | # | Was | Now |
 |---|---|---|
+| R1 | `withDeps` raw files were **counted in the menu label and never written** — "1 model + 37 raw files" produced zero | `exportItemModel` now writes them, into a `deps/` folder beside the model, and the notifier reports `+ N raw source file(s)`. Sourced through `MaterialDecode::texturesFor` rather than reading `.mat.json` directly (verify-src's d4data baseline forced it, and it also resolves the ~1,079 ENCRYPTED materials a direct read misses) |
 | R2 | The look-card menu labelled "Export model to last folder (…)" from `wardrobe2/lastExportDir`, but `exportItemModel` reads and writes `wardrobe2/exportDir` — so the menu advertised one destination and the export used another, and with `exportDir` unset it showed a path and then opened a dialog | Labels from `exportDir`. The two remembered folders stay separate on purpose (one item vs a whole outfit); only the label was wrong |
 | R3 | `wardrobe2/light/sss`: slider default 15, renderer default 24 — a fresh profile rendered at 24 while the slider read 15, so the first nudge produced a jump no input accounted for | Slider default 24. The renderer's value wins because it is the one that has been shipping as the look |
 | R4 | Crash recovery cleared `/trophy`; the tab writes `/backTrophy` — a back trophy that faulted on load survived the sweep untouched and was restored again, i.e. an actual **crash-loop** | `/backTrophy` added, plus `/weaponSheath*`, `/attachClip`, `/skinTone`, `/skinDetail` — everything the rebuild consumes. `/trophy` kept: removing an absent key is a no-op |
+| R5 | Dead keys: `weaponType`/`weaponType2` written on every change and read by nothing (and written as `currentText()`); `dyeSel` read on restore and written by nothing, with a default (`"None"`) that could never match the item text (`"None (undyed)"`) | Both handlers deleted — the type combos have been retired backing widgets since the icon browser replaced the dropdowns, cleared under a `QSignalBlocker` and never refilled, so those handlers could not fire either. `fillHand` no longer takes a type key, and saved Looks stop carrying the two dead fields. `dyeSel`'s owner `m_dyeCombo` turned out never to be **constructed**: the global dye combo was retired when Set Pigment went per-slot, so `rebuildDyeCombo()` was unreachable and every other use was a null-guarded no-op. Widget, restore path and the now-unused `pigmentIcon()` removed rather than left reading like a live feature. All three keys stay in the four migration sweeps so an existing profile's stale value is still cleared. verify-src's combo-text baseline lowered 4 → 2 |
 | R6 | `skinTone` / `skinDetail` persisted `currentText()` — the display label, not the identity. The same rule the env / light-preset / view-channel combos were already fixed under | Persist `currentData()`; restore by `findData` with a permanent `findText` fallback, because saved **look presets** carry these keys and write labels straight back in. The restore also now lands on an index instead of returning early — an ensemble saved with no skin tone used to leave the previous one selected while the setting said empty, so the widget (what the renderer reads) and the setting (what the next save records) diverged for good |
+| R7 | The six `wardrobe2/weap/*` keys are registered with `live(…, rebuild=true)`, so they write immediately — but they were absent from `liveSettingKeys()`, so **Cancel could not revert them** | All six added to `liveSettingKeys()`. `wardrobe2/` is deliberately not a derived prefix there: the tab owns many non-live keys under it |
 | R8 | "Collision model" exists in both the Overlays and Physics panels over **one** settings key, unmirrored — ticking either left the other showing the opposite of the truth. The Physics copy also drove the GL directly, ignoring the overlay master gate that the startup replay applies | `linkColliderToggles()` ported from Stable, called from both builders so whichever runs second completes the pair; the Physics handler now ANDs `m_overlaysOn` |
+| R9a | `exportItemModel` ignored `export/bakeDetail`, which Stable's equivalent honours | Bake added, name-keyed so a material shared by several primitives bakes once, gated on `wantTex` |
 
 ### Open
 
 | # | Bug | Where |
 |---|---|---|
-| R1 | `withDeps` raw files are **counted in the menu label and never written** — "1 model + 37 raw files" produces zero. Stable's `exportAppearanceModel` has the only working implementation | `WardrobeTab2.cpp` 10770–10780 |
-| R5 | Dead keys: `weaponType`/`weaponType2` (written, never read — and via `currentText()`), `dyeSel` (read, never written, and its default can never match) | 2762 / 2772 / 4524 |
-| R7 | `wardrobe2/weap/*` are live-persisted but absent from `liveSettingKeys()` — **Cancel does not revert them** | `SettingsDialog.cpp` 1065 vs 2450 |
-| R9 | `exportItemModel` ignores `export/bakeDetail` and `export/includeAnim`; Stable's equivalent honours both | 4207 |
+| R9b | `exportItemModel` ignores `export/includeAnim`. **Held deliberately, needs a decision, not a patch:** `collectExportAnims(anims, names)` takes no geometry, so it cannot validate a clip against the skeleton of the ONE item being exported — body clips written onto a weapon export would be wrong in a way the file does not admit to. Either give it the item's skeleton to filter against, or leave the option off for single items and say so in the menu | `WardrobeTab2.cpp` `exportItemModel` |
 
 Found while fixing the above, not yet acted on:
 
@@ -143,7 +149,8 @@ debounce, "Copy all" on the clip menu, fullscreen honouring an existing collapse
 
 1. **G9, G11, G12** — small, high-visibility interaction wins (clip filter/sort + arrow keys, grid
    keyboard nav, transport step/frame/time controls).
-2. **R1–R4** in Wardrobe — R4 is a crash-loop and R1/R2 are silent data-loss-shaped.
+2. ~~**R1–R4** in Wardrobe~~ — done, along with R5–R8 and R9a. The reverse-gap list is closed
+   except **R9b**, which is a design decision (see its row), not an implementation.
 3. **G10, G13, G14, G15** — the remaining SMALLs.
 4. **G4 / G7** — the two LARGE ones, worth doing only once the cheap list is empty.
 

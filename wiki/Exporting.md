@@ -1,5 +1,15 @@
 # Exporting
 
+**Read [The normal-map convention](#the-normal-map-convention) before you judge how anything
+looks.** It is the single most common reason an export lights wrong in Blender when it looked
+correct in the viewport, and it is a one-setting fix rather than anything you need to repair
+by hand.
+
+Where the options live: **Settings ▸ Export**, covered per box on
+[Settings](Settings#export--everything-that-lands-on-disk). The three that change the *result*
+rather than the presentation are called out at
+[the top of that page](Settings#the-options-that-change-results).
+
 ## Models
 
 Rigged, animated `.glb`. Exports **exactly what is visible** — hidden parts stay out unless
@@ -15,6 +25,21 @@ composited into the exported normal and ORM zone by zone, exactly as the viewpor
 every path that writes a model.
 
 **Animation libraries** — skeleton plus selected clips and no mesh, for retargeting.
+
+### Exporting parts you picked in the viewport
+
+Left-click a part in the 3D view to select it; **Ctrl** or **Shift** click to add more or take
+one back out; click empty space to clear. The selection outlines in blue and stays in step with
+the Parts panel both ways.
+
+Right-click **inside** the selection and the menu acts on all of it — `Export 3 parts
+(5,120 tris)…` writes one `.glb` containing those three, named after the piece or model they
+came from. Right-click **outside** it and the selection is replaced by that one part first, so
+what is outlined is always what the menu is about to export. Double-click frames a part and
+leaves the selection where it was.
+
+This works the same in Models, Wardrobe and Stable. Visibility follows the same set — hiding or
+isolating from that menu applies to every selected part at once.
 
 ## Images and GIFs
 

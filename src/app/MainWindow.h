@@ -77,6 +77,11 @@ private:
     void finishReload(const ReloadResult& r);   // GUI-thread tail: status, fingerprint, tabs
     bool m_reloading = false;           // a reload worker is in flight (guards re-entry + close)
     bool m_reloadPending = false;       // reload() called mid-flight → run again when done
+    // The d4dad fetch finished while the icon audit held the indexes → re-derive once it lets go.
+    // Same defer-and-replay shape as m_reloadPending, and for exactly the same reason.
+    bool m_dadResetPending = false;
+    // Drop the two indexes that read the diablo4.dad DB, or defer if the audit is reading them.
+    void applyDadReset();
 
     void buildMenu();
     void buildTabs();

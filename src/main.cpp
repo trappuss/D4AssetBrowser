@@ -1,7 +1,7 @@
 // D4AssetBrowser — entry point.
 //
 // A native C++/Qt6 rewrite of the asset browser in d4analyzer's exact stack:
-//   C++17 · Qt 6 Widgets · OpenGL 4.5 · CascLib · fastgltf + tinygltf · Draco.
+//   C++17 · Qt 6 Widgets · OpenGL 4.5 · native CASC reader · hand-written glTF 2.0 writer.
 #include <QApplication>
 #include <QDateTime>
 #include <QColor>
@@ -178,7 +178,7 @@ int main(int argc, char** argv)
     LogBuffer::instance();   // construct on the GUI thread (queued log delivery)
     QApplication::setOrganizationName("D4AssetBrowser");
     QApplication::setApplicationName("D4AssetBrowser");
-    QApplication::setApplicationVersion("2.3.0");
+    QApplication::setApplicationVersion("2.4.0");
 
     // Portable: every QSettings() default-ctor writes to an INI in the beside-exe data/ folder
     // (no Windows registry). Must run before any QSettings use. Combined with AppPaths, the whole

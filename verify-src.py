@@ -50,6 +50,9 @@ HEADER_ONLY = {
     "ExportLayout":     "util/ExportLayout.h",
     "HoverInfo":        "util/HoverInfo.h",
     "ExportNotifier":   "app/ExportNotifier.h",
+    # The Catalogue's contents descent, shared with IconAudit so the audit measures the same
+    # thing the tab draws. It got its own header precisely because a second copy had drifted.
+    "ProductContents":  "index/ProductContents.h",
 }
 
 QT_MACROS = {"emit", "signals", "slots", "foreach"}
@@ -753,7 +756,10 @@ def check_dead_settings_keys(files: list) -> tuple:
 # actually use) and have been converted to currentData(). A count ABOVE the baseline means a new
 # combo is being persisted by label — check whether its items carry userData first.
 SETTINGS_TEXT_BASELINE = {
-    "src/tabs/WardrobeTab2.cpp": 4,   # slot/%1 x2 (gender-swap + the handler), weaponType, weaponType2
+    # 2026-09-18: was 4. weaponType/weaponType2 were write-only keys behind two retired, never-
+    # populated backing combos; both handlers are gone (R5), leaving only slot/%1 x2 (the
+    # gender-swap path and the slot handler), where the appearance NAME is the identity.
+    "src/tabs/WardrobeTab2.cpp": 2,   # slot/%1 x2 (gender-swap + the handler)
 }
 _TEXT_PERSIST = re.compile(r'setValue\s*\([^;]{0,240}?currentText\s*\(\s*\)', re.S)
 
@@ -774,6 +780,73 @@ def check_text_persisted_combos(files: list) -> tuple:
             warns.append(f"{rel}: {n} left (baseline {base}) — lower the baseline in verify-src.py")
         else:
             warns.append(f"{rel}: {n}")
+    return fails, warns
+
+
+# ── 4. Line endings, per file ──────────────────────────────────────────────────────────────────
+# This repo has 163 commits of committed line endings and deliberately NO .gitattributes, so a
+# file that flips wholesale is a diff of every line in it — and it happens silently: reading a
+# CRLF file in Python text mode and writing it back converts the whole file to LF without
+# touching a single character of content. That is exactly how CatalogueTab.cpp flipped, and the
+# only reason it was caught is that the byte size moved in the wrong direction.
+#
+# Two rules, both cheap:
+#   · no file may be MIXED — half-converted is a botched edit, whichever direction it went;
+#   · a file listed below is CRLF and must stay CRLF; every other file is LF and must stay LF.
+# Adding a file? Give it LF unless it sits beside CRLF siblings, and add it here if it is CRLF.
+CRLF_FILES = {
+    "src/app/ExportNotifier.h",
+    "src/app/MainWindow.cpp",
+    "src/app/MainWindow.h",
+    "src/app/SettingsDialog.cpp",
+    "src/deps/D4DataDownloader.cpp",
+    "src/deps/DependencyDialog.h",
+    "src/index/IconIndex.cpp",
+    "src/index/SnoIndex.cpp",
+    "src/index/SnoListModel.cpp",
+    "src/index/SnoListModel.h",
+    "src/main.cpp",
+    "src/model/MaterialDecode.cpp",
+    "src/model/ModelExporter.cpp",
+    "src/model/ModelExporter.h",
+    "src/tabs/CatalogueTab.cpp",
+    "src/tabs/CatalogueTab.h",
+    "src/tabs/MarkingCompose.cpp",
+    "src/tabs/MarkingCompose.h",
+    "src/tabs/ModelsTab.cpp",
+    "src/tabs/TexturesTab.cpp",
+    "src/tabs/TexturesTab.h",
+    "src/tabs/WardrobeTab2.cpp",
+    "src/tabs/WardrobeTab2.h",
+    "src/tex/BcDecode.cpp",
+    "src/tex/BcDecode.h",
+}
+
+
+def check_line_endings(files: list) -> tuple:
+    fails, warns = [], []
+    crlf_seen = 0
+    for path in files:
+        try:
+            raw = path.read_bytes()
+        except OSError:
+            continue
+        rel = path.relative_to(ROOT).as_posix()
+        n, c = raw.count(b"\n"), raw.count(b"\r\n")
+        if c and n != c:
+            fails.append(f"{rel}: MIXED line endings ({c} CRLF of {n} lines) — a half-converted "
+                         f"edit; rewrite the whole file in one ending")
+            continue
+        want_crlf = rel in CRLF_FILES
+        if c and not want_crlf:
+            fails.append(f"{rel}: became CRLF and is not in CRLF_FILES — either it flipped by "
+                         f"accident (every line shows as changed) or the table needs the row")
+        elif n and not c and want_crlf:
+            fails.append(f"{rel}: flipped to LF but CRLF_FILES says CRLF — usually a Python text-"
+                         f"mode round trip; restore CRLF rather than committing a whole-file diff")
+        if c:
+            crlf_seen += 1
+    warns.append(f"{crlf_seen} CRLF file(s), {len(files) - crlf_seen} LF")
     return fails, warns
 
 
@@ -874,6 +947,7 @@ def main() -> int:
     for title, (cfails, cwarns) in (
             ("settings keys written but never read", check_dead_settings_keys(files)),
             ("combos persisted by display text",     check_text_persisted_combos(files)),
+            ("line endings",                         check_line_endings(files)),
             ("character tokens tested by name",      check_character_name_tests(files))):
         if cfails:
             total += len(cfails)
@@ -890,7 +964,8 @@ def main() -> int:
             print(f"verify-src: OK — {len(files)} file(s) clean "
                   f"(non-empty, balance, header-only includes, format args, Qt macro names, "
                   f"duplicate lambdas, duplicate map keys, d4data JSON baseline, "
-                  f"dead settings keys, combo text persistence, character name tests)")
+                  f"dead settings keys, combo text persistence, character name tests, "
+                  f"line endings)")
         return 0
     print(f"\nverify-src: {total} problem(s) in {len(files)} file(s) — fix before building.")
     return 1

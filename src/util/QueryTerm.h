@@ -7,10 +7,12 @@
 //
 // The name-box query language (space = AND, leading '-' = exclude, leading '#' = metadata-only)
 // is parsed in three places that must agree or Bulk Extract silently returns a different set from
-// the list it was filtered in: SnoListModel::setFilter/rebuild, ModelsTab::queryEntries, and the
-// textures branch of BulkExtractorTab::computeMatches. Each used to do its own bare
-// hay.contains(term); this helper replaces that call in all three so a syntax addition lands
-// everywhere at once instead of in whichever parser someone remembered.
+// the list it was filtered in: SnoListModel::setFilter/rebuild, ModelsTab::queryEntries, the
+// textures branch of BulkExtractorTab::computeMatches, and TexturesTab::applyNameFilter (found
+// still on a bare contains() in the 2026-09 core audit — '|' did nothing on the Textures tab for
+// as long as this header existed). Each used to do its own bare hay.contains(term); this helper
+// replaces that call in all four so a syntax addition lands everywhere at once instead of in
+// whichever parser someone remembered.
 //
 // Syntax handled HERE: '|' inside a term is OR — "jwl|test999" matches a name containing either.
 // Combined with the outer AND: "barf_|barm_ _hlm|_trs" = (barf_ OR barm_) AND (_hlm OR _trs).

@@ -94,7 +94,27 @@ inline int kTextureGroupId() { static const int g = SnoIndex::groupIdByName(QStr
 // as a directory name; the raw index name is the fallback if a template resolves to nothing.
 }
 
-bool BulkExtractorTab::textureMode() const { return m_mode && m_mode->currentIndex() == 1; }
+int  BulkExtractorTab::modeIndex()    const { return m_mode ? m_mode->currentIndex() : kModeModels; }
+bool BulkExtractorTab::textureMode()  const { return modeIndex() == kModeTextures; }
+bool BulkExtractorTab::wantsModels()  const { return modeIndex() != kModeTextures; }
+bool BulkExtractorTab::wantsTextures() const { return modeIndex() != kModeModels; }
+
+// "<group>:<sno>" — see BulkExtractorTab::Item for why the group belongs in the key.
+QString BulkExtractorTab::itemKey(int group, int sno)
+{
+    return QString::number(group) + QLatin1Char(':') + QString::number(sno);
+}
+
+// The export pipelines take (sno, name) and each handles ONE group, so a mixed set is split here
+// and nowhere else. Order is preserved inside each group.
+QVector<QPair<int, QString>> BulkExtractorTab::pairsOfGroup(const QVector<Item>& items, int group)
+{
+    QVector<QPair<int, QString>> out;
+    out.reserve(items.size());
+    for (const Item& it : items)
+        if (it.group == group) out.push_back({it.sno, it.name});
+    return out;
+}
 
 BulkExtractorTab::BulkExtractorTab(ModelsTab* models, TexturesTab* textures, QWidget* parent)
     : BrowserTab(parent), m_models(models), m_textures(textures)
@@ -111,7 +131,21 @@ BulkExtractorTab::BulkExtractorTab(ModelsTab* models, TexturesTab* textures, QWi
     m_mode = new QComboBox(this);
     m_mode->addItem(QStringLiteral("Models (.glb)"));
     m_mode->addItem(QStringLiteral("Textures (image)"));
-    m_mode->setCurrentIndex(qBound(0, QSettings().value(QStringLiteral("bulk/mode"), 0).toInt(), 1));
+    // Both runs the two queries over the same NAME box and extracts each into its own place:
+    // models per the folder layout, textures into a textures\ subfolder beside them. It is not
+    // "models plus their textures" — that is the co-texture pass, which follows the models. This
+    // is "everything matching this query", which is how you reach loose maps no material binds:
+    // fur masks, dye masks and ramps, atlas sheets, recolour variants.
+    m_mode->addItem(QStringLiteral("Both"));
+    m_mode->setToolTip(QStringLiteral(
+        "What a run extracts.\n\n"
+        "Models — appearances as .glb.\n"
+        "Textures — game textures as images.\n"
+        "Both — the model matches AND the texture matches for the same NAME query, in one run.\n\n"
+        "The funnel's tag filters apply to MODELS only, because textures carry no tags; the texture\n"
+        "half is narrowed by the texture category checkboxes instead. In Both mode the match count\n"
+        "shows the two halves separately, so you always know which filter is acting on what."));
+    m_mode->setCurrentIndex(qBound(0, QSettings().value(QStringLiteral("bulk/mode"), 0).toInt(), 2));
     modeRow->addWidget(m_mode);
     // Funnel button — identical to the Models tab's: a painted funnel icon that opens ONE filter
     // popup (Special usage facets + grouped tag checkboxes). It sits right before the NAME box.
@@ -390,23 +424,27 @@ BulkExtractorTab::BulkExtractorTab(ModelsTab* models, TexturesTab* textures, QWi
     });
     connect(m_list, &QListWidget::customContextMenuRequested, this,
             [this](const QPoint& p) { showListMenu(p); });
-    // Drop a queued sno from the persistent store (and de-select it on the left if visible).
-    auto removeQueued = [this](int sno) {
+    // Drop one queued item from the persistent store (and de-select it on the left if visible).
+    // Keyed on group AND sno: in Both mode the list holds two groups and the numbers overlap.
+    auto removeQueued = [this](int group, int sno) {
         for (int i = 0; i < m_queued.size(); ++i)
-            if (m_queued[i].first == sno) { m_queued.remove(i); break; }
-        m_queuedSnos.remove(sno);
+            if (m_queued[i].group == group && m_queued[i].sno == sno) { m_queued.remove(i); break; }
+        m_queuedKeys.remove(itemKey(group, sno));
         for (int i = 0; i < m_list->count(); ++i) {
             QListWidgetItem* li = m_list->item(i);
-            if (li->data(Qt::UserRole).isValid() && li->data(Qt::UserRole).toInt() == sno) {
+            if (li->data(Qt::UserRole).isValid()
+                && li->data(Qt::UserRole).toInt() == sno
+                && li->data(Qt::UserRole + 2).toInt() == group) {
                 QSignalBlocker b(m_list); li->setSelected(false); break;
             }
         }
         rebuildQueueWidget();
-        saveQueue(m_mode ? m_mode->currentIndex() : 0);
+        saveQueue(modeIndex());
         syncExtractButtons();
     };
     connect(m_queue, &QListWidget::itemDoubleClicked, this, [removeQueued](QListWidgetItem* it) {
-        if (it && it->data(Qt::UserRole).isValid()) removeQueued(it->data(Qt::UserRole).toInt());
+        if (it && it->data(Qt::UserRole).isValid())
+            removeQueued(it->data(Qt::UserRole + 2).toInt(), it->data(Qt::UserRole).toInt());
     });
     connect(m_queue, &QListWidget::customContextMenuRequested, this, [this, removeQueued](const QPoint& p) {
         QListWidgetItem* under = m_queue->itemAt(p);
@@ -418,14 +456,16 @@ BulkExtractorTab::BulkExtractorTab(ModelsTab* models, TexturesTab* textures, QWi
         if (act == rm) {
             QList<QListWidgetItem*> sel = m_queue->selectedItems();
             if (sel.isEmpty() && under) sel << under;
-            QVector<int> snos;
-            for (QListWidgetItem* s : sel) if (s->data(Qt::UserRole).isValid()) snos << s->data(Qt::UserRole).toInt();
-            for (int sno : snos) removeQueued(sno);
+            QVector<QPair<int, int>> keys;   // (group, sno) — snapshot BEFORE the removals reflow
+            for (QListWidgetItem* s : sel)
+                if (s->data(Qt::UserRole).isValid())
+                    keys << qMakePair(s->data(Qt::UserRole + 2).toInt(), s->data(Qt::UserRole).toInt());
+            for (const auto& k : keys) removeQueued(k.first, k.second);
         } else if (act == clr) {
-            m_queued.clear(); m_queuedSnos.clear();
+            m_queued.clear(); m_queuedKeys.clear();
             { QSignalBlocker b(m_list); m_list->clearSelection(); }
             rebuildQueueWidget();
-            saveQueue(m_mode ? m_mode->currentIndex() : 0);
+            saveQueue(modeIndex());
             syncExtractButtons();
         }
     });
@@ -524,10 +564,10 @@ BulkExtractorTab::BulkExtractorTab(ModelsTab* models, TexturesTab* textures, QWi
         m_list->setFocus();
     });
     connect(noneBtn, &QPushButton::clicked, this, [this] {   // clears the WHOLE queue, not just visible
-        m_queued.clear(); m_queuedSnos.clear();
+        m_queued.clear(); m_queuedKeys.clear();
         { QSignalBlocker b(m_list); m_list->clearSelection(); }
         rebuildQueueWidget();
-        saveQueue(m_mode ? m_mode->currentIndex() : 0);
+        saveQueue(modeIndex());
         syncExtractButtons();
     });
     connect(m_onlyNew, &QRadioButton::toggled, this,
@@ -541,7 +581,7 @@ BulkExtractorTab::BulkExtractorTab(ModelsTab* models, TexturesTab* textures, QWi
     connect(m_copyBtn, &QPushButton::clicked, this, [this] {
         const auto m = computeMatches();
         QStringList names; names.reserve(m.size());
-        for (const auto& it : m) names << it.second;
+        for (const Item& it : m) names << it.name;
         QGuiApplication::clipboard()->setText(names.join(QLatin1Char('\n')));
         if (m_count) m_count->setText(QStringLiteral("Copied %1 name(s) to the clipboard.").arg(names.size()));
     });
@@ -566,10 +606,22 @@ void BulkExtractorTab::refresh() { refillTagPanel(); updateCount(); }
 // The current UI state, resolved to matches. Thin wrapper over matchesFor so that the preset
 // audit can evaluate a query WITHOUT driving the widgets — an audit that had to click through the
 // UI to measure would be a second matcher, and a second matcher is how these drift.
-QVector<QPair<int, QString>> BulkExtractorTab::computeMatches()
+QVector<BulkExtractorTab::Item> BulkExtractorTab::computeMatches()
 {
-    return matchesFor(textureMode(), m_name ? m_name->text() : QString(), m_texCatSel,
-                      m_catFacet, m_tagFilter, m_tagOrMode, m_hideUnrend);
+    const QString q = m_name ? m_name->text() : QString();
+    QVector<Item> out;
+    // Models first, then textures — the order the run itself uses, so the list reads in the order
+    // things will be written. Each half is tagged with its group, which is what lets one list hold
+    // both without appearance 12345 and texture 12345 colliding in the queue.
+    if (wantsModels())
+        for (const auto& p : matchesFor(false, q, m_texCatSel, m_catFacet, m_tagFilter,
+                                        m_tagOrMode, m_hideUnrend))
+            out.push_back({kModelGroup, p.first, p.second});
+    if (wantsTextures())
+        for (const auto& p : matchesFor(true, q, m_texCatSel, m_catFacet, m_tagFilter,
+                                        m_tagOrMode, m_hideUnrend))
+            out.push_back({kTextureGroup, p.first, p.second});
+    return out;
 }
 
 QVector<QPair<int, QString>> BulkExtractorTab::matchesFor(
@@ -770,17 +822,20 @@ void BulkExtractorTab::buildTagPanel()
     updateFunnelMode();   // show model tags vs texture categories for the current mode
 }
 
-// Show the MODEL tag facets in Models mode, or the TEXTURE category checkboxes in Textures mode, so
-// the funnel is always context-appropriate. The shared bits (Search box, Clear, Remember) stay.
+// Show the MODEL tag facets in Models mode, the TEXTURE category checkboxes in Textures mode, and
+// BOTH sets in Both mode — where each half of the query is genuinely filtered by its own controls,
+// so hiding either would leave a filter acting invisibly. The shared bits (Search box, Clear,
+// Remember) stay throughout.
 void BulkExtractorTab::updateFunnelMode()
 {
-    const bool tex = textureMode();
-    if (m_specialBox)  m_specialBox->setVisible(!tex);
-    if (m_tagOrChk)    m_tagOrChk->setVisible(!tex);
-    if (m_hideChk)     m_hideChk->setVisible(!tex);
-    if (m_tagScroll)   m_tagScroll->setVisible(!tex);
-    if (m_tagSearch)   m_tagSearch->setVisible(!tex);   // "Search tags…" filters model tag groups
-    if (m_texFilterBox) m_texFilterBox->setVisible(tex);
+    const bool showModelFilters = wantsModels();
+    const bool showTexFilters   = wantsTextures();
+    if (m_specialBox)  m_specialBox->setVisible(showModelFilters);
+    if (m_tagOrChk)    m_tagOrChk->setVisible(showModelFilters);
+    if (m_hideChk)     m_hideChk->setVisible(showModelFilters);
+    if (m_tagScroll)   m_tagScroll->setVisible(showModelFilters);
+    if (m_tagSearch)   m_tagSearch->setVisible(showModelFilters);   // filters the model tag groups
+    if (m_texFilterBox) m_texFilterBox->setVisible(showTexFilters);
     if (m_tagPanel && m_tagPanel->isVisible()) m_tagPanel->adjustSize();
 }
 
@@ -838,9 +893,11 @@ void BulkExtractorTab::refillTagPanel()
 void BulkExtractorTab::updateTagBtn()
 {
     if (!m_tagBtn) return;
-    const bool active = textureMode()
-        ? !m_texCatSel.isEmpty()
-        : (!m_tagFilter.isEmpty() || !m_catFacet.isEmpty() || m_hideUnrend);
+    // Either half being filtered tints the funnel. Testing only the half the mode "is" would
+    // leave Both mode showing a clean funnel while a texture category was quietly narrowing it.
+    const bool active =
+        (wantsTextures() && !m_texCatSel.isEmpty())
+        || (wantsModels() && (!m_tagFilter.isEmpty() || !m_catFacet.isEmpty() || m_hideUnrend));
     m_tagBtn->setStyleSheet(active
         ? QStringLiteral("QToolButton{padding:1px;border:1px solid #a07a1a;border-radius:3px;"
                          "background:#3a2f12;} QToolButton:hover{border-color:#b0453c;}")
@@ -887,12 +944,24 @@ void BulkExtractorTab::updateCount()
     const auto matches = computeMatches();
     const int n = matches.size();
     const QString noun = textureMode() ? QStringLiteral("texture") : QStringLiteral("model");
-    auto present = [this](const QPair<int, QString>& it) {
-        return m_folderDone.contains(it.first) || m_folderStems.contains(it.second);
+    // Both mode is the only one that can put two kinds in one folder tree, so it is the only one
+    // that has to ask which set a name belongs in. The single-kind modes keep the old test exactly.
+    const bool both = modeIndex() == kModeBoth;
+    auto present = [this, both](const Item& it) {
+        if (both && it.group == kTextureGroup)
+            return m_folderDone.contains(it.sno) || m_folderTexStems.contains(it.name);
+        return m_folderDone.contains(it.sno) || m_folderStems.contains(it.name);
     };
-    int done = 0;
-    for (const auto& it : matches) if (present(it)) ++done;
-    QString txt = QStringLiteral("%1 %2(s) match").arg(n).arg(noun);
+    int done = 0, nModels = 0;
+    for (const Item& it : matches) {
+        if (present(it)) ++done;
+        if (it.group == kModelGroup) ++nModels;
+    }
+    // Both mode names the two halves rather than one total: the funnel's tags narrow the model
+    // half only, so "1200 match" would hide which filter is acting on what.
+    QString txt = (modeIndex() == kModeBoth)
+                      ? QStringLiteral("%1 model(s) + %2 texture(s) match").arg(nModels).arg(n - nModels)
+                      : QStringLiteral("%1 %2(s) match").arg(n).arg(noun);
     if (done > 0) txt += QStringLiteral("   ·   %1 new · %2 already in folder").arg(n - done).arg(done);
     if (m_count) m_count->setText(txt);
     if (m_listLbl) m_listLbl->setText(QStringLiteral("Matches (%1)").arg(n));
@@ -907,12 +976,18 @@ void BulkExtractorTab::updateCount()
         m_list->clear();
         const int shown = qMin(n, kCap);
         for (int i = 0; i < shown; ++i) {
-            const int sno = matches[i].first;
-            const bool exists = present(matches[i]);
-            auto* item = new QListWidgetItem((exists ? QStringLiteral("✓  ") : QString()) + matches[i].second);
+            const Item& mi = matches[i];
+            const bool exists = present(mi);
+            const bool both = modeIndex() == kModeBoth;
+            const QString tag = both ? (mi.group == kTextureGroup ? QStringLiteral("  [tex]")
+                                                                  : QStringLiteral("  [model]"))
+                                     : QString();
+            auto* item = new QListWidgetItem(
+                (exists ? QStringLiteral("✓  ") : QString()) + mi.name + tag);
             item->setForeground(exists ? QColor(120, 130, 120) : QColor(215, 215, 215));
-            item->setData(Qt::UserRole,     sno);                 // sno (for the work set)
-            item->setData(Qt::UserRole + 1, matches[i].second);   // clean name
+            item->setData(Qt::UserRole,     mi.sno);    // sno — unique only WITHIN its group
+            item->setData(Qt::UserRole + 1, mi.name);   // clean name, without the [tex] tag
+            item->setData(Qt::UserRole + 2, mi.group);  // the other half of the identity
             if (exists)
                 item->setToolTip(QStringLiteral("Already in this folder — will be %1")
                                      .arg(skip ? QStringLiteral("skipped") : QStringLiteral("overwritten")));
@@ -948,22 +1023,24 @@ void BulkExtractorTab::syncQueue()
         QListWidgetItem* it = m_list->item(i);
         const QVariant sv = it->data(Qt::UserRole);
         if (!sv.isValid()) continue;
-        const int sno = sv.toInt();
+        const int sno   = sv.toInt();
+        const int group = it->data(Qt::UserRole + 2).toInt();
+        const QString k = itemKey(group, sno);
         const bool sel = it->isSelected();
-        const bool inQ = m_queuedSnos.contains(sno);
+        const bool inQ = m_queuedKeys.contains(k);
         if (sel && !inQ) {
-            m_queued.append({sno, it->data(Qt::UserRole + 1).toString()});
-            m_queuedSnos.insert(sno);
+            m_queued.append({group, sno, it->data(Qt::UserRole + 1).toString()});
+            m_queuedKeys.insert(k);
             changed = true;
         } else if (!sel && inQ) {
             for (int j = 0; j < m_queued.size(); ++j)
-                if (m_queued[j].first == sno) { m_queued.remove(j); break; }
-            m_queuedSnos.remove(sno);
+                if (m_queued[j].group == group && m_queued[j].sno == sno) { m_queued.remove(j); break; }
+            m_queuedKeys.remove(k);
             changed = true;
         }
     }
     rebuildQueueWidget();
-    if (changed) saveQueue(m_mode ? m_mode->currentIndex() : 0);
+    if (changed) saveQueue(modeIndex());
     syncExtractButtons();
 }
 
@@ -979,11 +1056,11 @@ void BulkExtractorTab::queueAllMatches()
 {
     const auto all = computeMatches();
     m_queued = all;
-    m_queuedSnos.clear();
-    m_queuedSnos.reserve(all.size());
-    for (const auto& it : all) m_queuedSnos.insert(it.first);
+    m_queuedKeys.clear();
+    m_queuedKeys.reserve(all.size());
+    for (const Item& it : all) m_queuedKeys.insert(itemKey(it.group, it.sno));
     reflectQueueInList();   // selects the visible subset and rebuilds the queue widget
-    saveQueue(m_mode ? m_mode->currentIndex() : 0);
+    saveQueue(modeIndex());
     syncExtractButtons();
 }
 
@@ -993,10 +1070,18 @@ void BulkExtractorTab::rebuildQueueWidget()
     if (!m_queue) return;
     m_syncingQueue = true;
     m_queue->clear();
-    for (const auto& it : m_queued) {
-        auto* qi = new QListWidgetItem(it.second, m_queue);
-        qi->setData(Qt::UserRole,     it.first);
-        qi->setData(Qt::UserRole + 1, it.second);
+    for (const Item& it : m_queued) {
+        // In Both mode one queue holds two kinds, and the names alone do not say which — a texture
+        // and the appearance it belongs to are routinely spelt the same. The tag is the only thing
+        // on screen that distinguishes them.
+        const bool both = modeIndex() == kModeBoth;
+        const QString tag = both ? (it.group == kTextureGroup ? QStringLiteral("  [tex]")
+                                                              : QStringLiteral("  [model]"))
+                                 : QString();
+        auto* qi = new QListWidgetItem(it.name + tag, m_queue);
+        qi->setData(Qt::UserRole,     it.sno);
+        qi->setData(Qt::UserRole + 1, it.name);
+        qi->setData(Qt::UserRole + 2, it.group);
     }
     if (m_queueLbl)
         m_queueLbl->setText(m_queued.isEmpty() ? QStringLiteral("Queue")
@@ -1014,42 +1099,66 @@ void BulkExtractorTab::reflectQueueInList()
         QListWidgetItem* it = m_list->item(i);
         const QVariant sv = it->data(Qt::UserRole);
         if (!sv.isValid()) continue;
-        it->setSelected(manual && m_queuedSnos.contains(sv.toInt()));
+        it->setSelected(manual
+                        && m_queuedKeys.contains(itemKey(it->data(Qt::UserRole + 2).toInt(),
+                                                         sv.toInt())));
     }
     rebuildQueueWidget();
+}
+
+// One persisted queue per mode. Records are "<group>\x1f<sno>\x1f<name>" — three fields, where
+// the pre-Both format had two. A two-field record is still read, and its group is inferred from
+// the queue it was stored in, so an existing Models or Textures queue survives the upgrade
+// untouched. There is no two-field case for Both: that queue did not exist before.
+static QString queueKeyFor(int mode)
+{
+    switch (mode) {
+        case 1:  return QStringLiteral("bulk/queueTex");
+        case 2:  return QStringLiteral("bulk/queueBoth");
+        default: return QStringLiteral("bulk/queueModels");
+    }
 }
 
 void BulkExtractorTab::saveQueue(int mode) const
 {
     QStringList l;
     l.reserve(m_queued.size());
-    for (const auto& it : m_queued)
-        l << QStringLiteral("%1\x1f%2").arg(it.first).arg(it.second);
-    QSettings().setValue(mode == 1 ? QStringLiteral("bulk/queueTex")
-                                   : QStringLiteral("bulk/queueModels"), l);
+    for (const Item& it : m_queued)
+        l << QStringLiteral("%1\x1f%2\x1f%3").arg(it.group).arg(it.sno).arg(it.name);
+    QSettings().setValue(queueKeyFor(mode), l);
 }
 
 void BulkExtractorTab::loadQueueForMode(int mode)
 {
     m_queued.clear();
-    m_queuedSnos.clear();
-    const QStringList l = QSettings().value(mode == 1 ? QStringLiteral("bulk/queueTex")
-                                                      : QStringLiteral("bulk/queueModels")).toStringList();
+    m_queuedKeys.clear();
+    const int legacyGroup = (mode == kModeTextures) ? kTextureGroup : kModelGroup;
+    const QStringList l = QSettings().value(queueKeyFor(mode)).toStringList();
     for (const QString& s : l) {
-        const int sep = s.indexOf(QChar(0x1f));
-        if (sep <= 0) continue;
-        const int sno = s.left(sep).toInt();
-        const QString name = s.mid(sep + 1);
-        if (sno != 0 && !m_queuedSnos.contains(sno)) {
-            m_queued.append({sno, name});
-            m_queuedSnos.insert(sno);
+        const QStringList f = s.split(QChar(0x1f));
+        int group = legacyGroup, sno = 0;
+        QString name;
+        if (f.size() >= 3) {
+            group = f[0].toInt();
+            sno   = f[1].toInt();
+            name  = f.mid(2).join(QChar(0x1f));   // a name containing the separator stays intact
+        } else if (f.size() == 2) {
+            sno  = f[0].toInt();
+            name = f[1];
+        } else {
+            continue;
         }
+        if (sno == 0 || group == 0) continue;
+        const QString k = itemKey(group, sno);
+        if (m_queuedKeys.contains(k)) continue;
+        m_queued.append({group, sno, name});
+        m_queuedKeys.insert(k);
     }
 }
 
 // Per-run CSV: name · SNO · status (ok/failed/missing) · reason · bytes. Built from the folder
 // manifest + this run's _bulk_failed.txt + on-disk file sizes — no pipeline changes needed.
-void BulkExtractorTab::writeRunReport(const QString& dir, const QVector<QPair<int, QString>>& items) const
+void BulkExtractorTab::writeRunReport(const QString& dir, const QVector<Item>& items) const
 {
     // Failure reasons this run wrote (one "name — why" per line).
     QHash<QString, QString> failReason;
@@ -1076,14 +1185,23 @@ void BulkExtractorTab::writeRunReport(const QString& dir, const QVector<QPair<in
         }
         return s;
     };
-    out << "name,sno,status,reason,bytes\n";
-    for (const auto& it : items) {
-        const bool present = m_folderDone.contains(it.first) || m_folderStems.contains(it.second);
+    // "kind" is new, and it is not cosmetic: a Both run puts models and textures in one report,
+    // the two can share a sno, and a row that says "missing" means different things for each.
+    out << "name,kind,sno,status,reason,bytes\n";
+    const bool both = modeIndex() == kModeBoth;
+    for (const Item& it : items) {
+        // Same split as updateCount()'s present(): in Both mode a texture is looked up in the
+        // textures/ stems, so a model of the same name cannot report it as "ok".
+        const bool present = m_folderDone.contains(it.sno)
+                             || ((both && it.group == kTextureGroup) ? m_folderTexStems
+                                                                     : m_folderStems).contains(it.name);
         const QString status = present ? QStringLiteral("ok")
-                                        : (failReason.contains(it.second) ? QStringLiteral("failed")
-                                                                          : QStringLiteral("missing"));
-        out << csv(it.second) << ',' << it.first << ',' << status << ','
-            << csv(failReason.value(it.second)) << ',' << sizeByBase.value(it.second, 0) << '\n';
+                                        : (failReason.contains(it.name) ? QStringLiteral("failed")
+                                                                        : QStringLiteral("missing"));
+        out << csv(it.name) << ','
+            << (it.group == kTextureGroup ? "texture" : "model") << ','
+            << it.sno << ',' << status << ','
+            << csv(failReason.value(it.name)) << ',' << sizeByBase.value(it.name, 0) << '\n';
     }
 }
 
@@ -1099,21 +1217,30 @@ bool BulkExtractorTab::eventFilter(QObject* obj, QEvent* ev)
             if (now - m_lastPressMs > QApplication::doubleClickInterval()) {
                 m_preClickSel.clear();
                 for (QListWidgetItem* it : m_list->selectedItems())
-                    if (it->data(Qt::UserRole).isValid()) m_preClickSel.insert(it->data(Qt::UserRole).toInt());
+                    if (it->data(Qt::UserRole).isValid())
+                        m_preClickSel.insert(itemKey(it->data(Qt::UserRole + 2).toInt(),
+                                                     it->data(Qt::UserRole).toInt()));
             }
             m_lastPressMs = now;
         } else if (ev->type() == QEvent::MouseButtonDblClick) {
             auto* me = static_cast<QMouseEvent*>(ev);
             QListWidgetItem* hit = m_list->itemAt(me->position().toPoint());
             if (hit && hit->data(Qt::UserRole).isValid()) {
-                const int sno = hit->data(Qt::UserRole).toInt();
+                // Keyed by group+sno like every other membership test in this file. It was the one
+                // that kept a bare sno, and in Both mode that is precisely the collision the
+                // group-aware queue exists to prevent: the [model] and [tex] rows of one number
+                // would restore and flip together.
+                const QString hitKey = itemKey(hit->data(Qt::UserRole + 2).toInt(),
+                                               hit->data(Qt::UserRole).toInt());
                 QSignalBlocker block(m_list);
                 for (int i = 0; i < m_list->count(); ++i) {   // restore the pre-click selection…
                     QListWidgetItem* it = m_list->item(i);
                     const QVariant sv = it->data(Qt::UserRole);
-                    if (sv.isValid()) it->setSelected(m_preClickSel.contains(sv.toInt()));
+                    if (sv.isValid())
+                        it->setSelected(m_preClickSel.contains(
+                            itemKey(it->data(Qt::UserRole + 2).toInt(), sv.toInt())));
                 }
-                hit->setSelected(!m_preClickSel.contains(sno));   // …then flip just this row
+                hit->setSelected(!m_preClickSel.contains(hitKey));   // …then flip just this row
                 syncExtractButtons();
                 return true;   // swallow so the view doesn't re-select on top of us
             }
@@ -1123,7 +1250,7 @@ bool BulkExtractorTab::eventFilter(QObject* obj, QEvent* ev)
 }
 
 // The work set for a run: in manual mode the persistent QUEUE (the items you picked); else every match.
-QVector<QPair<int, QString>> BulkExtractorTab::workSet()
+QVector<BulkExtractorTab::Item> BulkExtractorTab::workSet()
 {
     if (m_showList && m_showList->isChecked())
         return m_queued;   // may be empty — manual mode requires an explicit pick
@@ -1133,7 +1260,9 @@ QVector<QPair<int, QString>> BulkExtractorTab::workSet()
 // Extract-button labels/enablement track the work set: queue size (manual) or the full match count.
 void BulkExtractorTab::syncExtractButtons()
 {
-    const QString noun = textureMode() ? QStringLiteral("texture") : QStringLiteral("model");
+    const QString noun = (modeIndex() == kModeBoth) ? QStringLiteral("item")
+                       : textureMode()               ? QStringLiteral("texture")
+                                                     : QStringLiteral("model");
     const bool manual = m_showList && m_showList->isChecked();
     int n;
     QString verb;
@@ -1157,11 +1286,13 @@ void BulkExtractorTab::showListMenu(const QPoint& pos)
     if (!m_list) return;
     QListWidgetItem* under = m_list->itemAt(pos);
     const QList<QListWidgetItem*> sel = m_list->selectedItems();
-    QVector<QPair<int, QString>> items;
+    QVector<Item> items;
     QList<QListWidgetItem*> actItems;
     auto add = [&](QListWidgetItem* it) {
         if (it && it->data(Qt::UserRole).isValid()) {
-            items.append({it->data(Qt::UserRole).toInt(), it->data(Qt::UserRole + 1).toString()});
+            items.append({it->data(Qt::UserRole + 2).toInt(),
+                          it->data(Qt::UserRole).toInt(),
+                          it->data(Qt::UserRole + 1).toString()});
             actItems << it;
         }
     };
@@ -1192,12 +1323,14 @@ void BulkExtractorTab::showListMenu(const QPoint& pos)
 
     // Copy block (previews for a single row; counts for a multi-selection).
     QStringList snoL, fileL, nameL, collL;
-    for (const auto& it : items) {
-        snoL << QString::number(it.first);
-        fileL << it.second;
-        const QString t = am.titleFor(it.first);
-        nameL << (t.isEmpty() ? it.second : t);
-        collL << am.collectionFor(it.first);
+    for (const Item& it : items) {
+        snoL << QString::number(it.sno);
+        fileL << it.name;
+        // titleFor/collectionFor are an APPEARANCE index; asking it about a texture sno would
+        // return whatever appearance happens to share the number. Only models get looked up.
+        const QString t = (it.group == kModelGroup) ? am.titleFor(it.sno) : QString();
+        nameL << (t.isEmpty() ? it.name : t);
+        collL << ((it.group == kModelGroup) ? am.collectionFor(it.sno) : QString());
     }
     if (n == 1) {
         menu.addAction(QStringLiteral("%1  (%2)").arg(MenuText::kCopySno).arg(snoL.first()), this, [snoL, copy] { copy(snoL); });
@@ -1212,10 +1345,11 @@ void BulkExtractorTab::showListMenu(const QPoint& pos)
         menu.addAction(QStringLiteral("%1  —  %2 rows").arg(MenuText::kCopyCollection).arg(n), this, [collL, copy] { copy(collL); });
     }
 
-    // Cross-tab (single model-mode row).
-    if (n == 1 && !textureMode() && m_models) {
-        const int sno = items.first().first;
-        const QString nm = items.first().second;
+    // Cross-tab (a single MODEL row — tested on the row's own group, not on the tab's mode, so it
+    // is still offered for the model half of a Both selection and still withheld for a texture).
+    if (n == 1 && items.first().group == kModelGroup && m_models) {
+        const int sno = items.first().sno;
+        const QString nm = items.first().name;
         menu.addSeparator();
         menu.addAction(QStringLiteral("Open in Models"), this, [this, sno] {
             for (QWidget* w = parentWidget(); w; w = w->parentWidget())
@@ -1243,13 +1377,13 @@ void BulkExtractorTab::showListMenu(const QPoint& pos)
     menu.exec(m_list->viewport()->mapToGlobal(pos));
 }
 
-void BulkExtractorTab::doExtract(bool promptDir, const QVector<QPair<int, QString>>& explicitItems)
+void BulkExtractorTab::doExtract(bool promptDir, const QVector<Item>& explicitItems)
 {
     if (m_running) return;
 
     // ── Work set: an explicit set (context menu) if given, else the queue/all-matches. Computed
     // first so an empty result short-circuits before we bother prompting for a folder.
-    QVector<QPair<int, QString>> matches = explicitItems.isEmpty() ? workSet() : explicitItems;
+    QVector<Item> matches = explicitItems.isEmpty() ? workSet() : explicitItems;
     if (matches.isEmpty()) {
         QMessageBox::information(this, QStringLiteral("Bulk extract"),
                                 QStringLiteral("Nothing to extract — widen the filters or queue some items."));
@@ -1271,12 +1405,14 @@ void BulkExtractorTab::doExtract(bool promptDir, const QVector<QPair<int, QStrin
     }
 
     const bool onlyNew = m_onlyNew && m_onlyNew->isChecked();
-    const QString noun = textureMode() ? QStringLiteral("texture") : QStringLiteral("model");
+    const QString noun = (modeIndex() == kModeBoth) ? QStringLiteral("item")
+                       : textureMode()              ? QStringLiteral("texture")
+                                                    : QStringLiteral("model");
 
     // Size guard + rough size estimate on large runs.
     if (matches.size() > 500) {
         qint64 bytes = 0;
-        if (m_reader) for (const auto& it : matches) bytes += qint64(m_reader->payloadSize(quint64(it.first)));
+        if (m_reader) for (const Item& it : matches) bytes += qint64(m_reader->payloadSize(quint64(it.sno)));
         const double gb = double(bytes) / (1024.0 * 1024.0 * 1024.0);
         const QString est = bytes > 0 ? QStringLiteral(" (~%1 GB source data)").arg(gb, 0, 'f', gb < 1.0 ? 2 : 1)
                                       : QString();
@@ -1310,17 +1446,43 @@ void BulkExtractorTab::doExtract(bool promptDir, const QVector<QPair<int, QStrin
     // ── Sink: called from the WORKER thread — every GUI touch is marshaled to the GUI thread
     // (queued), so the pipelines never need to pump the event loop and the UI never freezes.
     auto sink = std::make_shared<BatchSink>();
-    sink->progress = [this, startMs](int done, int total) {
-        QMetaObject::invokeMethod(this, [this, done, total, startMs] {
-            m_progress->setMaximum(total);
-            m_progress->setValue(done);
+
+    // ── Run-scoped progress ──────────────────────────────────────────────────────────────────────
+    // Every pipeline reports done/total counting from zero for ITS OWN pass, and a run is several
+    // passes: one per output folder in a grouped layout, a name-matched-texture pass beside each of
+    // those, and in Both mode the whole texture half afterwards. So the bar emptied and the ETA
+    // restarted repeatedly inside a single run - most visibly halfway through Both, which is where
+    // it was reported.
+    //
+    // Folded here rather than by teaching each pipeline a base offset: a pass RESTARTING its count
+    // is the signal, and it needs no knowledge of how many passes there are or what order the run
+    // decides on. `done` going backwards means the previous pass finished, so its total joins the
+    // base and the bar carries on from where it was.
+    struct RunProg { int base = 0, lastDone = 0, lastTotal = 0, grand = 0; };
+    auto rp = std::make_shared<RunProg>();
+    rp->grand = int(matches.size());
+
+    sink->progress = [this, startMs, rp](int done, int total) {
+        QMetaObject::invokeMethod(this, [this, done, total, startMs, rp] {
+            if (done < rp->lastDone) rp->base += rp->lastTotal;   // a new pass began
+            rp->lastDone  = done;
+            rp->lastTotal = total;
+            const int overall = rp->base + done;
+            // qMax, because the co-texture passes write files that were never in `matches` - the
+            // run legitimately does more work than the match count, and a bar pinned to the smaller
+            // number would sit full while work continued.
+            const int grand = qMax(rp->grand, overall);
+            m_progress->setMaximum(grand);
+            m_progress->setValue(overall);
             // Throughput + ETA — active time only (pauses excluded). Shown once the rate settles.
             const qint64 pausedNow = m_pauseRequested.load()
                 ? m_pausedMs + (QDateTime::currentMSecsSinceEpoch() - m_pauseT0) : m_pausedMs;
             const double activeS = double(QDateTime::currentMSecsSinceEpoch() - startMs - pausedNow) / 1000.0;
-            if (done >= 5 && activeS > 2.0) {
-                const double rate = done / activeS;
-                const int remainS = rate > 0.01 ? int((total - done) / rate) : 0;
+            // Rate and ETA over the WHOLE run, not the current pass - a per-pass ETA said "3s
+            // left" three times in a run that had a minute to go.
+            if (overall >= 5 && activeS > 2.0) {
+                const double rate = overall / activeS;
+                const int remainS = rate > 0.01 ? int((grand - overall) / rate) : 0;
                 m_progress->setFormat(QStringLiteral("%v / %m  ·  %1/s  ·  ~%2 left")
                     .arg(rate, 0, 'f', rate < 10.0 ? 1 : 0)
                     .arg(remainS >= 3600
@@ -1342,7 +1504,9 @@ void BulkExtractorTab::doExtract(bool promptDir, const QVector<QPair<int, QStrin
     };
 
     logLine(QStringLiteral("── %1 run: %2 match(es) → %3")
-                .arg(textureMode() ? QStringLiteral("Texture") : QStringLiteral("Model"))
+                .arg(modeIndex() == kModeBoth ? QStringLiteral("Model + texture")
+                     : textureMode()          ? QStringLiteral("Texture")
+                                              : QStringLiteral("Model"))
                 .arg(matches.size()).arg(dir));
     logLine(QStringLiteral("   existing: %1 · layout: %2")
                 .arg(onlyNew ? QStringLiteral("only new") : QStringLiteral("overwrite"),
@@ -1357,16 +1521,28 @@ void BulkExtractorTab::doExtract(bool promptDir, const QVector<QPair<int, QStrin
     QString org = m_organize ? m_organize->currentData().toString() : QString();
     // Masked, not rewritten. A layout selected for model runs stays selected; it simply does not
     // apply to this one, and the log says so rather than producing a silent single "_misc" folder.
+    // Textures are not appearances, so no layout can group them. In Both mode the layout still
+    // applies to the MODEL half — masking it for the whole run because half of it cannot be
+    // grouped would throw away the part that can.
     if (textureMode() && !org.isEmpty()) {
         logLine(QStringLiteral("── layout: %1 groups by appearance, which textures are not — "
                                "this run is flat").arg(m_organize->currentText()));
         org.clear();
     }
+
+    // ── Split the work set by group ONCE, here on the GUI thread ─────────────────────────────
+    // Every pass below wants one or the other, never the mixture, and splitting per pass would
+    // walk the set several times. In the two single-kind modes exactly one of these is non-empty.
+    const QVector<QPair<int, QString>> modelItems = pairsOfGroup(matches, kModelGroup);
+    const QVector<QPair<int, QString>> texItems   = pairsOfGroup(matches, kTextureGroup);
     // Grouped HERE rather than inside exportModels(): the buffer and name-matched-texture passes
     // below need the same folders, so the split has to exist before any of them run. exportModels()
     // is told not to group again (applyLayout=false in bulkExport).
+    // Grouped on the MODEL half only: ExportLayout asks AppearanceMeta which class/type a sno is,
+    // and a texture sno is not an appearance — passing the mixture would file every texture under
+    // _misc and, worse, occasionally under whichever appearance shares its number.
     const QVector<ExportLayout::Group> groups =
-        org.isEmpty() ? QVector<ExportLayout::Group>() : ExportLayout::group(org, matches);
+        org.isEmpty() ? QVector<ExportLayout::Group>() : ExportLayout::group(org, modelItems);
     const bool texMode  = textureMode();
     // Read from QSettings, not from a widget: the checkbox lives in Settings ▸ Export now.
     const bool wantCoTex = !texMode && QSettings().value(QStringLiteral("bulk/coTextures"), false).toBool()
@@ -1377,9 +1553,12 @@ void BulkExtractorTab::doExtract(bool promptDir, const QVector<QPair<int, QStrin
     // ── Worker thread: the entire extract pipeline runs OFF the GUI thread, so the window stays
     // fully responsive during large runs and Cancel reacts instantly. Per-item SEH guards live in
     // the pipelines; sink callbacks marshal GUI updates back (queued).
-    std::thread([this, sink, matches, dir, onlyNew, noun, org, groups, texMode,
+    std::thread([this, sink, matches, modelItems, texItems, dir, onlyNew, noun, org, groups, texMode,
                  wantCoTex, wantBuffers, wantReport, manBefore, runT]() mutable {
+        // The MODEL half of one layout folder. Textures never reach here — they are one flat pass
+        // after the folder loop, because no layout can group them.
         auto runOne = [&](const QVector<QPair<int, QString>>& items, const QString& d) {
+            if (items.isEmpty()) return;
             if (texMode) { if (m_textures) m_textures->bulkExportTextures(items, d, onlyNew, sink.get()); }
             else         { if (m_models)   m_models->bulkExport(items, d, onlyNew, sink.get()); }
         };
@@ -1389,9 +1568,12 @@ void BulkExtractorTab::doExtract(bool promptDir, const QVector<QPair<int, QStrin
         // RUN ROOT, so no layout choice could reach them — every buffer from a by-Class run landed
         // in one buffers/ folder at the top while the models themselves were correctly split. Flat
         // is now just a single unnamed group, which removes the special case entirely.
+        // In Textures mode the single pass carries the texture items (runOne routes them to
+        // bulkExportTextures); in Models and Both it carries the model half, and Both's texture
+        // half is written by its own pass after this loop.
         QVector<QPair<QString, QVector<QPair<int, QString>>>> passes;
         if (groups.isEmpty()) {
-            passes.append({dir, matches});
+            passes.append({dir, texMode ? texItems : modelItems});
         } else {
             for (const ExportLayout::Group& g : groups)
                 passes.append({ExportLayout::folderFor(dir, g), g.items});
@@ -1401,10 +1583,15 @@ void BulkExtractorTab::doExtract(bool promptDir, const QVector<QPair<int, QStrin
         // run and bucketed by the stem that matched. Doing the sweep inside the per-folder loop
         // instead would re-scan the entire texture group per folder — harmless for by-Class, but
         // by-Model has a folder per model, so a 500-model run would scan it 500 times.
+        //
+        // Over modelItems, not the whole work set: the stems being matched are MODEL names. In
+        // Both mode the set also holds textures, and a texture whose name is a prefix of another
+        // texture's would otherwise claim it — a stem bucket keyed on something that is already a
+        // texture, exported twice under two folders.
         QHash<QString, QVector<QPair<int, QString>>> texByStem;
         if (!m_cancelRequested.load() && wantCoTex) {
             for (const SnoEntry& te : m_index->entries(kTextureGroup))
-                for (const auto& it : matches)
+                for (const auto& it : modelItems)
                     if (te.name.startsWith(it.second, Qt::CaseInsensitive)) {
                         texByStem[it.second].append({te.snoId, te.name});
                         break;   // first match owns it, exactly as before
@@ -1465,6 +1652,49 @@ void BulkExtractorTab::doExtract(bool promptDir, const QVector<QPair<int, QStrin
                 // distinguishable from "the tick did not stick".
                 if (sink->log)
                     sink->log(QStringLiteral("   buffers: %1 raw %2 file(s) → buffers/").arg(wrote).arg(bufExt));
+            }
+        }
+
+        // ── Both mode: the TEXTURE half, once, after every model folder ──────────────────────
+        //
+        // Flat and outside the folder loop, for the same reason the layout is masked in Textures
+        // mode: a texture is not an appearance, so there is no class or type to file it under.
+        // They land in <out>\textures\ — the same subfolder the co-texture pass uses, which is
+        // deliberate: these are the query's own texture matches, which is how a loose map no
+        // material binds (a fur mask, a dye ramp, an atlas sheet) reaches the output at all.
+        //
+        // On a FLAT layout the two passes share that folder. Their filenames do not collide — both
+        // keep the game's own texture name, so a texture matched by both is written to one path —
+        // but on "Overwrite" it is decoded and written twice, once per pass. "Only new" avoids
+        // even that, because the second pass sees the first one's ledger entry. Wasted work in one
+        // configuration, never a wrong file.
+        //
+        // A run cancelled during the model half never reaches this, which is the right order: the
+        // models are what a cancelled run has already half-written.
+        if (!m_cancelRequested.load() && !texMode && !texItems.isEmpty() && m_textures) {
+            const QString texDir = QDir(dir).filePath(QStringLiteral("textures"));
+            QDir().mkpath(texDir);
+            if (sink->log)
+                sink->log(QStringLiteral("── texture half: %1 match(es) → textures/").arg(texItems.size()));
+            m_textures->bulkExportTextures(texItems, texDir, onlyNew, sink.get());
+
+            // Raw payloads for the texture half, mirroring the model one. Without this, ticking
+            // "Also write raw game buffers" on a Both run would produce .app files and silently no
+            // .tex files — a half-kept promise, which is the kind of gap nobody reports because it
+            // looks like the option working.
+            if (!m_cancelRequested.load() && m_reader && m_reader->isReady() && wantBuffers) {
+                const QString bufDir = QDir(texDir).filePath(QStringLiteral("buffers"));
+                QDir().mkpath(bufDir);
+                int wrote = 0;
+                for (const auto& it : texItems) {
+                    if (sink->canceled()) break;
+                    const QByteArray raw = m_reader->readPayloadBySno(quint64(it.first));
+                    if (raw.isEmpty()) continue;
+                    QFile f(QDir(bufDir).filePath(it.second + QStringLiteral(".tex")));
+                    if (f.open(QIODevice::WriteOnly)) { f.write(raw); ++wrote; }
+                }
+                if (sink->log)
+                    sink->log(QStringLiteral("   buffers: %1 raw .tex file(s) → textures/buffers/").arg(wrote));
             }
         }
 
@@ -1573,6 +1803,7 @@ void BulkExtractorTab::loadFolderManifest()
 {
     m_folderDone.clear();
     m_folderStems.clear();
+    m_folderTexStems.clear();
     const QString dir = m_outDir ? m_outDir->text().trimmed() : QString();
     if (dir.isEmpty()) return;
     // The root, THEN one level of subfolders. bulkExport writes its ledger into the folder it was
@@ -1589,8 +1820,18 @@ void BulkExtractorTab::loadFolderManifest()
             for (const QJsonValue& v : man) m_folderDone.insert(v.toObject().value(QStringLiteral("sno")).toInt());
         }
         // Also treat any file already on disk (any extension) as "present", matching the skip logic.
+        //
+        // Files under a "textures" folder are kept in their OWN set. A texture and the appearance
+        // it belongs to are routinely spelt the same, so once the model half of a Both run had
+        // written foo.glb, the texture named foo was reported already-in-folder — a wrong ✓, a
+        // wrong "N already in folder" count and a wrong status column in the report. It never
+        // changed what was extracted (each pipeline scopes its own skip check to its own output
+        // directory), which is why it would have gone unnoticed.
+        const bool isTexDir = QFileInfo(r).fileName().compare(QStringLiteral("textures"),
+                                                              Qt::CaseInsensitive) == 0;
+        QSet<QString>& into = isTexDir ? m_folderTexStems : m_folderStems;
         for (const QFileInfo& fi : QDir(r).entryInfoList(QDir::Files))
-            m_folderStems.insert(fi.completeBaseName());
+            into.insert(fi.completeBaseName());
     }
 }
 
@@ -1638,34 +1879,113 @@ const QVector<BulkExtractorTab::FactoryPreset>& BulkExtractorTab::factoryPresets
                         .join(QLatin1Char('|')),
                     {}, false, /*coTex*/ true});
         // Textures: everything the character creator draws — skins (P##_BOD/HED), hair sheets,
-        // jewelry sheets, markings/facial hair/eyeshadow (global_*), eyes, teeth, makeup, lashes.
+        // jewelry sheets, markings/facial hair/eyeshadow, eyes, teeth, makeup, lashes.
+        //
+        // "bodymarking" is listed SEPARATELY from "global_" because most body markings are not
+        // global_ anything. *(measured, CoreTOC 2026-09)* the game ships 580 body-marking
+        // textures; only 70 of them contain "global_", so this preset was returning 12% of the
+        // family and looking healthy while doing it. The other 510 are named two ways —
+        // bodymarking_BOD_<cls>###_stor and bodymarking_<cls>###_BOD_stor, the slot and the class
+        // swapping places — plus event sets like bodyMarking_lunar001_BOD_lte that carry no class
+        // at all. One "bodymarking" substring covers every spelling; matching the orderings
+        // individually is what missed them.
         out.append({QStringLiteral("All Global & Base Textures"), 1,
                     (QStringList() << skinAlts << hairAlts
-                                   << QStringLiteral("global_") << QStringLiteral("jwl")
+                                   << QStringLiteral("global_") << QStringLiteral("bodymarking")
+                                   << QStringLiteral("jwl")
+                                   << QStringLiteral("base_eyes") << QStringLiteral("baseeye")
+                                   << QStringLiteral("base_teeth") << QStringLiteral("makeup_")
+                                   << QStringLiteral("eyelash"))
+                        .join(QLatin1Char('|')),
+                    {}, false});
+        // Both: the union of the two queries above, so one run brings out the creator's models
+        // AND its sheets. It is a union rather than either half reused, because the two halves
+        // genuinely name different things — bodies and hair meshes on one side, skin and marking
+        // sheets on the other — and each side's alternatives pick up records in the OTHER group
+        // that its own preset misses. *(measured)* the union returns 1,184 appearances against the
+        // models preset's 923: the extra 261 are the P## face meshes that the skin alternatives
+        // reach, which belong in "everything the character creator draws" by any reading.
+        out.append({QStringLiteral("All Global & Base — Everything"), 2,
+                    (QStringList() << bodyAlts << hairAlts << skinAlts
+                                   << QStringLiteral("global_") << QStringLiteral("bodymarking")
+                                   << QStringLiteral("jwl") << QStringLiteral("test999")
                                    << QStringLiteral("base_eyes") << QStringLiteral("baseeye")
                                    << QStringLiteral("base_teeth") << QStringLiteral("makeup_")
                                    << QStringLiteral("eyelash"))
                         .join(QLatin1Char('|')),
                     {}, false});
 
-        // Per class: everything tagged with the class, the armour-only subset, and the class's
-        // texture sheets. Textures (group 44) carry no tags, so that preset is name-based: every
-        // class-owned sheet starts {cls}{f|m}_ (skins, hair, armour looks) — and because matching
-        // is contains(), it also catches the class token mid-name (jwl00_barF_…). The bare code
-        // without "_" is NOT used: "barm" would match unrelated names like "barmaid".
+        // Per class: everything tagged with the class, and the class's texture sheets. Textures
+        // (group 44) carry no tags, so that preset is name-based: every class-owned sheet starts
+        // {cls}{f|m}_ (skins, hair, armour looks) — and because matching is contains(), it also
+        // catches the class token mid-name (jwl00_barF_…, s02_bloodseeker_necM_color). The bare
+        // code without "_" is NOT used: "barm" would match unrelated names like "barmaid".
+        //
+        // "All {class} Armor" was CUT here. *(measured, Help ▸ Audit bulk presets)* it returned
+        // 87–91% of the same class's Appearance preset on every one of the eight — 1340 of 1502
+        // for Sorcerer, 650 of 749 for Paladin — and the ~140-item difference is hair, faces,
+        // jewelry and the base body, all of which "All Global & Base Appearance" already covers.
+        // Eight presets that duplicate eight others is most of what made this combo long, and the
+        // armour-only view is one tick of the funnel's "armor" tag away.
         for (int i = 0; i < ItemDef::HeroClassCount; ++i) {
             const QString n = QString::fromLatin1(ItemDef::heroClassName(i));
             const QString c = QString::fromLatin1(ItemDef::heroClassCode(i));
             out.append({QStringLiteral("All %1 Appearance").arg(n), 0, QString(), {n}, false,
                         /*coTex*/ true});
-            out.append({QStringLiteral("All %1 Armor").arg(n), 0, QString(),
-                        {n, QStringLiteral("armor")}, false, /*coTex*/ true});
             // "{c}_p0" adds the class's genderless skin sheets (rog_P00_HED_…); Druid also ships
             // sheets spelling the class in full (druidM_P00_HED_eyelash).
             QString texQ = c + QStringLiteral("f_|") + c + QStringLiteral("m_|")
                          + c + QStringLiteral("_p0");
             if (c == QLatin1String("dru")) texQ += QStringLiteral("|druidf_p0|druidm_p0");
+            // That class's body markings, which none of the above reach: a marking is named
+            // bodyMarking_BOD_bar011_stor or bodyMarking_bar011_BOD_stor, and neither contains
+            // "barf_", "barm_" or "bar_p0". Both orderings are listed because both ship.
+            //
+            // Scoped to the class on purpose. A bare "bodymarking" would put all 580 of the
+            // game's markings into every one of the eight class presets; these three alternatives
+            // add only that class's own — *(measured)* +95 bar, +84 sor, +88 rog, +86 nec, +56
+            // dru, +54 spi, +35 pal, +26 war, with **zero** cross-class leaks. The class-less
+            // global_ and lunar sets stay where they belong, in Global & Base Textures.
+            texQ += QStringLiteral("|bodymarking_bod_") + c
+                  + QStringLiteral("|bodymarking_hed_") + c
+                  + QStringLiteral("|bodymarking_") + c;
+            // Two of the eight class codes form an English word when the gender letter is glued
+            // on, and contains() cannot see a word boundary. A leading space makes these separate
+            // AND terms and '-' excludes. *(measured, CoreTOC 2026-09, over BOTH groups)*:
+            //
+            //   pal + m_  matches "…WalkingPalm…", "…Fan_Palm…", "…Palm_Bark…" — Kehj, Naha and
+            //             Tora foliage. One "-foliage" covers every spelling in both groups and
+            //             costs ZERO genuine Paladin records; the earlier "-walkingpalm" caught
+            //             only the Naha set and left 43 Kehj appearances behind.
+            //   war + f_  matches "…Dwarf_Pine…" (Skov foliage).
+            //   war + m_  matches "…Swarm…" and "…stormCloudWarm…".
+            //
+            // "-swarm" was the first cut for Warlock and it was WRONG: ShadowDemonSwarm is a
+            // Warlock ability, so it also deleted six genuine records — war_ShadowDemonSwarm_varC_*
+            // and abyss_shadowDemonSwarm_ColorGradient. The owners are named instead, which drops
+            // the Vampire corpse piles, the Spiritborn bat swarm and the Druid storm cloud while
+            // keeping every Warlock one. Verified: zero genuine class records lost on either group.
+            // The other six codes collide with nothing.
+            if      (c == QLatin1String("pal")) texQ += QStringLiteral(" -foliage");
+            else if (c == QLatin1String("war")) texQ += QStringLiteral(" -dwarf -corpse_swarm"
+                                                                       " -bugswarm -cloudwarm"
+                                                                       " -batswarm");
             out.append({QStringLiteral("All %1 Textures").arg(n), 1, texQ, {}, false});
+            // ── Both: the SAME query, run over both groups ──────────────────────────────────
+            // One string serves both halves because the class-code alternatives are how models
+            // are named too — barF_/barM_ is an appearance prefix as much as a texture one. The
+            // bodymarking alternatives cost nothing on the model half: the game ships 374
+            // MarkingShape records and zero marking appearances.
+            //
+            // Name-based rather than tagged, unlike "All %1 Appearance" above, because a Both
+            // preset has ONE name box and ONE tag set, and the tags reach only the model half —
+            // so a tagged Both preset would filter its two halves by different rules. Measured
+            // against the tag-based preset the model counts land within a few percent either way
+            // (Barbarian 1535 vs 1534, Paladin 753 vs 749).
+            //
+            // coTex stays OFF here. The texture half already extracts this query's textures; the
+            // co-texture pass would add a second, overlapping sweep for the same folder.
+            out.append({QStringLiteral("All %1 — Everything").arg(n), 2, texQ, {}, false});
         }
 
         // Weapon TEXTURES have no class or category marker of their own — they are named after
@@ -1673,6 +1993,45 @@ const QVector<BulkExtractorTab::FactoryPreset>& BulkExtractorTab::factoryPresets
         // there is no separate "All Weapons Textures" preset: this IS it.
         out.append({QStringLiteral("All Weapons"), 0, QString(), {QStringLiteral("weapon")}, false,
                     /*coTex*/ true});
+
+        // ── Families that had no preset at all *(measured, CoreTOC 2026-09)* ─────────────────
+        //
+        // Mounts and back trophies are whole subjects of the tool — the Stable tab exists for the
+        // first and the Wardrobe has a slot for the second — and neither could be reached from
+        // this combo. They are name-matched rather than tagged because these presets have to keep
+        // working before AppearanceMeta finishes, and because "mnt_" is exact: all 747 mount
+        // appearances start with it and nothing else does.
+        out.append({QStringLiteral("All Mounts & Mount Armor"), 0, QStringLiteral("mnt_"),
+                    {}, false, /*coTex*/ true});
+        out.append({QStringLiteral("All Mount Textures"), 1, QStringLiteral("mnt_"), {}, false});
+        // *(measured)* "mnt_" is exact on both groups — 747 appearances and 4,849 textures start
+        // with it, and nothing else does — so the same one-token query serves the pair.
+        out.append({QStringLiteral("All Mounts — Everything"), 2, QStringLiteral("mnt_"), {}, false});
+
+        // Back trophies, enumerated rather than matched on "trophy_".
+        //
+        // "trophy_ -mnt" was the first cut and it was too loose: *(measured, Help ▸ Audit bulk
+        // presets)* it returned 116 including Flippy_Trophy_001 and
+        // QST_Hawe_Soulrot_03_HunterTrophy_Dyn — world props that carry the word mid-name. A back
+        // trophy is trophy_<class><NN> or trophy_glo<NN> (the class-agnostic ones), so listing
+        // those prefixes is exact: 114, dropping precisely those two and nothing else. It also
+        // makes the mount exclusion unnecessary — no mount trophy is named that way — which is
+        // one fewer term that could quietly exclude something real.
+        QStringList trophyAlts;
+        for (int i = 0; i < ItemDef::HeroClassCount; ++i)
+            trophyAlts << QStringLiteral("trophy_") + QString::fromLatin1(ItemDef::heroClassCode(i));
+        trophyAlts << QStringLiteral("trophy_glo");
+        out.append({QStringLiteral("All Back Trophies"), 0, trophyAlts.join(QLatin1Char('|')),
+                    {}, false, /*coTex*/ true});
+        // The same enumeration over both groups: 114 appearances and 743 textures. coTex off, as
+        // for every Both preset — the texture half is already doing that job.
+        out.append({QStringLiteral("All Back Trophies — Everything"), 2,
+                    trophyAlts.join(QLatin1Char('|')), {}, false});
+
+        // Body markings are TEXTURE-ONLY — the game ships 374 MarkingShape records and **zero**
+        // marking appearances, so there is deliberately no models counterpart to this one.
+        out.append({QStringLiteral("All Body Markings"), 1, QStringLiteral("bodymarking"),
+                    {}, false});
         return out;
     }();
     return v;
@@ -1681,7 +2040,7 @@ const QVector<BulkExtractorTab::FactoryPreset>& BulkExtractorTab::factoryPresets
 void BulkExtractorTab::applyFactoryPreset(const FactoryPreset& p)
 {
     m_loadingPreset = true;
-    if (m_mode) m_mode->setCurrentIndex(qBound(0, p.mode, 1));
+    if (m_mode) m_mode->setCurrentIndex(qBound(0, p.mode, 2));
     if (m_name) m_name->setText(p.query);
     m_catFacet.clear();
     m_tagFilter = QSet<QString>(p.tags.begin(), p.tags.end());
@@ -1715,13 +2074,30 @@ QString BulkExtractorTab::auditPresets()
        << "count means a pattern is too loose. Both are invisible in the UI until you extract.\n\n";
     int empty = 0;
     for (const auto& p : fp) {
-        const auto m = matchesFor(p.mode == 1, p.query, {}, QString(),
-                                  QSet<QString>(p.tags.begin(), p.tags.end()), p.tagOr, false);
+        // A Both preset is two queries, so it is two calls summed. Reporting only one half would
+        // make a healthy preset look half-broken — and this file is the only place a preset's
+        // coverage is ever checked.
+        const QSet<QString> tg(p.tags.begin(), p.tags.end());
+        QVector<QPair<int, QString>> m;
+        int nMdl = 0, nTex = 0;
+        if (p.mode != 1) {
+            m = matchesFor(false, p.query, {}, QString(), tg, p.tagOr, false);
+            nMdl = m.size();
+        }
+        if (p.mode != 0) {
+            const auto t = matchesFor(true, p.query, {}, QString(), tg, p.tagOr, false);
+            nTex = t.size();
+            m += t;
+        }
         if (m.isEmpty()) ++empty;
-        ts << QStringLiteral("%1  %2  %3\n")
+        ts << QStringLiteral("%1  %2  %3%4\n")
                   .arg(m.isEmpty() ? QStringLiteral("EMPTY ") : QStringLiteral("      "))
                   .arg(QString::number(m.size()).rightJustified(6))
-                  .arg(p.name);
+                  .arg(p.name)
+                  // Both presets print their split: one of the two halves coming back empty is a
+                  // real fault that a healthy-looking total would hide.
+                  .arg(p.mode == 2 ? QStringLiteral("   [%1 model + %2 texture]").arg(nMdl).arg(nTex)
+                                   : QString());
         // Three examples make a wrong-but-non-empty preset visible too: "All Warlock Armor"
         // returning barbarian pieces is a count that looks perfectly healthy.
         for (int i = 0; i < qMin(3, m.size()); ++i)
@@ -1807,7 +2183,10 @@ void BulkExtractorTab::loadPreset(const QString& name)
     s.beginGroup(QStringLiteral("bulk/presets/") + name);
     if (s.childKeys().isEmpty()) { s.endGroup(); return; }
     m_loadingPreset = true;
-    m_mode->setCurrentIndex(qBound(0, s.value(QStringLiteral("mode"), 0).toInt(), 1));
+    // Clamp to 2, not 1. savePreset stores m_mode->currentIndex(), which can be Both; clamping to
+    // 1 here loaded a Both preset back as Textures — silently, and it then swapped to the Textures
+    // queue as well. The twin clamp in applyFactoryPreset was updated and this one was missed.
+    m_mode->setCurrentIndex(qBound(0, s.value(QStringLiteral("mode"), 0).toInt(), 2));
     m_name->setText(s.value(QStringLiteral("name")).toString());
     m_catFacet = s.value(QStringLiteral("facet")).toString();
     const QStringList tags = s.value(QStringLiteral("tags")).toStringList();

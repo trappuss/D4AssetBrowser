@@ -27,12 +27,28 @@ content ships encrypted; without keys those records are present but unreadable. 
 11,500 assets stay locked behind keys nobody has harvested — that is a limit of what is
 public, not of this tool.
 
+Neither download reaches Blizzard, and neither ships game assets. d4data is community-decoded
+metadata; TACT keys are community-harvested. The tool reads your own installation for
+everything else. → [Asset formats §3](Asset-formats#3-directories-and-file-types) ·
+[Glossary](Glossary#storage-and-identity)
+
 ## Requirements
 
 - Windows 10/11 x64
 - A Diablo IV installation (Battle.net or Steam)
-- A GPU with OpenGL 4.5
+- A GPU with **OpenGL 4.5** — on a laptop with switchable graphics, make sure Windows is
+  handing the app the discrete GPU
 - An internet connection on first run
+
+## What to do next
+
+Once both downloads finish, **[the six tabs](Tabs)** is the five-minute tour, and
+**[Keyboard & mouse](Keyboard-and-mouse)** is worth keeping open beside the app for the first
+session — several viewport actions are not written on any button.
+
+If something does not look right on first run, **Help ▸ Health check** reports which of the
+two folders is incomplete rather than leaving you to guess.
+→ [Diagnostics](Diagnostics#help--health-check)
 
 ## "Windows flagged the download"
 

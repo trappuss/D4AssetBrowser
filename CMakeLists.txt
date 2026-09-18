@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.21)
 
 project(D4AssetBrowser
-    VERSION 2.3.0
+    VERSION 2.4.0
     DESCRIPTION "Native C++/Qt6 Diablo IV asset browser (d4analyzer code stack)"
     LANGUAGES CXX)
 
@@ -20,15 +20,10 @@ find_package(Qt6 REQUIRED COMPONENTS Core Gui Widgets OpenGL OpenGLWidgets Svg)
 find_package(ZLIB REQUIRED)
 find_package(lz4 CONFIG REQUIRED)
 
-# glTF: fastgltf (writer/parser) + tinygltf (image/loader).
-# These back the Models tab / .glb export. (Draco mesh-compression is deferred to the
-# Models .glb-export milestone — it's omitted for now because its long internal file
-# paths trip the Windows 260-char path limit under deep build trees. Re-add it with
-# long-path support enabled when we wire export.)
-find_package(fastgltf CONFIG REQUIRED)
-# tinygltf is header-only in vcpkg; it exposes an include dir (and, on some ports,
-# a config target). We locate the header and add it to the include path.
-find_path(TINYGLTF_INCLUDE_DIR "tiny_gltf.h")
+# glTF: the .glb writer is hand-written (model/ModelExporter.cpp, QJson + a binary chunk) and
+# includes no glTF library. fastgltf and tinygltf were required here and in vcpkg.json from the
+# first milestone plan, but no source file ever included either (grep: only comments and the
+# About text mentioned them) — two vcpkg builds and a link line for nothing. Removed 2026-09.
 
 qt_standard_project_setup()
 
@@ -130,7 +125,6 @@ qt_add_executable(D4AssetBrowser WIN32
 
 target_include_directories(D4AssetBrowser PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src
-    ${TINYGLTF_INCLUDE_DIR}
 )
 
 # Crash resilience: /EHa lets C++ try/catch intercept Windows structured
@@ -191,7 +185,6 @@ target_link_libraries(D4AssetBrowser PRIVATE
     Qt6::Svg
     ZLIB::ZLIB
     lz4::lz4
-    fastgltf::fastgltf
 )
 
 # ── Packaging ────────────────────────────────────────────────────────────────

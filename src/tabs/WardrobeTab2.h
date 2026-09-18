@@ -129,7 +129,6 @@ private:
     QCache<QString, QImage> m_texCache;
     QMutex                  m_texCacheMutex;
     void applyDye();         // push the selected pigment across the whole outfit
-    void rebuildDyeCombo();  // (re)fill the dye dropdown from real DyeDefinitions
     void ensureWeaponIndex();// enumerate weapon appearances by name prefix (data-driven)
     void populateWeapons();
     static QString weaponKeyOf(const QComboBox* cb);   // unambiguous settings value for a weapon slot  // fill the weapon type/model combos (class-filtered)
@@ -366,7 +365,6 @@ private:
     bool navLookGrid(int key);
     void refreshCreatorCells();
     QImage creatorIconImage(int cat, const QString& stem) const;   // hIconImage / tIcons / colour swatch
-    QComboBox* m_dyeCombo = nullptr;   // None + real player dyes (4-colour pigments)
     QComboBox* m_weaponType = nullptr; // main-hand weapon type
     QComboBox* m_weapon = nullptr;     // main-hand weapon model within the chosen type
     QComboBox* m_weaponType2 = nullptr;// off-hand weapon type (dual-wield / shield / focus)

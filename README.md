@@ -12,6 +12,38 @@ hair, makeup and animations.
 > that you own. **No game assets and no decryption keys are included in this repository.**
 
 ---
+
+## Documentation
+
+**The [wiki](https://github.com/trappuss/D4AssetBrowser/wiki) is the manual.** This README is the overview — what the tool is and what it
+can do. The wiki is where the detail lives, and it is the better place to start if you are
+trying to *do* something rather than decide whether to download it.
+
+| Start here | |
+|---|---|
+| **[Install](https://github.com/trappuss/D4AssetBrowser/wiki/Install)** | Download, first run, the two folders you point it at, and what to do when Windows flags the exe. |
+| **[The six tabs](https://github.com/trappuss/D4AssetBrowser/wiki/Tabs)** | What each tab is for, and when to use which. |
+| **[Keyboard & mouse](https://github.com/trappuss/D4AssetBrowser/wiki/Keyboard-and-mouse)** | Every binding, including the viewport ones that are not written on any button. |
+| **[Settings](https://github.com/trappuss/D4AssetBrowser/wiki/Settings)** | The nine settings tabs, and the handful of options that change results rather than looks. |
+
+| Doing things | |
+|---|---|
+| **[Exporting](https://github.com/trappuss/D4AssetBrowser/wiki/Exporting)** | Formats, scopes, animations, the normal-map convention, and which option you actually want. |
+| **[After a game patch](https://github.com/trappuss/D4AssetBrowser/wiki/After-a-patch)** | What to re-download, and how to tell "new" from "broken". |
+| **[FAQ](https://github.com/trappuss/D4AssetBrowser/wiki/FAQ)** | Short answers to the questions that come up most. |
+
+| When it goes wrong | |
+|---|---|
+| **[Troubleshooting](https://github.com/trappuss/D4AssetBrowser/wiki/Troubleshooting)** | Routed by symptom: nothing renders · a piece is white · a model is missing parts · an export looks wrong in Blender. |
+| **[Diagnostics](https://github.com/trappuss/D4AssetBrowser/wiki/Diagnostics)** | Find SNO, Patch contents, Health check, Explain this material, the audit scripts, and the log. |
+
+| Understanding the data | |
+|---|---|
+| **[Asset formats](https://github.com/trappuss/D4AssetBrowser/wiki/Asset-formats)** | How Diablo IV actually stores everything — storage, SNO groups, directories, naming, materials, textures, cloth, animation, encryption. Measured against a retail build, with the method for checking any of it yourself. |
+| **[Glossary](https://github.com/trappuss/D4AssetBrowser/wiki/Glossary)** | One-line definitions of the vocabulary the rest of the documentation uses. |
+| **[Building from source](https://github.com/trappuss/D4AssetBrowser/wiki/Building)** | Prerequisites, the build, the source checks, CI and cutting a release. |
+
+---
 ## Preview
 
 
@@ -43,6 +75,9 @@ hair, makeup and animations.
 
 No Python. No `pip`. No d4extract.
 
+*Longer version, including what the two downloads actually are and why both are needed:*
+**[Install](https://github.com/trappuss/D4AssetBrowser/wiki/Install)**.
+
 **Requirements:** Windows 10/11 x64 · a Diablo IV install (Battle.net or Steam) ·
 GPU with OpenGL 4.5 · internet on first run.
 
@@ -55,14 +90,15 @@ GPU with OpenGL 4.5 · internet on first run.
 
 | Tab | What it does |
 |---|---|
-| **Models** | Browse and inspect all 67k+ appearances in a live PBR viewport. |
-| **Wardrobe** | Dress a character — armour, weapons, dyes, hair, markings, animations. |
-| **Stable** | The same for mounts and pets. |
-| **Textures** | Browse and decode every texture in the game. |
-| **Catalogue** | The Cosmetics Shop — every bundle the game has, what was in it, and export the lot. |
-| **Bulk Extract** | Filter the index and export in one run. |
+| **[Models](https://github.com/trappuss/D4AssetBrowser/wiki/Tabs#models)** | Browse and inspect all 67k+ appearances in a live PBR viewport. |
+| **[Wardrobe](https://github.com/trappuss/D4AssetBrowser/wiki/Tabs#wardrobe)** | Dress a character — armour, weapons, dyes, hair, markings, animations. |
+| **[Stable](https://github.com/trappuss/D4AssetBrowser/wiki/Tabs#stable)** | The same for mounts and pets. |
+| **[Textures](https://github.com/trappuss/D4AssetBrowser/wiki/Tabs#textures)** | Browse and decode every texture in the game. |
+| **[Catalogue](https://github.com/trappuss/D4AssetBrowser/wiki/Tabs#catalogue)** | The Cosmetics Shop — every bundle the game has, what was in it, and export the lot. |
+| **[Bulk Extract](https://github.com/trappuss/D4AssetBrowser/wiki/Tabs#bulk-extract)** | Filter the index and export in one run. |
 
-Each is covered in detail below.
+Each is covered in detail below, and again — with the parts you need while actually using it
+— on the wiki's **[six tabs](https://github.com/trappuss/D4AssetBrowser/wiki/Tabs)** page.
 
 ---
 
@@ -174,9 +210,16 @@ The Cosmetics Shop, browsable. Every bundle it has sold — hero art, card, lore
 item inside resolved to the appearance or texture it actually is. Search matches the shop title,
 the SNO name and the lore.
 
-**Filters** live behind the same funnel the other tabs use: contents kind, patch, season, and
-**Latest** (new in this game update), plus a sort by name, season or patch. Active filters show as
-removable chips and tint the funnel.
+**Filters** live behind the same funnel the other tabs use: contents kind, **class**, **slot**,
+patch, season, **Latest** (new in this game update) and **Reward only**, plus a sort by name,
+season, patch or SNO. Active filters show as removable chips and tint the funnel. **Ctrl+F**
+focuses the search; **Esc** clears it.
+
+Class and slot come from the game's own authored fields and are asked of what a bundle *contains*,
+so a pack matches when any piece inside it does — and their entries are built from the data, so a
+class or slot added in a later patch appears without an update. **Reward only** is the shop's
+`requires` relationship: the cosmetics that were never sold, and came with a battlepass or a
+season pass instead.
 
 **Two views of the contents.** The shop's own *INCLUDES 8 ITEMS* strip, showing each piece's real
 inventory icon — one row per gender, because armour resolves to a female and a male appearance and
@@ -186,7 +229,8 @@ wherever a product could not be resolved. Selection is mirrored between the two 
 own shop art is listed as its own branch.
 
 **Double-click** any item to open it in Models — textured, with its parts tree and animations.
-Bundle art opens in Textures.
+Bundle art opens in Textures. **Right-click** one for *Also sold in*: every other product carrying
+the same piece, with its season, and one click to go there.
 
 **Provenance.** Supported classes, whether it shipped with VFX, its associated season, and the
 shop's own *requires* / *add-on to* / *excludes* relationships — which is how you discover a mount
@@ -206,6 +250,18 @@ snapshot"*. Re-downloading d4data once it catches up fills the text back in.
 Filter the whole index, watch the match count update live, then export everything at once.
 Same funnel filters as the Models tab. **Pick items manually** moves matches into a persistent
 **Queue** that survives filter changes, mode switches and restarts.
+
+**Three modes** — Models (`.glb`), Textures (images), and **Both**, which runs the two queries
+over one NAME box in a single run: models into the folder layout, textures into a `textures\`
+subfolder beside them. Both is the route to loose maps no material binds — fur masks, dye masks
+and ramps, atlas sheets, recolour variants. Tag filters reach the model half only (textures
+carry no tags), so Both reports its two counts separately rather than one total, and each mode
+keeps its own queue.
+
+**34 built-in presets** — per class an Appearance, a Textures and an *— Everything*, plus
+Global & Base, Weapons, Mounts, Back Trophies and Body Markings. *Help ▸ Audit bulk presets*
+resolves every one through the real matcher and writes its match count to
+`data\preset_audit.txt`.
 
 Options: include textures · all animations · pulled animations · raw sources. **Parallel**
 workers (auto = core count). **Only new** skips anything already exported — tracked in a
@@ -263,6 +319,16 @@ Right-click works nearly everywhere, and the same object offers the same actions
 find it — the list, the grid and the outliner all raise one menu, as do the Parts panel, the
 outliner's part nodes and the 3D viewport.
 
+**Selecting parts in the viewport.** Left-click a part to select it, **Ctrl** or **Shift** click
+to add one or take one back out, click empty space to clear. The selection is outlined in blue
+and is mirrored in the Parts panel, in both directions. Right-clicking a part that is already
+selected acts on the whole selection; right-clicking one outside it replaces the selection with
+that part, so the outline and the menu never disagree about what is about to happen. The menu
+counts what it has — *Export 3 parts (5,120 tris)…*, *Frame 3 parts*, *Hide 3 parts*,
+*Isolate 3 parts*, *Copy 3 material names* — and names the source piece only when the whole
+selection came from one. **Double-click frames** the part under the cursor and leaves the
+selection alone. Models, Wardrobe and Stable all behave this way.
+
 **An asset row / grid tile / outliner row**
 Load / preview · Copy image · Save image(s) · Save image(s) as… · Render icon(s) ·
 Export to last dir · Export to… · Copy SNO id · Copy file name · Copy name ·
@@ -281,6 +347,10 @@ export and copy block.
 Delete custom pigment.
 **A texture** — Export to… · Copy image · Save image as… · Copy SNO / file name / name.
 **Any detail table** — Copy · Copy all (also `Ctrl+C`).
+
+**Every binding, including the viewport ones that are not written on any button:**
+[Keyboard & mouse](https://github.com/trappuss/D4AssetBrowser/wiki/Keyboard-and-mouse). The app carries the same list itself under
+**Help ▸ Shortcuts**, or <kbd>F1</kbd>.
 
 ---
 
@@ -345,6 +415,10 @@ base body as a fit reference, and batch the whole armour set with a `manifest.js
 in sub-tabs — including a side-by-side of the two ways to get loose texture files, which look
 interchangeable and are not: one copies the maps a model already decoded, the other decodes
 every map in the material whether the model uses it or not.
+
+**More on this:** [Exporting](https://github.com/trappuss/D4AssetBrowser/wiki/Exporting) covers the same ground with the decisions
+attached — which option you actually want, and why an export that looked right in the viewport
+can light wrong in Blender. Where each option lives: [Settings](https://github.com/trappuss/D4AssetBrowser/wiki/Settings).
 
 ---
 
@@ -566,6 +640,15 @@ distribute them.
 
 ---
 
+**How the data is actually put together** — storage, SNO groups, directories, naming,
+materials, textures, cloth, animation, encryption — is documented at length in
+[Asset formats](https://github.com/trappuss/D4AssetBrowser/wiki/Asset-formats). Everything on that page was measured against a retail
+build, it says so where something is unverified rather than filling the gap, and section 13
+gives you the method to re-derive any claim on it yourself. [Glossary](https://github.com/trappuss/D4AssetBrowser/wiki/Glossary) is the
+one-line version of the same vocabulary.
+
+---
+
 ## Keeping up with the project
 
 Roadmap, what's in progress and what's planned live on the project board:
@@ -590,6 +673,12 @@ works on the ten models you tried and fails on the eleventh is the usual failure
 **Settings → General → Directories**. New seasonal and collab content usually needs both. If something still
 won't load, `Audit Asset Health.bat` diffs against your last run and reports exactly what
 changed — attach that output to an issue and it saves a lot of back-and-forth.
+The full procedure, and why something can still be missing afterwards, is on
+[After a game patch](https://github.com/trappuss/D4AssetBrowser/wiki/After-a-patch).
+
+- **[Wiki](https://github.com/trappuss/D4AssetBrowser/wiki)** — the manual. Install, the six tabs, shortcuts, settings, exporting,
+  troubleshooting, diagnostics, the asset-format reference and a glossary. Contributions to it
+  are as welcome as contributions to the code.
 
 ---
 

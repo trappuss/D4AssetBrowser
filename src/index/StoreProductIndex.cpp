@@ -10,12 +10,14 @@
 #include <QDirIterator>
 #include <QFile>
 #include <QFileInfo>
+#include <QDebug>
 #include <QJsonArray>
 #include <QSet>
 #include <QJsonDocument>
 #include <QJsonObject>
 
 #include <algorithm>
+#include <cmath>
 #include <thread>
 
 namespace {
@@ -56,6 +58,18 @@ const char* const kArtFields[] = {
     "hOwnedTileImage", "hSmallOwnedTileImage", "hPurchaseCompleteImage", "hDetailsDisplayImage",
     "hIconRepresentation", "hAddOnDetailsScreenImage", "hStoreIconOverride",
 };
+
+// The same twelve as a set, for the "is this one we already knew about" test that decides whether
+// a field is worth announcing. Built once from kArtFields so the two can never drift.
+inline const QSet<QString>& kArtFieldSet()
+{
+    static const QSet<QString> s = [] {
+        QSet<QString> out;
+        for (const char* f : kArtFields) out.insert(QString::fromLatin1(f));
+        return out;
+    }();
+    return s;
+}
 
 // d4data wraps every SNO reference as { "__raw__": <id>, "name": "...", ... }.
 inline int rawSno(const QJsonValue& v) { return v.toObject().value(QStringLiteral("__raw__")).toInt(); }
@@ -483,11 +497,58 @@ void StoreProductIndex::ensureBuilt(const QString& d4dataDir, const SnoIndex* in
                     break;
                 }
             }
+            // ── Art handles: the twelve known fields first, then anything else that looks like one ──
+            //
+            // kArtFields is a list of field names someone wrote down, and a list of names is a
+            // promise about a file format the game is free to change. When a patch adds a
+            // thirteenth image field, every product using it loses art that the tool can see, and
+            // the symptom is a blank tile with no error anywhere - the failure mode this whole tab
+            // keeps being bitten by. It is not a theoretical risk: measured, 318 catalogue rows get
+            // their icon from an art handle and from NO other route, so for those the field list is
+            // a single point of failure.
+            //
+            // So the named list is kept for its ORDER - it encodes which image is preferred, and
+            // ownArtHandle reads that order - and then the record is swept for any other field that
+            // is shaped like an image handle: name beginning with 'h' (the game's own prefix for a
+            // handle, true of all twelve) and a numeric value.
+            //
+            // Nothing is validated against IconIndex here, deliberately: this parse runs before the
+            // icon index is necessarily up, and it does not need to. A value that is not a real
+            // handle simply fails IconIndex::has() at the point of use and is skipped, which every
+            // consumer already does. A wrong guess costs nothing; a missing field costs a blank row.
+            //
+            // Today this adds nothing at all - the game has exactly the twelve - so behaviour is
+            // unchanged until the day it matters, which is the point.
+            QSet<quint32> seenArt;
             for (const char* af : kArtFields) {
                 const QJsonValue v = d.value(QLatin1String(af));
                 // Handles are u32; QJsonValue stores them as double, so read as double then narrow.
                 const quint32 h = quint32(v.toDouble());
-                if (v.isDouble() && h) p.art.append(h);
+                if (v.isDouble() && h && !seenArt.contains(h)) { seenArt.insert(h); p.art.append(h); }
+            }
+            for (auto fi = d.constBegin(); fi != d.constEnd(); ++fi) {
+                if (!fi.value().isDouble()) continue;
+                const QString& key = fi.key();
+                if (key.size() < 2 || key.at(0) != QLatin1Char('h')
+                    || !key.at(1).isUpper())    // hCardImage yes, "hash"/"height" no
+                    continue;
+                const double raw = fi.value().toDouble();
+                // A handle is a u32. Anything negative, fractional or out of range is some other
+                // kind of number that happens to live under an h-name.
+                if (raw <= 0.0 || raw > 4294967295.0 || raw != std::floor(raw)) continue;
+                const quint32 h = quint32(raw);
+                if (seenArt.contains(h)) continue;
+                seenArt.insert(h);
+                p.art.append(h);
+                // Said once per field name, not per product: a new image field appearing in the
+                // game is worth knowing about, and silence here is how the last one would have
+                // been missed.
+                static QSet<QString> announced;
+                if (!kArtFieldSet().contains(key) && !announced.contains(key)) {
+                    announced.insert(key);
+                    qInfo().noquote() << "StoreProduct: image field not in kArtFields, picked up "
+                                         "automatically:" << key;
+                }
             }
 
             // Shop-facing name + lore. Absent for plenty of products (internal/test entries), which
@@ -543,6 +604,79 @@ void StoreProductIndex::ensureBuilt(const QString& d4dataDir, const SnoIndex* in
                 return quint32(uchar(b[off])) | quint32(uchar(b[off + 1])) << 8
                      | quint32(uchar(b[off + 2])) << 16 | quint32(uchar(b[off + 3])) << 24;
             };
+            // ── Where art lives in THIS build, measured rather than remembered ───────────────────
+            //
+            // The art offsets used to be six numbers from a histogram taken once, over 401
+            // products. That is a fact about the build it was taken on, written down as if it were
+            // a fact about the format. When a patch moves those fields, every CASC-recovered
+            // product silently loses its art and nothing says so - and CASC recovery is the only
+            // description these ~1,600 products have.
+            //
+            // They can be measured instead, every run, because we already know the answer for a
+            // large sample: d4data describes ~7,500 products, and for each of those the art
+            // handles are known from the JSON. Read that product's BINARY record, find the offsets
+            // its known handles sit at, and tally. Offsets that recur across the sample are where
+            // art lives in the build actually installed. A patch that moves the field moves this
+            // with it, the same run, with no update to ship.
+            //
+            // The sample is capped: this costs one meta read per sampled product, and the answer
+            // converges long before the cap. Sampling stops early once enough products have
+            // contributed.
+            QVector<int> artOffsets;
+            {
+                QHash<int, int> tally;
+                int sampled = 0;
+                constexpr int kSampleCap = 250;
+                // SORTED, not hash order. Qt 6 randomises the hash seed per process, so iterating
+                // prdEntries directly would sample a different 250 products every launch - and a
+                // marginal offset could then appear one run and not the next, changing which image
+                // a row shows for no reason the user could see. This report is also compared
+                // between builds to spot a format shift, which an unstable sample would bury in
+                // noise. Sorting a few thousand ints costs nothing next to the meta reads below.
+                QVector<int> sampleKeys = prdEntries.keys();
+                std::sort(sampleKeys.begin(), sampleKeys.end());
+                for (int key : sampleKeys) {
+                    if (sampled >= kSampleCap) break;
+                    const auto bi = byId.constFind(key);
+                    if (bi == byId.constEnd() || bi.value().art.isEmpty()) continue;
+                    const QByteArray m = reader->readMetaBySno(quint64(key));
+                    if (m.size() < kPayload0 + 13 * 4) continue;
+                    const QSet<quint32> want(bi.value().art.constBegin(), bi.value().art.constEnd());
+                    for (int off = 0; off + 4 <= m.size(); off += 4)
+                        if (want.contains(u32(m, off))) ++tally[off];
+                    ++sampled;
+                }
+                // 5% support. The measured spread on the build this was written against ran from
+                // 89% down to 6% across six offsets, so the threshold has to sit below the tail
+                // without admitting the one-off coincidences - a stray u32 that happens to equal a
+                // handle shows up once, not in one product in twenty.
+                const int need = qMax(2, sampled / 20);
+                QVector<QPair<int, int>> keep;   // (support, offset)
+                for (auto t = tally.constBegin(); t != tally.constEnd(); ++t)
+                    if (t.value() >= need) keep.push_back({ t.value(), t.key() });
+                // Strongest first, offset as the tiebreak so the order is identical between runs
+                // rather than following QHash iteration. That order becomes the art[] order, which
+                // ownArtHandle reads as a preference.
+                std::sort(keep.begin(), keep.end(),
+                          [](const QPair<int, int>& a, const QPair<int, int>& b) {
+                              return a.first != b.first ? a.first > b.first : a.second < b.second;
+                          });
+                for (const auto& k : keep) artOffsets.append(k.second);
+
+                // The historical six, appended, never replacing. Calibration can only ADD here: if
+                // the sample was too small, or this build hides its art somewhere the sample did
+                // not reach, the tool still does exactly what it did before.
+                for (int legacy : {0x114, 0x110, 0x10c, 0x15c, 0x148, 0x140})
+                    if (!artOffsets.contains(legacy)) artOffsets.append(legacy);
+
+                QStringList shown;
+                for (int o : artOffsets) shown << QStringLiteral("0x%1").arg(o, 0, 16);
+                qInfo().noquote() << QStringLiteral(
+                    "StoreProductIndex: art offsets calibrated from %1 described product(s), "
+                    "%2 measured (support >= %3), using: %4")
+                    .arg(sampled).arg(keep.size()).arg(need).arg(shown.join(QStringLiteral(", ")));
+            }
+
             int recovered = 0, rejected = 0, childless = 0, locked = 0;
             for (auto pe = prdEntries.constBegin(); pe != prdEntries.constEnd(); ++pe) {
                 if (byId.contains(pe.key())) continue;        // json already described this one
@@ -614,17 +748,15 @@ void StoreProductIndex::ensureBuilt(const QString& d4dataDir, const SnoIndex* in
                     break;
                 }
 
-                // Art handles. WEAKER EVIDENCE than everything above, and treated as such: these
-                // offsets came from a histogram over 401 products, not from a unanimity test,
-                // because the index skips zero handles when it builds `art` and so cannot say
-                // which field a given value came from. What the histogram does show is six
-                // offsets that recur far above noise (357, 217, 182, 128, 58, 25 hits).
+                // Art handles, from the offsets calibrated above against this build rather than
+                // from six numbers measured on an older one.
                 //
-                // Safe to read on that basis because the failure mode is bounded: a handle that is
-                // wrong simply fails to resolve in IconIndex and the UI falls through to the
-                // name-based shop-art lookup it already uses. Nothing is displayed incorrectly,
-                // and a bundle with no art at all is the status quo.
-                for (int aOff : {0x114, 0x110, 0x10c, 0x15c, 0x148, 0x140}) {
+                // The failure mode stays bounded either way, which is why reading a merely likely
+                // offset is safe: a handle that is wrong fails IconIndex::has() at the point of
+                // use and the row falls through to the name-derived art, and ownArtHandle declines
+                // any handle another product also carries. A wrong guess cannot put another
+                // product's picture on this row; it can only fail to add one.
+                for (int aOff : artOffsets) {
                     if (aOff + 4 > m.size()) continue;
                     const quint32 h = u32(m, aOff);
                     if (h && h != kEmpty && !p.art.contains(h)) p.art.append(h);
