@@ -250,6 +250,22 @@ snapshot"*. Re-downloading d4data once it catches up fills the text back in.
 
 ---
 
+**Collections — the sets the game itself names.** A "Series" row on the product's string table
+carries the set a bundle belongs to, and measurement says where it lives: of the snapshot's 61,330
+string tables, exactly **7,017 carry one and every last one is a store product** — no item, emblem,
+marking or emote table has one. So "Beauty in Sin" is six per-class bundles plus a separately-sold
+mount and an emote: eight rows with nothing in their own records tying them together. The
+**Collection** filter puts them side by side, the bundle's detail line names its set beside the
+patch and season, and right-click offers *Show the rest of "…"*. A bundle is a container, so its set
+is resolved up the parent chain — a per-class bundle matches its set even though its own record
+never names one. Counts beside each set are in bundle rows, so the number predicts what picking it
+leaves. This regroups the shop by the game's own names; it does not reach anything the shop never
+listed, because nothing outside the shop carries a set name at all.
+
+Measured on the current snapshot: **473 sets covering 5,314 pieces**, from 9,385 products of which 7,017 name a set — 436 sold outright, 37 seasonal. "Beauty in Sin" comes out as 46 pieces across five classes, armour and weapons alongside its emotes, emblems, headstones and mount.
+
+---
+
 ## Bulk Extract
 
 Filter the whole index, watch the match count update live, then export everything at once.

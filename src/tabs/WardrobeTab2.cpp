@@ -9793,13 +9793,15 @@ QString WardrobeTab2::exportNameStem() const
     // in-game display name is exposed separately as {{Name}}. Two placeholders rather than a
     // toggle: a toggle meant the same template produced different names depending on a checkbox
     // somewhere else, which is exactly the kind of hidden state that makes a filename surprising.
+    // slotCombo(): m_slot[] holds only the 5 armour combos — indexing it with 5/6 (Main/Off) read
+    // past its end into m_slotCells (undefined behaviour on every outfit export using the template).
     auto slotName = [&](int slot) -> QString {
-        const QComboBox* cb = (slot == 9) ? m_backTrophy : (slot >= 0 && slot < kSlotCount ? m_slot[slot] : nullptr);
+        const QComboBox* cb = (slot >= 0 && slot < kSlotCount) ? slotCombo(slot) : nullptr;
         if (!cb || cb->currentIndex() <= 0) return QString();
         return cb->currentText();
     };
     auto slotTitle = [&](int slot) -> QString {   // display name, falling back to the raw one
-        const QComboBox* cb = (slot == 9) ? m_backTrophy : (slot >= 0 && slot < kSlotCount ? m_slot[slot] : nullptr);
+        const QComboBox* cb = (slot >= 0 && slot < kSlotCount) ? slotCombo(slot) : nullptr;
         if (!cb || cb->currentIndex() <= 0) return QString();
         const QString t = am.titleFor(cb->currentData().toInt());
         return t.isEmpty() ? cb->currentText() : t;

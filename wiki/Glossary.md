@@ -156,6 +156,19 @@ hands the brightest strands the dullest stop, and the result reads as flat neon 
 **not** `back_*`; scanning for `back_*` returns six placeholder proxies and zero real
 trophies.
 
+**Series** — the game's own name for a set, stored as a `Series` row in a **store product's**
+string table (`StoreProduct_<name>.stl.json`). Measured: 7,017 of the snapshot's 61,330 string
+tables carry the row, and every one of them is a store product — item, emblem, marking, emote and
+actor tables carry none. A thing you can own therefore inherits its set name from the product that
+sold it. The value is quote-wrapped as authored (`"Ash Knight"`), and per-class bundles append the
+class (`"Ash Knight" Barbarian Equipment`).
+
+**Collection** — a Series after that tidying: one named set, every piece the products under it
+sell, and a derived **source**. Seasonal when a product names a season or sits behind `requires`
+("came with a pass, never sold alone"), Shop when neither, Uncategorised when every product for it
+is TACT-locked and the answer is unreadable. Nothing in the data marks a set as *promotional*, so
+there is no such category rather than a guessed one.
+
 ---
 
 ## Words this project uses in a specific way

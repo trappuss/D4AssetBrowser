@@ -1193,8 +1193,33 @@ bool CascReader::open(const QString& gameDir, const QString& product)
     return m_ready;
 }
 
+// See CascReader::ReadStats. Atomics rather than a mutex: this is measured on the very path whose
+// contention is in question, and a diagnostic that adds a lock to it would be measuring itself.
+static std::atomic<qint64> s_rsLookup{0}, s_rsArchive{0}, s_rsCalls{0}, s_rsBytes{0};
+static bool cascPerfOn()
+{
+    static const bool on = qEnvironmentVariableIsSet("D4_DUMP_ICONPERF");
+    return on;
+}
+CascReader::ReadStats CascReader::readStats()
+{
+    ReadStats s;
+    s.lookupNs  = s_rsLookup.load();
+    s.archiveNs = s_rsArchive.load();
+    s.calls     = s_rsCalls.load();
+    s.bytes     = s_rsBytes.load();
+    return s;
+}
+void CascReader::resetReadStats()
+{
+    s_rsLookup.store(0); s_rsArchive.store(0); s_rsCalls.store(0); s_rsBytes.store(0);
+}
+
 QByteArray CascReader::readFile(const QString& name)
 {
+    const bool perf = cascPerfOn();
+    QElapsedTimer rt;
+    if (perf) { rt.start(); s_rsCalls.fetch_add(1); }
     // Resolve the index entries under the lock, but do the raw archive read + BLTE inflate
     // OUTSIDE it: readArchive() opens its own QFile per call and blteDecode is pure CPU on
     // local buffers (the TACT-key lookup takes its own tiny m_keysMutex), so concurrent bulk
@@ -1211,10 +1236,15 @@ QByteArray CascReader::readFile(const QString& name)
             if (it != m_index.constEnd()) entries.append(it.value());
         }
     }
+    if (perf) { s_rsLookup.fetch_add(rt.nsecsElapsed()); rt.restart(); }
     for (const IndexEntry& e : entries) {
         const QByteArray raw = readArchive(e);
-        if (!raw.isEmpty()) return raw;
+        if (!raw.isEmpty()) {
+            if (perf) { s_rsArchive.fetch_add(rt.nsecsElapsed()); s_rsBytes.fetch_add(raw.size()); }
+            return raw;
+        }
     }
+    if (perf) s_rsArchive.fetch_add(rt.nsecsElapsed());
     return {};
 }
 

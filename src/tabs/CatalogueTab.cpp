@@ -8,6 +8,7 @@
 // contentSnos / leafContentSnos / isContainer — shared with IconAudit so the audit measures the
 // SAME descent the tab draws. Comment on its own line (verify-src matches the directive to EOL).
 #include "index/ProductContents.h"
+#include "index/SeriesIndex.h"
 #include "model/MaterialDecode.h"
 #include "tex/FrameTable.h"     // CASC-side atlas frames — the only frame source for shop art that
                                 // d4data has no .tex.json for, which is most of it
@@ -47,6 +48,7 @@
 #include <QLabel>
 #include <QLineEdit>
 #include <QListWidget>
+#include <QMap>          // the Collection combo: sorted by set name, for free
 #include <QMessageBox>   // "Export all N matching" confirmation
 #include <QPushButton>
 #include <QCheckBox>
@@ -457,6 +459,21 @@ void CatalogueTab::buildUi()
         "armour sets read as eight helmets."));
     connect(m_slotFilter, &QComboBox::currentIndexChanged, this, [this] { reloadBundleList(); });
 
+    // ── Collection ──────────────────────────────────────────────────────────────────────────────
+    // The game's own set name, which lives as a "Series" row on the PRODUCT's string table —
+    // measured: 7,017 of the snapshot's 61,330 tables carry one and every last one is a
+    // StoreProduct. So "Beauty in Sin" is six per-class bundles plus a separately-sold mount and
+    // an emote, eight rows with nothing in their own records tying them together. This is the one
+    // filter that can put them side by side.
+    m_collFilter = new QComboBox(left);
+    m_collFilter->setFixedHeight(kBarH);
+    m_collFilter->addItem(QStringLiteral("Any collection"), QString());
+    m_collFilter->setToolTip(QStringLiteral(
+        "The set a bundle belongs to, named by the game itself.\n"
+        "A set's pieces are often sold as separate products - one bundle per class, the mount\n"
+        "on its own - and nothing in a product's own record says they belong together."));
+    connect(m_collFilter, &QComboBox::currentIndexChanged, this, [this] { reloadBundleList(); });
+
     m_branchFilter = new QComboBox(left);
     m_branchFilter->setFixedHeight(kBarH);
     m_branchFilter->addItem(QStringLiteral("Any patch"), QString());
@@ -608,6 +625,7 @@ void CatalogueTab::buildUi()
     fp->addWidget(m_kindFilter);
     fp->addWidget(m_classFilter);
     fp->addWidget(m_slotFilter);
+    fp->addWidget(m_collFilter);
     secHdr(QStringLiteral("Released"));
     fp->addWidget(m_branchFilter);
     fp->addWidget(m_seasonFilter);
@@ -644,6 +662,7 @@ void CatalogueTab::buildUi()
         { QSignalBlocker b(m_hasIconChk);    m_hasIconChk->setChecked(false); }
         { QSignalBlocker b(m_classFilter);   m_classFilter->setCurrentIndex(0); }
         { QSignalBlocker b(m_slotFilter);    m_slotFilter->setCurrentIndex(0); }
+        { QSignalBlocker b(m_collFilter);    m_collFilter->setCurrentIndex(0); }
         { QSignalBlocker b(m_rewardChk);     m_rewardChk->setChecked(false); }
         // Back to TRUE, not false: this one is a filter whose default is "show everything", so
         // clearing it means ticking it. Leaving it out of this list is what let it hide 337
@@ -1056,6 +1075,10 @@ void CatalogueTab::buildUi()
                 emit scanStatus(QString());   // clears this tab's slot in the shared toast
                 reloadBundleList();
             });
+    // The set names land AFTER the products, since they are derived from them. Without this the
+    // Collection combo stays empty for the whole session on a cold start — the combo is filled
+    // inside reloadBundleList, and nothing calls it again once the product index has landed.
+    connect(&SeriesIndex::instance(), &SeriesIndex::readyChanged, this, [this] { reloadBundleList(); });
     // Reported in BOTH places, and they are not redundant. The toast is where indexing status lives
     // for every other tab, and this build is the slowest of the lot — ~15,000 file opens plus a
     // 47 MB reference-graph parse — so it belongs there. The inline label stays because the toast
@@ -1373,6 +1396,18 @@ void CatalogueTab::showRowMenu(QWidget* from, const QPoint& globalPos, int bundl
     // not answer "this helm is also in four other bundles". The entries jump: the row is selected
     // when the current filters still show it, and the detail pane opens either way, with the status
     // line saying so when the list cannot follow.
+    // The rest of this set. "Also sold in" answers "what else contains this exact piece";
+    // this answers "what else belongs with it", which is a different and usually larger answer —
+    // the other five classes' bundles, the mount, the emote, none of which share a piece.
+    if (rowProductSno > 0 && m_collFilter) {
+        const QString coll = SeriesIndex::instance().seriesForProduct(rowProductSno);
+        const int ci = coll.isEmpty() ? -1 : m_collFilter->findData(coll);
+        if (ci > 0) {
+            menu.addSeparator();
+            menu.addAction(QStringLiteral("Show the rest of \"%1\"").arg(coll), this,
+                           [this, ci] { m_collFilter->setCurrentIndex(ci); });
+        }
+    }
     if (rowProductSno > 0) {
         const QVector<int> also = alsoSoldIn(rowProductSno);
         if (!also.isEmpty()) {
@@ -1594,6 +1629,9 @@ void CatalogueTab::refresh()
     // m_reader enables the CASC fallback — without it the ~1,800 products d4data never described
     // (the Doom collab bundles among them) are simply absent from this tab.
     StoreProductIndex::instance().ensureBuilt(Config::d4dataDir(), m_index, m_reader);
+    // Set names come from the products, so this arms itself and builds the moment the line above
+    // lands. Its readyChanged refills the Collection combo, which is empty until then.
+    SeriesIndex::instance().ensureBuilt(Config::d4dataDir());
     IconIndex::instance().ensureBuilt(Config::d4dataDir(), m_reader);
     AppearanceMeta::instance().ensureBuilt(Config::d4dataDir(), m_index, m_reader);
     // Warm the texture-definition table OFF the GUI thread. Otherwise the first thumbnail decode
@@ -1647,6 +1685,13 @@ void CatalogueTab::reset()
         m_dropFilter->clear();
         m_dropFilter->addItem(QStringLiteral("Any locked drop"), QString());
     }
+    // Same reason as the patch and drop combos: the set list is filled once and gated on
+    // count() <= 1, so a d4data switch would leave the PREVIOUS snapshot's sets selectable.
+    if (m_collFilter) {
+        const QSignalBlocker block(m_collFilter);
+        m_collFilter->clear();
+        m_collFilter->addItem(QStringLiteral("Any collection"), QString());
+    }
     m_dropLabel.clear();   // derived from the previous build's cohorts; a switch invalidates them
 }
 
@@ -1669,6 +1714,7 @@ void CatalogueTab::revealBundle(int storeProductSno)
     if (m_onlyDecrypted) { QSignalBlocker b(m_onlyDecrypted); m_onlyDecrypted->setChecked(false); }
     if (m_onlyEncrypted) { QSignalBlocker b(m_onlyEncrypted); m_onlyEncrypted->setChecked(false); }
     if (m_hasIconChk)    { QSignalBlocker b(m_hasIconChk);    m_hasIconChk->setChecked(false); }
+    if (m_collFilter)    { QSignalBlocker b(m_collFilter);    m_collFilter->setCurrentIndex(0); }
     // The one that mattered most and was missing. "Sold in" maps an asset to ANY product that
     // reaches it, loose products included — so with this box unticked the jump landed on a list
     // that did not contain its target and reported "it may be a single item rather than a bundle",
@@ -1900,6 +1946,18 @@ void CatalogueTab::reloadBundleList()
             m_seasonFilter->addItem(QStringLiteral("%1  (%2)").arg(byId.value(pr.second))
                                         .arg(perSeason.value(pr.second)), pr.second);
     }
+    // Collections. Counted in BUNDLE ROWS, not in pieces: the number beside a set has to predict
+    // how many rows picking it leaves, or it reads as a bug the first time "52" yields eight.
+    if (m_collFilter && m_collFilter->count() <= 1 && SeriesIndex::instance().ready()) {
+        QMap<QString, int> perColl;   // QMap: sorted by name, which is the order to offer them in
+        for (int sno : idx.bundles()) {
+            const QString c = SeriesIndex::instance().seriesForProduct(sno);
+            if (!c.isEmpty()) perColl[c] = perColl.value(c) + 1;
+        }
+        const QSignalBlocker block(m_collFilter);
+        for (auto i = perColl.constBegin(); i != perColl.constEnd(); ++i)
+            m_collFilter->addItem(QStringLiteral("%1  (%2)").arg(i.key()).arg(i.value()), i.key());
+    }
 
     // Class and slot, built from the data like the patch and season combos above, and counted the
     // same way they are: over ROWS, not products. A label reading "Helm  (612)" promises 612 rows
@@ -1969,6 +2027,7 @@ void CatalogueTab::reloadBundleList()
     const bool wantLatest = m_latestChk && m_latestChk->isChecked();
     const bool wantHasIcon = m_hasIconChk && m_hasIconChk->isChecked();
     const QString wantDrop = m_dropFilter ? m_dropFilter->currentData().toString() : QString();
+    const QString wantColl = m_collFilter ? m_collFilter->currentData().toString() : QString();
     const int wantClassBit = m_classFilter ? m_classFilter->currentData().toInt() : -1;
     const QString wantSlot = m_slotFilter ? m_slotFilter->currentData().toString() : QString();
     const bool wantReward  = m_rewardChk && m_rewardChk->isChecked();
@@ -2053,6 +2112,10 @@ void CatalogueTab::reloadBundleList()
         // A drop is a set of LOCKED products, so choosing one necessarily excludes readable
         // bundles - they have no key. Said plainly rather than left to look like a bug.
         if (!wantDrop.isEmpty() && b->tactKey != wantDrop) continue;
+        // Resolved through the product's parent chain, so a per-class bundle matches its set even
+        // though its own record never names one.
+        if (!wantColl.isEmpty() && SeriesIndex::instance().seriesForProduct(sno) != wantColl)
+            continue;
         {
             bool drop = false;
             if (!wantBr.isEmpty() && b->branch != wantBr) drop = true;
@@ -2337,6 +2400,8 @@ void CatalogueTab::rebuildFilterChips()
         addChip(m_branchFilter->currentText(), [this] { m_branchFilter->setCurrentIndex(0); });
     if (m_seasonFilter && m_seasonFilter->currentIndex() > 0)
         addChip(m_seasonFilter->currentText(), [this] { m_seasonFilter->setCurrentIndex(0); });
+    if (m_collFilter && m_collFilter->currentIndex() > 0)
+        addChip(m_collFilter->currentText(), [this] { m_collFilter->setCurrentIndex(0); });
     if (m_latestChk && m_latestChk->isChecked())
         addChip(QStringLiteral("Latest"), [this] { m_latestChk->setChecked(false); });
     if (m_dropFilter && m_dropFilter->currentIndex() > 0)
@@ -2406,6 +2471,8 @@ void CatalogueTab::saveFilterState()
                m_branchFilter ? m_branchFilter->currentData().toString() : QString());
     s.setValue(QStringLiteral("catalogue/lastSeason"),
                m_seasonFilter ? m_seasonFilter->currentData().toInt() : 0);
+    s.setValue(QStringLiteral("catalogue/lastColl"),
+               m_collFilter ? m_collFilter->currentData().toString() : QString());
     s.setValue(QStringLiteral("catalogue/lastSort"),
                m_sortCombo ? m_sortCombo->currentData().toString() : QString());
     s.setValue(QStringLiteral("catalogue/lastLatest"), m_latestChk && m_latestChk->isChecked());
@@ -2437,6 +2504,9 @@ void CatalogueTab::restoreFilterState()
     pick(m_kindFilter,   s.value(QStringLiteral("catalogue/lastKind"), -1));
     pick(m_branchFilter, s.value(QStringLiteral("catalogue/lastBranch")));
     pick(m_seasonFilter, s.value(QStringLiteral("catalogue/lastSeason"), 0));
+    // Filled from SeriesIndex in reloadBundleList above this call, and empty until that index
+    // lands — pick() then finds nothing and leaves it at "Any", the same shape as the patch combo.
+    pick(m_collFilter, s.value(QStringLiteral("catalogue/lastColl")));
     pick(m_sortCombo,    s.value(QStringLiteral("catalogue/lastSort")));
     if (m_latestChk) {
         QSignalBlocker b(m_latestChk);
@@ -2526,6 +2596,12 @@ void CatalogueTab::showBundle(int sno)
     QStringList sub{ b->name, QStringLiteral("SNO %1").arg(b->sno) };
     if (!b->branch.isEmpty()) sub << QStringLiteral("patch %1").arg(b->branch);
     if (!b->seasonName.isEmpty()) sub << b->seasonName;
+    // The set this bundle belongs to. Resolved through the parent chain, so it appears on a
+    // per-class bundle whose own record names no set at all.
+    {
+        const QString coll = SeriesIndex::instance().seriesForProduct(b->sno);
+        if (!coll.isEmpty()) sub << QStringLiteral("collection: %1").arg(coll);
+    }
     // The shop's "Supported Classes" line. fPreviewOnClasses was sitting in the data unused.
     const QString cls = StoreProductIndex::classSummary(b->classMask);
     if (!cls.isEmpty()) sub << cls;
@@ -4244,7 +4320,12 @@ CatalogueTab::Written CatalogueTab::writeBundle(const StoreProductIndex::Product
     sink.log = [this](const QString& line) { m_exportLog << line; };
     if (wantModels && !r.models.isEmpty() && m_models) {
         QDir().mkpath(QDir(outDir).filePath(QStringLiteral("models")));
-        m_models->bulkExport(r.models, QDir(outDir).filePath(QStringLiteral("models")), false, &sink);
+        // rememberDir=false: this is THIS bundle's own subfolder, not the folder the user chose.
+        // Recording it left the Models tab's "export to last folder" pointing inside the last
+        // bundle exported from here. The Catalogue keeps its own catalogue/lastDir, which is the
+        // chosen parent, so nothing is lost by not writing the Models tab's key from here.
+        m_models->bulkExport(r.models, QDir(outDir).filePath(QStringLiteral("models")), false, &sink,
+                             /*rememberDir*/ false);
     }
     if (wantArt && !r.textures.isEmpty() && m_textures) {
         QDir().mkpath(QDir(outDir).filePath(QStringLiteral("art")));

@@ -2,6 +2,7 @@
 #include "model/ModelGeometry.h"
 #include "model/AnimParser.h"
 #include "model/Attachments.h"
+#include "index/ModelAnimIndex.h"   // the anim + entity indexes (shared with the core D4 store)
 #include "tabs/BrowserTab.h"
 
 #include <array>
@@ -74,8 +75,12 @@ public:
     int  currentSno() const { return m_curSno; }   // for the Ctrl+K palette / nav history
     // Bulk extractor entry point: export a matched (sno,name) set to dir, reusing the batch pipeline.
     // onlyNew skips items already present in dir (by <name>.glb or the _bulk_manifest.json ledger).
+    // `rememberDir` records `dir` as the Models tab's "last export folder". TRUE only when the
+    // USER chose that folder. A caller that synthesises a destination — the Catalogue's per-bundle
+    // subfolder, the drag-out temp directory — passes false, or "Export to last folder" silently
+    // starts pointing inside someone else's export.
     void bulkExport(const QVector<QPair<int, QString>>& items, const QString& dir, bool onlyNew,
-                    const struct BatchSink* sink = nullptr);
+                    const struct BatchSink* sink = nullptr, bool rememberDir = true);
 
     // ── Filter service (shared with the Bulk Extract tab so its filters are IDENTICAL) ──────────
     // A snapshot of a filter selection, evaluated against the model/texture index by queryEntries().
@@ -118,6 +123,10 @@ public:
     bool   m_dragPrimed = false;             // pressed on an already-selected top-level row
 
 signals:
+    // "bring this tab to the front". The offscreen thumbnail pass needs the GL widget to have
+    // been initialised, which only happens once the tab has actually been shown — so the
+    // automated icon benchmark cannot start from a background tab.
+    void focusRequested();
     void scanStatus(const QString& msg);   // merged background-scan status → the app's floating toast
     void filtersChanged();                 // combos / tag groups were rebuilt (meta ready) → mirrors re-sync
     // Clicking a "Sold in" bundle → open it in the Catalogue. MainWindow routes this the same way
@@ -286,7 +295,8 @@ private:
     void exportModels(const QVector<QPair<int, QString>>& models, const QString& dir,
                       const struct BatchSink* sink = nullptr,
                       QStringList* failures = nullptr,
-                      bool applyLayout = true);           // "name — reason" per failure
+                      bool applyLayout = true,            // "name — reason" per failure
+                      bool rememberDir = true);           // see bulkExport
     void setListIconSize(int px); // icon size + matching row height + column width
     void setGridThumbPx(int px);  // Grid thumbnail size (Ctrl+scroll), persisted
     void showColumnMenu(const QPoint& globalPos);   // table column show/hide menu (header + Columns button)
@@ -304,6 +314,8 @@ private:
     int  suggestedAnimSource(QString* why = nullptr) const;   // base-rig SNO for the current model, or -1
     QString apprNameForSno(int sno) const;               // appearance name for a SNO (cached)
     QStringList clipFamiliesFor(int sno, const QString& nameLower) const;   // families a model may play
+    // What the shared clip queries read, for this sno (the skeleton fallback only for the model on screen).
+    modelanim::Lookup animLookup(int sno) const;
     // The rows a model owns/plays. Used for the panel AND for "Pull from…", so a pull yields
     // exactly what the source model shows.
     QStringList modelAnimRows(int sno, const QString& nameLower, bool* fallbackOut = nullptr) const;
@@ -361,17 +373,22 @@ private:
     QTimer*                m_visIconTimer = nullptr;   // debounce auto-render of in-view thumbnails
     QSet<int>              m_renderBlocklist;          // SNOs that crashed the renderer — never retried
     QSet<int>              m_noRenderSnos;             // SNOs tried but yielded no thumbnail — don't re-attempt (prevents freeze loop)
-    QSet<int>              m_animatedSnos;             // appearance SNOs that directly own ≥1 animation
-    QHash<int, QStringList> m_animRowsBySno;           // owner appearance SNO → its animation rows ("name  ·  N frames")
+    // The anim + entity index data lives in these two blobs (index/ModelAnimIndex.h), shared in shape
+    // with the core D4 store; the members below are REFERENCES into them, so every use in this tab
+    // reads exactly as before. Declared first: references are bound in declaration order.
+    modelanim::AnimBlob    m_anim;
+    modelanim::EntityBlob  m_ent;
+    QSet<int>&              m_animatedSnos = m_anim.animatedSnos;             // appearance SNOs that directly own ≥1 animation
+    QHash<int, QStringList>& m_animRowsBySno = m_anim.rowsBySno;           // owner appearance SNO → its animation rows ("name  ·  N frames")
     // Authoritative AnimSet index (base/meta/AnimSet/*.ans.json): the game's own clip grouping.
     // Each set's ptPowerEntryList maps snoPower → snoAnim (+ optional snoFemaleOverrideAnim), so we
     // record every clip's owning set (provenance + display grouping) and which clips are the female
     // variant. This is exact game data — no name/skeleton guesswork — used to label & order the list.
-    QHash<QString, QString> m_clipSet;                 // clip name (lower) → its AnimSet display name
-    QHash<QString, QStringList> m_setClips;            // AnimSet name → its clip rows ("name  ·  N frames")
-    QHash<QString, QString> m_clipPower;               // clip name (lower) → its snoPower name (the action it plays)
-    QSet<QString>          m_femaleClips;              // clip names (lower) that are female-override variants
-    QHash<QString, QString> m_femalePair;              // base clip (lower) → its female-override clip name
+    QHash<QString, QString>& m_clipSet = m_anim.clipSet;                 // clip name (lower) → its AnimSet display name
+    QHash<QString, QStringList>& m_setClips = m_anim.setClips;            // AnimSet name → its clip rows ("name  ·  N frames")
+    QHash<QString, QString>& m_clipPower = m_anim.clipPower;               // clip name (lower) → its snoPower name (the action it plays)
+    QSet<QString>&          m_femaleClips = m_anim.femaleClips;              // clip names (lower) that are female-override variants
+    QHash<QString, QString>& m_femalePair = m_anim.femalePair;              // base clip (lower) → its female-override clip name
     // Sequential "play whole set" queue + a female-preview toggle (swaps in snoFemaleOverrideAnim clips).
     QStringList            m_playQueue;                // clips queued for back-to-back playback
     int                    m_playQueueIdx = -1;        // current index into m_playQueue (-1 = no queue)
@@ -386,10 +403,10 @@ private:
     // npcF_S14_Dannica_base00) and every piece skinned to that rig plays them (bone-hash retarget).
     // Map each base's family prefix (name minus _base<NN>/slot) → its clips, and keep the prefix set
     // so a rigged piece like *_TRS or *_Gizmo can resolve/inherit its base's animations.
-    QSet<QString>          m_animFamilyPrefixes;       // base family prefixes that own clips
-    QHash<QString, QStringList> m_animFamilyRows;      // family prefix → merged clip rows
-    QHash<QString, QString> m_animFamilyOwner;         // family prefix → a base appearance name (for the tooltip)
-    QHash<QString, QSet<quint32>> m_familyBones;       // family prefix → union of its base rig's bone-name hashes (Phase-2 skeleton fallback)
+    QSet<QString>&          m_animFamilyPrefixes = m_anim.famPrefixes;       // base family prefixes that own clips
+    QHash<QString, QStringList>& m_animFamilyRows = m_anim.famRows;      // family prefix → merged clip rows
+    QHash<QString, QString>& m_animFamilyOwner = m_anim.famOwner;         // family prefix → a base appearance name (for the tooltip)
+    QHash<QString, QSet<quint32>>& m_familyBones = m_anim.famBones;       // family prefix → union of its base rig's bone-name hashes (Phase-2 skeleton fallback)
     QSet<QString>          m_rigFamilyPrefixes;        // family prefixes of every *_base<NN> body (the "Rigged" filter)
     bool                   m_rigIndexBuilt = false;    // ensureRigIndex() has run
     QHash<int, QString>    m_searchBlobCache;          // sno → lowercased tags/collection/title (name-box search)
@@ -399,24 +416,24 @@ private:
     // snoAppearance + snoMonsterFamily; Items carry snoActor. One background scan resolves each model
     // to the NPCs/monsters that wear it, its monster family, and the gear items that render it — turning
     // a cryptic filename into real context. Exact game data (no inference).
-    QHash<int, QStringList> m_apprActors;               // appearance sno → using actor names (capped)
+    QHash<int, QStringList>& m_apprActors = m_ent.apprActors;               // appearance sno → using actor names (capped)
     QHash<QString, QStringList> m_appSetsByName;        // appearance name(lower) → AppearanceSet names
     bool                   m_appSetsLoaded = false;     // lazy: only ~20 .aps.json files exist
     void ensureAppearanceSets();
-    QHash<int, int>         m_apprActorN;               // appearance sno → true count of using actors
+    QHash<int, int>&         m_apprActorN = m_ent.apprActorN;               // appearance sno → true count of using actors
     // AUTHORITATIVE animation assignment: the AnimSets of every Actor that uses this appearance
     // (Actor.arAnimSets, keyed to Actor.snoAppearance + its add-on skin appearances). This is exactly
     // what the game plays on the model — it replaces the old name/skeleton guesswork for any appearance
     // that has an actor. Appearances with no actor (runtime-applied costumes) fall back to the skeleton
     // bridge, clearly marked as "compatible" rather than confirmed.
-    QHash<int, QStringList> m_apprSets;                 // appearance sno → AnimSet names its actors use
-    QHash<int, QStringList> m_apprVariants;             // appearance sno → sibling skin-variant names (same actor)
-    QHash<int, QList<int>>  m_apprVariantSnos;          // appearance sno → sibling variant SNOs (for jump)
-    QHash<int, QString>     m_apprName;                 // appearance sno → short name (variant menu labels)
-    QHash<int, QString>     m_apprFamily;               // appearance sno → monster family name
-    QHash<int, QStringList> m_apprItems;                // appearance sno → item names (capped)
-    QHash<int, int>         m_apprItemN;                // appearance sno → true count of items
-    QHash<QString, int>     m_itemAppr;                 // item name (original case) → appearance sno (browse-by-item)
+    QHash<int, QStringList>& m_apprSets = m_ent.apprSets;                 // appearance sno → AnimSet names its actors use
+    QHash<int, QStringList>& m_apprVariants = m_ent.apprVariants;             // appearance sno → sibling skin-variant names (same actor)
+    QHash<int, QList<int>>&  m_apprVariantSnos = m_ent.apprVariantSnos;          // appearance sno → sibling variant SNOs (for jump)
+    QHash<int, QString>&     m_apprName = m_ent.apprName;                 // appearance sno → short name (variant menu labels)
+    QHash<int, QString>&     m_apprFamily = m_ent.apprFamily;               // appearance sno → monster family name
+    QHash<int, QStringList>& m_apprItems = m_ent.apprItems;                // appearance sno → item names (capped)
+    QHash<int, int>&         m_apprItemN = m_ent.apprItemN;                // appearance sno → true count of items
+    QHash<QString, int>&     m_itemAppr = m_ent.itemAppr;                 // item name (original case) → appearance sno (browse-by-item)
     bool                   m_entityScanned = false;     // the Actor/Item scan has completed
     bool                   m_entityScanning = false;    // the Actor/Item scan is running (background)
     int                    m_renderCrashSno = -1;      // recovered-from crash suspect (warn once)
@@ -600,6 +617,85 @@ private:
     // Both are bounded by cost (KB) so memory stays capped no matter how many models are viewed.
     QCache<int, std::shared_ptr<ModelGeometry>> m_geoCache;   // sno → parsed geometry
     QCache<QString, QImage> m_texCache;                       // "ROLE|material" → decoded texture
+    // One material's BASE_COLOR through m_texCache ("BASE|<material>"), so the viewport and the
+    // 3D icons never decode the same map twice. applyPartMaterials' own decodeBase calls this.
+    QImage cachedBaseColor(const QString& matName);
+    // Per-part base maps for a freshly parsed model, scaled to icon size and cached ("ICON|<mat>").
+    //
+    // The material names come from MaterialDecode::appearanceRosterAny, indexed by the primitive's
+    // materialIndex. NOT from MeshPrimitive::materialName, which the parser fills with a synthetic
+    // "Material_<n>" placeholder, and not from m_appMatNames, which describes the LOADED model's
+    // active look and means nothing for an arbitrary row. `meta` is the appearance's CASC blob
+    // when the caller already holds it (the icon batch does) — empty is fine, `sno` then reads it.
+    QVector<QImage> iconBaseTextures(const ModelGeometry& geo, const QString& apprName,
+                                     const QByteArray& meta, int sno);
+    // Settings ▸ Models ▸ Preview rendering. All four are mirrored here because the icon path
+    // reads them per row; the ctor seeds them and onSettingsChanged keeps them in step.
+    bool m_iconBaseColor = false;   // base-colour maps instead of grey clay
+    // NOT m_iconPx — that name was already taken, further down, by the OUTLINER's icon size
+    // (Ctrl+scroll, 48 by default, driven by setListIconSize). The compiler caught the clash, but
+    // the quiet version of this bug is the one worth recording: had the names merely coexisted,
+    // scrolling the outliner would have changed the icon RENDER resolution and silently binned
+    // the thumbnail cache. Two different pixel sizes, two different names.
+    int  m_iconRenderPx  = 128;     // STORED icon size; the grid shows 48..256, so 48 was upscaled
+    bool m_iconCrop      = true;    // crop to the model's own silhouette
+    bool m_iconAlpha     = true;    // keep the cut-out instead of baking the viewport grey in
+    // One finished list icon: render at 2x, crop or scale to m_iconRenderPx, then flatten onto the
+    // viewport grey when the cut-out is not wanted. The single place the four settings meet, so
+    // the batch and the just-loaded-model path cannot produce differently-shaped icons.
+    QImage renderIconImage(const ModelGeometry& geo, const QString& apprName,
+                           const QByteArray& meta, int sno);
+    // Drop any cached thumbnails that were rendered under different icon settings. Returns true
+    // if anything was removed, so the caller can clear the in-memory caches with them.
+    bool ensureThumbCacheVariant();
+
+    // ── D4_DUMP_ICONPERF: where an icon's time actually goes ────────────────────────────────────
+    // Every claim about icon cost so far has been read off the code rather than measured, and the
+    // path was just changed substantially (128 px instead of 48, a 2x supersample over that, and
+    // base-colour texture decodes). These are cumulative for the session and written to
+    // data\icon_perf.txt at the end of each batch, so one file answers which stage to attack.
+    // Nanoseconds; nothing is timed unless the variable is set.
+    struct IconPerf {
+        qint64 read = 0;      // CASC meta + payload, for icons that produced something
+        qint64 readMeta = 0;  //   split: the meta blob
+        qint64 readPay = 0;   //   split: the payload blob
+        // Reads spent on snos that turned out to have no payload at all. Kept SEPARATE so the
+        // per-icon figures are not inflated by work that produced no icon — 36,930 assets share
+        // another sno's payload and plenty carry none, so a sample taken across the whole index
+        // hits them constantly. Large here means the sampling is the problem, not the reader.
+        qint64 readMissed = 0;
+        // What the GUI thread actually WAITED for. `read` above is worker-side time summed across
+        // threads once prefetching is on, so it stops being wall clock — this is the number that
+        // belongs in the total, and the gap between the two IS the overlap the prefetch buys.
+        qint64 readWait = 0;
+        bool   prefetch = true;
+        int    missed = 0;
+        // From CascReader::readStats, per pass: the index lookup runs under m_mutex, the archive
+        // read + inflate outside it. Which dominates decides whether prefetching on workers helps.
+        qint64 cascLookup = 0;
+        qint64 cascArchive = 0;
+        qint64 cascBytes = 0;
+        qint64 cascCalls = 0;
+        qint64 parse = 0;     // ModelParser::parseApp
+        qint64 upload = 0;    // GLModelWidget::setGeometry (flatten + tangents + VBO)
+        qint64 tangent = 0;   //   of which: the tangent build the icon pass cannot use
+        qint64 tex = 0;       // base-colour roster + texture decode (base-colour icons only)
+        qint64 grab = 0;      // the offscreen pass itself, including its glFinish
+        qint64 post = 0;      // crop / scale / flatten
+        qint64 save = 0;      // PNG encode + write
+        qint64 tris = 0;
+        qint64 trisMax = 0;
+        int    n = 0;
+    };
+    IconPerf m_iconPerf;                                  // the pass currently being measured
+    QVector<QPair<QString, IconPerf>> m_iconPerfPasses;   // finished passes, in order
+    void writeIconPerf() const;
+    // D4_ICONPERF_AUTO=<n>: render n icons in EACH style with the caches bypassed, write the
+    // report and quit. Entirely self-driving — the alternative was a list of UI steps to perform
+    // by hand, which is not a benchmark, and a mis-performed one silently measures the wrong thing.
+    void runIconPerfSweep();
+    bool m_iconPerfRan = false;        // the sweep is armed once per launch
+    bool m_iconPerfSweeping = false;   // suppress the per-batch write; the sweep writes once, at the end
     QTimer*                m_hoverTimer = nullptr;   // 0.5s dwell before icon preview
     QLabel*                m_iconPreview = nullptr;  // floating hover preview popup
     int                    m_hoverSno   = -1;

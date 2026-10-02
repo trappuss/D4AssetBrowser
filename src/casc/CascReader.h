@@ -110,6 +110,19 @@ public:
     struct PayloadVariants { quint64 payload = 0; quint64 paylow = 0; };
     PayloadVariants payloadVariants(quint64 sno);
 
+    // ── D4_DUMP_ICONPERF: where a CASC read's time goes ─────────────────────────────────────────
+    // The icon benchmark measured the read at three quarters of an icon's cost, which makes the
+    // split between these two the question that decides what to do about it: the index lookup
+    // runs UNDER m_mutex, the archive read + BLTE inflate outside it. Lookup-bound means worker
+    // threads would only queue on the same lock; archive-bound means they genuinely parallelise,
+    // which is what readFile was written for.
+    //
+    // Cumulative and atomic, because reads are already concurrent. Nothing is timed unless the
+    // variable is set.
+    struct ReadStats { qint64 lookupNs = 0; qint64 archiveNs = 0; qint64 calls = 0; qint64 bytes = 0; };
+    static ReadStats readStats();
+    static void resetReadStats();
+
     QByteArray tactKeyFor(quint64 sno);
     bool       haveTactKey(const QByteArray& keyName) const;
 

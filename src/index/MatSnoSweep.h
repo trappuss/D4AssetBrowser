@@ -1,6 +1,8 @@
 #pragma once
 #include <QString>
 
+class QWidget;   // the parent-widget parameters below; MSVC's forced PCH (QtWidgets) hid its absence
+
 class SnoIndex;
 class CascReader;
 

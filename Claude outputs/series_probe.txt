@@ -1,0 +1,128 @@
+=== Series / collection probe ===
+StringList folder : build\release\data\d4data\json\enUS_Text\meta\StringList
+StringList files  : 61330
+StoreProduct files: 7786
+
+-- PASS A: every szLabel in the StringLists, most common first --
+   (this is the discovery pass: a grouping field we do not know about shows up here)
+   label                          files   top prefixes
+   Name                           46709   Actor:12380, Item:11987, StoreProduct:7777, Quest:2812
+   Series                          7017   StoreProduct:7017
+   Description                     4679   Item:2947, StoreProduct:1448, CollectiblePower:189, Recipe:91
+   Desc                            4122   Affix:1872, Achievement:1529, World:566, ParagonGlyphAffix:155
+   MenuLabel                       3776   Conv:3776
+   Flavor                          3635   Item:3604, Recipe:31
+   Toast                           2067   Quest:2067
+   name                            1542   Power:1542
+   desc                            1507   Power:1507
+   NoticeSignText                  1252   Actor:1252
+   Name_Suffix                     1022   Affix:1022
+   Name_Prefix                     1022   Affix:1022
+   FlavorName                      1012   Actor:1012
+   DisembodiedVoice                 900   Conv:900
+   Quote                            818   StoreProduct:818
+   Category                         802   Recipe:802
+   Callback4Header                  776   Quest:776
+   AffixName                        668   DungeonAffix:667, UITestStrings:1
+   DescShort                        586   Achievement:586
+   rankup_desc                      558   Power:558
+   Phase0Description                418   Quest:418
+   Callback2Header                  374   Quest:374
+   CodexDesc                        358   Affix:358
+   AffixDesc                        347   DungeonAffix:347
+   Callback17Header                 337   Quest:337
+   Callback13Header                 270   Quest:270
+   Buff0_Name                       256   Power:256
+   Buff0_Description                253   Power:253
+   simple_desc                      229   Power:229
+   Callback7Header                  222   Quest:222
+   FlavorText                       211   Actor:210, UITestStrings:1
+   title                            205   Tutorial:205
+   UIName                           202   Actor:202
+   BreadcrumbDescription            190   Quest:190
+   BreadcrumbHeader                 190   Quest:190
+   HowToUnlock                      189   CollectiblePower:189
+   RequirementText                  189   Item:188, UITestStrings:1
+   Line1.6D03F                      185   Conv:185
+   Callback27Header                 181   Quest:181
+   Callback5Header                  176   Quest:176
+   Callback10Header                 165   Quest:165
+   Line3.6D03F                      162   Conv:162
+   Mod2_Name                        160   Power:160
+   Mod2_Description                 158   Power:158
+   Next_Rank                        152   CollectiblePower:152
+   ShortenedName                    151   Actor:151
+   Callback77Header                 147   Quest:147
+   Mod3_Name                        133   Power:133
+   AffixDesc_Legendary              131   DungeonAffix:131
+   AffixDesc_Rare                   131   DungeonAffix:131
+   AffixDesc_Magic                  130   DungeonAffix:130
+   Mod4_Description                 130   Power:130
+   Mod4_Name                        130   Power:130
+   Mod1_Name                        129   Power:129
+   Mod1_Description                 128   Power:128
+   SuperElite                       124   Actor:123, MonsterTypes:1
+   Mod5_Description                 124   Power:124
+   Mod5_Name                        124   Power:124
+   Line5.6D03F                      123   Conv:123
+   Mod6_Name                        122   Power:122
+   ... and 44462 more labels (full set is implicit in the TSVs)
+
+-- PASS B: Series coverage --
+   files carrying a Series row : 7017
+   ... of which StoreProduct_* : 7017  (the product's own
+       label -- the ONLY route AppearanceMeta.cpp reads today)
+   ... owned things (members)  : 0
+   distinct raw Series strings : 732
+   distinct after normalising  : 640
+
+   by SNO-group prefix:
+     StoreProduct               7017  (of 7777 files with that prefix)
+
+-- PASS C: how far the shop and the seasons reach --
+   members reachable from a StoreProduct : 0 / 0
+   ... of those, carrying a season       : 0
+   ... of those, gated by arRequiresOwning (pass-locked, never sold): 0
+   members NO StoreProduct reaches       : 0 / 0
+   ^ that last number is the size of the gap the Catalogue tab cannot see today,
+     because CatalogueTab is a view over StoreProductIndex and nothing else.
+
+   series with NO shop member at all (candidates for a non-shop category):
+     640 series, 0 members; largest 25:
+           0  Prestige Mega Bundle
+           0  Ammon's Secrets Platinum Pack
+           0  Death's Messenger Platinum Pack
+           0  Shadow Market Platinum Pack
+           0  Jinkai Tiger Platinum Pack [ph]
+           0  Silver City Platinum Pack [ph]
+           0  Dark Pathways
+           0  Prestige Mount & Mount Armor
+           0  Rebel's Cache Platinum Pack
+           0  Barbarian Armor
+           0  Druid Armor
+           0  Necromancer Armor
+           0  Rogue Armor
+           0  Sorcerer Armor
+           0  Ursa Noctua
+           0  Tamer of the Beast
+           0  Undying Rage
+           0  Plague Rat
+           0  Hired Muscle
+           0  Hell-Lava Pearl
+           0  Crypt Hunter
+           0  Season of the Malignant
+           0  Returning Champion
+           0  Brutal Idol
+           0  Shards of Light
+
+   eType distribution over shop-linked members (labels are NOT in the data --
+   this is the only way to find out whether eType separates promo from ordinary):
+
+   szProductReleaseBranch distribution (the patch a product shipped in):
+
+   series whose members are split across several SNO groups (real bundles):
+     0 of 640
+
+Wrote: Claude outputs\series_rows.tsv
+Wrote: Claude outputs\series_summary.tsv
+Wrote: Claude outputs\series_probe.txt

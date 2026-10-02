@@ -1,0 +1,75 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>abcore provenance</title>
+<style>
+:root{--bg:#fcfcfb;--ink:#1a1a19;--ink2:#5a5955;--line:#e6e5e0;--d4:#2a78d6;--fox:#eb6834;--poe2:#1baf7a;--new:#8a8983}
+@media(prefers-color-scheme:dark){:root{--bg:#1a1a19;--ink:#fff;--ink2:#c3c2b7;--line:#33322f;--d4:#3987e5;--fox:#d95926;--poe2:#199e70;--new:#9a9994}}
+body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.45 system-ui,-apple-system,Segoe UI,sans-serif;padding:24px 16px;max-width:1100px;margin-inline:auto}
+h1{font-size:20px;margin:0 0 4px}p.sub{margin:0 0 20px;color:var(--ink2)}
+.bar{display:flex;height:22px;border-radius:4px;overflow:hidden;gap:2px;margin:8px 0 6px}
+.bar span{display:block}
+.legend{display:flex;flex-wrap:wrap;gap:16px;color:var(--ink2);font-size:13px;margin-bottom:22px}
+.legend i{display:inline-block;width:10px;height:10px;border-radius:2px;margin-right:6px;vertical-align:-1px}
+.chip{display:inline-block;padding:1px 7px;border-radius:3px;font-size:12px;color:#fff;margin-right:4px;white-space:nowrap}
+.chip.d4{background:var(--d4)}.chip.fox{background:var(--fox)}.chip.poe2{background:var(--poe2)}.chip.new{background:var(--new)}
+.chip.minor{opacity:.55}
+table{border-collapse:collapse;width:100%}th{text-align:left;font-weight:600;color:var(--ink2);font-size:12px;letter-spacing:.02em;padding:6px 8px;border-bottom:1px solid var(--line)}
+td{padding:7px 8px;border-bottom:1px solid var(--line);vertical-align:top}
+td.m{white-space:nowrap;font-weight:600}td.w{color:var(--ink2)}
+tr.g td{background:none;border:0;padding:16px 8px 4px;font-size:12px;color:var(--ink2);text-transform:uppercase;letter-spacing:.06em}
+.overflow{overflow-x:auto}
+</style></head><body>
+<h1>abcore — where each piece came from, and why</h1>
+<p class="sub">33 core modules by the tool their base came from. A faded chip is a contribution folded in from another tool. Source: the provenance note at the top of each core header.</p>
+
+<div class="bar" aria-label="Modules by primary base: FOX 18, D4 5, POE2 5, merged or new 5">
+  <span style="width:54.5%;background:var(--fox)"></span>
+  <span style="width:15.2%;background:var(--d4)"></span>
+  <span style="width:15.2%;background:var(--poe2)"></span>
+  <span style="width:15.2%;background:var(--new)"></span>
+</div>
+<div class="legend">
+  <span><i style="background:var(--fox)"></i>FOX — 18 modules (shell, panels, search, hotkeys, logging, harness)</span>
+  <span><i style="background:var(--d4)"></i>D4 — 5 (viewport, capture, GIF)</span>
+  <span><i style="background:var(--poe2)"></i>POE2 — 5 (list model, funnel, bulk, textures, self-tests)</span>
+  <span><i style="background:var(--new)"></i>merged / new — 5 (math, store, exporter, layouts, main)</span>
+</div>
+
+<div class="overflow"><table>
+<thead><tr><th>Module</th><th>Base</th><th>Why that one</th></tr></thead>
+<tbody>
+<tr class="g"><td colspan="3">Rendering &amp; export</td></tr>
+<tr><td class="m">GLModelWidget (viewport)</td><td><span class="chip d4">D4</span><span class="chip fox minor">FOX</span><span class="chip poe2 minor">POE2</span></td><td class="w">D4's pipeline is the richest (shadow map, SSAO, IBL, ACES, picking) — chosen against the audit's FOX recommendation. Its cloth/fur/dye/hair code left through <code>ViewportExtension</code>. FOX gave the single <code>ShadingMode</code> and the overlay master gate; POE2 the <code>AlphaMode</code> two-pass draw.</td></tr>
+<tr><td class="m">GlbExporter</td><td><span class="chip new">merged</span></td><td class="w">All three hand-wrote glTF; the core writer keeps every scar each one paid for (POE2's per-array rotation → one v·M swap; D4's per-clip time arrays → shared accessors; POE2's column-major palette bug).</td></tr>
+<tr><td class="m">GifEncoder</td><td><span class="chip d4">D4</span></td><td class="w">Byte-identical in all three; D4 was the origin the other two copied from.</td></tr>
+<tr><td class="m">ExportCapture (GIF budget)</td><td><span class="chip d4">D4</span><span class="chip poe2 minor">POE2</span></td><td class="w">D4's budget ladder, carried verbatim through POE2 — same constants in all three copies.</td></tr>
+<tr><td class="m">NameTemplate</td><td><span class="chip d4">D4</span></td><td class="w">D4's and POE2's files were byte-identical (same md5).</td></tr>
+<tr><td class="m">ExportLayout</td><td><span class="chip new">merged</span></td><td class="w">Each tool's folder layouts (D4 Flat/Class/Type, FOX game/category/family, POE2 Type/Folder) expressed over one tag vocabulary.</td></tr>
+<tr><td class="m">ThumbnailRenderer</td><td><span class="chip fox">FOX</span><span class="chip poe2 minor">POE2</span></td><td class="w">FOX's structure (one GL thread, memory cache in front of disk cache) with POE2's simpler API on the front.</td></tr>
+
+<tr class="g"><td colspan="3">Contract &amp; data</td></tr>
+<tr><td class="m">RigMath</td><td><span class="chip new">new</span></td><td class="w">One matrix convention (row-vector v·M) for the whole family — settled decision; the three tools disagreed and the exporter bugs came from that.</td></tr>
+<tr><td class="m">IGameStore + BackgroundIndex</td><td><span class="chip new">new</span></td><td class="w">The index shape was hand-rolled eleven times (7 D4 singletons, FOX's three indexes, POE2's loader) and the copies disagreed; one contract, thread-safe load set, worker-thread loading for every game.</td></tr>
+<tr><td class="m">Lazy clips (Clip::lazy / bakeClip)</td><td><span class="chip fox">FOX</span></td><td class="w">FOX decoded one clip at a time; baking all of a Fox model's 20,921 clips at load measured 99 s.</td></tr>
+
+<tr class="g"><td colspan="3">Application shell</td></tr>
+<tr><td class="m">Application (main)</td><td><span class="chip new">merged</span></td><td class="w">Every main.cpp was the same lines in a different order with different omissions (POE2 had no message handler). One runApp, plus FOX's DevShot harness mechanism (--shot/--settle/--tab).</td></tr>
+<tr><td class="m">AppShell (window)</td><td><span class="chip fox">FOX</span><span class="chip d4 minor">D4</span><span class="chip poe2 minor">POE2</span></td><td class="w">FOX's first-run stack, StatusLine and hotkeys-by-key; D4's export hooks, LazyTab and IndexSpec; POE2's "Show in folder" button.</td></tr>
+<tr><td class="m">SettingsDialog</td><td><span class="chip fox">FOX</span><span class="chip d4 minor">D4</span></td><td class="w">FOX's skeleton (pages by name, hotkey-clash detector, live density with Cancel revert) plus D4's first-show screen clamp.</td></tr>
+<tr><td class="m">CoreSettings</td><td><span class="chip fox">FOX</span></td><td class="w">FOX's Config pattern with the session override, so a harness run never rewrites the INI.</td></tr>
+<tr><td class="m">Hotkeys</td><td><span class="chip fox">FOX</span></td><td class="w">Rebindable registry with roles and a cheat sheet; the row table is injected per game.</td></tr>
+<tr><td class="m">LogConsole · CrashHandler · StatusLine · FirstRunPage · Density · FontScale</td><td><span class="chip fox">FOX</span></td><td class="w">Lifted; FOX was the only tool that had them at all (a crash note with the last 20 log lines; a first-run page instead of five empty tabs).</td></tr>
+<tr><td class="m">SelfTests</td><td><span class="chip poe2">POE2</span><span class="chip fox minor">FOX</span></td><td class="w">POE2's table shape with FOX's reporting — POE2 printed to stderr, which a Windows GUI build has none of, so failures were silent.</td></tr>
+
+<tr class="g"><td colspan="3">UI &amp; tabs</td></tr>
+<tr><td class="m">AssetListModel</td><td><span class="chip poe2">POE2</span><span class="chip d4 minor">D4</span></td><td class="w">POE2's flat model (filter once per keystroke, facet counts) with D4's row flags (unrenderable ⚠, encrypted 🔒).</td></tr>
+<tr><td class="m">FunnelFilter</td><td><span class="chip poe2">POE2</span></td><td class="w">The sticky popup with live counts and chips; the vocabulary comes from the plugin.</td></tr>
+<tr><td class="m">SearchQuery / QueryTerm</td><td><span class="chip fox">FOX</span></td><td class="w">FOX's search language ("-mgo", "a|b") so it means the same in every tab; the id test is injected per engine.</td></tr>
+<tr><td class="m">NPanel · PanelBox</td><td><span class="chip fox">FOX</span></td><td class="w">One panel column, one class — replaced three separate panes in the splitter.</td></tr>
+<tr><td class="m">HoverPreview</td><td><span class="chip fox">FOX</span><span class="chip d4 minor">D4</span></td><td class="w">FOX's behaviour (dwell, wheel resize, clamp) reading D4's settings keys.</td></tr>
+<tr><td class="m">MenuText · Glyphs</td><td><span class="chip fox">FOX</span></td><td class="w">One label vocabulary and painter-drawn icons; engine nouns ("SNO" vs "hash") supplied by the plugin.</td></tr>
+<tr><td class="m">ModelsTab</td><td><span class="chip d4">D4</span><span class="chip fox minor">FOX</span><span class="chip poe2 minor">POE2</span></td><td class="w">D4's worker load path and panel set; FOX's harness hooks (selectModel, --clip); POE2's export flow.</td></tr>
+<tr><td class="m">TexturesTab</td><td><span class="chip poe2">POE2</span><span class="chip d4 minor">D4</span></td><td class="w">POE2's structure with D4's funnel — through the one list model, so "a|b" works (D4's tab bypassed the matcher).</td></tr>
+<tr><td class="m">BulkExtractor / BulkTab</td><td><span class="chip poe2">POE2</span><span class="chip d4 minor">D4</span></td><td class="w">"The cleanest" of the three per the audit; D4's per-item SEH guard added (POE2 lacked it) and D4's layout-before-run order.</td></tr>
+</tbody></table></div>
+</body></html>

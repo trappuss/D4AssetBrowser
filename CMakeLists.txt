@@ -57,6 +57,8 @@ qt_add_executable(D4AssetBrowser WIN32
 
     src/index/CoreToc.h         src/index/CoreToc.cpp
     src/index/SnoIndex.h        src/index/SnoIndex.cpp
+    src/index/ModelAnimIndex.h  src/index/ModelAnimIndex.cpp
+    src/util/ParallelMap.h
     src/index/SnoListModel.h    src/index/SnoListModel.cpp
     src/index/AppearanceMeta.h  src/index/AppearanceMeta.cpp
     src/index/MatSnoSweep.h     src/index/MatSnoSweep.cpp
@@ -71,6 +73,7 @@ qt_add_executable(D4AssetBrowser WIN32
     src/index/ItemHoverIndex.h   src/index/ItemHoverIndex.cpp
     src/index/BackTrophyIndex.h  src/index/BackTrophyIndex.cpp
     src/index/WardrobeAnimIndex.h  src/index/WardrobeAnimIndex.cpp
+    src/index/SeriesIndex.h      src/index/SeriesIndex.cpp
 
     src/tex/TexFormat.h         src/tex/TexFormat.cpp
     src/tex/TexMeta.h           src/tex/TexMeta.cpp

@@ -1,4 +1,6 @@
 #include "tabs/ModelsTab.h"
+#include "index/ModelAnimIndex.h"   // anim + entity index scans, cache, clip queries (moved out 2026-09-23)
+#include "util/ParallelMap.h"         // parallelMap (moved out 2026-09-23)
 #include "util/ViewportPartMenu.h"
 
 #include "app/AppPaths.h"
@@ -119,6 +121,8 @@
 #include <utility>   // std::as_const
 #include <atomic>
 #include <cmath>
+#include <QSemaphore>    // icon read-ahead: one chunk's completions
+#include <QThreadPool>   // icon read-ahead: CascReader is safe for concurrent reads
 #include <memory>
 #include <thread>
 #include <vector>
@@ -151,6 +155,19 @@ constexpr int kGroupAppearance = 9;
 inline int kGroupTextureId()
 {
     static const int g = SnoIndex::groupIdByName(QStringLiteral("Texture"), 44);
+    return g;
+}
+
+// D4_DUMP_ICONPERF, resolved once — see ModelsTab::IconPerf.
+inline bool iconPerfOn()
+{
+    static const bool on = qEnvironmentVariableIsSet("D4_DUMP_ICONPERF");
+    return on;
+}
+
+inline int kGroupAppearanceId()
+{
+    static const int g = SnoIndex::groupIdByName(QStringLiteral("Appearance"), 9);
     return g;
 }
 
@@ -486,10 +503,33 @@ QImage applyDyeBake(const QImage& base0, const QImage& mask0, const QImage& ramp
 
 // Disk path for a model's cached 3D-render thumbnail, so list icons persist across
 // sessions instead of being re-rendered each launch.
-QString thumbCachePath(int sno)
+//
+// The two icon styles keep SEPARATE folders rather than sharing one and invalidating on change.
+// Sharing would mean either showing a grey thumbnail as a base-colour one (silently wrong) or
+// wiping every cached icon each time the setting is toggled (minutes of re-rendering to undo a
+// mistaken click). With two folders, flipping the setting swaps instantly to the other set and
+// neither is ever stale. `baseColor` is not defaulted on purpose: every caller must say which
+// style it is reading or writing, so a new call site cannot quietly write into the wrong one.
+QString thumbCacheDir(bool baseColor)
 {
-    static const QString dir = AppPaths::subDir(QStringLiteral("model_thumbs"));
-    return dir + QStringLiteral("/%1.png").arg(sno);
+    static const QString dirLit = AppPaths::subDir(QStringLiteral("model_thumbs"));
+    static const QString dirBC  = AppPaths::subDir(QStringLiteral("model_thumbs_basecolor"));
+    return baseColor ? dirBC : dirLit;
+}
+
+QString thumbCachePath(int sno, bool baseColor)
+{
+    return thumbCacheDir(baseColor) + QStringLiteral("/%1.png").arg(sno);
+}
+
+// The icon settings a cached folder was written under. Stored beside the PNGs and compared on
+// startup: size, cropping and the cut-out all change the stored image, and there is no way to
+// tell by looking at a 128px PNG which settings produced it. The alternative — a folder or a
+// filename per combination — leaves orphans behind for ever, because nothing in the tool sweeps
+// this directory. Signing it means exactly one set of files per style, always current.
+QString thumbVariantPath(bool baseColor)
+{
+    return thumbCacheDir(baseColor) + QStringLiteral("/.variant");
 }
 
 // Sentinel written just before a risky thumbnail render and deleted right after. If it
@@ -504,148 +544,9 @@ QString renderCrashLogPath()
     return AppPaths::file(QStringLiteral("model_render_crashes.log"));
 }
 
-// ── Parallel file-scan helper (first-run indexing speed) ──────────────────────────────────────────
-namespace {
-// Parse a big list of metadata files across all CPU cores. `parse(path)` runs on worker threads and
-// returns one record R per file (no shared state → no locking); the caller then aggregates the returned
-// records serially (keeping the existing, correct merge logic). Results preserve input order.
-// `report(done,total)` is polled from the coordinating thread for live progress. Blocks until done —
-// call it from a background thread (the scans already run on one). Cuts first-run parsing ~N-fold.
-// `threadMul` oversubscribes the pool: for I/O-bound loose-file scans (opening tens of thousands of
-// tiny JSON files, where threads spend most of their time blocked on disk), running ~2× cores hides
-// that latency and raises throughput. Leave it 1 for CPU-bound work (e.g. the texture BC-decode).
-template <typename R, typename ParseFn, typename ReportFn>
-std::vector<R> parallelMap(const QStringList& files, ParseFn parse, ReportFn report,
-                           bool installSeh = false, int threadMul = 1)
-{
-    const int total = files.size();
-    const size_t nSlots = size_t(total);   // NB: a plain variable (NOT 'slots' — that's a Qt macro!)
-    std::vector<R> out(nSlots);   // one slot per file; workers write distinct indices (no COW, no lock)
-                                  // NB: 'nSlots' as a plain variable also avoids a most-vexing-parse.
-    if (total == 0) return out;
-    unsigned hw = std::thread::hardware_concurrency();
-    if (hw < 2) hw = 2;
-    if (threadMul < 1) threadMul = 1;
-    const int nThreads = std::min<int>(int(hw) * threadMul, total);
-    std::atomic<int> done{0};
-    std::vector<std::thread> pool;
-    pool.reserve(size_t(nThreads));
-    for (int t = 0; t < nThreads; ++t) {
-        pool.emplace_back([&, t]() {
-            if (installSeh) seh::installSehTranslator();
-            for (int i = t; i < total; i += nThreads) {   // strided → balanced load
-                // A parse that throws (or an SEH fault translated to a C++ exception when
-                // installSeh is set) must not std::terminate the whole app from a worker —
-                // leave that slot default-constructed so one bad file is skipped, not fatal.
-                try { out[i] = parse(files.at(i)); }
-                catch (...) { }
-                done.fetch_add(1, std::memory_order_relaxed);
-            }
-        });
-    }
-    while (done.load(std::memory_order_relaxed) < total) {
-        report(done.load(std::memory_order_relaxed), total);
-        QThread::msleep(60);
-    }
-    for (std::thread& th : pool) th.join();
-    report(total, total);
-    return out;
-}
-} // namespace
+// parallelMap: util/ParallelMap.h (moved there so index/ModelAnimIndex.cpp shares it).
 
-// ── Disk cache for the heavy background indexes (anim + entity) ───────────────────────────────────
-namespace {
-// Cache key = d4data buildVersion.txt (content + mtime) AND the game build id.
-//
-// The comment here used to claim the game build was included; it was not — the signature was
-// snapshot-only. Phase 2 of the anim scan parses rig bones through CascReader, so a game patch that
-// reskeletons a rig served stale family/bone data from the cache with nothing to indicate it. The
-// caller passes the build id because this helper has no reader.
-QString d4dataSignature(const QString& gameBuildId = QString())
-{
-    const QString bv = Config::d4dataDir() + QStringLiteral("/buildVersion.txt");
-    QString ver;
-    QFile f(bv);
-    if (f.open(QIODevice::ReadOnly)) ver = QString::fromUtf8(f.readAll()).trimmed();
-    const QDateTime m = QFileInfo(bv).lastModified();
-    return ver + QLatin1Char('|') + (m.isValid() ? m.toString(Qt::ISODate) : QString())
-               + QLatin1Char('|') + gameBuildId;
-}
-QString indexCachePath(const QString& name)
-{
-    static const QString dir = AppPaths::subDir(QStringLiteral("index_cache"));
-    return dir + QLatin1Char('/') + name;
-}
-
-// The full result of the animation scan (Anim + AnimSet + rig-bone parse + family index).
-struct AnimBlob {
-    QSet<int>                     animatedSnos;
-    QHash<int, QStringList>       rowsBySno;
-    QSet<QString>                 famPrefixes;
-    QHash<QString, QStringList>   famRows;
-    QHash<QString, QString>       famOwner;
-    QHash<QString, QSet<quint32>> famBones;
-    QHash<QString, QString>       clipSet;
-    QHash<QString, QStringList>   setClips;
-    QSet<QString>                 femaleClips;
-    QHash<QString, QString>       femalePair;
-    QHash<QString, QString>       clipPower;
-};
-QDataStream& operator<<(QDataStream& ds, const AnimBlob& b) {
-    return ds << b.animatedSnos << b.rowsBySno << b.famPrefixes << b.famRows << b.famOwner
-              << b.famBones << b.clipSet << b.setClips << b.femaleClips << b.femalePair << b.clipPower;
-}
-QDataStream& operator>>(QDataStream& ds, AnimBlob& b) {
-    return ds >> b.animatedSnos >> b.rowsBySno >> b.famPrefixes >> b.famRows >> b.famOwner
-              >> b.famBones >> b.clipSet >> b.setClips >> b.femaleClips >> b.femalePair >> b.clipPower;
-}
-
-// The full result of the entity scan (Actor + Item metadata).
-struct EntityBlob {
-    QHash<int, QStringList> apprActors;
-    QHash<int, int>         apprActorN;
-    QHash<int, QString>     apprFamily;
-    QHash<int, QStringList> apprItems;
-    QHash<int, int>         apprItemN;
-    QHash<QString, int>     itemAppr;
-    QHash<int, QStringList> apprSets;
-    QHash<int, QStringList> apprVariants;
-    QHash<int, QList<int>>  apprVariantSnos;
-    QHash<int, QString>     apprName;
-};
-QDataStream& operator<<(QDataStream& ds, const EntityBlob& b) {
-    return ds << b.apprActors << b.apprActorN << b.apprFamily << b.apprItems << b.apprItemN
-              << b.itemAppr << b.apprSets << b.apprVariants << b.apprVariantSnos << b.apprName;
-}
-QDataStream& operator>>(QDataStream& ds, EntityBlob& b) {
-    return ds >> b.apprActors >> b.apprActorN >> b.apprFamily >> b.apprItems >> b.apprItemN
-              >> b.itemAppr >> b.apprSets >> b.apprVariants >> b.apprVariantSnos >> b.apprName;
-}
-
-template <typename T>
-bool readIndexCache(const QString& path, const QString& magic, const QString& sig, T& out)
-{
-    QFile f(path);
-    if (!f.open(QIODevice::ReadOnly)) return false;
-    QDataStream ds(&f);
-    ds.setVersion(QDataStream::Qt_6_0);
-    QString gotMagic, gotSig;
-    ds >> gotMagic >> gotSig;
-    if (gotMagic != magic || gotSig != sig) return false;   // wrong version → re-scan
-    ds >> out;
-    return ds.status() == QDataStream::Ok;
-}
-template <typename T>
-void writeIndexCache(const QString& path, const QString& magic, const QString& sig, const T& blob)
-{
-    QSaveFile f(path);   // atomic write (temp + rename) so a crash mid-write can't corrupt the cache
-    if (!f.open(QIODevice::WriteOnly)) return;
-    QDataStream ds(&f);
-    ds.setVersion(QDataStream::Qt_6_0);
-    ds << magic << sig << blob;
-    f.commit();
-}
-}   // namespace
+// The anim / entity index cache (key, path, blobs, read/write): index/ModelAnimIndex.{h,cpp}.
 
 // Equipment slot tags (DJB2 seed=0 of the 3-letter slot code → readable name).
 // Matches d4extract's hash dictionary; used to label parts whose material slot
@@ -1104,6 +1005,19 @@ ModelsTab::ModelsTab(QWidget* parent) : BrowserTab(parent)
 
     m_countLabel = new QLabel(QStringLiteral("0 models"), left);
     // (Indexing progress is shown in the app's floating toast, not inline — see setScan/scanStatus.)
+    // Read BEFORE the first icon load: thumbCachePath picks its folder from this, so a session
+    // that started with the setting on must not spend its first screenful reading the other
+    // style's cache. onSettingsChanged keeps it in step from here on.
+    {
+        QSettings s;
+        m_iconBaseColor = s.value(QStringLiteral("models/iconBaseColor"), false).toBool();
+        m_iconRenderPx = qBound(48, s.value(QStringLiteral("models/iconRenderPx"), 128).toInt(), 256);
+        m_iconCrop  = s.value(QStringLiteral("models/iconCrop"),  true).toBool();
+        m_iconAlpha = s.value(QStringLiteral("models/iconAlpha"), true).toBool();
+    }
+    // Before the first cache read: anything written under other icon settings goes now, so the
+    // list never shows a mix of old and new framing.
+    ensureThumbCacheVariant();
     m_iconModeCombo = new QComboBox(left);
     m_iconModeCombo->addItem(QStringLiteral("Original icons"), QStringLiteral("orig"));
     m_iconModeCombo->addItem(QStringLiteral("3D"), QStringLiteral("3d"));
@@ -3767,7 +3681,7 @@ QPixmap ModelsTab::listIconPixmap(int sno)
     if (mode == QLatin1String("3d") || mode == QLatin1String("both")) {
         if (!m_renderCache.contains(sno)) {   // lazily load a persisted thumbnail
             QPixmap pm;
-            if (pm.load(thumbCachePath(sno))) m_renderCache.insert(sno, pm);
+            if (pm.load(thumbCachePath(sno, m_iconBaseColor))) m_renderCache.insert(sno, pm);
         }
         return m_renderCache.value(sno);
     }
@@ -4087,7 +4001,7 @@ void ModelsTab::renderVisibleIcons()
         if (m_renderBlocklist.contains(e->snoId)) continue;   // known-bad model — never auto-render
         if (m_noRenderSnos.contains(e->snoId)) continue;      // tried, yields no thumbnail — don't loop on it
         QPixmap pm;                              // prefer a persisted thumbnail over re-rendering
-        if (pm.load(thumbCachePath(e->snoId))) { m_renderCache.insert(e->snoId, pm); loadedFromDisk = true; }
+        if (pm.load(thumbCachePath(e->snoId, m_iconBaseColor))) { m_renderCache.insert(e->snoId, pm); loadedFromDisk = true; }
         else                                      snos.append(e->snoId);
     }
     if (loadedFromDisk && m_listModel) m_listModel->refreshIconRange(top, bot);   // only the visible span
@@ -4182,6 +4096,33 @@ void ModelsTab::loadList()
     }
     m_listModel->setEntries(entries);
     updateCount();
+    // ── D4_ICONPERF_AUTO: the self-driving icon benchmark ───────────────────────────────────────
+    // Armed once per launch, here, because this is the first moment the list has rows to render.
+    // It then waits for the three things the icon path actually needs — CASC ready, rows present,
+    // and the GL widget initialised (which only happens once this tab has been SHOWN, hence the
+    // focus request) — rather than guessing a delay and measuring an empty run.
+    if (!m_iconPerfRan && qEnvironmentVariableIsSet("D4_ICONPERF_AUTO")) {
+        m_iconPerfRan = true;
+        emit focusRequested();
+        auto* wait = new QTimer(this);
+        wait->setInterval(500);
+        connect(wait, &QTimer::timeout, this, [this, wait, tries = 0]() mutable {
+            const bool ready = m_reader && m_reader->isReady()
+                            && m_listModel && m_listModel->rowCount() > 0
+                            && m_modelView && m_modelView->isValid();
+            if (!ready && ++tries < 120) return;   // up to a minute, then run anyway and say so
+            wait->stop();
+            wait->deleteLater();
+            if (!ready)
+                qWarning("icon perf: starting the sweep without everything ready — CASC=%d rows=%d "
+                         "GL=%d. The numbers may be short.",
+                         m_reader && m_reader->isReady() ? 1 : 0,
+                         m_listModel ? int(m_listModel->rowCount()) : 0,
+                         m_modelView && m_modelView->isValid() ? 1 : 0);
+            runIconPerfSweep();
+        });
+        wait->start();
+    }
     // If a model was mid-load when the app last died, it crashed the load (parse or, far
     // more often, the GPU upload/cloth/draw stage). Blocklist it so it never auto-loads
     // again, and forget it as the "last selected" so we don't get stuck.
@@ -4257,8 +4198,10 @@ static QString classCodeToName(const QString& code)
 
 // Shared-rig animation helpers (defined below, before ensureAnimatedIndex) — forward-declared
 // here so the Animatable filter predicate can use them.
-static QString animFamilyPrefix(const QString& nameLower);
-static QString animLongestFamily(const QString& nameLower, const QSet<QString>& families);
+using modelanim::animFamilyPrefix;   // index/ModelAnimIndex.h
+using modelanim::animLongestFamily;
+using modelanim::clipInFamily;
+using modelanim::clipNamesOf;
 
 // Extra searchable text for a model (its tags + collection + title), lowercased and cached, so the
 // NAME search box's include/exclude terms (e.g. "-player", "-armor") match metadata, not just names.
@@ -4512,35 +4455,7 @@ QVector<QPair<int, QString>> ModelsTab::queryEntries(int group, const FilterSpec
     return out;
 }
 
-// ── Shared-rig ("base") animation resolution helpers ─────────────────────────
-// Family prefix of a clip-owning appearance name: strip a trailing _base<NN> (the body-rig
-// carrier) or a slot token, so barF_base00 → "barf" and npcF_S14_Dannica_base00 → "npcf_s14_dannica".
-static QString animFamilyPrefix(const QString& nameLower)
-{
-    static const QRegularExpression rxBase(QStringLiteral("_base\\d*$"));
-    const auto m = rxBase.match(nameLower);
-    if (m.hasMatch()) return nameLower.left(m.capturedStart());
-    static const QSet<QString> kSlots = {
-        QStringLiteral("trs"), QStringLiteral("hlm"), QStringLiteral("leg"), QStringLiteral("glv"),
-        QStringLiteral("bts"), QStringLiteral("sho"), QStringLiteral("cap"), QStringLiteral("blt"),
-        QStringLiteral("hed"), QStringLiteral("bdy")};
-    const int us = nameLower.lastIndexOf(QLatin1Char('_'));
-    if (us > 0 && kSlots.contains(nameLower.mid(us + 1))) return nameLower.left(us);
-    return nameLower;
-}
-// The longest `_`-boundary prefix of a model name that names a clip-owning base family
-// (empty if none): npcF_S14_Dannica_TRS matches base family "npcf_s14_dannica".
-static QString animLongestFamily(const QString& nameLower, const QSet<QString>& families)
-{
-    QString best;
-    for (int i = nameLower.indexOf(QLatin1Char('_')); i > 0;
-         i = nameLower.indexOf(QLatin1Char('_'), i + 1)) {
-        const QString p = nameLower.left(i);
-        if (families.contains(p) && p.size() > best.size()) best = p;
-    }
-    if (families.contains(nameLower) && nameLower.size() > best.size()) best = nameLower;
-    return best;
-}
+// animLongestFamily: index/ModelAnimIndex.cpp (shared with the core D4 store).
 
 // Background-scan the Anim JSON once, collecting every appearance SNO that an animation
 // references (snoAppearance). Cached for the session. When it finishes, re-apply the filter
@@ -4550,23 +4465,18 @@ void ModelsTab::ensureAnimatedIndex()
     if (m_animatedScanned || m_animatedScanning) return;
     m_animatedScanning = true;
     setScan(QStringLiteral("anim"), QStringLiteral("Loading animation index…"));
-    const QString animDir = QStringLiteral("%1/json/base/meta/Anim").arg(Config::d4dataDir());
+    const QString d4 = Config::d4dataDir();
     CascReader* reader = m_reader;   // thread-safe (mutex-locked reads); used for the Phase-2 rig parse
-    // Build id included: phase 2 below parses rig bones out of CASC, so a game patch must
-    // invalidate this even when the d4data snapshot is unchanged.
-    const QString sig = d4dataSignature(m_reader ? m_reader->buildId() : QString());
-    const QString cachePath = indexCachePath(QStringLiteral("anim_index.bin"));
-    std::thread([this, animDir, reader, sig, cachePath]() {
-        // Load the cached index if it matches the current game/d4data build → skip the whole scan.
-        AnimBlob cached;
-        if (readIndexCache(cachePath, QStringLiteral("ANIMIDX2"), sig, cached)) {
+    // Build id included: phase 2 parses rig bones out of CASC, so a game patch must invalidate this
+    // even when the d4data snapshot is unchanged.
+    const QString sig = modelanim::dataSignature(d4, m_reader ? m_reader->buildId() : QString());
+    // The scan itself — Anim + AnimSet + rig bones — is index/ModelAnimIndex.cpp's (shared with the
+    // core D4 store). The family pass still runs HERE, on the GUI thread, as it always did.
+    std::thread([this, d4, reader, sig]() {
+        modelanim::AnimBlob cached;
+        if (modelanim::readAnim(sig, cached)) {
             QMetaObject::invokeMethod(this, [this, cached]() {
-                m_animatedSnos = cached.animatedSnos;   m_animRowsBySno = cached.rowsBySno;
-                m_animFamilyPrefixes = cached.famPrefixes; m_animFamilyRows = cached.famRows;
-                m_animFamilyOwner = cached.famOwner;    m_familyBones = cached.famBones;
-                m_clipSet = cached.clipSet;             m_setClips = cached.setClips;
-                m_femaleClips = cached.femaleClips;     m_femalePair = cached.femalePair;
-                m_clipPower = cached.clipPower;
+                m_anim = cached;
                 m_animatedScanned = true;
                 m_animatedScanning = false;
                 m_animCache.clear();
@@ -4582,226 +4492,14 @@ void ModelsTab::ensureAnimatedIndex()
         QMetaObject::invokeMethod(this, [this]() {   // cache miss → announce the scan
             if (m_animatedScanning) setScan(QStringLiteral("anim"), QStringLiteral("Scanning animations… 0%"));
         }, Qt::QueuedConnection);
-        QElapsedTimer idxClk; idxClk.start();   // first-run indexing timing (logged via qInfo below)
-        QSet<int> found;
-        QHash<int, QStringList> rowsBySno;   // authoritative anim rows per appearance SNO
-        QHash<QString, QString> clipRowByName;   // clip name (lower) → its display row ("name  ·  N frames")
-        // Each .ani.json may reference one or more snoAppearance blocks — capture every one, plus
-        // the clip's keyframe count, matching the per-model ANIMATIONS panel's row format exactly.
-        QStringList files;
-        {
-            QDirIterator it(animDir, QStringList{QStringLiteral("*.ani.json")}, QDir::Files);
-            while (it.hasNext()) files << it.next();
-        }
-        clipRowByName.reserve(files.size());   // ~one clip row per .ani.json → size up-front, avoid rehashing
-        found.reserve(files.size() / 4);
-        // Parse every .ani.json in parallel (its snoAppearance owners + frame count), then aggregate.
-        struct AnimRec { QString lower; QString row; QList<int> snos; };
-        const std::vector<AnimRec> arecs = parallelMap<AnimRec>(files,
-            [](const QString& path) -> AnimRec {
-                static const QRegularExpression rxApp(
-                    QStringLiteral("\"snoAppearance\":\\s*\\{[^{}]*?\"__raw__\":\\s*(\\d+)"));
-                static const QRegularExpression rxFrames(QStringLiteral("\"nKeyframeCount\":\\s*(\\d+)"));
-                AnimRec r;
-                QFile jf(path);
-                if (!jf.open(QIODevice::ReadOnly)) return r;
-                // fromLatin1 (not fromUtf8): we only match ASCII patterns (snoAppearance ids,
-                // nKeyframeCount, base/meta paths) and capture ASCII — skipping UTF-8 decoding of
-                // every file is faster and cannot affect the (ASCII-only) captured values.
-                const QString raw = QString::fromLatin1(jf.readAll());
-                QString animName = QFileInfo(path).fileName();
-                if (animName.endsWith(QLatin1String(".ani.json"))) animName.chop(9);
-                r.lower = animName.toLower();
-                const auto fm = rxFrames.match(raw);
-                r.row = fm.hasMatch()
-                    ? QStringLiteral("%1  ·  %2 frames").arg(animName, fm.captured(1)) : animName;
-                auto mi = rxApp.globalMatch(raw);
-                while (mi.hasNext()) {
-                    const int sno = mi.next().captured(1).toInt();
-                    if (sno > 0) r.snos << sno;
-                }
-                return r;
-            },
-            [this](int d, int t) {
-                QMetaObject::invokeMethod(this, [this, d, t]() {
-                    if (m_animatedScanning) setScan(QStringLiteral("anim"),
-                        QStringLiteral("Scanning animations… %1%").arg(t > 0 ? int(qint64(d) * 100 / t) : 100));
-                }, Qt::QueuedConnection);
-            }, /*installSeh=*/false, /*threadMul=*/2);   // I/O-bound loose-file scan → oversubscribe
-        for (const AnimRec& r : arecs) {
-            if (r.lower.isEmpty()) continue;
-            clipRowByName.insert(r.lower, r.row);   // for AnimSet → clip-row resolution
-            for (int sno : r.snos) {
-                found.insert(sno);
-                QStringList& list = rowsBySno[sno];
-                if (!list.contains(r.row)) list << r.row;
-            }
-        }
-        for (auto it = rowsBySno.begin(); it != rowsBySno.end(); ++it) it.value().sort();
-        qInfo("[index] anim files: %lld parsed in %lld ms", (qint64)files.size(), idxClk.elapsed());
-
-        // ── AnimSet index: the game's authoritative clip grouping (base/meta/AnimSet/*.ans.json).
-        // Every set's ptPowerEntryList lists snoAnim (+ optional snoFemaleOverrideAnim) clips; we map
-        // each clip → its set name (for provenance + display grouping) and flag female-override
-        // variants. Pure game data — no name/skeleton inference.
-        QHash<QString, QString> clipSet;   // clip name (lower) → AnimSet display name
-        QHash<QString, QStringList> setClips;  // AnimSet name → its clip rows (for authoritative borrow)
-        QSet<QString> femaleClips;         // clip names (lower) that appear as a female override
-        QHash<QString, QString> femalePair;// base clip (lower) → its female-override clip (for gender swap)
-        QHash<QString, QString> clipPower; // clip name (lower) → snoPower name (the action it plays)
-        {
-            const QString setDir = QStringLiteral("%1/json/base/meta/AnimSet").arg(Config::d4dataDir());
-            QStringList setFiles;
-            { QDirIterator it(setDir, QStringList{QStringLiteral("*.ans.json")}, QDir::Files);
-              while (it.hasNext()) setFiles << it.next(); }
-            // Parse every .ans.json in parallel into a per-file record, then aggregate serially in
-            // file order so the "first set/pair/power wins" semantics stay identical to the old loop.
-            struct ClipEntry { QString clip; bool female; QString orig; };
-            struct SetRec { QString setName;
-                            QList<ClipEntry> clips;
-                            QList<QPair<QString, QString>> pairs;    // base(lower) → female clip name
-                            QList<QPair<QString, QString>> powers; };// clip(lower) → power name
-            const std::vector<SetRec> srecs = parallelMap<SetRec>(setFiles,
-                [](const QString& path) -> SetRec {
-                    // Match a snoAnim / snoFemaleOverrideAnim block and pull the referenced Anim file name.
-                    static const QRegularExpression rxSetAnim(
-                        QStringLiteral("\"sno(FemaleOverride)?Anim\":\\s*\\{[^{}]*?base/meta/Anim/([^\"]+?)\\.ani"));
-                    // Pair a base clip with its female override IN THE SAME entry: the "(?!\"snoAnim\")"
-                    // guard stops the gap crossing into the next entry, so a null female never mis-pairs.
-                    static const QRegularExpression rxPair(QStringLiteral(
-                        "\"snoAnim\":\\s*\\{[^{}]*?base/meta/Anim/([^\"]+?)\\.ani"
-                        "(?:(?!\"snoAnim\")[\\s\\S])*?"
-                        "\"snoFemaleOverrideAnim\":\\s*\\{[^{}]*?base/meta/Anim/([^\"]+?)\\.ani"));
-                    // Pair the entry's Power (the action) with its clip. Group1 = power, group2 = clip.
-                    static const QRegularExpression rxPower(QStringLiteral(
-                        "\"snoPower\":\\s*\\{[^{}]*?base/meta/Power/([^\"]+?)\\.pow"
-                        "(?:(?!\"snoPower\")[\\s\\S])*?"
-                        "\"snoAnim\":\\s*\\{[^{}]*?base/meta/Anim/([^\"]+?)\\.ani"));
-                    // The female-override clip shares the entry's power → label it too.
-                    static const QRegularExpression rxPowerFemale(QStringLiteral(
-                        "\"snoPower\":\\s*\\{[^{}]*?base/meta/Power/([^\"]+?)\\.pow"
-                        "(?:(?!\"snoPower\")[\\s\\S])*?"
-                        "\"snoFemaleOverrideAnim\":\\s*\\{[^{}]*?base/meta/Anim/([^\"]+?)\\.ani"));
-                    SetRec r;
-                    QFile sf(path);
-                    if (!sf.open(QIODevice::ReadOnly)) return r;
-                    // fromLatin1 (not fromUtf8): only ASCII patterns/captures here → faster, identical result.
-                    const QString raw = QString::fromLatin1(sf.readAll());
-                    r.setName = QFileInfo(path).fileName();
-                    if (r.setName.endsWith(QLatin1String(".ans.json"))) r.setName.chop(9);
-                    auto mi = rxSetAnim.globalMatch(raw);
-                    while (mi.hasNext()) {
-                        const auto m = mi.next();
-                        const QString clip = m.captured(2).toLower();
-                        if (clip.isEmpty()) continue;
-                        r.clips.append({clip, !m.captured(1).isEmpty(), m.captured(2)});
-                    }
-                    auto pi = rxPair.globalMatch(raw);
-                    while (pi.hasNext()) { const auto m = pi.next();
-                        r.pairs.append({m.captured(1).toLower(), m.captured(2)}); }
-                    auto qi = rxPower.globalMatch(raw);        // base clips first…
-                    while (qi.hasNext()) { const auto m = qi.next();
-                        r.powers.append({m.captured(2).toLower(), m.captured(1)}); }
-                    auto qf = rxPowerFemale.globalMatch(raw);  // …then female overrides (same first-wins order)
-                    while (qf.hasNext()) { const auto m = qf.next();
-                        r.powers.append({m.captured(2).toLower(), m.captured(1)}); }
-                    return r;
-                },
-                [this](int d, int t) {
-                    QMetaObject::invokeMethod(this, [this, d, t]() {
-                        if (m_animatedScanning) setScan(QStringLiteral("anim"),
-                            QStringLiteral("Indexing anim sets… %1%").arg(t > 0 ? int(qint64(d) * 100 / t) : 100));
-                    }, Qt::QueuedConnection);
-                }, /*installSeh=*/false, /*threadMul=*/2);   // I/O-bound loose-file scan → oversubscribe
-            for (const SetRec& rec : srecs) {
-                if (rec.setName.isEmpty()) continue;
-                QStringList& sc = setClips[rec.setName];       // creates the (possibly empty) set entry
-                for (const ClipEntry& ce : rec.clips) {
-                    if (!clipSet.contains(ce.clip)) clipSet.insert(ce.clip, rec.setName);  // first set wins
-                    if (ce.female) femaleClips.insert(ce.clip);                            // female-override slot
-                    const QString row = clipRowByName.value(ce.clip, ce.orig);             // "name · N frames"
-                    if (!sc.contains(row)) sc << row;                                      // set → its clip rows
-                }
-                for (const auto& pr : rec.pairs)
-                    if (!pr.first.isEmpty() && !pr.second.isEmpty() && !femalePair.contains(pr.first))
-                        femalePair.insert(pr.first, pr.second);   // base → female clip name
-                for (const auto& pw : rec.powers)
-                    if (!pw.first.isEmpty() && !pw.second.isEmpty() && !clipPower.contains(pw.first))
-                        clipPower.insert(pw.first, pw.second);     // clip → the action/power it plays
-            }
-            qInfo("[index] animset files: %lld parsed, cumulative %lld ms", (qint64)setFiles.size(), idxClk.elapsed());
-        }
-
-        // Phase 2: parse each clip-owning base rig's skeleton → its bone-name-hash set, so a model
-        // with no name-family match can still be matched to its rig by bone-hash overlap. parseApp is
-        // the crash-prone path, so each parse is SEH-guarded — a bad base can't kill the scan thread.
-        QHash<int, QSet<quint32>> bonesBySno;
-        if (reader) {
-            seh::installSehTranslator();
-            const QList<int> owners = rowsBySno.keys();
-            const int otot = owners.size();
-            int lastRp = -1;
-            for (int i = 0; i < otot; ++i) {
-                const int osno = owners.at(i);
-                QSet<quint32> bones;
-                seh::runGuarded("rigparse", [&]() {
-                    const QByteArray meta = reader->readMetaBySno(quint64(osno));
-                    const QByteArray payload = reader->readPayloadBySno(quint64(osno));
-                    if (!meta.isEmpty() && !payload.isEmpty()) {
-                        const ModelGeometry g = ModelParser::parseApp(meta, payload);
-                        for (const ModelJoint& j : g.skeleton) if (j.nameHash) bones.insert(j.nameHash);
-                    }
-                });
-                if (!bones.isEmpty()) bonesBySno.insert(osno, bones);
-                const int pct = otot > 0 ? int((qint64(i + 1) * 100) / otot) : 100;
-                if (pct != lastRp) {
-                    lastRp = pct;
-                    QMetaObject::invokeMethod(this, [this, pct]() {
-                        if (m_animatedScanning)
-                            setScan(QStringLiteral("anim"), QStringLiteral("Indexing rigs… %1%").arg(pct));
-                    }, Qt::QueuedConnection);
-                }
-            }
-        }
-
-        qInfo("[index] anim TOTAL (incl. rig phase): %lld ms", idxClk.elapsed());
-        QMetaObject::invokeMethod(this, [this, found, rowsBySno, bonesBySno, clipSet, setClips, femaleClips, femalePair, clipPower, sig, cachePath]() {
-            m_animatedSnos = found;
-            m_animRowsBySno = rowsBySno;
-            m_clipSet = clipSet;             // authoritative clip → AnimSet grouping
-            m_setClips = setClips;           // AnimSet → its clip rows
-            m_femaleClips = femaleClips;     // female-override clip variants
-            m_femalePair = femalePair;       // base → female clip (gender swap)
-            m_clipPower = clipPower;         // clip → action/power name
-            // Build the base-family index: each clip owner's name → family prefix → its clips, so a
-            // rigged piece can inherit its base body's animations (bone-hash retargeting handles the rest).
-            m_animFamilyPrefixes.clear();
-            m_animFamilyRows.clear();
-            m_animFamilyOwner.clear();
-            m_familyBones.clear();
-            if (m_index) {
-                QHash<int, QString> ownerName;
-                for (const SnoEntry& e : m_index->entries(kGroupAppearance))
-                    if (m_animRowsBySno.contains(e.snoId)) ownerName.insert(e.snoId, e.name);
-                for (auto it = m_animRowsBySno.begin(); it != m_animRowsBySno.end(); ++it) {
-                    const QString nm = ownerName.value(it.key());
-                    if (nm.isEmpty()) continue;
-                    const QString fam = animFamilyPrefix(nm.toLower());
-                    if (fam.isEmpty()) continue;
-                    m_animFamilyPrefixes.insert(fam);
-                    if (!m_animFamilyOwner.contains(fam)) m_animFamilyOwner.insert(fam, nm);   // base name for the tooltip
-                    QStringList& fr = m_animFamilyRows[fam];
-                    for (const QString& r : it.value()) if (!fr.contains(r)) fr << r;
-                }
-                for (auto it = m_animFamilyRows.begin(); it != m_animFamilyRows.end(); ++it) it.value().sort();
-                // Phase 2: union each family's base-rig bone-hash sets (parsed on the scan thread),
-                // keyed by the same family prefix, for skeleton-overlap fallback matching.
-                for (auto it = bonesBySno.constBegin(); it != bonesBySno.constEnd(); ++it) {
-                    const QString fam = animFamilyPrefix(ownerName.value(it.key()).toLower());
-                    if (!fam.isEmpty() && !ownerName.value(it.key()).isEmpty())
-                        m_familyBones[fam].unite(it.value());
-                }
-            }
+        const modelanim::AnimScan scan = modelanim::scanAnim(d4, reader, [this](const QString& msg) {
+            QMetaObject::invokeMethod(this, [this, msg]() {
+                if (m_animatedScanning) setScan(QStringLiteral("anim"), msg);
+            }, Qt::QueuedConnection);
+        });
+        QMetaObject::invokeMethod(this, [this, scan, sig]() {
+            // The base-family index over the SNO index (GUI thread, as before).
+            m_anim = modelanim::finishFamilies(scan, m_index);
             m_animatedScanned = true;
             m_animatedScanning = false;
             m_animCache.clear();   // drop the prefix-based cache; the map is authoritative now
@@ -4818,12 +4516,8 @@ void ModelsTab::ensureAnimatedIndex()
                 updateCount();
             }
             // Persist the whole index so the next launch skips this scan (until the game/d4data updates).
-            AnimBlob blob{ m_animatedSnos, m_animRowsBySno, m_animFamilyPrefixes, m_animFamilyRows,
-                           m_animFamilyOwner, m_familyBones, m_clipSet, m_setClips, m_femaleClips,
-                           m_femalePair, m_clipPower };
-            std::thread([blob, sig, cachePath]() {
-                writeIndexCache(cachePath, QStringLiteral("ANIMIDX2"), sig, blob);
-            }).detach();
+            const modelanim::AnimBlob blob = m_anim;
+            std::thread([blob, sig]() { modelanim::writeAnim(sig, blob); }).detach();
         }, Qt::QueuedConnection);
     }).detach();
 }
@@ -4841,247 +4535,35 @@ void ModelsTab::ensureEntityIndex()
     m_entityScanning = true;
     setScan(QStringLiteral("entity"), QStringLiteral("Loading model-usage index…"));
     const QString d4 = Config::d4dataDir();
-    const QString sig = d4dataSignature(m_reader ? m_reader->buildId() : QString());
-    const QString cachePath = indexCachePath(QStringLiteral("entity_index.bin"));
-    std::thread([this, d4, sig, cachePath]() {
-        // Load the cached index if it matches the current game/d4data build → skip the whole scan.
-        EntityBlob cached;
-        if (readIndexCache(cachePath, QStringLiteral("ENTIDX3"), sig, cached)) {
-            QMetaObject::invokeMethod(this, [this, cached]() {
-                m_apprActors = cached.apprActors;   m_apprActorN = cached.apprActorN;
-                m_apprFamily = cached.apprFamily;
-                m_apprItems  = cached.apprItems;    m_apprItemN  = cached.apprItemN;
-                m_itemAppr   = cached.itemAppr;     m_apprSets   = cached.apprSets;
-                m_apprVariants = cached.apprVariants; m_apprVariantSnos = cached.apprVariantSnos;
-                m_apprName   = cached.apprName;
-                m_entityScanned = true;
-                m_entityScanning = false;
-                setScan(QStringLiteral("entity"), QString());
-                if (m_curSno >= 0) {
-                    updateEntityInfo(m_curSno);
-                    if (m_animatedScanned) populateAnimList(m_curSno, m_curName.toLower());
-                    scanAttachments();   // appearance→actors now known → list held/spawned models
-                }
-                if (m_catCombo) {
-                    const QString c = m_catCombo->currentData().toString();
-                    if (c == QLatin1String("__orphaned__")) { applyCategoryFilter(); updateCount(); }
-                }
-            }, Qt::QueuedConnection);
-            return;
-        }
-        constexpr int kCap = 50;   // keep per-appearance name lists bounded (shared base rigs are huge)
-        QElapsedTimer idxClk; idxClk.start();   // first-run indexing timing (logged via qInfo below)
-
-        QHash<int, QStringList> apprActors;   // appearance → capped actor names
-        QHash<int, int>         apprActorN;   // appearance → true count
-        QHash<int, QString>     apprFamily;   // appearance → family name
-        QHash<int, int>         actorAppr;    // actor sno → its (base) appearance sno (to resolve items)
-        QHash<int, QStringList> apprSets;     // appearance → AnimSet names its actors play (AUTHORITATIVE)
-        QHash<int, QStringList> apprVariants; // appearance → sibling skin-variant names (same actor)
-        QHash<int, QList<int>>  apprVariantSnos; // appearance → sibling variant SNOs (for jump)
-        QHash<int, QString>     apprName;     // appearance sno → its short name (for variant display/menu)
-
-        // ── Actors (parsed as JSON so appearance/animset scoping is exact, not guessed) ──────────
-        {
-            const QString dir = d4 + QStringLiteral("/json/base/meta/Actor");
-            QStringList files;
-            { QDirIterator it(dir, QStringList{QStringLiteral("*.acr.json")}, QDir::Files);
-              while (it.hasNext()) files << it.next(); }
-            actorAppr.reserve(files.size());   // ~one entry per actor → size up-front, avoid rehashing
-            apprName.reserve(files.size());
-            // Parse every actor JSON in parallel (the slow part), then aggregate the records serially
-            // (identical logic to the old loop). A record is one actor's self-appearances + animsets.
-            struct ActorRec {
-                bool ok = false;
-                int  selfSno = 0;
-                int  base = 0;
-                QList<int> apprs;              // self appearances (base + add-on skins), base first
-                QHash<int, QString> apprName;  // appearance sno → short name
-                QStringList sets;              // AnimSet names this actor plays
-                QString fam;                   // monster family name
-                QString name;                  // actor filename (no ext)
-            };
-            const std::vector<ActorRec> recs = parallelMap<ActorRec>(files,
-                [](const QString& path) -> ActorRec {
-                    ActorRec r;
-                    QFile f(path);
-                    if (!f.open(QIODevice::ReadOnly)) return r;
-                    QJsonParseError pe;
-                    const QJsonDocument doc = QJsonDocument::fromJson(f.readAll(), &pe);
-                    if (pe.error != QJsonParseError::NoError || !doc.isObject()) return r;
-                    const QJsonObject o = doc.object();
-                    auto nameOfAppr = [](const QJsonObject& ob) {
-                        QString nm = ob.value(QStringLiteral("__targetFileName__")).toString()
-                                         .section(QLatin1Char('/'), -1);
-                        if (nm.endsWith(QLatin1String(".app"))) nm.chop(4);
-                        return nm;
-                    };
-                    QSet<int> seen;
-                    auto addAppr = [&](int sno, const QString& anm) {
-                        if (sno > 0 && !seen.contains(sno)) {
-                            seen.insert(sno); r.apprs << sno;
-                            if (!anm.isEmpty()) r.apprName.insert(sno, anm);
-                        }
-                    };
-                    const QJsonObject baseObj = o.value(QStringLiteral("snoAppearance")).toObject();
-                    r.base = baseObj.value(QStringLiteral("__raw__")).toInt();
-                    addAppr(r.base, nameOfAppr(baseObj));
-                    std::function<void(const QJsonValue&)> gatherApp = [&](const QJsonValue& v) {
-                        if (v.isObject()) {
-                            const QJsonObject ob = v.toObject();
-                            if (ob.value(QStringLiteral("__targetFileName__")).toString()
-                                    .contains(QLatin1String("/Appearance/")))
-                                addAppr(ob.value(QStringLiteral("__raw__")).toInt(), nameOfAppr(ob));
-                            for (const QString& k : ob.keys()) gatherApp(ob.value(k));
-                        } else if (v.isArray()) {
-                            for (const QJsonValue& e : v.toArray()) gatherApp(e);
-                        }
-                    };
-                    gatherApp(o.value(QStringLiteral("arActorAppearanceAddOnEntries")));
-                    gatherApp(o.value(QStringLiteral("arCustomizationAppearances")));
-                    auto gatherSets = [&](const QJsonValue& v) {
-                        if (!v.isArray()) return;
-                        for (const QJsonValue& e : v.toArray()) {
-                            QString tf = e.toObject().value(QStringLiteral("__targetFileName__")).toString();
-                            if (!tf.contains(QLatin1String("/AnimSet/"))) continue;
-                            QString nm = tf.section(QLatin1Char('/'), -1);
-                            if (nm.endsWith(QLatin1String(".ans"))) nm.chop(4);
-                            if (!nm.isEmpty() && !r.sets.contains(nm)) r.sets << nm;
-                        }
-                    };
-                    gatherSets(o.value(QStringLiteral("arAnimSets")));
-                    gatherSets(o.value(QStringLiteral("arStoreAnimSets")));
-                    // Monster family — lives under ptMonsterData[], NOT at the actor's top level.
-                    // (Verified against d4data: 0/400 actors have a top-level snoMonsterFamily;
-                    // ~7% have ptMonsterData[0].snoMonsterFamily. The old top-level read always
-                    // came back empty, which left "Family" blank and made the Creature filter
-                    // match nothing.) `name` is the family directly — no path parsing needed.
-                    { const QJsonArray md = o.value(QStringLiteral("ptMonsterData")).toArray();
-                      if (!md.isEmpty()) {
-                          const QJsonObject fam = md.first().toObject()
-                                                      .value(QStringLiteral("snoMonsterFamily")).toObject();
-                          r.fam = fam.value(QStringLiteral("name")).toString();
-                          if (r.fam.endsWith(QLatin1String(".mfm"))) r.fam.chop(4);
-                      } }
-                    r.selfSno = o.value(QStringLiteral("__snoID__")).toInt();
-                    r.name = QFileInfo(path).fileName();
-                    if (r.name.endsWith(QLatin1String(".acr.json"))) r.name.chop(9);
-                    r.ok = true;
-                    return r;
-                },
-                [this](int d, int t) {
-                    QMetaObject::invokeMethod(this, [this, d, t]() {
-                        if (m_entityScanning) setScan(QStringLiteral("entity"),
-                            QStringLiteral("Indexing actors… %1%").arg(t > 0 ? int(qint64(d) * 100 / t) : 100));
-                    }, Qt::QueuedConnection);
-                }, /*installSeh=*/false, /*threadMul=*/2);   // I/O-bound loose-file scan → oversubscribe
-            qInfo("[index] actor files: %lld parsed in %lld ms", (qint64)files.size(), idxClk.elapsed());
-            for (const ActorRec& r : recs) {
-                if (!r.ok) continue;
-                for (auto it = r.apprName.constBegin(); it != r.apprName.constEnd(); ++it)
-                    if (!apprName.contains(it.key())) apprName.insert(it.key(), it.value());
-                if (r.base > 0 && r.selfSno > 0) actorAppr.insert(r.selfSno, r.base);   // items resolve via base
-                for (int appr : r.apprs) {
-                    int& n = apprActorN[appr]; ++n;
-                    QStringList& l = apprActors[appr];
-                    if (l.size() < kCap && !l.contains(r.name)) l << r.name;
-                    if (!r.fam.isEmpty() && !apprFamily.contains(appr)) apprFamily.insert(appr, r.fam);
-                    if (!r.sets.isEmpty()) {
-                        QStringList& as = apprSets[appr];
-                        for (const QString& s : r.sets) if (!as.contains(s)) as << s;
-                    }
-                    if (r.apprs.size() > 1) {   // sibling skin variants
-                        QStringList& vs = apprVariants[appr];
-                        QList<int>& vsno = apprVariantSnos[appr];
-                        for (int b : r.apprs) {
-                            if (b == appr) continue;
-                            const QString bn = r.apprName.value(b);
-                            if (!bn.isEmpty() && !vs.contains(bn)) vs << bn;
-                            if (b > 0 && !vsno.contains(b)) vsno << b;
-                        }
-                    }
-                }
+    const QString sig = modelanim::dataSignature(d4, m_reader ? m_reader->buildId() : QString());
+    // The Actor + Item scan is index/ModelAnimIndex.cpp's (shared with the core D4 store).
+    std::thread([this, d4, sig]() {
+        modelanim::EntityBlob blob;
+        const bool cached = modelanim::readEntity(sig, blob);
+        if (!cached)
+            blob = modelanim::scanEntity(d4, [this](const QString& msg) {
+                QMetaObject::invokeMethod(this, [this, msg]() {
+                    if (m_entityScanning) setScan(QStringLiteral("entity"), msg);
+                }, Qt::QueuedConnection);
+            });
+        QMetaObject::invokeMethod(this, [this, blob, cached, sig]() {
+            m_ent = blob;
+            m_entityScanned = true;
+            m_entityScanning = false;
+            setScan(QStringLiteral("entity"), QString());   // clear the actor/item-scan status
+            if (m_curSno >= 0) {
+                updateEntityInfo(m_curSno);
+                if (m_animatedScanned) populateAnimList(m_curSno, m_curName.toLower());   // now authoritative
+                scanAttachments();   // appearance→actors now known → list held/spawned models
             }
-        }
-
-        // ── Items → (via their actor) the appearances they render ────────────────
-        QHash<int, QStringList> apprItems;
-        QHash<int, int>         apprItemN;
-        QHash<QString, int>     itemAppr;   // item name (original case) → appearance sno (forward jump)
-        {
-            const QString dir = d4 + QStringLiteral("/json/base/meta/Item");
-            QStringList files;
-            { QDirIterator it(dir, QStringList{QStringLiteral("*.itm.json")}, QDir::Files);
-              while (it.hasNext()) files << it.next(); }
-            struct ItemRec { int actor = 0; QString name; };
-            const std::vector<ItemRec> recs = parallelMap<ItemRec>(files,
-                [](const QString& path) -> ItemRec {
-                    static const QRegularExpression rxA(
-                        QStringLiteral("\"snoActor\":\\s*\\{[^{}]*?\"__raw__\":\\s*(\\d+)"));
-                    ItemRec r;
-                    QFile f(path);
-                    if (!f.open(QIODevice::ReadOnly)) return r;
-                    const auto mo = rxA.match(QString::fromUtf8(f.readAll()));
-                    if (mo.hasMatch()) {
-                        r.actor = mo.captured(1).toInt();
-                        r.name = QFileInfo(path).fileName();
-                        if (r.name.endsWith(QLatin1String(".itm.json"))) r.name.chop(9);
-                    }
-                    return r;
-                },
-                [this](int d, int t) {
-                    QMetaObject::invokeMethod(this, [this, d, t]() {
-                        if (m_entityScanning) setScan(QStringLiteral("entity"),
-                            QStringLiteral("Indexing items… %1%").arg(t > 0 ? int(qint64(d) * 100 / t) : 100));
-                    }, Qt::QueuedConnection);
-                }, /*installSeh=*/false, /*threadMul=*/2);   // I/O-bound loose-file scan → oversubscribe
-            qInfo("[index] item files: %lld parsed in %lld ms", (qint64)files.size(), idxClk.elapsed());
-            for (const ItemRec& r : recs) {
-                if (r.actor <= 0) continue;
-                const int appr = actorAppr.value(r.actor, 0);
-                if (appr <= 0) continue;
-                int& n = apprItemN[appr]; ++n;
-                QStringList& l = apprItems[appr];
-                if (l.size() < kCap) l << r.name;
-                itemAppr.insert(r.name, appr);   // forward: item → its model (original-case key)
+            // If the Orphaned usage filter is active, it can now resolve → re-apply.
+            if (m_catCombo) {
+                const QString c = m_catCombo->currentData().toString();
+                if (c == QLatin1String("__orphaned__")) { applyCategoryFilter(); updateCount(); }
             }
-        }
-        for (auto it = apprActors.begin(); it != apprActors.end(); ++it) it.value().sort();
-        for (auto it = apprItems.begin();  it != apprItems.end();  ++it) it.value().sort();
-        for (auto it = apprVariants.begin(); it != apprVariants.end(); ++it) it.value().sort();
-        qInfo("[index] entity TOTAL (actors+items): %lld ms", idxClk.elapsed());
-
-        QMetaObject::invokeMethod(this,
-            [this, apprActors, apprActorN, apprFamily, apprItems, apprItemN, itemAppr, apprSets,
-             apprVariants, apprVariantSnos, apprName, sig, cachePath]() {
-                m_apprActors = apprActors;   m_apprActorN = apprActorN;
-                m_apprFamily = apprFamily;
-                m_apprItems  = apprItems;    m_apprItemN  = apprItemN;
-                m_itemAppr   = itemAppr;
-                m_apprSets   = apprSets;     // authoritative appearance → AnimSets
-                m_apprVariants = apprVariants;   // sibling skin variants
-                m_apprVariantSnos = apprVariantSnos;
-                m_apprName   = apprName;
-                m_entityScanned = true;
-                m_entityScanning = false;
-                setScan(QStringLiteral("entity"), QString());   // clear the actor/item-scan status
-                if (m_curSno >= 0) {
-                    updateEntityInfo(m_curSno);
-                    if (m_animatedScanned) populateAnimList(m_curSno, m_curName.toLower());   // now authoritative
-                    scanAttachments();   // appearance→actors now known → list held/spawned models
-                }
-                // If the Orphaned usage filter is active, it can now resolve → re-apply.
-                if (m_catCombo) {
-                    const QString c = m_catCombo->currentData().toString();
-                    if (c == QLatin1String("__orphaned__")) { applyCategoryFilter(); updateCount(); }
-                }
-                // Persist the index so the next launch skips the 60k-actor scan (until game/d4data updates).
-                EntityBlob blob{ m_apprActors, m_apprActorN, m_apprFamily, m_apprItems, m_apprItemN,
-                                 m_itemAppr, m_apprSets, m_apprVariants, m_apprVariantSnos, m_apprName };
-                std::thread([blob, sig, cachePath]() {
-                    writeIndexCache(cachePath, QStringLiteral("ENTIDX3"), sig, blob);
-                }).detach();
-            }, Qt::QueuedConnection);
+            // Persist the index so the next launch skips the 60k-actor scan (until game/d4data updates).
+            if (!cached) std::thread([blob, sig]() { modelanim::writeEntity(sig, blob); }).detach();
+        }, Qt::QueuedConnection);
     }).detach();
 }
 
@@ -5324,25 +4806,18 @@ void ModelsTab::openItemBrowser()
 // family, then skeleton (bone-hash) matches for assets whose names say nothing.
 // An EMPTY result means "we could not establish a family" — callers must then expand nothing,
 // never everything. Getting that backwards is what listed 20k clips on a leg armour piece.
+modelanim::Lookup ModelsTab::animLookup(int sno) const
+{
+    modelanim::Lookup L;
+    L.anim = &m_anim; L.ent = &m_ent; L.rigFams = &m_rigFamilyPrefixes;
+    // The skeleton fallback only for the model on screen, exactly as before.
+    L.skel = (sno == m_curSno && m_curGeo.valid) ? &m_curGeo.skeleton : nullptr;
+    return L;
+}
+
 QStringList ModelsTab::clipFamiliesFor(int sno, const QString& nameLower) const
 {
-    QStringList fams;
-    auto add = [&fams](const QString& f) { if (!f.isEmpty() && !fams.contains(f)) fams << f; };
-    add(animLongestFamily(nameLower, m_animFamilyPrefixes));
-    add(animLongestFamily(nameLower, m_rigFamilyPrefixes));
-    // animFamilyPrefix strips a slot/base suffix (barF_stor189_LEG → barf_stor189); the family that
-    // actually owns clips is usually the shorter body prefix, so offer the stripped form too.
-    const QString stripped = animFamilyPrefix(nameLower);
-    if (m_animFamilyPrefixes.contains(stripped) || m_rigFamilyPrefixes.contains(stripped)) add(stripped);
-    // Leading token (barf_stor189_leg → barf) when it is a known clip-owning family.
-    const int us = nameLower.indexOf(QLatin1Char('_'));
-    if (us > 0) {
-        const QString head = nameLower.left(us);
-        if (m_animFamilyPrefixes.contains(head) || m_rigFamilyPrefixes.contains(head)) add(head);
-    }
-    if (fams.isEmpty() && sno == m_curSno && m_curGeo.valid)
-        for (const QString& f : animFamiliesBySkeleton(m_curGeo.skeleton, 0.5)) add(f);
-    return fams;
+    return modelanim::clipFamiliesFor(animLookup(sno), nameLower);
 }
 
 QString ModelsTab::apprNameForSno(int sno) const
@@ -5482,16 +4957,7 @@ void ModelsTab::ensureRigIndex()
 {
     if (m_rigIndexBuilt || !m_index) return;
     m_rigIndexBuilt = true;
-    // `_base` with the digits OPTIONAL — must match animFamilyPrefix's `_base\d*$`, which is what
-    // strips the token when the filter tests a name. With `\d+` here, the 84 rigs named plain
-    // "<family>_base" (council_hydra_base, boss_inarius_*_base, cave_*_base…) never entered the
-    // family set, so nothing on those rigs could ever match "Rigged".
-    static const QRegularExpression rxBaseName(QStringLiteral("_base\\d*$"));
-    for (const SnoEntry& e : m_index->entries(kGroupAppearance)) {
-        const QString nl = e.name.toLower();
-        if (rxBaseName.match(nl).hasMatch())
-            m_rigFamilyPrefixes.insert(animFamilyPrefix(nl));
-    }
+    m_rigFamilyPrefixes = modelanim::rigFamilies(*m_index);   // index/ModelAnimIndex.cpp
 }
 
 // Fill the ANIMATIONS list for a model. Clips it owns are drawn normally; clips inherited from its
@@ -5501,34 +4967,7 @@ void ModelsTab::ensureRigIndex()
 // (the model's own skeleton). Returns the family prefix if the overlap is convincing, else "".
 QStringList ModelsTab::animFamiliesBySkeleton(const QVector<ModelJoint>& skel, double minScore) const
 {
-    QStringList out;
-    if (skel.isEmpty() || m_familyBones.isEmpty()) return out;
-    QSet<quint32> mine;
-    for (const ModelJoint& j : skel) if (j.nameHash) mine.insert(j.nameHash);
-    if (mine.isEmpty()) return out;
-    // SCORING. This used to be inter / min(|mine|, |fb|) — the fraction of the SMALLER set covered.
-    // That makes any small skeleton match everything: a leg-armour piece is skinned to ~20 bones,
-    // every humanoid rig in the game contains those same leg bones, so it scored ~1.0 against
-    // hundreds of families and inherited all of their clips (measured: 20,251 rows on
-    // barF_stor189_LEG). Use a symmetric Jaccard score instead — a genuine same-rig match stays
-    // near 1.0, while a 20-bone subset of a 300-bone rig scores ~0.07 and is correctly rejected.
-    QVector<QPair<double, QString>> ranked;
-    for (auto it = m_familyBones.constBegin(); it != m_familyBones.constEnd(); ++it) {
-        const QSet<quint32>& fb = it.value();
-        if (fb.isEmpty()) continue;
-        int inter = 0;
-        for (quint32 h : mine) if (fb.contains(h)) ++inter;
-        const double uni = double(mine.size() + fb.size() - inter);
-        const double score = uni > 0 ? inter / uni : 0.0;
-        if (score >= minScore) ranked.append({ score, it.key() });
-    }
-    // Best first, and only a handful. This is a GUESS used when the game data gave us nothing;
-    // it should offer the closest rigs, never a union of every rig that happens to overlap.
-    std::sort(ranked.begin(), ranked.end(),
-              [](const QPair<double, QString>& a, const QPair<double, QString>& b) { return a.first > b.first; });
-    constexpr int kMaxFamilies = 3;
-    for (int i = 0; i < ranked.size() && i < kMaxFamilies; ++i) out << ranked[i].second;
-    return out;
+    return modelanim::familiesBySkeleton(m_anim, skel, minScore);
 }
 
 // Turn a raw snoPower name into a readable action label: drop the "AnimKey_" prefix, underscores→
@@ -5595,14 +5034,7 @@ QStringList ModelsTab::modelAnimRows(int sno, const QString& nameLower, bool* fa
     return rows;
 }
 
-// Does this clip name belong to one of the model's own animation families?
-static bool clipInFamily(const QString& clipName, const QStringList& fams)
-{
-    const QString c = clipName.toLower();
-    for (const QString& f : fams)
-        if (c == f || c.startsWith(f + QLatin1Char('_'))) return true;
-    return false;
-}
+// clipInFamily: index/ModelAnimIndex.cpp (shared with the core D4 store).
 
 // ── AnimSet colour ──────────────────────────────────────────────────────────────────────────────
 // A stable hue per AnimSet, so the panel bands by set while you scroll instead of relying on the
@@ -7720,20 +7152,7 @@ AnimParser::DecodedAnim ModelsTab::decodeAnimByName(const QString& animName) con
     return decodeAnimForSkeleton(animName, m_curGeo);
 }
 
-// A model's clip NAMES (own + inherited base-rig, deduped) from the animation index — the batch
-// export's clip lister, so "include all animations" works for models that were never LOADED in
-// the viewport. Requires the anim index (ensureAnimatedIndex) to have completed.
-// Row list → clip names, deduped and sorted. Rows are "clip  ·  extra".
-static QStringList clipNamesOf(const QStringList& rows)
-{
-    QStringList names;
-    for (const QString& r : rows) {
-        const QString nm = r.section(QStringLiteral("  ·  "), 0, 0);
-        if (!nm.isEmpty() && !names.contains(nm)) names << nm;
-    }
-    names.sort();
-    return names;
-}
+// clipNamesOf: index/ModelAnimIndex.cpp (shared with the core D4 store).
 
 // ── Two halves of ONE authoritative set ─────────────────────────────────────────────────────────
 // MEASURED, not reasoned about (barM_base00, sno 218797, parsed straight out of anim_index.bin):
@@ -7753,43 +7172,7 @@ static QStringList clipNamesOf(const QStringList& rows)
 // together they are everything the data attributes to this model.
 QStringList ModelsTab::authoredAnimClips(int sno, const QString& nameLower) const
 {
-    const QStringList all = clipNamesOf(m_animRowsBySno.value(sno));
-    const QStringList fams = clipFamiliesFor(sno, nameLower);
-    // Unresolvable family → keep the whole set. This is a REFINEMENT of an already-authoritative
-    // list, not an expansion of a speculative one: failing closed here would mean exporting
-    // nothing. (The fail-closed rule applies to expansions — see modelAnimRows, where an unknown
-    // family must expand NOTHING.)
-    if (fams.isEmpty()) return all;
-
-    QStringList out;
-    QSet<QString> have;
-    auto add = [&](const QString& nm) {
-        if (nm.isEmpty() || have.contains(nm)) return;
-        have.insert(nm);
-        out << nm;
-    };
-    for (const QString& nm : all)
-        if (clipInFamily(nm, fams)) add(nm);
-
-    // The clips of the AnimSets the game assigns to this appearance's ACTORS, filtered to the same
-    // family. This belongs HERE, not in setAnimClips: it is how a gear piece or a prop — which owns
-    // no .ani.json rows of its own — gets any animation at all. Moving it to the opt-in source made
-    // every such model export with zero clips by default, and put in-family clips behind a checkbox
-    // labelled "named outside this model's family". m_apprSets is usually empty for a BASE rig (the
-    // player body is applied at runtime, so no Actor references it), which is why this line does
-    // nothing for barM_base00 and everything for barM_stor191_LEG.
-    const QStringList authSets = m_apprSets.value(sno);
-    if (!authSets.isEmpty()) {
-        QStringList rows;
-        for (const QString& sn : authSets)
-            for (const QString& r : m_setClips.value(sn)) {
-                const QString clip = r.section(QStringLiteral("  ·  "), 0, 0).toLower();
-                if (clipInFamily(clip, fams) && !rows.contains(r)) rows << r;
-            }
-        for (const QString& nm : clipNamesOf(rows)) add(nm);
-    }
-    out.sort();
-    return out;
+    return modelanim::authoredAnimClips(animLookup(sno), sno, nameLower);
 }
 
 // The complement: clips this model's snoAppearance claims but whose NAME is outside its family —
@@ -7797,12 +7180,7 @@ QStringList ModelsTab::authoredAnimClips(int sno, const QString& nameLower) cons
 // the same predicate, so ticking both can never double-count.
 QStringList ModelsTab::setAnimClips(int sno, const QString& nameLower) const
 {
-    const QStringList fams = clipFamiliesFor(sno, nameLower);
-    if (fams.isEmpty()) return {};   // no family → authoredAnimClips already returned everything
-    QStringList out;
-    for (const QString& nm : clipNamesOf(m_animRowsBySno.value(sno)))
-        if (!clipInFamily(nm, fams)) out << nm;
-    return out;
+    return modelanim::setAnimClips(animLookup(sno), sno, nameLower);
 }
 
 // Authored ∪ complement. NOT an export source — it exists only as the dedup baseline for
@@ -7811,11 +7189,7 @@ QStringList ModelsTab::setAnimClips(int sno, const QString& nameLower) const
 // m_animRowsBySno without a name filter, so a family's rows include its IGC_/Conv_ clips too.
 QStringList ModelsTab::ownAnimClips(int sno, const QString& nameLower) const
 {
-    QStringList names = authoredAnimClips(sno, nameLower);
-    for (const QString& nm : setAnimClips(sno, nameLower))
-        if (!names.contains(nm)) names << nm;
-    names.sort();
-    return names;
+    return modelanim::ownAnimClips(animLookup(sno), sno, nameLower);
 }
 
 // The base-rig clips this model INHERITS — sorF_base00's clips for sorF_stor191_LEG, reached
@@ -7823,28 +7197,13 @@ QStringList ModelsTab::ownAnimClips(int sno, const QString& nameLower) const
 // ownAnimClips, so "original" always wins and the two sets never double-count.
 QStringList ModelsTab::baseAnimClips(int sno, const QString& nameLower) const
 {
-    const QString fam = animLongestFamily(nameLower, m_animFamilyPrefixes);
-    if (fam.isEmpty()) return {};
-    const QStringList own = ownAnimClips(sno, nameLower);
-    QStringList out;
-    for (const QString& nm : clipNamesOf(m_animFamilyRows.value(fam)))
-        if (!own.contains(nm)) out << nm;
-    return out;
+    return modelanim::baseAnimClips(animLookup(sno), sno, nameLower);
 }
 
 QStringList ModelsTab::animClipsFor(int sno, const QString& nameLower,
                                     bool wantOriginal, bool wantSets, bool wantBase) const
 {
-    QStringList names;
-    if (wantOriginal) names = authoredAnimClips(sno, nameLower);
-    if (wantSets)
-        for (const QString& nm : setAnimClips(sno, nameLower))
-            if (!names.contains(nm)) names << nm;
-    if (wantBase)
-        for (const QString& nm : baseAnimClips(sno, nameLower))
-            if (!names.contains(nm)) names << nm;
-    names.sort();
-    return names;
+    return modelanim::animClipsFor(animLookup(sno), sno, nameLower, wantOriginal, wantSets, wantBase);
 }
 
 // Geometry-parametrised decode — the batch pipeline hands each model's OWN skeleton in, where
@@ -7852,42 +7211,7 @@ QStringList ModelsTab::animClipsFor(int sno, const QString& nameLower,
 AnimParser::DecodedAnim ModelsTab::decodeAnimForSkeleton(const QString& animName,
                                                          const ModelGeometry& geo) const
 {
-    AnimParser::DecodedAnim bad;
-    if (animName.isEmpty() || !geo.valid || geo.skeleton.isEmpty() ||
-        !m_reader || !m_reader->isReady())
-        return bad;
-    const QString d4 = Config::d4dataDir();
-    QFile jf(QStringLiteral("%1/json/base/meta/Anim/%2.ani.json").arg(d4, animName));
-    if (!jf.open(QIODevice::ReadOnly))
-        return bad;
-    const QJsonObject root = QJsonDocument::fromJson(jf.readAll()).object();
-    const int animSno = root.value(QStringLiteral("__snoID__")).toInt();
-    const QJsonArray perms = root.value(QStringLiteral("ptPermutations")).toArray();
-    if (animSno <= 0 || perms.isEmpty())
-        return bad;
-    const QJsonObject perm = perms.first().toObject();
-    const QJsonObject pv = perm.value(QStringLiteral("ptPayloadData")).toObject()
-                               .value(QStringLiteral("value")).toObject();
-    const int offset = pv.value(QStringLiteral("dataOffset")).toInt();
-    const int frames = perm.value(QStringLiteral("nKeyframeCount")).toInt();
-    const int comp = perm.value(QStringLiteral("flCompression")).toInt();
-    const float fps = float(perm.value(QStringLiteral("flFrameRate")).toDouble(30.0));
-    if (frames <= 0)
-        return bad;
-    const QByteArray payload = m_reader->readPayloadBySno(quint64(animSno));
-    if (payload.isEmpty())
-        return bad;
-    QHash<quint32, AnimParser::RestTRS> rest;
-    for (const ModelJoint& j : geo.skeleton) {
-        AnimParser::RestTRS t; t.q = j.restQ; t.t = j.restT; t.s = j.restS;
-        rest.insert(j.nameHash, t);
-    }
-    // Guard the decode (arbitrary .ani payload) — a malformed clip would otherwise access-violate
-    // and kill the process. Covers both the interactive "play clip" path and the export path.
-    AnimParser::DecodedAnim out;
-    if (!seh::runGuarded("anim", [&]() { out = AnimParser::decode(payload, offset, frames, comp, fps, rest); }))
-        return bad;
-    return out;
+    return modelanim::decodeForSkeleton(m_reader, Config::d4dataDir(), animName, geo);
 }
 
 // The clip names an export WOULD embed, without decoding any of them. Cheap enough to call from a
@@ -8316,11 +7640,15 @@ void ModelsTab::applyLoadedGeometry(std::shared_ptr<ModelGeometry> geo, int toke
         if (!m_renderCache.contains(m_curSno)) {
             renderGuardStage(m_curSno, m_curName, "grab");
             QImage thumb;
-            seh::runGuarded("thumbnail", [&]() { thumb = m_modelView->grabThumbnail(48); });
+            // Inside the guard with the grab, because resolving this model's base maps reads
+            // materials and decodes textures — the same work the icon batch guards.
+            seh::runGuarded("thumbnail", [&]() {
+                thumb = renderIconImage(m_curGeo, m_curName, QByteArray(), m_curSno);
+            });
             endRenderGuard();
             if (!thumb.isNull()) {
                 m_renderCache.insert(m_curSno, QPixmap::fromImage(thumb));
-                thumb.save(thumbCachePath(m_curSno), "PNG");   // persist across sessions
+                thumb.save(thumbCachePath(m_curSno, m_iconBaseColor), "PNG");   // persist across sessions
                 if (m_listModel) m_listModel->refreshIconForSno(m_curSno);   // repaint one row, don't reflow
             }
         }
@@ -8967,9 +8295,9 @@ void ModelsTab::applyPartMaterials()
         m_texCache.insert(key, new QImage(img), qMax(1, int(img.sizeInBytes() / 1024)));
         return img;
     };
-    auto decodeBase = [&](const QString& mn) -> QImage {
-        return cached("BASE", mn, [&] { return baseColorForMaterial(mn); });
-    };
+    // Same cache, same key — moved to a member so the 3D-icon path can share the decode instead
+    // of keeping a second copy of every base map.
+    auto decodeBase = [this](const QString& mn) -> QImage { return cachedBaseColor(mn); };
     auto decodeNorm = [&](const QString& mn) -> QImage {
         return cached("NORM", mn, [&] { return normalForMaterial(mn); });
     };
@@ -9276,6 +8604,30 @@ void ModelsTab::onSettingsChanged()
             if (m_curGeo.valid) applyPartMaterials();
         }
     }
+    // "Base colour 3D rendered icons" toggled → the two styles keep separate thumbnail folders, so
+    // nothing on disk is invalidated. What DOES have to go is the in-memory cache, which is keyed
+    // by SNO alone and would otherwise keep serving the previous style's pixmaps for the rest of
+    // the session. Cleared, then the list is asked to repaint: rows with a persisted icon in the
+    // new style get it immediately, the rest fill in exactly as they did on a first run.
+    {
+        QSettings s;
+        const bool bc  = s.value(QStringLiteral("models/iconBaseColor"), false).toBool();
+        const int  px  = qBound(48, s.value(QStringLiteral("models/iconRenderPx"), 128).toInt(), 256);
+        const bool cr  = s.value(QStringLiteral("models/iconCrop"),  true).toBool();
+        const bool al  = s.value(QStringLiteral("models/iconAlpha"), true).toBool();
+        // Style picks the FOLDER; the other three change the images inside it. Both kinds of
+        // change invalidate the in-memory cache, which is keyed by SNO alone and would otherwise
+        // keep serving the previous settings' pixmaps for the rest of the session.
+        const bool styleMoved = (bc != m_iconBaseColor);
+        const bool shapeMoved = (px != m_iconRenderPx) || (cr != m_iconCrop) || (al != m_iconAlpha);
+        if (styleMoved || shapeMoved) {
+            m_iconBaseColor = bc; m_iconRenderPx = px; m_iconCrop = cr; m_iconAlpha = al;
+            if (shapeMoved) ensureThumbCacheVariant();   // drops what no longer matches, on disk
+            m_renderCache.clear();
+            m_noRenderSnos.clear();   // "yields nothing" was decided under the other settings
+            if (m_listModel) m_listModel->refreshIcons();
+        }
+    }
     // "Base colour only" toggled → re-decode with/without the extra maps, same live-apply as above.
     // Turning it OFF must decode the maps that were skipped, so this cannot be a no-op either way.
     {
@@ -9479,64 +8831,177 @@ void ModelsTab::renderIcons(const QList<int>& snos, bool force, bool quiet)
     const int  savedAnimFrame  = m_animSlider ? m_animSlider->value() : 0;
     if (m_animTimer) m_animTimer->stop();   // don't advance frames onto swapped icon geometry
     m_modelView->setUpdatesEnabled(false);
-    const int n = snos.size();
-    int done = 0;
+    const bool perf = iconPerfOn();
+
+    // ── The reads run ahead, on workers ─────────────────────────────────────────────────────────
+    // Measured: the CASC read is 73% of an icon (13.6 ms of 18.6), and essentially all of it is
+    // the archive read + BLTE inflate — the index lookup under m_mutex came to 0.7 ms against
+    // 1832 ms of inflate, 0.0% of the two. CascReader::readFile is built for exactly this: it
+    // holds the lock only for the lookup and does the read and inflate outside it, so workers
+    // genuinely parallelise instead of taking turns.
+    //
+    // Everything else stays where it was. The parse, the GL upload, the draw and the PNG write
+    // all run on the GUI thread in the original order, inside the original fault guard — GL is
+    // not thread-safe, and the guard's whole purpose is to attribute a crash to one model.
+    //
+    // Two chunks are in flight: while chunk N is being turned into icons, chunk N+1 is being
+    // read. Bounded on purpose — the payloads inflate to about half a megabyte each, so an
+    // unbounded read-ahead over a few thousand rows would be gigabytes.
+    struct Slot { int sno = 0; QByteArray meta, payload; qint64 metaNs = 0, payNs = 0; };
+    // NOT `slots`: that is a Qt macro and expands to nothing. Second time this session — the
+    // verify-src check caught both.
+    struct Chunk { QVector<Slot> reads; QSemaphore done; int count = 0; };
+    constexpr int kChunk = 16;
+
+    // Filtered first, so a row that is already cached, blocklisted or known-empty never costs a
+    // read at all — the old loop decided that after paying for the bytes on a forced run.
+    QList<int> todo;
+    todo.reserve(snos.size());
     for (int sno : snos) {
-        ++done;
-        if (!quiet && n > 1) {   // live percentage while rendering thumbnails
-            setScan(QStringLiteral("render"), QStringLiteral("Rendering icons %1%").arg(done * 100 / n));
-            QCoreApplication::processEvents();
-        }
         if (!force && m_renderCache.contains(sno)) continue;
         if (m_renderBlocklist.contains(sno)) continue;   // known to crash the renderer — skip
-        if (!force && m_noRenderSnos.contains(sno)) continue;   // already tried, yields nothing — don't loop on it
-        const QByteArray meta = m_reader->readMetaBySno(quint64(sno));
-        const QByteArray payload = m_reader->readPayloadBySno(quint64(sno));
-        if (meta.isEmpty() || payload.isEmpty()) { m_noRenderSnos.insert(sno); continue; }   // nothing to render — don't retry
-        // Guard the risky part in stages so a crash records WHERE it died (parse / GL upload /
-        // grab). The sentinel survives a hard crash → next launch blocklists this model.
-        const QString rname = (sno == m_curSno ? m_curName : QString());
-        // Fault-protected: if parse/upload/draw hits an access violation the guard
-        // catches it, quarantines this SNO, and rendering continues with the next row —
-        // the icon batch never takes the whole tool down.
-        seh::HardwareFault iconFault;
-        bool produced = false;
-        const bool iconOk = seh::runGuarded("icon", [&]() {
-            renderGuardStage(sno, rname, "parse");
-            const ModelGeometry geo = ModelParser::parseApp(meta, payload);
-            if (geo.valid) {
-                renderGuardStage(sno, rname, "upload");
-                m_modelView->setGeometry(geo);
-                renderGuardStage(sno, rname, "grab");
-                const QImage thumb = m_modelView->grabThumbnail(48);
-                if (!thumb.isNull()) {
-                    m_renderCache.insert(sno, QPixmap::fromImage(thumb));
-                    thumb.save(thumbCachePath(sno), "PNG");   // persist across sessions
-                    produced = true;
+        if (!force && m_noRenderSnos.contains(sno)) continue;   // already tried, yields nothing
+        todo << sno;
+    }
+    const int n = todo.size();
+    int done = 0;
+
+    auto readOne = [this, perf](Slot& s) {
+        QElapsedTimer t;
+        if (perf) t.start();
+        s.meta = m_reader->readMetaBySno(quint64(s.sno));
+        if (perf) { s.metaNs = t.nsecsElapsed(); t.restart(); }
+        s.payload = m_reader->readPayloadBySno(quint64(s.sno));
+        if (perf) s.payNs = t.nsecsElapsed();
+    };
+    // reads.data() is taken ONCE, here on the GUI thread, and the workers write through that raw
+    // pointer. Indexing a QList from several threads would detach an implicitly-shared container
+    // concurrently, which is a race; writing distinct elements of an already-detached buffer is
+    // not. The vector is never resized after this.
+    // D4_ICONPERF_NOPREFETCH=1 reads inline on the GUI thread instead, so the two modes can be
+    // compared in ONE binary with nothing else changed. Without it the only baseline was a
+    // different build against a colder file cache, which is exactly the comparison that could not
+    // separate this change from the operating system's page cache.
+    static const bool noPrefetch = qEnvironmentVariableIsSet("D4_ICONPERF_NOPREFETCH");
+    m_iconPerf.prefetch = !noPrefetch;
+    auto launch = [&](int from) {
+        auto c = std::make_unique<Chunk>();
+        for (int i = from; i < todo.size() && c->reads.size() < kChunk; ++i) {
+            Slot s; s.sno = todo.at(i);
+            c->reads.append(s);
+        }
+        c->count = int(c->reads.size());
+        if (c->count > 0 && !noPrefetch) {
+            Slot* raw = c->reads.data();
+            QSemaphore* sem = &c->done;
+            for (int i = 0; i < c->count; ++i)
+                QThreadPool::globalInstance()->start([raw, i, sem, readOne] {
+                    readOne(raw[i]);
+                    sem->release();
+                });
+        }
+        return c;
+    };
+
+    auto cur = launch(0);
+    for (int base = 0; base < todo.size(); base += kChunk) {
+        auto next = launch(base + kChunk);   // read the NEXT chunk while this one draws
+        QElapsedTimer wt;
+        if (perf) wt.start();
+        if (noPrefetch) {                    // baseline: the reads happen here, in line, unshared
+            for (Slot& s : cur->reads) readOne(s);
+        } else {
+            cur->done.acquire(cur->count);   // always matched: count releases were started
+        }
+        if (perf) m_iconPerf.readWait += wt.nsecsElapsed();
+        for (const Slot& slot : cur->reads) {
+            const int sno = slot.sno;
+            const QByteArray& meta = slot.meta;
+            const QByteArray& payload = slot.payload;
+            ++done;
+            if (!quiet && n > 1) {   // live percentage while rendering thumbnails
+                setScan(QStringLiteral("render"), QStringLiteral("Rendering icons %1%").arg(done * 100 / n));
+                QCoreApplication::processEvents();
+            }
+            QElapsedTimer pt;
+            if (meta.isEmpty() || payload.isEmpty()) {
+                // Charged to the missed bucket, not to `read`: this sno produced no icon, and folding
+                // its read into the per-icon average would make the reader look slower than it is.
+                if (perf) { m_iconPerf.readMissed += slot.metaNs + slot.payNs; ++m_iconPerf.missed; }
+                m_noRenderSnos.insert(sno); continue;   // nothing to render — don't retry
+            }
+            if (perf) {
+                m_iconPerf.readMeta += slot.metaNs;
+                m_iconPerf.readPay  += slot.payNs;
+                m_iconPerf.read     += slot.metaNs + slot.payNs;
+            }
+            // Guard the risky part in stages so a crash records WHERE it died (parse / GL upload /
+            // grab). The sentinel survives a hard crash → next launch blocklists this model.
+            const QString rname = (sno == m_curSno ? m_curName : QString());
+            // Fault-protected: if parse/upload/draw hits an access violation the guard
+            // catches it, quarantines this SNO, and rendering continues with the next row —
+            // the icon batch never takes the whole tool down.
+            seh::HardwareFault iconFault;
+            bool produced = false;
+            const bool iconOk = seh::runGuarded("icon", [&]() {
+                renderGuardStage(sno, rname, "parse");
+                if (perf) pt.start();
+                const ModelGeometry geo = ModelParser::parseApp(meta, payload);
+                if (perf) m_iconPerf.parse += pt.nsecsElapsed();
+                if (geo.valid) {
+                    renderGuardStage(sno, rname, "upload");
+                    if (perf) pt.start();
+                    m_modelView->setGeometry(geo);
+                    if (perf) {
+                        m_iconPerf.upload  += pt.nsecsElapsed();
+                        m_iconPerf.tangent += GLModelWidget::lastTangentNs();
+                        qint64 tris = 0;
+                        for (const MeshPrimitive& mp : geo.primitives) tris += mp.indices.size() / 3;
+                        m_iconPerf.tris += tris;
+                        m_iconPerf.trisMax = qMax(m_iconPerf.trisMax, tris);
+                        ++m_iconPerf.n;
+                    }
+                    renderGuardStage(sno, rname, "grab");
+                    // Base-colour icons resolve this model's own materials and reuse whatever the
+                    // session has already decoded (m_texCache), so a material shared across models
+                    // — which most armour is — costs one decode for the whole list, not one per row.
+                    // `meta` is already in hand from the read above, so the roster costs no extra I/O.
+                    const QString aname = rname.isEmpty() && m_index
+                                              ? m_index->nameForSno(kGroupAppearanceId(), sno)
+                                              : rname;
+                    const QImage thumb = renderIconImage(geo, aname, meta, sno);
+                    if (!thumb.isNull()) {
+                        m_renderCache.insert(sno, QPixmap::fromImage(thumb));
+                        if (perf) pt.start();
+                        thumb.save(thumbCachePath(sno, m_iconBaseColor), "PNG");   // persist across sessions
+                        if (perf) m_iconPerf.save += pt.nsecsElapsed();
+                        produced = true;
+                    }
+                }
+            }, &iconFault);
+            endRenderGuard();
+            // Rendered but produced nothing (no geometry / null thumbnail): record it so auto-render
+            // doesn't keep re-attempting the same stuck model every tick and freezing the tool.
+            if (iconOk && !produced) m_noRenderSnos.insert(sno);
+            if (!iconOk) {
+                // Quarantine quietly — don't touch the viewport mid-batch (it's restored below).
+                m_renderBlocklist.insert(sno);
+                QStringList bl = QSettings().value(QStringLiteral("models/renderBlocklist")).toStringList();
+                if (!bl.contains(QString::number(sno))) {
+                    bl.append(QString::number(sno));
+                    QSettings().setValue(QStringLiteral("models/renderBlocklist"), bl);
+                }
+                QFile log(renderCrashLogPath());
+                if (log.open(QIODevice::Append | QIODevice::Text)) {
+                    log.write(QStringLiteral("%1  CAUGHT fault (%2) rendering icon sno=%3 — quarantined, batch continued\n")
+                                  .arg(QDateTime::currentDateTime().toString(Qt::ISODate),
+                                       iconFault.what.isEmpty() ? QStringLiteral("icon") : iconFault.what)
+                                  .arg(sno).toUtf8());
+                    log.close();
                 }
             }
-        }, &iconFault);
-        endRenderGuard();
-        // Rendered but produced nothing (no geometry / null thumbnail): record it so auto-render
-        // doesn't keep re-attempting the same stuck model every tick and freezing the tool.
-        if (iconOk && !produced) m_noRenderSnos.insert(sno);
-        if (!iconOk) {
-            // Quarantine quietly — don't touch the viewport mid-batch (it's restored below).
-            m_renderBlocklist.insert(sno);
-            QStringList bl = QSettings().value(QStringLiteral("models/renderBlocklist")).toStringList();
-            if (!bl.contains(QString::number(sno))) {
-                bl.append(QString::number(sno));
-                QSettings().setValue(QStringLiteral("models/renderBlocklist"), bl);
-            }
-            QFile log(renderCrashLogPath());
-            if (log.open(QIODevice::Append | QIODevice::Text)) {
-                log.write(QStringLiteral("%1  CAUGHT fault (%2) rendering icon sno=%3 — quarantined, batch continued\n")
-                              .arg(QDateTime::currentDateTime().toString(Qt::ISODate),
-                                   iconFault.what.isEmpty() ? QStringLiteral("icon") : iconFault.what)
-                              .arg(sno).toUtf8());
-                log.close();
-            }
         }
+        cur = std::move(next);
     }
     // Restore the preview to EXACTLY what it was before the batch, so the last icon's geometry is
     // never left showing. If a model was loaded, put it back (keepView keeps the current camera,
@@ -9558,6 +9023,76 @@ void ModelsTab::renderIcons(const QList<int>& snos, bool force, bool quiet)
     if (!quiet) QApplication::restoreOverrideCursor();
     m_listModel->refreshIcons();
     if (!quiet) updateIndexStatus();   // revert to build state (or hide)
+    // Rewritten per batch, cumulative for the session — so a scroll through a few hundred rows
+    // leaves one file that answers which stage to attack, rather than a log to reconstruct.
+    // The sweep writes ONE report covering every pass; a per-batch write here would leave the
+    // file holding whichever pass finished last.
+    if (iconPerfOn() && !m_iconPerfSweeping) writeIconPerf();
+}
+
+// Render the same models twice — grey clay, then base colour — with both caches bypassed, then
+// write the report and quit. force=true on both passes is the point: a benchmark that measured
+// cache hits would report the icon path as free.
+void ModelsTab::runIconPerfSweep()
+{
+    int n = qEnvironmentVariableIntValue("D4_ICONPERF_AUTO");
+    if (n <= 1) n = 150;                 // "=1" reads as "on", not as "one icon"
+    n = qBound(10, n, 2000);
+
+    // Sampled across the WHOLE appearance group with a stride, not from the visible list.
+    // The first sweep drew from a list filtered to "Latest" + "Hide un-renderable" and averaged
+    // 1,154 triangles — small props — which is exactly the sample that makes parse and upload
+    // look free. A stride over every appearance includes characters and armour, so the mesh-size
+    // dependent stages get a fair hearing. Falls back to the list if the index is unavailable.
+    QList<int> snos;
+    if (m_index) {
+        const QVector<SnoEntry>& all = m_index->entries(kGroupAppearanceId());
+        const int stride = qMax(1, int(all.size()) / qMax(1, n));
+        for (int i = 0; i < all.size() && snos.size() < n; i += stride) {
+            const int s = all.at(i).snoId;
+            if (s < 0 || m_renderBlocklist.contains(s)) continue;
+            snos << s;
+        }
+    }
+    if (snos.isEmpty())
+        for (int r = 0; r < m_listModel->rowCount() && snos.size() < n; ++r) {
+            const SnoEntry* e = m_listModel->entryAt(r);
+            if (!e || e->snoId < 0) continue;              // header row
+            if (m_renderBlocklist.contains(e->snoId)) continue;   // known to crash the renderer
+            snos << e->snoId;
+        }
+    if (snos.isEmpty()) {
+        qWarning("icon perf: no renderable rows in the list — nothing to measure.");
+        QCoreApplication::quit();
+        return;
+    }
+    qInfo("icon perf: sweeping %d model(s) per style…", int(snos.size()));
+
+    const bool userStyle = m_iconBaseColor;
+    m_iconPerfSweeping = true;
+    m_iconPerfPasses.clear();
+    for (const bool style : { false, true }) {
+        m_iconBaseColor = style;
+        m_iconPerf = IconPerf{};
+        m_renderCache.clear();
+        m_noRenderSnos.clear();   // a model that "yields nothing" must be retried per style
+        CascReader::resetReadStats();
+        renderIcons(snos, /*force=*/true, /*quiet=*/true);
+        const CascReader::ReadStats rs = CascReader::readStats();
+        m_iconPerf.cascLookup  = rs.lookupNs;
+        m_iconPerf.cascArchive = rs.archiveNs;
+        m_iconPerf.cascBytes   = rs.bytes;
+        m_iconPerf.cascCalls   = rs.calls;
+        m_iconPerfPasses.append({ style ? QStringLiteral("base colour") : QStringLiteral("grey clay"),
+                                  m_iconPerf });
+    }
+    m_iconBaseColor = userStyle;   // the sweep is a measurement, not a settings change
+    m_iconPerfSweeping = false;
+    m_renderCache.clear();
+    m_noRenderSnos.clear();
+    writeIconPerf();
+    qInfo("icon perf: done — data\\icon_perf.txt");
+    QCoreApplication::quit();
 }
 
 void ModelsTab::copyIconImage(int sno)
@@ -10211,6 +9746,225 @@ static QImage normalizeAlpha(const QImage& src)
     uchar* d = img.bits();
     for (int i = 0; i < n; ++i) d[i * 4 + 3] = 255;
     return img;
+}
+
+// One finished list icon, from parsed geometry to the pixmap the row shows.
+//
+// Rendered at TWICE the stored size and scaled down: the offscreen FBO is single-sampled and the
+// shader's alpha cutout is hard (uA2C = 0), so at 1:1 every silhouette edge stair-steps. The
+// downsample is the anti-aliasing, and at these sizes the extra pixels cost nothing.
+//
+// Always rendered with a transparent clear, whatever the background setting says, because the
+// crop measures alpha coverage — rendering opaque would leave cropping silently doing nothing
+// whenever the cut-out was switched off. The grey is put back at the end instead, so the two
+// settings are genuinely independent rather than one quietly disabling the other.
+QImage ModelsTab::renderIconImage(const ModelGeometry& geo, const QString& apprName,
+                                  const QByteArray& meta, int sno)
+{
+    if (!m_modelView) return {};
+    const bool perf = iconPerfOn();
+    QElapsedTimer t;
+    const int ss = qMax(16, m_iconRenderPx * 2);
+    QImage img;
+    if (m_iconBaseColor) {
+        if (perf) t.start();
+        const QVector<QImage> base = iconBaseTextures(geo, apprName, meta, sno);
+        if (perf) m_iconPerf.tex += t.nsecsElapsed();
+        if (perf) t.start();
+        img = m_modelView->grabThumbnailBaseColor(ss, base, /*transparent=*/true);
+        if (perf) m_iconPerf.grab += t.nsecsElapsed();
+    } else {
+        if (perf) t.start();
+        img = m_modelView->grabThumbnail(ss, /*transparent=*/true);
+        if (perf) m_iconPerf.grab += t.nsecsElapsed();
+    }
+    if (img.isNull()) return img;
+    if (perf) t.start();
+    img = m_iconCrop
+              ? GLModelWidget::cropToSilhouette(img, m_iconRenderPx)
+              : img.scaled(m_iconRenderPx, m_iconRenderPx,
+                           Qt::IgnoreAspectRatio, Qt::SmoothTransformation);
+    if (!m_iconAlpha && !img.isNull()) {
+        // 31/255 ≈ the 0.12 the offscreen passes clear to, so an opaque icon is indistinguishable
+        // from the ones this tool has always produced — only sharper and better framed.
+        QImage flat(img.size(), QImage::Format_RGBA8888);
+        flat.fill(QColor(31, 31, 33));
+        QPainter p(&flat);
+        p.drawImage(0, 0, img);
+        p.end();
+        img = flat;
+    }
+    if (perf) m_iconPerf.post += t.nsecsElapsed();
+    return img;
+}
+
+// The report. One file per run, covering every pass the sweep made, so two styles can be compared
+// without reconstructing anything from a log. Shares are of the stages measured here — the list
+// rebuild, the disk cache read and Qt's own painting are outside it.
+void ModelsTab::writeIconPerf() const
+{
+    QVector<QPair<QString, IconPerf>> passes = m_iconPerfPasses;
+    if (passes.isEmpty()) passes.append({ QString(), m_iconPerf });   // a plain batch, not a sweep
+
+    auto ms = [](qint64 ns) { return double(ns) / 1e6; };
+    QStringList out;
+    out << QStringLiteral("ICON RENDER TIMING")
+        << QStringLiteral("==================")
+        << QString()
+        << QStringLiteral("Stored icon size %1 px, rendered at %2 and scaled down. Crop %3, "
+                          "cut-out %4.")
+               .arg(m_iconRenderPx).arg(m_iconRenderPx * 2)
+               .arg(m_iconCrop  ? QStringLiteral("on") : QStringLiteral("off"))
+               .arg(m_iconAlpha ? QStringLiteral("on") : QStringLiteral("off"))
+        << QStringLiteral("Caches bypassed: every icon below is real work, not a cache hit.")
+        << QString();
+
+    for (const auto& pass : passes) {
+        const IconPerf& p = pass.second;
+        if (p.n <= 0) continue;
+        // readWait, not read: with prefetching on, `read` is worker time summed across threads
+        // and is not wall clock. The wait is what the GUI thread actually lost to reading.
+        const qint64 total = p.readWait + p.parse + p.upload + p.tex + p.grab + p.post + p.save;
+        if (total <= 0) continue;
+        auto row = [&](const char* name, qint64 ns) {
+            return QStringLiteral("  %1 %2 %3 %4")
+                       .arg(QString::fromLatin1(name), -22)
+                       .arg(QStringLiteral("%1 s").arg(ms(ns) / 1000.0, 0, 'f', 2), 9)
+                       .arg(QStringLiteral("%1 ms").arg(ms(ns) / p.n, 0, 'f', 2), 11)
+                       .arg(QStringLiteral("%1%").arg(100.0 * double(ns) / double(total), 0, 'f', 1), 7);
+        };
+        if (!pass.first.isEmpty())
+            out << QStringLiteral("-- %1%2 --")
+                       .arg(pass.first,
+                            p.prefetch ? QString() : QStringLiteral(", read-ahead OFF (baseline)"));
+        out << QStringLiteral("%1 icon(s) - %2 s total, %3 ms each; mesh %4 triangles average, "
+                              "%5 largest")
+                   .arg(p.n).arg(ms(total) / 1000.0, 0, 'f', 2)
+                   .arg(ms(total) / p.n, 0, 'f', 2).arg(p.tris / qMax(1, p.n)).arg(p.trisMax)
+            << QString()
+            << QStringLiteral("  %1 %2 %3 %4").arg(QStringLiteral("stage"), -22)
+                   .arg(QStringLiteral("total"), 9).arg(QStringLiteral("per icon"), 11)
+                   .arg(QStringLiteral("share"), 7)
+            << row("CASC read (waited)", p.readWait)
+            << row("parse", p.parse)
+            << row("GL upload", p.upload)
+            << row("base textures", p.tex)
+            << row("GL draw + glFinish", p.grab)
+            << row("crop / scale", p.post)
+            << row("PNG encode + write", p.save)
+            << QString()
+            << QStringLiteral("  tangents, inside GL upload: %1 s   %2 ms/icon   %3% of the total")
+                   .arg(ms(p.tangent) / 1000.0, 0, 'f', 2).arg(ms(p.tangent) / p.n, 0, 'f', 2)
+                   .arg(100.0 * double(p.tangent) / double(total), 0, 'f', 1)
+            << QString()
+            // The question the read row cannot answer on its own. readFile holds m_mutex only for
+            // the index lookup; the archive read and BLTE inflate run outside it. Archive-heavy
+            // means worker threads parallelise (which is what readFile was written for);
+            // lookup-heavy means they would queue on the same lock and gain nothing.
+            << QStringLiteral("  inside CASC: index lookup (locked) %1 ms, archive read + inflate "
+                              "%2 ms")
+                   .arg(ms(p.cascLookup), 0, 'f', 1).arg(ms(p.cascArchive), 0, 'f', 1)
+            << QStringLiteral("               %1 call(s), %2 MB inflated - lookup is %3% of the two")
+                   .arg(p.cascCalls).arg(double(p.cascBytes) / 1048576.0, 0, 'f', 1)
+                   .arg(100.0 * double(p.cascLookup)
+                            / double(qMax(qint64(1), p.cascLookup + p.cascArchive)), 0, 'f', 1)
+            << QStringLiteral("  read work done off-thread: %1 ms total (%2 ms/icon) against %3 ms "
+                              "waited - the gap is the overlap")
+                   .arg(ms(p.read), 0, 'f', 1).arg(ms(p.read) / p.n, 0, 'f', 2)
+                   .arg(ms(p.readWait), 0, 'f', 1)
+            << QStringLiteral("     meta %1 ms, payload %2 ms (both off-thread when read-ahead is on)")
+                   .arg(ms(p.readMeta), 0, 'f', 1).arg(ms(p.readPay), 0, 'f', 1)
+            << QStringLiteral("  %1 sno(s) had no payload - %2 ms spent finding out, charged here "
+                              "rather than per icon")
+                   .arg(p.missed).arg(ms(p.readMissed), 0, 'f', 1)
+            << QString();
+    }
+    out << QStringLiteral("The icon pass sets uHasNormal = 0 and never samples a normal map, so the")
+        << QStringLiteral("tangent share is work no icon can use. It covers the accumulation pass "
+                          "only — the")
+        << QStringLiteral("per-vertex orthogonalize is interleaved with the vertex flatten and is "
+                          "counted")
+        << QStringLiteral("under GL upload with it, so treat that figure as a floor.")
+        << QString();
+
+    QSaveFile f(AppPaths::file(QStringLiteral("icon_perf.txt")));
+    if (f.open(QIODevice::WriteOnly | QIODevice::Text)) {
+        f.write(out.join(QLatin1Char('\n')).toUtf8());
+        f.commit();
+    }
+    for (const QString& line : out)
+        if (!line.isEmpty()) qInfo().noquote() << QStringLiteral("icon perf| ") + line;
+}
+
+bool ModelsTab::ensureThumbCacheVariant()
+{
+    const QString sig = QStringLiteral("px=%1;ss=2;crop=%2;alpha=%3;v1")
+                            .arg(m_iconRenderPx).arg(m_iconCrop ? 1 : 0).arg(m_iconAlpha ? 1 : 0);
+    bool wiped = false;
+    for (bool bc : { false, true }) {
+        QFile f(thumbVariantPath(bc));
+        QString have;
+        if (f.open(QIODevice::ReadOnly)) { have = QString::fromUtf8(f.readAll()).trimmed(); f.close(); }
+        if (have == sig) continue;
+        QDir dir(thumbCacheDir(bc));
+        const QStringList stale = dir.entryList(QStringList{QStringLiteral("*.png")}, QDir::Files);
+        for (const QString& fn : stale) dir.remove(fn);
+        if (!stale.isEmpty()) wiped = true;
+        if (f.open(QIODevice::WriteOnly | QIODevice::Truncate)) { f.write(sig.toUtf8()); f.close(); }
+        if (!stale.isEmpty())
+            qInfo("model icons: %d cached thumbnail(s) in %s dropped — rendered under different "
+                  "icon settings (now %s)", int(stale.size()),
+                  bc ? "model_thumbs_basecolor" : "model_thumbs", qPrintable(sig));
+    }
+    return wiped;
+}
+
+QImage ModelsTab::cachedBaseColor(const QString& matName)
+{
+    if (matName.isEmpty()) return {};
+    // "BASE|<material>", byte-identical to the key applyPartMaterials has always used, so moving
+    // the lambda here neither invalidates the existing cache nor splits it in two.
+    const QString key = QStringLiteral("BASE|") + matName;
+    if (QImage* c = m_texCache.object(key)) return *c;   // copy out: a later insert may evict it
+    const QImage img = baseColorForMaterial(matName);
+    m_texCache.insert(key, new QImage(img), qMax(1, int(img.sizeInBytes() / 1024)));
+    return img;
+}
+
+// Per-part base maps for one parsed model, at icon resolution.
+//
+// Scaled to 64px and cached under "ICON|<material>": the icon is 48px, so uploading a 2048² map
+// per part per row would be pure waste, and the scaled copy is 16 KB against the original's
+// megabytes. The full decode still goes through the shared "BASE|" entry, so a material the
+// viewport has already loaded costs nothing here — and vice versa.
+QVector<QImage> ModelsTab::iconBaseTextures(const ModelGeometry& geo, const QString& apprName,
+                                            const QByteArray& meta, int sno)
+{
+    QVector<QImage> out;
+    out.reserve(geo.primitives.size());
+    // The roster, not MeshPrimitive::materialName. The parser writes "Material_<n>" there — a
+    // positional placeholder, never a real material — so resolving textures from it finds nothing
+    // and every part draws flat. appearanceRosterAny is the one resolver that answers this for
+    // both routes: the .app.json when d4data has one, the CASC meta binary when it does not (every
+    // encrypted appearance, and anything newer than the d4data snapshot).
+    const QStringList roster =
+        MaterialDecode::appearanceRosterAny(m_reader, Config::d4dataDir(), apprName, meta, sno, m_index);
+    if (roster.isEmpty()) return out;   // nothing resolvable — caller draws the grey silhouette
+    for (const MeshPrimitive& p : geo.primitives) {
+        const QString mn = roster.value(p.materialIndex);
+        if (mn.isEmpty()) { out.append(QImage()); continue; }
+        const QString key = QStringLiteral("ICON|") + mn;
+        if (QImage* c = m_texCache.object(key)) { out.append(*c); continue; }
+        const QImage full = cachedBaseColor(mn);
+        // A 4×4 placeholder (armor_skin_mat and friends) is not a texture; leave the part flat
+        // rather than stretching four pixels across it. Same threshold applyPartMaterials uses.
+        const QImage small = (full.isNull() || full.width() <= 8)
+                                 ? QImage()
+                                 : full.scaled(64, 64, Qt::IgnoreAspectRatio, Qt::SmoothTransformation);
+        m_texCache.insert(key, new QImage(small), qMax(1, int(small.sizeInBytes() / 1024)));
+        out.append(small);
+    }
+    return out;
 }
 
 QImage ModelsTab::baseColorForMaterial(const QString& matName)

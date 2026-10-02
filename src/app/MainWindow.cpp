@@ -13,6 +13,7 @@
 #include "index/AssetLinks.h"
 #include "index/BackTrophyIndex.h"
 #include "index/WardrobeAnimIndex.h"
+#include "index/SeriesIndex.h"
 #include "index/StoreProductIndex.h"
 #include "index/ItemHoverIndex.h"
 #include "index/DadOverride.h"
@@ -599,6 +600,11 @@ void MainWindow::buildTabs()
     auto* textures = new TexturesTab; add(textures, QStringLiteral("Textures"));
     auto* models   = new ModelsTab;   add(models,   QStringLiteral("Models"));
     // Route the Models tab's background-scan progress into the shared floating toast.
+    // The automated icon benchmark (D4_ICONPERF_AUTO) needs this tab shown before it starts:
+    // the offscreen thumbnail pass draws through the tab's GL widget, which is not initialised
+    // until the tab has been displayed once. Harmless otherwise — nothing else emits it.
+    connect(models, &ModelsTab::focusRequested, this,
+            [this, models] { if (m_tabs) m_tabs->setCurrentWidget(models); });
     connect(models, &ModelsTab::scanStatus, this,
             [this](const QString& s) {
                 if (s.isEmpty()) m_idxTabMsgs.remove(QStringLiteral("models"));
@@ -1532,6 +1538,9 @@ void MainWindow::finishReload(const ReloadResult& r)
             ItemHoverIndex::instance().reset();   // hover metadata re-derives from the new snapshot
             BackTrophyIndex::instance().reset();  // Item→Actor→Appearance chain is snapshot-specific
             WardrobeAnimIndex::instance().reset();   // ItemType→weapon class + the wardrobe AnimSets
+            // Series strings AND the StoreProduct join that categorises them both come from
+            // the snapshot, so a swap changes the collections and their labels together.
+            SeriesIndex::instance().reset();
             // Clip→action labels ("Walk", "Get Hit", emote names). Memory-only and built once per
             // process, so without this a d4data change left every clip labelled from the previous
             // snapshot until the app was restarted — silently.
@@ -1725,6 +1734,12 @@ QVector<MainWindow::IndexDesc> MainWindow::indexRoster()
         [] { return StoreProductIndex::instance().building(); },
         [d4, ix, casc] { StoreProductIndex::instance().ensureBuilt(d4, ix, casc); },
         [] { StoreProductIndex::instance().reset(); }, true });
+
+    r.push_back({ QStringLiteral("Collections"), QStringLiteral("named sets + how you get them"),
+        [] { return SeriesIndex::instance().ready(); },
+        [] { return SeriesIndex::instance().building(); },
+        [d4] { SeriesIndex::instance().ensureBuilt(d4); },
+        [] { SeriesIndex::instance().reset(); }, true });
 
     // The last two are not QObjects, so they have no building() and no progress signal.
     // TextureDefTable's ensureBuilt is SYNCHRONOUS, so by the time start() returns it is either
@@ -3647,6 +3662,8 @@ void MainWindow::buildIndexIndicator()
     connect(&WardrobeAnimIndex::instance(), &WardrobeAnimIndex::readyChanged, this, done);
     connect(&StoreProductIndex::instance(), &StoreProductIndex::progress, this, tick(QStringLiteral("Store products")));
     connect(&StoreProductIndex::instance(), &StoreProductIndex::readyChanged, this, done);
+    connect(&SeriesIndex::instance(),       &SeriesIndex::progress,       this, tick(QStringLiteral("Collections")));
+    connect(&SeriesIndex::instance(),       &SeriesIndex::readyChanged,   this, done);
     // Auto-regenerate icon_audit.txt once indexing completes (whichever of the two finishes last).
     connect(&AppearanceMeta::instance(), &AppearanceMeta::readyChanged, this, &MainWindow::autoIconAudit);
     connect(&IconIndex::instance(), &IconIndex::readyChanged, this, &MainWindow::autoIconAudit);

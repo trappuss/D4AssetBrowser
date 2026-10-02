@@ -20,6 +20,7 @@
 #include <QEnterEvent>
 #include <QMouseEvent>
 #include <QOpenGLContext>
+#include <QElapsedTimer>   // D4_DUMP_ICONPERF tangent timing
 #include <QOpenGLFramebufferObject>
 #include <memory>
 #include <QSet>
@@ -1214,8 +1215,19 @@ static void fillClothTuningFromD4(QVector<ClothSim>& sims)
     }
 }
 
+// D4_DUMP_ICONPERF, resolved once. See lastTangentNs().
+static bool glIconPerfOn()
+{
+    static const bool on = qEnvironmentVariableIsSet("D4_DUMP_ICONPERF");
+    return on;
+}
+static qint64 s_tangentNs = 0;
+qint64 GLModelWidget::lastTangentNs() { return s_tangentNs; }
+
 void GLModelWidget::setGeometry(const ModelGeometry& geo, bool keepView)
 {
+    const bool perfTan = glIconPerfOn();
+    qint64 tanNs = 0;
     m_verts.clear();
     m_indices.clear();
     m_parts.clear();
@@ -1256,6 +1268,8 @@ void GLModelWidget::setGeometry(const ModelGeometry& geo, bool keepView)
     quint32 base = 0;
     int pi = 0;
     for (const MeshPrimitive& p : geo.primitives) {
+        QElapsedTimer tanT;
+        if (perfTan) tanT.start();
         // Per-vertex tangents (Lengyel) from positions + UVs, for normal mapping.
         QVector<QVector3D> tan(p.vertices.size(), QVector3D(0, 0, 0));
         for (int t = 0; t + 2 < p.indices.size(); t += 3) {
@@ -1271,6 +1285,7 @@ void GLModelWidget::setGeometry(const ModelGeometry& geo, bool keepView)
             const QVector3D tg = (e1 * dv2 - e2 * dv1) * r;
             tan[i0] += tg; tan[i1] += tg; tan[i2] += tg;
         }
+        if (perfTan) tanNs += tanT.nsecsElapsed();
         for (int vi = 0; vi < p.vertices.size(); ++vi) {
             const MeshVertex& v = p.vertices[vi];
             const QVector3D n(v.nx, v.ny, v.nz);
@@ -1364,6 +1379,7 @@ void GLModelWidget::setGeometry(const ModelGeometry& geo, bool keepView)
     }
     m_hasPending = true;
     m_error.clear();
+    if (perfTan) s_tangentNs = tanNs;   // read back by the icon-timing report
     update();
 }
 
@@ -5499,7 +5515,7 @@ QImage GLModelWidget::grabSupersampled(int factor)
     return img;
 }
 
-QImage GLModelWidget::grabThumbnail(int size)
+QImage GLModelWidget::grabThumbnail(int size, bool transparent)
 {
     if (m_prog == 0)              // GL never initialized (tab never shown)
         return {};
@@ -5518,7 +5534,8 @@ QImage GLModelWidget::grabThumbnail(int size)
     fbo.bind();
     glViewport(0, 0, size, size);
     glEnable(GL_DEPTH_TEST);
-    glClearColor(0.12f, 0.12f, 0.13f, 1.0f);
+    if (transparent) glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+    else             glClearColor(0.12f, 0.12f, 0.13f, 1.0f);
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 
     const float cp = std::cos(0.25f), sp = std::sin(0.25f);
@@ -5566,6 +5583,135 @@ QImage GLModelWidget::grabThumbnail(int size)
     return img;
 }
 
+// The base-colour twin of grabThumbnail. Same camera, same persistent FBO, same single pass —
+// but drawn one part at a time so each can bind its own BASE_COLOR map, with uViewChannel = 1
+// (the shader's unlit base-colour channel) so the icon is the model's flat palette rather than
+// a lit grey clay render.
+//
+// Deliberately NOT routed through paintGL/grabFramebuffer the way grabEnsembleThumb is: that path
+// needs the widget's real framebuffer and the full material set uploaded, which is exactly what an
+// icon does not have. This stays a self-contained offscreen pass.
+//
+// Every part is drawn, `visible` included, so a base-colour icon frames identically to the grey
+// one it replaces — a per-part visibility toggle belongs to the on-screen model, not to its icon.
+QImage GLModelWidget::grabThumbnailBaseColor(int size, const QVector<QImage>& partBase,
+                                             bool transparent)
+{
+    if (m_prog == 0)              // GL never initialized (tab never shown)
+        return {};
+    makeCurrent();
+    if (m_hasPending) uploadPending();
+    if (m_indexCount == 0) { doneCurrent(); return {}; }
+
+    // The SAME persistent FBO grabThumbnail uses. Creating one per call is a known driver-crash
+    // source, and two thumbnail paths each owning one would double that risk for no gain.
+    if (!m_thumbFbo || m_thumbFboSize != size) {
+        m_thumbFbo = std::make_unique<QOpenGLFramebufferObject>(size, size, QOpenGLFramebufferObject::Depth);
+        m_thumbFboSize = size;
+    }
+    QOpenGLFramebufferObject& fbo = *m_thumbFbo;
+    if (!fbo.isValid()) { doneCurrent(); return {}; }
+
+    // Upload the part maps to throwaway textures. Done BEFORE binding the FBO so a failed upload
+    // cannot leave it bound, and tracked in one vector so every one is deleted on the way out.
+    QVector<GLuint> tmpTex(partBase.size(), 0);
+    for (int i = 0; i < partBase.size(); ++i) {
+        const QImage& src = partBase.at(i);
+        if (src.isNull() || src.width() <= 0 || src.height() <= 0) continue;
+        const QImage im = src.convertToFormat(QImage::Format_RGBA8888);
+        GLuint t = 0;
+        glGenTextures(1, &t);
+        if (!t) continue;
+        glBindTexture(GL_TEXTURE_2D, t);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, im.width(), im.height(), 0,
+                     GL_RGBA, GL_UNSIGNED_BYTE, im.constBits());
+        tmpTex[i] = t;
+    }
+
+    fbo.bind();
+    glViewport(0, 0, size, size);
+    glEnable(GL_DEPTH_TEST);
+    if (transparent) glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+    else             glClearColor(0.12f, 0.12f, 0.13f, 1.0f);
+    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+
+    // Camera: identical to grabThumbnail's, so the two icon styles frame a model the same way and
+    // switching the setting cannot silently re-crop every thumbnail.
+    const float cp = std::cos(0.25f), sp = std::sin(0.25f);
+    const float cy = std::cos(0.6f),  sy = std::sin(0.6f);
+    const QVector3D dir(cp * sy, sp, cp * cy);
+    const QVector3D eye = m_center + dir * (m_radius * 2.6f);
+    QMatrix4x4 proj; proj.perspective(45.0f, 1.0f, qMax(0.001f, m_radius * 0.02f), m_radius * 20.0f);
+    QMatrix4x4 view; view.lookAt(eye, m_center, QVector3D(0, 1, 0));
+    QMatrix4x4 model;
+    const QMatrix4x4 mvp = proj * view * model;
+
+    glUseProgram(m_prog);
+    glUniformMatrix4fv(uni(m_prog, "uMVP"), 1, GL_FALSE, mvp.constData());
+    glUniformMatrix4fv(uni(m_prog, "uModel"), 1, GL_FALSE, model.constData());
+    const QVector3D ld = (eye - m_center).normalized();
+    glUniform3f(uni(m_prog, "uLightDir"), ld.x(), ld.y(), ld.z());
+    glUniform3f(uni(m_prog, "uViewPos"), eye.x(), eye.y(), eye.z());
+    glUniform3f(uni(m_prog, "uBase"), 0.78f, 0.78f, 0.78f);   // parts with no map keep the grey
+    glUniform1i(uni(m_prog, "uHasNormal"), 0);
+    glUniform1i(uni(m_prog, "uPbr"), 0);
+    glUniform1i(uni(m_prog, "uViewChannel"), 1);   // BASE COLOUR — unlit, flat
+    glUniform1i(uni(m_prog, "uA2C"), 0);           // this FBO is single-sampled: hard cutout
+    glUniform1i(uni(m_prog, "uHasOrm"), 0);
+    glUniform1i(uni(m_prog, "uHasEmissive"), 0);
+    glUniform1i(uni(m_prog, "uHasDyeMask"), 0);
+    glUniform1i(uni(m_prog, "uHasDyeRamp"), 0);
+    glUniform1i(uni(m_prog, "uFDye"), 0);
+    // These two are set because this pass binds textures and grabThumbnail does not. With
+    // uHasTex = 1 the shader's alpha-cutout branch becomes live, and its threshold is chosen by
+    // uIsHair (0.16 vs 0.35); uFurEnabled drives both the vertex shell extrusion and the alpha
+    // the channel viewer returns. Left at whatever the last on-screen paint wrote, an icon would
+    // cut out differently depending on what the viewport happened to be drawing beforehand.
+    glUniform1i(uni(m_prog, "uIsHair"), 0);
+    glUniform1i(uni(m_prog, "uFurEnabled"), 0);
+
+    const GLint uHasTex = uni(m_prog, "uHasTex");
+    glBindVertexArray(m_vao);
+    if (m_parts.isEmpty()) {
+        // No part table (geometry uploaded without one): one flat pass, same as grabThumbnail.
+        glUniform1i(uHasTex, 0);
+        glDrawElements(GL_TRIANGLES, m_indexCount, GL_UNSIGNED_INT, nullptr);
+    } else {
+        for (int i = 0; i < m_parts.size(); ++i) {
+            const Part& pt = m_parts.at(i);
+            if (pt.count == 0) continue;
+            const GLuint tex = (i < tmpTex.size()) ? tmpTex.at(i) : 0;
+            if (tex) {
+                glActiveTexture(GL_TEXTURE0);
+                glBindTexture(GL_TEXTURE_2D, tex);
+                glUniform1i(uHasTex, 1);
+            } else {
+                glUniform1i(uHasTex, 0);
+            }
+            glDrawElements(GL_TRIANGLES, pt.count, GL_UNSIGNED_INT,
+                           reinterpret_cast<void*>(qintptr(pt.offset) * sizeof(quint32)));
+        }
+    }
+    glBindVertexArray(0);
+
+    // Same reasoning as grabThumbnail: finish this icon's GPU work before moving on, so a hang is
+    // attributed to the model that caused it instead of resetting the device during a later one.
+    glFinish();
+    glGetError();   // swallow any accumulated GL error so it doesn't bleed into the next render
+
+    fbo.release();
+    QImage img = fbo.toImage();
+    // After the read-back, so nothing is deleted while it could still be sampled.
+    for (GLuint t : tmpTex) if (t) glDeleteTextures(1, &t);
+    doneCurrent();
+    update();   // restore on-screen view
+    return img;
+}
+
 // Ensemble tile: unlike grabThumbnail's grey single-pass, this runs the REAL paintGL (per-part
 // textures, dyes, fur) via grabFramebuffer, with the camera parked on the front (+X) axis and
 // the channel forced to BASE COLOUR — unlit, so the tile is the outfit's flat palette. Guides
@@ -5607,14 +5753,31 @@ QImage GLModelWidget::grabEnsembleThumb(int size)
     update();
 
     if (img.isNull()) return img;
-    // Crop to the MODEL, not to the middle of the viewport. The transparent clear above leaves
-    // alpha as pure character coverage, so the silhouette's bounding box is known exactly — a
-    // centre crop framed whatever the camera happened to be pointing at and left the character
-    // small and off-centre in the tile.
-    const int W = img.width(), H = img.height();
+    // Crop to the MODEL, not to the middle of the viewport — see cropToSilhouette, which this
+    // used to do inline and which the list icons now share.
+    return cropToSilhouette(img, size);
+}
+
+// Square-crop to the drawn silhouette, then scale. The caller's transparent clear leaves alpha as
+// pure coverage, so the bounding box is known exactly rather than guessed at; a centre crop frames
+// whatever the camera happened to point at, which is how a long thin model ends up a sliver of a
+// tile with empty space all round it.
+//
+// Shared by the Wardrobe's ensemble cards (where it was written) and the Models list's 3D icons.
+// A second copy would have drifted; this one is a pure image operation with no GL and no state,
+// which is why it can be static and tested by eye from either caller.
+QImage GLModelWidget::cropToSilhouette(const QImage& img, int outSize)
+{
+    if (img.isNull() || outSize <= 0) return img;
+    // Needs an alpha channel to measure. Without one every pixel reads as covered and the crop
+    // would be a no-op wearing a cost — say so by returning the input rather than pretending.
+    if (!img.hasAlphaChannel()) return img;
+    const QImage src = img.format() == QImage::Format_RGBA8888
+                           ? img : img.convertToFormat(QImage::Format_RGBA8888);
+    const int W = src.width(), H = src.height();
     int x0 = W, y0 = H, x1 = -1, y1 = -1;
     for (int y = 0; y < H; ++y) {
-        const uchar* row = img.constScanLine(y);
+        const uchar* row = src.constScanLine(y);
         for (int x = 0; x < W; ++x)
             if (row[x * 4 + 3] >= 8) {   // 8/255: anti-aliased edges fade to near-zero coverage
                 if (x < x0) x0 = x;
@@ -5634,8 +5797,8 @@ QImage GLModelWidget::grabEnsembleThumb(int size)
         ox = qBound(0, x0 + bw / 2 - sq / 2, W - sq);
         oy = qBound(0, y0 + bh / 2 - sq / 2, H - sq);
     }
-    return img.copy(ox, oy, sq, sq)
-              .scaled(size, size, Qt::IgnoreAspectRatio, Qt::SmoothTransformation);
+    return src.copy(ox, oy, sq, sq)
+              .scaled(outSize, outSize, Qt::IgnoreAspectRatio, Qt::SmoothTransformation);
 }
 
 void GLModelWidget::mousePressEvent(QMouseEvent* e)

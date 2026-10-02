@@ -1,6 +1,7 @@
 #pragma once
 #include <QHash>
 #include <QObject>
+#include <QSet>   // m_prefixes; MSVC's forced PCH (QtCore/QSet) hid its absence
 #include <QString>
 #include <QVector>
 

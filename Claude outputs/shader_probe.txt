@@ -1,0 +1,38 @@
+=== d4shader — shader-reuse feasibility probe ===
+game    : G:/G Games/Diablo IV
+product :    version 3.2.1.73552
+
+The question: are the game's compiled shader programs reachable, or does it ship only
+declarations? DXBC / DXIL / SPIR-V in the bytes below means reachable. Small records with
+no recognised container mean declaration-only, and the answer is no.
+
+-- group 107 --
+   records in CoreTOC        : 145
+   with a base/meta blob     : 145   (6 KB total)
+   with a base/payload blob  : 0   (0 KB total)
+   with neither              : 0
+   TACT-encrypted            : 0   (of those, key missing: 0)
+   first bytes say:
+        145  meta: unknown — ef be ad de 00 00 00 00  |........|
+   meta size:
+        145  <256 B
+
+-- group 108 --
+   records in CoreTOC        : 81
+   with a base/meta blob     : 81   (142 KB total)
+   with a base/payload blob  : 0   (0 KB total)
+   with neither              : 0
+   TACT-encrypted            : 0   (of those, key missing: 0)
+   first bytes say:
+         81  meta: unknown — ef be ad de 00 00 00 00  |........|
+   meta size:
+         80  1 – 8 KB
+          1  <256 B
+
+Every record name: Claude outputs\shader_probe.txt.records.tsv
+
+-- verdict --
+   No compiled shader container found in any record. On this evidence the game does
+   not ship runnable shader code here, and reimplementing in GLSL — what the app
+   already does — is the only path. Close the question and spend the effort on the
+   lighting rig and tonemap instead.

@@ -44,7 +44,35 @@ public:
     static QString glInfo() { return s_glInfo; }
 
     // Render the current (bind-pose) model to a square thumbnail. Null if empty.
-    QImage grabThumbnail(int size = 64);
+    // `transparent` clears to alpha 0 instead of the viewport grey, so the icon is a cut-out that
+    // sits on whatever is behind it — and so cropToSilhouette below has coverage to measure.
+    QImage grabThumbnail(int size = 64, bool transparent = false);
+    // The same thumbnail, drawn per part with each part's BASE COLOUR map and the shader's
+    // unlit base-colour channel — what the model actually looks like rather than grey clay.
+    // `partBase` is indexed like the parts; a null or missing entry draws that part flat, so a
+    // model whose materials do not resolve degrades to the grey render rather than to nothing.
+    //
+    // The images are uploaded to TEMPORARY GL textures and deleted before returning: the live
+    // preview's own m_partTex is never touched, so rendering icons cannot leave the on-screen
+    // model wearing an icon's textures. Callers should pass images already scaled down — a 48px
+    // icon cannot show more, and this uploads exactly what it is given.
+    QImage grabThumbnailBaseColor(int size, const QVector<QImage>& partBase,
+                                  bool transparent = false);
+    // Square-crop an RGBA image to its own silhouette (alpha >= 8/255) with a little air, then
+    // scale to outSize. Factored out of grabEnsembleThumb, which is where it was proven: a centre
+    // crop frames whatever the camera pointed at, so a long thin model ends up a sliver adrift in
+    // the tile. Returns a centre crop when nothing was drawn, and the input unchanged if it has
+    // no alpha channel to measure.
+    static QImage cropToSilhouette(const QImage& img, int outSize);
+    // Nanoseconds the LAST setGeometry() spent building per-vertex tangents, or 0.
+    //
+    // Diagnostic only, and measured only while D4_DUMP_ICONPERF is set — the timer is not even
+    // started otherwise, so this costs one already-resolved bool in the normal path. It exists
+    // because the icon pass sets uHasNormal = 0 and never samples a normal map, which makes the
+    // tangent build look like pure waste per icon; "looks like" is not a number, and this is the
+    // number. Covers the accumulation pass and its allocation, NOT the per-vertex orthogonalize,
+    // which is interleaved with the vertex flatten and cannot be separated without restructuring.
+    static qint64 lastTangentNs();
     // The full pipeline rendered at `factor`x the viewport's own resolution. Real extra pixels, not
     // an upscale: paintGL sizes its SSAO G-buffer and every pass from m_fbW/m_fbH, so enlarging
     // those and pointing the passes at a bigger FBO supersamples the whole thing. Uniform scaling

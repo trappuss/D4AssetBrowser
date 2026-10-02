@@ -1,9 +1,8 @@
 {
   "$schema": "https://raw.githubusercontent.com/microsoft/vcpkg/master/scripts/vcpkg.schema.json",
-  "name": "d4assetbrowser",
-  "version": "2.4.0",
-  "description": "Native C++/Qt6 Diablo IV asset browser and 3D wardrobe studio — reads the installed game's CASC storage directly.",
-  "homepage": "https://github.com/trappuss/D4AssetBrowser",
+  "name": "d4shader",
+  "version": "0.1.0",
+  "description": "Feasibility probe: are Diablo IV's compiled shaders reachable and reusable?",
   "dependencies": [
     {
       "name": "qtbase",
@@ -16,7 +15,6 @@
         "jpeg"
       ]
     },
-    "qtsvg",
     "zlib",
     "lz4"
   ],

@@ -337,6 +337,9 @@ private:
     QCheckBox*    m_rewardChk   = nullptr;    // arRequiresOwning set: a reward, not a shop purchase
     QComboBox*    m_branchFilter = nullptr;
     QComboBox*    m_seasonFilter = nullptr;   // snoAssociatedSeason, by display name
+    // The game's own set name, from SeriesIndex. A bundle is a container and resolves to the
+    // set through its parent chain, so this filters rows the product's own record never names.
+    QComboBox*    m_collFilter  = nullptr;
     QComboBox*    m_sortCombo   = nullptr;    // name / season / patch / sno asc / sno desc
     QCheckBox*    m_latestChk   = nullptr;    // only bundles new in this game build
     QCheckBox*    m_showLoose     = nullptr;  // products that are neither a bundle nor in one

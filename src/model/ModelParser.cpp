@@ -277,7 +277,29 @@ QVector<IB> scanIndexBuffers(const Reader& meta, int payloadSize, const QVector<
 
 // ── Segment / SubObject scans ────────────────────────────────────────
 struct Segment { int fileOffset; quint32 vc, vo, ic, io; QVector<int> bonePalette; };
-struct SubObj  { int fileOffset; qint32 mat, vbi, ibi; quint32 hash, slotHash; Segment seg; };
+// `more`: a sub-object's segments after its first (SubObject.ptSegments holds 1..n 32-byte records;
+// each segment has its own vertex/index range and its own bone palette). Filled unless
+// multiSegmentEnabled() is switched off — see findSubObjects.
+struct SubObj  { int fileOffset; qint32 mat, vbi, ibi; quint32 hash, slotHash; Segment seg; QVector<Segment> more; };
+
+// A SubObject whose ptSegments array holds MORE than one segment was never matched by
+// findSubObjects (it accepted a 32-byte = one-segment array only), so the whole sub-object — every
+// one of its segments — was silently absent from the mesh. Measured over d4data 2026-09-23: 338 of
+// 64,787 appearances with LOD0 geometry have one, 123 of them lose over half their LOD0 vertices
+// (Barbarian_Ancient_Korlic: 20,710 of 20,873 — it rendered as a 256-triangle shell; barF_base00:
+// 23,113 of 41,426). They are loaded: all segments into the sub-object's ONE primitive, each
+// through its own palette. Verified on the real install 2026-09-23 (Korlic 256 → 32,944 tris, a
+// whole character; barF_base00 20,305 → 54,621 with its head and helm, and the glow that appears
+// is real — barF_base00 carries the barbarianF_wrath "transformed" submeshes too, confirmed in
+// D4's own viewport). D4_PARSE_MULTISEG=0 restores the old behaviour for diagnosis; the loss is
+// then logged instead of silent.
+static bool multiSegmentEnabled()
+{
+    static const bool on = qEnvironmentVariableIntValue("D4_PARSE_MULTISEG") != 0
+                           || !qEnvironmentVariableIsSet("D4_PARSE_MULTISEG");
+    return on;
+}
+struct MultiSegRef { qint32 vbi, ibi; int segments; quint32 verts; };
 
 // SubObjectSegment.pBoneIDs: DT_VARIABLEARRAY<int32> at the segment struct head
 // (8 zero bytes, then dataOffset/dataSize). Meta-resident values live at
@@ -336,10 +358,14 @@ QByteArray le32(quint32 v)
     return b;
 }
 
-QVector<SubObj> findSubObjects(const Reader& meta, const QByteArray& metaBytes, const QVector<Segment>& segs)
+QVector<SubObj> findSubObjects(const Reader& meta, const QByteArray& metaBytes, const QVector<Segment>& segs,
+                               QVector<MultiSegRef>* multiSkipped = nullptr)
 {
     QVector<SubObj> out;
     QHash<int, bool> usedSeg;
+    QHash<int, int> segAt;   // fileOffset → index in segs (a sub-object's later segments follow its first, 32 bytes apart)
+    for (int i = 0; i < segs.size(); ++i) segAt.insert(segs[i].fileOffset, i);
+    const bool multi = multiSegmentEnabled();
     for (const Segment& seg : segs) {
         if (usedSeg.value(seg.fileOffset - 16, false)) continue;
         const int target = seg.fileOffset - 32;
@@ -350,17 +376,39 @@ QVector<SubObj> findSubObjects(const Reader& meta, const QByteArray& metaBytes, 
             const int p = metaBytes.indexOf(pat, pos);
             if (p < 0) break;
             if (p < 8 || p + 8 > meta.n) { pos = p + 1; continue; }
-            if (meta.u32(p - 8) != 0 || meta.u32(p - 4) != 0 || meta.u32(p + 4) != 32) { pos = p + 1; continue; }
+            const quint32 arrBytes = meta.u32(p + 4);
+            // The ptSegments array must start at this segment and hold whole 32-byte records.
+            const int nSeg = (arrBytes >= 32 && arrBytes % 32 == 0 && arrBytes <= 32u * 256u) ? int(arrBytes / 32) : 0;
+            if (meta.u32(p - 8) != 0 || meta.u32(p - 4) != 0 || nSeg == 0) { pos = p + 1; continue; }
+            // Every later segment must be a record scanSegments found, exactly 32 bytes on.
+            QVector<Segment> more;
+            for (int k = 1; k < nSeg; ++k) {
+                const int si = segAt.value(seg.fileOffset + 32 * k, -1);
+                if (si < 0) { more.clear(); break; }
+                more.append(segs[si]);
+            }
+            if (nSeg > 1 && int(more.size()) != nSeg - 1) { pos = p + 1; continue; }
             const int so = p - 0x08 - 0xC8;
             if (so < 0 || so + 240 > meta.n) { pos = p + 1; continue; }
             const qint32 mat = meta.i32(so + 0x60);
             const qint32 vbi = meta.i32(so + 0x68);
             const qint32 ibi = meta.i32(so + 0x6C);
             if (!(vbi >= -1 && vbi <= 16) || !(ibi >= -1 && ibi <= 16)) { pos = p + 1; continue; }
+            if (nSeg > 1 && !multi) {
+                // The old path: not matched, the scan goes on exactly as before — only now it is
+                // counted, so the loss is logged instead of silent.
+                if (multiSkipped) {
+                    quint32 v = seg.vc;
+                    for (const Segment& m : more) v += m.vc;
+                    multiSkipped->append({vbi, ibi, nSeg, v});
+                }
+                pos = p + 1; continue;
+            }
             const quint32 hash = meta.u32(so + 0x64);
             const quint32 slot = meta.u32(so + 0x38 + 0x10);
-            out.push_back({so, mat, vbi, ibi, hash, slot, seg});
+            out.push_back({so, mat, vbi, ibi, hash, slot, seg, more});
             usedSeg[seg.fileOffset - 16] = true;
+            for (const Segment& m : more) usedSeg[m.fileOffset - 16] = true;
             break;
         }
     }
@@ -984,7 +1032,8 @@ ModelGeometry ModelParser::parseApp(const QByteArray& metaBytes, const QByteArra
     for (int i = 0; i < icount; ++i) rawIdx[i] = payload.u16(ib0->dataOffset + i * 2);
 
     QVector<Segment> segs = scanSegments(meta);
-    QVector<SubObj> subs = findSubObjects(meta, metaBytes, segs);
+    QVector<MultiSegRef> multiSkipped;
+    QVector<SubObj> subs = findSubObjects(meta, metaBytes, segs, &multiSkipped);
     // Sub-objects are kept only when they live on the ONE vertex/index buffer chosen above. Any
     // that reference a different buffer are silently dropped, and that is a real source of missing
     // geometry: measured over 1500 wardrobe appearances, 156 (10%) have at least one LOD0
@@ -1010,6 +1059,14 @@ ModelGeometry ModelParser::parseApp(const QByteArray& metaBytes, const QByteArra
     if (droppedSubs > 0)
         qWarning("model: %d sub-object(s) (~%u verts) sit on vertex buffer(s) other than %d and were "
                  "NOT loaded — this mesh is incomplete", droppedSubs, droppedVerts, vb0->arrayIndex);
+    {
+        int nMulti = 0; quint32 vMulti = 0;
+        for (const MultiSegRef& m : multiSkipped)
+            if (m.vbi == vb0->arrayIndex && m.ibi == ib0->arrayIndex) { ++nMulti; vMulti += m.verts; }
+        if (nMulti > 0)
+            qWarning("model: %d multi-segment sub-object(s) (~%u verts) were NOT loaded — this mesh is incomplete "
+                     "(D4_PARSE_MULTISEG=0 is set; unset it to load them)", nMulti, vMulti);
+    }
     if (lod0.isEmpty()) {
         // droppedSubs==0 here means findSubObjects returned NOTHING, which is a different fault
         // from "they all sat on another vertex buffer" — the warning above only fires for the latter.
@@ -1025,21 +1082,28 @@ ModelGeometry ModelParser::parseApp(const QByteArray& metaBytes, const QByteArra
 
     // One MeshPrimitive per LOD0 SubObject, with a remapped local vertex set.
     for (const SubObj& s : lod0) {
-        const int baseV = int(s.seg.vo) / stride;
-        const int endIdx = int(s.seg.io + s.seg.ic);
-        if (endIdx > rawIdx.size()) {
-            qWarning("model-parse: GATE index-overrun — sub-object wants %d indices, buffer has %d",
-                     endIdx, int(rawIdx.size()));
-            return ModelGeometry();
-        }
-        const QVector<int>& palette = s.seg.bonePalette;   // segment-local → global bone
         MeshPrimitive prim;
         prim.materialName = QStringLiteral("Material_%1").arg(s.mat);
         prim.materialIndex = s.mat;
         prim.subObjectHash = s.hash;
         prim.slotHash = s.slotHash;
+        // Every segment of the sub-object feeds its one primitive (a single-segment sub-object —
+        // all of them with D4_PARSE_MULTISEG=0 — runs this loop once, exactly as before). The
+        // remap is per segment: each has its own vertex range and bone palette.
+        QVector<const Segment*> allSegs{&s.seg};
+        for (const Segment& m : s.more) allSegs.append(&m);
+        for (const Segment* sp : allSegs) {
+        const Segment& sg = *sp;
+        const int baseV = int(sg.vo) / stride;
+        const int endIdx = int(sg.io + sg.ic);
+        if (endIdx > rawIdx.size()) {
+            qWarning("model-parse: GATE index-overrun — sub-object wants %d indices, buffer has %d",
+                     endIdx, int(rawIdx.size()));
+            return ModelGeometry();
+        }
+        const QVector<int>& palette = sg.bonePalette;   // segment-local → global bone
         QHash<int, quint32> remap;
-        for (int i = int(s.seg.io); i + 2 < endIdx; i += 3) {
+        for (int i = int(sg.io); i + 2 < endIdx; i += 3) {
             const int a = rawIdx[i], b = rawIdx[i + 1], c = rawIdx[i + 2];
             if (a == b || b == c || a == c) continue;       // drop degenerate
             const int g[3] = {a + baseV, b + baseV, c + baseV};
@@ -1067,6 +1131,7 @@ ModelGeometry ModelParser::parseApp(const QByteArray& metaBytes, const QByteArra
                 prim.indices.push_back(local);
             }
         }
+        }   // segments
         if (prim.indices.isEmpty()) continue;
         geo.primitives.push_back(std::move(prim));
     }

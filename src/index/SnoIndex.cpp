@@ -67,12 +67,35 @@ const QHash<int, QString>& groupNameMap()
         {59,"Reverb"}, {60,"MarkerSet"}, {62,"Recipe"}, {63,"Reputation"},
         {67,"Crafter"}, {68,"HoudiniParticles"}, {71,"SoundBank"}, {72,"Actor (NPC)"},
         {73,"Item"}, {74,"PlayerClass"}, {76,"Font"}, {77,"Affix"}, {78,"Unknown (78)"},
-        {79,"DungeonAffix"}, {80,"MonsterAffix"}, {81,"MaterialValue"},
+        // 80 was "MonsterAffix" and is not: a CoreTOC census of all 728 of its records finds
+        // Default / AxeLiteDefault / DGN_Scos_Oldstones / Scos_Strand — dungeon and zone names.
+        // The real monster-affix group is 107 (below), so this label had to move or the two would
+        // share a name, which is the nondeterministic-QHash-walk trap 143 already documents.
+        // Renamed Unknown rather than to a guess: only a 12-name sample of this group was read.
+        {79,"DungeonAffix"}, {80,"Unknown (80)"}, {81,"MaterialValue"},
         {82,"MaterialValueSet"}, {85,"Unknown (85)"}, {86,"Condition"}, {88,"ActorService"},
         {90,"Boost"}, {92,"ItemRequirement"}, {93,"Unknown (93)"}, {95,"Achievement"},
         {96,"Season"}, {98,"ItemType"}, {99,"WwiseSoundBank"}, {100,"MonsterFamily"},
         {101,"Physics"}, {102,"BehaviorContainer"}, {103,"Modal"}, {104,"Power (2)"},
-        {105,"Surface"}, {106,"SkillKit"}, {107,"Shader"}, {108,"ShaderMap"},
+        // ── 107 / 108: MEASURED, and both were wrong ────────────────────────────────────────
+        // These two carried "Shader" / "ShaderMap" purely by inheritance. They could never have
+        // been checked the way the rest were — that method matches json/base/meta/<Folder> stems
+        // against CoreTOC, and the d4data sparse checkout ships no Shader folder at all, so there
+        // was nothing to compare against. A shader-extraction probe read every record instead:
+        //
+        //   107, all 145 names: Waller · Teleporter · Vortex · Mortar · Frozen · Shielded ·
+        //        FireChains · LifeLink · ReflectDamage · Berserker · Earthquake · Suppressor ·
+        //        Plaguebearer · Summoner · Executioner · Martyrdom, the monster rarity tiers
+        //        (Unique/Legendary/Gilded/Ancestral/Mythic), the resistances, and the seasonal
+        //        sets (S01_MalignantAffix_*, S07_*, S08_BelialTide_*, X2_MindDelve_*).
+        //        The canonical elite-affix roster. Not one shader.
+        //   108, 80 of 81 names: Paragon_<class>_<NN> across all eight classes, Paladin and
+        //        Warlock included; the 81st is CoreTOC's "Axe Bad Data" placeholder. This is the
+        //        ParagonBoard label that went missing when 133 was corrected to MarkingColor.
+        //
+        // Both records are meta-only with no payload, ~42 bytes each for 107 — far too small to
+        // be compiled shader code, which is the separate question that started this.
+        {105,"Surface"}, {106,"SkillKit"}, {107,"MonsterAffix"}, {108,"ParagonBoard"},
         // 110 is StoreProductDefinition — the Cosmetics Shop catalogue — NOT a Power group.
         // definitions.json states it outright (snoGroup 110, 73 fields), and d4data ships 7,496
         // json/base/meta/StoreProduct/*.prd.json for it. It was labelled "Power (3)" and excluded

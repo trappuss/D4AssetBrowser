@@ -984,6 +984,60 @@ the internal <code>barF_stor150_HLM</code>.</li>
                        "renders flat-lit: no surface detail, glow or dye tinting.\n\n"
                        "Models tab only — it does not affect the Wardrobe or Stable previews, "
                        "or anything you export."));
+    mdlChk(QStringLiteral("models/iconBaseColor"),
+        QStringLiteral("Base colour 3D rendered icons"), false,
+        QStringLiteral("Render the list's 3D icons with each part's base-colour map, unlit, "
+                       "instead of the flat grey clay render.\n\n"
+                       "The icon then shows what the model actually looks like, which is the "
+                       "difference between telling two armour sets apart and not. It costs a "
+                       "texture decode per material the first time one is seen; materials are "
+                       "shared with the preview, so a model you have already opened is free.\n\n"
+                       "The two styles keep separate thumbnail caches, so switching back and "
+                       "forth never re-renders anything you already have."));
+    // ── 3D icon shape ───────────────────────────────────────────────────────────────────────────
+    // Stored size, not displayed size. The grid draws icons at 48-256 (Ctrl+scroll) while the
+    // renderer produced 48 flat, so every icon above the minimum was magnified — which is why 3D
+    // icons looked soft beside the original 2D ones. Rendering at 2x this and scaling down is the
+    // anti-aliasing, so the number here is the one that matters for both sharpness and disk.
+    {
+        auto* row = new QHBoxLayout;
+        auto* lbl = new QLabel(QStringLiteral("3D icon resolution"), models);
+        auto* px  = new QComboBox(models);
+        px->addItem(QStringLiteral("64 px — smallest files"), 64);
+        px->addItem(QStringLiteral("128 px — recommended"),  128);
+        px->addItem(QStringLiteral("256 px — sharp at full zoom"), 256);
+        { const int i = px->findData(QSettings().value(QStringLiteral("models/iconRenderPx"), 128).toInt());
+          px->setCurrentIndex(i >= 0 ? i : 1); }
+        const QString tip = QStringLiteral(
+            "How large each 3D list icon is rendered and stored.\n\n"
+            "The grid shows icons between 48 and 256 px depending on zoom, so anything stored "
+            "smaller than the tile gets magnified — 128 covers the default 88 px grid with room "
+            "to spare, 256 stays sharp at maximum zoom.\n\n"
+            "Bigger costs disk: roughly 0.3 KB per icon at 48 px against about 10 KB at 128. "
+            "Changing this clears the cached icons, which re-render as you browse.");
+        lbl->setToolTip(tip);
+        px->setToolTip(tip);
+        QObject::connect(px, &QComboBox::currentIndexChanged, this, [px](int) {
+            QSettings().setValue(QStringLiteral("models/iconRenderPx"), px->currentData().toInt());
+        });
+        row->addWidget(lbl);
+        row->addWidget(px, 1);
+        ml->addLayout(row);
+    }
+    mdlChk(QStringLiteral("models/iconCrop"),
+        QStringLiteral("Crop 3D icons to the model"), true,
+        QStringLiteral("Frame each icon on the model's own silhouette instead of on a fixed "
+                       "distance from its centre.\n\n"
+                       "Without it a long thin subject — a sword, a banner, a wall section — sits "
+                       "as a sliver in the middle of the tile with empty space all round it. The "
+                       "Wardrobe's ensemble cards have always been framed this way."));
+    mdlChk(QStringLiteral("models/iconAlpha"),
+        QStringLiteral("Transparent background for 3D icons"), true,
+        QStringLiteral("Keep the icon as a cut-out so it sits on the list's own background, the "
+                       "way the original 2D icons do.\n\n"
+                       "Off bakes the viewport grey into each icon, which shows as a rectangle "
+                       "around it — most visibly on the selected row. Cropping works either way: "
+                       "the icon is always rendered with transparency and flattened afterwards."));
     mdlChk(QStringLiteral("models/fillSkin"),
         QStringLiteral("Fill skin materials with the class body's skin textures"), true,
         QStringLiteral("Armor pieces carry a black 'skin' placeholder material that the game fills "
@@ -2487,6 +2541,8 @@ static QStringList liveSettingKeys()
         QStringLiteral("models/rememberPanels"), QStringLiteral("models/fillSkin"),
         QStringLiteral("models/autoRender3D"), QStringLiteral("models/clothSim"),
         QStringLiteral("models/baseColorOnly"),   // was missing: Cancel kept this edit
+        QStringLiteral("models/iconBaseColor"), QStringLiteral("models/iconRenderPx"),
+        QStringLiteral("models/iconCrop"),       QStringLiteral("models/iconAlpha"),
 
         QStringLiteral("wardrobe2/nudeBase"),
         QStringLiteral("wardrobe2/autoAnimate"),

@@ -742,7 +742,7 @@ void ModelsTab::exportCurrentModelGlb(const QVector<int>& keep, const QString& l
 // then append the newly-written ones to the ledger. This is what makes "extract only the NEW armors
 // after a patch" work: SNO ids are stable, so re-running the same query only exports what's missing.
 void ModelsTab::bulkExport(const QVector<QPair<int, QString>>& items, const QString& dir, bool onlyNew,
-                           const BatchSink* sink)
+                           const BatchSink* sink, bool rememberDir)
 {
     // Say so on the way out. A caller that resolved nothing — a Catalogue bundle whose items did
     // not map, a filter that matched none — otherwise gets a completely silent no-op, which reads
@@ -786,7 +786,7 @@ void ModelsTab::bulkExport(const QVector<QPair<int, QString>>& items, const QStr
     // applyLayout=false: Bulk Extract grouped this list itself before calling — it needs the group
     // map for its own buffer and name-matched-texture passes — and `dir` is already the group's
     // folder. Grouping again here would nest a second copy inside it.
-    exportModels(todo, dir, sink, &failReasons, /*applyLayout*/ false);
+    exportModels(todo, dir, sink, &failReasons, /*applyLayout*/ false, rememberDir);
 
     // Append the items that now have a .glb on disk to the ledger; anything without one failed.
     QStringList failed;
@@ -827,7 +827,8 @@ void ModelsTab::bulkExport(const QVector<QPair<int, QString>>& items, const QStr
 }
 
 void ModelsTab::exportModels(const QVector<QPair<int, QString>>& models, const QString& dir,
-                             const BatchSink* sink, QStringList* failures, bool applyLayout)
+                             const BatchSink* sink, QStringList* failures, bool applyLayout,
+                             bool rememberDir)
 {
     if (models.isEmpty() || dir.isEmpty() || !m_reader || !m_reader->isReady()) return;
 
@@ -1183,7 +1184,12 @@ void ModelsTab::exportModels(const QVector<QPair<int, QString>>& models, const Q
               (h + m) ? (100 * h / (h + m)) : 0, texCache.bytesSaved() >> 20,
               texCache.disabled() ? "OFF (D4_NO_TEXCACHE)" : "on");
     }
-    QSettings().setValue(QStringLiteral("models/lastExportDir"), dir);
+    // Only when the user picked this folder. `dir` here is whatever the caller passed, and two
+    // callers synthesise it: the Catalogue writes each bundle into its own <chosen>/<bundle>/models
+    // subfolder, and drag-out stages into a temp directory. Both used to land in this key, so
+    // "Export to last folder" afterwards pointed inside the last exported bundle — or at %TEMP% —
+    // instead of at the folder the user actually chose.
+    if (rememberDir) QSettings().setValue(QStringLiteral("models/lastExportDir"), dir);
     ExportNotifier::instance().notify(
         QStringLiteral("Exported %1 model(s)%2%3%4")
             .arg(ok).arg(fail ? QStringLiteral(", %1 failed").arg(fail) : QString(),
@@ -1371,7 +1377,9 @@ void ModelsTab::startModelDrag()
     // applyLayout=false: this stages into a temp folder and then rebuilds each path by hand to
     // hand the drag its file:// URLs. A layout would move the files under it and every exists()
     // below would miss, so the drag would silently carry nothing.
-    exportModels(items, dir, nullptr, nullptr, /*applyLayout*/ false);
+    // rememberDir=false: this is a temp staging folder for the drag, not a destination the user
+    // chose, and recording it would repoint "Export to last folder" at %TEMP%.
+    exportModels(items, dir, nullptr, nullptr, /*applyLayout*/ false, /*rememberDir*/ false);
     QApplication::restoreOverrideCursor();
     QList<QUrl> urls;
     for (const auto& m : items) {
