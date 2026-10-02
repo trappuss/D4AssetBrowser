@@ -178,7 +178,7 @@ int main(int argc, char** argv)
     LogBuffer::instance();   // construct on the GUI thread (queued log delivery)
     QApplication::setOrganizationName("D4AssetBrowser");
     QApplication::setApplicationName("D4AssetBrowser");
-    QApplication::setApplicationVersion("2.4.0");
+    QApplication::setApplicationVersion("2.4.1");
 
     // Portable: every QSettings() default-ctor writes to an INI in the beside-exe data/ folder
     // (no Windows registry). Must run before any QSettings use. Combined with AppPaths, the whole

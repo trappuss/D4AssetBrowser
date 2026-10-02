@@ -3,6 +3,19 @@
 Notable changes per release. The published GitHub releases are the canonical source;
 this file is the same content in one place.
 
+## 2.4.1
+
+### Fixed
+- **Some characters loaded as a fraction of themselves — Barbarian_Ancient_Korlic was a 256-triangle shell.** A sub-object whose segment list held more than one segment was skipped outright, taking every segment with it; 338 of 64,787 appearances with LOD0 geometry have one and 123 of those lost over half their vertices. Korlic now loads 32,944 triangles instead of 256, and barF_base00 goes from 20,305 to 54,621 with its head, helm and transformed submeshes.
+- **Exporting an outfit with a filename template read past the end of an array.** The slot lookup holds only the five armour combos and was being indexed with the main-hand and off-hand slots — undefined behaviour on every templated outfit export.
+
+### Internal
+- **The animation and entity indexes moved out of the Models tab** into their own index, shared with the AssetBrowser core's D4 store: the Anim and AnimSet scans, their disk cache, the rig-bone parse, the base-family index and the Actor/Item graph. The tab's members are now references into it, so every existing use reads unchanged — and its largest source file shrank by 46 KB. The parallel file-scan helper moved with it, for the same reason.
+- **Two headers only compiled because MSVC force-includes a precompiled header.** One needed a `QWidget` forward declaration and the other `<QSet>`; neither would have built outside that precompiled header, which is exactly where the shared core builds them.
+
+### Diagnostics
+- `D4_PARSE_MULTISEG=0` restores the old single-segment mesh behaviour for comparison, and logs what it drops rather than dropping it silently.
+
 ## 2.4.0
 
 ### Fixed
